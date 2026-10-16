@@ -1241,3 +1241,18 @@ Deno.test("sync and wait_ready refuse to rebind a server that moved project", as
     }
   }
 });
+
+Deno.test("a record without a project never gains one from a refresh", async () => {
+  const a = api(() => ok(rawServer({ project: { id: 2002 } })));
+  try {
+    const { context, getWrittenResources } = createModelTestContext({
+      globalArgs: GLOBALS,
+      storedResources: STORED,
+    });
+    await model.methods.sync.execute({}, context);
+    const data = getWrittenResources()[0].data as Record<string, unknown>;
+    assertEquals(data.project_id, undefined);
+  } finally {
+    a.restore();
+  }
+});

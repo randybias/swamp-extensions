@@ -361,7 +361,14 @@ Deno.test("an order is never resent after a 429", async () => {
 });
 
 Deno.test("summarize drops a provider code that could be a reflected token", () => {
-  for (const code of ["AbC123xyzTOKEN", "a1b2c3", "Bearer"]) {
+  for (
+    const code of [
+      "AbC123xyzTOKEN",
+      "a1b2c3",
+      "Bearer",
+      "abcdefghijklmnopqrstuvwx",
+    ]
+  ) {
     assertEquals(
       summarize(JSON.stringify({ code, message: "Bad request." })),
       "Bad request.",

@@ -119,9 +119,8 @@ export function summarize(text: string): string {
     const code = String(parsed.code ?? "");
     if (
       (typeof parsed.code === "string" || typeof parsed.code === "number") &&
-      // Numeric status codes or short lowercase/underscore words only: a
-      // reflected token cannot pass.
-      /^(?:\d{1,5}|[a-z_]{1,32})$/.test(code)
+      // Numeric codes only: a reflected token cannot pass.
+      /^\d{1,5}$/.test(code)
     ) {
       parts.push(`code ${code}`);
     }

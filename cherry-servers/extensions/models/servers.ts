@@ -231,6 +231,9 @@ function keepUserDataSha(
  * guards on, so a refresh must not rebind them. `get` re-adopts deliberately.
  */
 function assertSameBinding(stored: ServerState, live: ServerState): void {
+  // A record without a project never gains one from a refresh, so delete
+  // keeps falling back to the explicit project_id for it.
+  if (stored.project_id === undefined) delete live.project_id;
   if (
     live.hostname !== stored.hostname ||
     (stored.project_id !== undefined && live.project_id !== stored.project_id)

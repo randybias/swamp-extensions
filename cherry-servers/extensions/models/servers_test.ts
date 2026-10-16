@@ -1347,3 +1347,98 @@ Deno.test("readiness records the address of the final API state, not a deploy ad
     a.restore();
   }
 });
+
+Deno.test("no host key seen during deploy is scanned, recorded or pinned", async () => {
+  let n = 0;
+  const a = api(() =>
+    ok(
+      ++n <= 2
+        ? rawServer({ status: "deploying", state: "provisioning" })
+        : rawServer(),
+    )
+  );
+  const DEPLOY_KEY =
+    "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIProvisioningEnvKey0000000000";
+  let scans = 0;
+  const run: CommandRunner = (cmd) => {
+    if (cmd === "ssh-keyscan") {
+      scans++;
+      // The provisioning environment's key would show up here if scanned
+      // while the API still says deploying.
+      const line = n <= 2 ? DEPLOY_KEY : KEY_LINE;
+      return Promise.resolve({
+        code: 0,
+        stdout: `192.0.2.10 ${line}\n`,
+        stderr: "",
+      });
+    }
+    return Promise.resolve({
+      code: 0,
+      stdout: "256 SHA256:fake x (ED25519)\n",
+      stderr: "",
+    });
+  };
+  let t = 0;
+  const prev = setProbeDeps({
+    run,
+    banner: () => Promise.resolve("SSH-2.0-OpenSSH_8.9p1 Ubuntu\r\n"),
+    now: () => (t += 1000),
+  });
+  try {
+    const { context, getWrittenResources } = createModelTestContext({
+      globalArgs: GLOBALS,
+      storedResources: STORED,
+    });
+    await model.methods.wait_ready.execute(
+      {
+        host_key_policy: "accept-new",
+        port: 22,
+        ssh_user: "root",
+        timeout_seconds: 600,
+        poll_interval_seconds: 1,
+      },
+      context,
+    );
+    const data = getWrittenResources().find((r) => r.specName === "readiness")
+      ?.data as { known_hosts: string[] };
+    assertEquals(scans, 1);
+    assertEquals(data.known_hosts, [`192.0.2.10 ${KEY_LINE}`]);
+    assertEquals(JSON.stringify(data).includes("ProvisioningEnvKey"), false);
+  } finally {
+    setProbeDeps(prev);
+    a.restore();
+  }
+});
+
+Deno.test("strict fails clearly when the final keys differ from known_hosts", async () => {
+  const a = api(() => ok(rawServer()));
+  const p = probe({
+    keyLine:
+      "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIProvisioningEnvKey0000000000",
+  });
+  try {
+    const { context } = createModelTestContext({
+      globalArgs: GLOBALS,
+      storedResources: STORED,
+    });
+    await assertRejects(
+      () =>
+        model.methods.wait_ready.execute(
+          {
+            host_key_policy: "strict",
+            known_hosts: `192.0.2.10 ${KEY_LINE}`,
+            port: 22,
+            ssh_user: "root",
+            timeout_seconds: 600,
+            poll_interval_seconds: 15,
+          },
+          context,
+        ),
+      Error,
+      "host key mismatch for ssh-ed25519",
+    );
+  } finally {
+    p.restore();
+    a.restore();
+  }
+});

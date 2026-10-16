@@ -28,3 +28,9 @@ Deno.test("upgrades to 2026.10.16.3 keep existing attributes unchanged", () => {
   // Attributes a 2026.10.16.2 servers definition held still validate.
   assertEquals(servers.globalArguments.safeParse(old).success, true);
 });
+
+Deno.test("deletes are actions, so swamp never tombstones other records", () => {
+  for (const [name, m] of Object.entries({ projects, servers, sshKeys })) {
+    assertEquals(m.methods.delete.kind, "action", name);
+  }
+});

@@ -157,7 +157,8 @@ export const model = {
         }) as Record<string, unknown> | null;
         const state = raw ? toState(raw, g.team_id) : StateSchema.parse({
           ...stored,
-          status: "not_found",
+          // A record this model deleted stays recorded as deleted.
+          status: stored.status === "deleted" ? "deleted" : "not_found",
           observed_at: new Date().toISOString(),
         });
         context.logger.info("Project {id} status {status}", {
@@ -198,6 +199,11 @@ export const model = {
     },
 
     delete: {
+      // One definition holds many servers, projects or keys (one record per
+      // name). Swamp treats a "delete" kind as deleting the whole model and
+      // tombstones every record it holds, so this is declared an action: it
+      // marks only the record it deleted.
+      kind: "action" as const,
       description:
         "DESTRUCTIVE. Delete this model's recorded project and confirm the API no longer returns it. Refuses unless the live project's name matches and it holds no servers, and refuses an id other than the recorded one; an already-deleted recorded project is stored as not_found.",
       arguments: z.object({

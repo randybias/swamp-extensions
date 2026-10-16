@@ -315,3 +315,22 @@ Deno.test("delete fails when the key is still returned after delete", async () =
     a.restore();
   }
 });
+
+Deno.test("sync keeps a deleted record recorded as deleted", async () => {
+  const a = api(() => new Response("{}", { status: 404 }));
+  try {
+    const { context, getWrittenResources } = createModelTestContext({
+      globalArgs: GLOBALS,
+      storedResources: {
+        "deploy-key": { ...STORED_KEY["deploy-key"], status: "deleted" },
+      },
+    });
+    await model.methods.sync.execute({}, context);
+    assertEquals(
+      (getWrittenResources()[0].data as { status: string }).status,
+      "deleted",
+    );
+  } finally {
+    a.restore();
+  }
+});

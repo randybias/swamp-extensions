@@ -308,3 +308,25 @@ Deno.test("delete of an already-gone recorded project records not_found", async 
     a.restore();
   }
 });
+
+Deno.test("sync keeps a deleted record recorded as deleted", async () => {
+  const a = api(() => new Response("{}", { status: 404 }));
+  try {
+    const { context, getWrittenResources } = createModelTestContext({
+      globalArgs: GLOBALS,
+      storedResources: {
+        "example-project": {
+          ...STORED_PROJECT["example-project"],
+          status: "deleted",
+        },
+      },
+    });
+    await model.methods.sync.execute({}, context);
+    assertEquals(
+      (getWrittenResources()[0].data as { status: string }).status,
+      "deleted",
+    );
+  } finally {
+    a.restore();
+  }
+});

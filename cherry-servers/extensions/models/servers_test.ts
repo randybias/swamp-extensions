@@ -1135,8 +1135,10 @@ Deno.test("wait_ready keeps polling through API server errors", async () => {
   let n = 0;
   const a = api(() => {
     n++;
+    // A network failure on one poll is retried too.
+    if (n === 1) throw new TypeError("fetch failed");
     // Five 500s exhaust one request's retries; the next poll succeeds.
-    return n <= 5
+    return n <= 10
       ? new Response('{"code":500,"message":"Something went wrong"}', {
         status: 500,
       })

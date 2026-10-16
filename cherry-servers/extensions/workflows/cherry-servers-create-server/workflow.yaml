@@ -97,7 +97,7 @@ jobs:
             image: ${{ inputs.image }}
             cycle: ${{ inputs.cycle }}
             ssh_keys: ${{ inputs.ssh_keys }}
-            os_partition_size: "${{ has(inputs.os_partition_size) ? inputs.os_partition_size : null }}"
+            os_partition_size: "${{ has(inputs.os_partition_size) ? dyn(inputs.os_partition_size) : dyn(null) }}"
             spot_market: ${{ inputs.spot_market }}
             tags: "${{ has(inputs.tags) ? dyn(inputs.tags) : dyn(null) }}"
             user_data: '${{ inputs.user_data_key == "" ? dyn(null) : dyn(vault.get(inputs.secrets_vault, inputs.user_data_key)) }}'

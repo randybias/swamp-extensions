@@ -605,9 +605,15 @@ export const model = {
               token: g.token,
             }) as Raw | null;
           } catch (e) {
-            // One bad poll must not end a wait of up to two hours.
-            if (!(e instanceof CherryApiError) || e.status < 500) throw e;
-            lastReason = `API unavailable (${e.status})`;
+            // One bad poll must not end a wait of up to two hours: no
+            // response, a 5xx or a network failure is retried; a 4xx is not.
+            const transient = e instanceof CherryApiError
+              ? e.status === 0 || e.status >= 500
+              : e instanceof TypeError;
+            if (!transient) throw e;
+            lastReason = e instanceof CherryApiError
+              ? `API unavailable (${e.status || "no response"})`
+              : "API unreachable";
             context.logger.info("Server {id} not ready: {reason}", {
               id: stored.id,
               reason: lastReason,
@@ -733,6 +739,11 @@ export const model = {
     },
 
     delete: {
+      // One definition holds many servers, projects or keys (one record per
+      // name). Swamp treats a "delete" kind as deleting the whole model and
+      // tombstones every record it holds, so this is declared an action: it
+      // marks only the record it deleted.
+      kind: "action" as const,
       description:
         "DESTRUCTIVE. Delete this model's recorded server and confirm the API no longer returns it. Refuses unless the live server's hostname and its recorded project both match, and refuses an id other than the recorded one; an already-deleted recorded server is stored as not_found.",
       arguments: z.object({

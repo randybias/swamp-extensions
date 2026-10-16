@@ -48,8 +48,23 @@ Not packaged. Notes for whoever maintains this extension.
   - `get` and `list` dropped the stored user-data hash; `sync` turned
     `deleted` into `not_found`.
   - Projects had no delete, so a scratch project could not be cleaned up.
-  - Observed: VPS ready about 2.5 min after the order; bare metal about 9 min,
-    spot about 8.5 min, with the API still reporting `deploying`. Deletes take
+  - Readiness could record the wrong address and host keys on bare metal.
+    During deploy, port 22 first answers from Cherry's provisioning
+    environment (OpenSSH 8.9 on Ubuntu 22.04, its own host keys). With
+    `os_partition_size` on a two-disk plan, the marker check passed on the
+    installed system at one public IP while the API still said deploying;
+    the server then moved to another IP, rebooted with new host keys and
+    kept its disk. metal-2 changed IP mid-deploy as well. `wait_ready` now
+    needs the API at deployed/active too, and records the address and keys
+    from that poll; live, the recorded keys equal an `ssh-keyscan` of the
+    final IP (bare metal and VPS).
+  - `os_partition_size` works on a two-disk plan (40 GB RAID1 root, the rest
+    unallocated) and is silently ignored on the one-disk `e3-1240v3`.
+  - Secrets: a key given with `--stdin` is printed in `--json` output (swamp
+    lab 3555); a vault reference in `--input` resolves and is never printed.
+  - Observed: VPS ready about 2.5 min after the order. Bare metal reached
+    deployed/active in about 15 min on one disk and about 27 min with a
+    custom partition on two; spot about 9 min to a booted system. Deletes take
     about 2 s and the API returns 404 at once. Cherry reuses a deleted
     server's IP for the next order. Ubuntu 24.04 socket-activates sshd, so
     cloud-init that adds a port must restart `ssh.socket`. The image's vendor

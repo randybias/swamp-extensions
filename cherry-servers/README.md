@@ -3,10 +3,11 @@
 [Swamp](https://github.com/swamp-club/swamp) extension for the
 [Cherry Servers](https://www.cherryservers.com) API: bare-metal and VPS servers,
 projects, SSH keys and live plan stock. Built against the Cherry Servers v1 REST
-API. Exercised live so far: the read-only `list` calls; `projects create`,
-`ssh-keys create`, and on a VPS order `servers create`, `wait_ready` and an
-idempotent `create` re-run that adopted the server. `delete` is covered by unit
-tests only and has not yet been run against a real server.
+API. Every method and both workflows have run live, end to end, on throwaway
+hourly servers: a VPS, bare metal with one and two disks, and a spot server,
+including adopt on re-run, repeat deletes, the delete guards, bad credentials
+and an unreachable port. Not run live: the `annually` billing cycle, which is
+charged a year upfront; `monthly` and `hourly` were.
 
 ## Models
 

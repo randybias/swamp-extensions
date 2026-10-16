@@ -1,7 +1,7 @@
 manifestVersion: 1
 name: "@randybias/cherry-servers"
 version: "2026.10.16.3"
-description: "Order, inspect, wait for and delete Cherry Servers bare-metal and VPS servers, with their projects, SSH keys and live plan stock. One model type per API resource; server readiness is judged by SSH, not by the API's status."
+description: "Order, inspect, wait for and delete Cherry Servers bare-metal and VPS servers, with their projects, SSH keys and live plan stock. One model type per API resource; a server is ready only when the API reports it deployed and it answers SSH with the expected host keys."
 license: Apache-2.0
 repository: https://github.com/randybias/swamp-extensions
 platforms: [darwin-aarch64, darwin-x86_64, linux-x86_64, linux-aarch64]

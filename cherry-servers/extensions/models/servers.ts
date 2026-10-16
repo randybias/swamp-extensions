@@ -658,7 +658,15 @@ export const model = {
             } catch (e) {
               lastReason = `ssh not answering: ${(e as Error).message}`;
             }
-            if (banner) {
+            // Bare metal is installed from a provisioning environment that
+            // runs its own sshd. Without a marker check, SSH counts only once
+            // the API has finished deploying.
+            const deploying = state.status === "deploying" ||
+              state.state === "provisioning";
+            if (banner && args.marker_path === undefined && deploying) {
+              lastReason =
+                "SSH answers but the API still reports deploying; without marker_path this may be the provisioning environment";
+            } else if (banner) {
               const observed = await scanHostKeys(deps.run, address, args.port);
               if (observed.length === 0) {
                 lastReason = "ssh answered but keyscan returned no host keys";

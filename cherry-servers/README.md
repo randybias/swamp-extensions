@@ -155,8 +155,11 @@ with `--input` or with `--stdin`: the swamp CLI currently prints method
 arguments, including ones marked sensitive and ones read from stdin
 ([swamp-club lab 3555](https://swamp-club.com/lab/3555)).
 
-SSH keys are installed when a server is deployed, which can be well after the
-order. Don't delete a key while servers that use it are still deploying.
+On bare metal, port 22 first answers from Cherry's provisioning environment,
+which has its own host keys and does not accept yours. Set `marker_path` (for
+example `/var/lib/cloud/instance/boot-finished`) so readiness means the
+installed system; without one, `wait_ready` also waits for the API to stop
+reporting the server as deploying, which can take several minutes longer.
 
 ## How it works
 

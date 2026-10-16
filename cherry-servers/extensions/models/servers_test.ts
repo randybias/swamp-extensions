@@ -1256,3 +1256,39 @@ Deno.test("a record without a project never gains one from a refresh", async () 
     a.restore();
   }
 });
+
+Deno.test("without a marker, SSH during deploy is not readiness", async () => {
+  let n = 0;
+  const a = api(() => {
+    n++;
+    return ok(
+      n <= 2
+        ? rawServer({ status: "deploying", state: "provisioning" })
+        : rawServer(),
+    );
+  });
+  const p = probe({});
+  try {
+    const { context, getWrittenResources } = createModelTestContext({
+      globalArgs: GLOBALS,
+      storedResources: STORED,
+    });
+    await model.methods.wait_ready.execute(
+      {
+        host_key_policy: "accept-new",
+        port: 22,
+        ssh_user: "root",
+        timeout_seconds: 600,
+        poll_interval_seconds: 15,
+      },
+      context,
+    );
+    const data = getWrittenResources().find((r) => r.specName === "readiness")
+      ?.data as { api_status: string };
+    assertEquals(data.api_status, "deployed");
+    assertEquals(n, 3);
+  } finally {
+    p.restore();
+    a.restore();
+  }
+});

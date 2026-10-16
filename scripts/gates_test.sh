@@ -41,7 +41,9 @@ expect 2 "bad ext name: space" bash "$here/gates.sh" "a b"
 expect 2 "dir without manifest" bash "$here/gates.sh" "scripts"
 expect 2 "quality with no factors" verdict_quality "$td/quality-nofactors.json"
 expect 2 "dry missing registry checks" verdict_dry "$td/dry-partial.json" beta
-expect 2 "dry missing warnings field" verdict_dry "$td/dry-nowarnings.json" beta
+expect 0 "dry missing warnings field means none (beta)" verdict_dry "$td/dry-nowarnings.json" beta
+expect 0 "dry missing warnings field means none (stable)" verdict_dry "$td/dry-nowarnings.json" stable
+expect 2 "dry warnings field of the wrong type" verdict_dry "$td/dry-badwarnings.json" beta
 printf '{"code": "auth_gate_blocked"}' >"$td/../../.gates-test.err"
 expect 2 "swamp exit: no credentials" swamp_exit 1 "$td/../../.gates-test.err"
 expect 1 "swamp exit: other failure" swamp_exit 3 /dev/null

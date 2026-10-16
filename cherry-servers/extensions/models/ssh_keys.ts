@@ -71,11 +71,16 @@ type Ctx = any;
 /** Model definition for `@randybias/cherry-servers/ssh-keys`. */
 export const model = {
   type: "@randybias/cherry-servers/ssh-keys",
-  version: "2026.10.16.2",
+  version: "2026.10.16.3",
   upgrades: [
     {
       toVersion: "2026.10.16.2",
       description: "Version bump for the public release; no schema changes",
+      upgradeAttributes: (old: Record<string, unknown>) => old,
+    },
+    {
+      toVersion: "2026.10.16.3",
+      description: "Version bump with the package; no schema changes",
       upgradeAttributes: (old: Record<string, unknown>) => old,
     },
   ],

@@ -154,3 +154,157 @@ Deno.test("list stores one record per project in the team", async () => {
     a.restore();
   }
 });
+
+const STORED_PROJECT = {
+  "example-project": {
+    id: 5,
+    name: "example-project",
+    team_id: 300,
+    status: "present",
+    observed_at: "2026-01-01T00:00:00Z",
+  },
+};
+
+const gone = () => new Response("{}", { status: 404 });
+
+Deno.test("delete checks the name and emptiness, deletes and verifies", async () => {
+  let deleted = false;
+  const a = api((m, path) => {
+    if (m === "DELETE") {
+      deleted = true;
+      return new Response(null, { status: 204 });
+    }
+    if (path === "/v1/projects/5/servers") return ok([]);
+    return deleted ? gone() : ok({ id: 5, name: "example-project" });
+  });
+  try {
+    const { context, getWrittenResources } = createModelTestContext({
+      globalArgs: GLOBALS,
+      storedResources: STORED_PROJECT,
+    });
+    await model.methods.delete.execute(
+      { confirm_name: "example-project" },
+      context,
+    );
+    assertEquals(
+      a.calls.filter((c) => c.method === "DELETE").map((c) => c.path),
+      ["/v1/projects/5"],
+    );
+    assertEquals(
+      (getWrittenResources()[0].data as { status: string }).status,
+      "deleted",
+    );
+  } finally {
+    a.restore();
+  }
+});
+
+Deno.test("delete refuses a project that still holds servers", async () => {
+  const a = api((m, path) => {
+    if (m !== "GET") return null;
+    if (path === "/v1/projects/5/servers") return ok([{ id: 77 }]);
+    return ok({ id: 5, name: "example-project" });
+  });
+  try {
+    const { context } = createModelTestContext({
+      globalArgs: GLOBALS,
+      storedResources: STORED_PROJECT,
+    });
+    await assertRejects(
+      () =>
+        model.methods.delete.execute(
+          { confirm_name: "example-project" },
+          context,
+        ),
+      Error,
+      "still holds 1 servers",
+    );
+    assertEquals(a.calls.some((c) => c.method === "DELETE"), false);
+  } finally {
+    a.restore();
+  }
+});
+
+Deno.test("delete refuses with no record, before any API call", async () => {
+  const a = api(() => null);
+  try {
+    const { context } = createModelTestContext({ globalArgs: GLOBALS });
+    await assertRejects(
+      () =>
+        model.methods.delete.execute(
+          { id: 5, confirm_name: "example-project" },
+          context,
+        ),
+      Error,
+      "no recorded project",
+    );
+    assertEquals(a.calls.length, 0);
+  } finally {
+    a.restore();
+  }
+});
+
+Deno.test("delete refuses an id other than the recorded project", async () => {
+  const a = api(() => null);
+  try {
+    const { context } = createModelTestContext({
+      globalArgs: GLOBALS,
+      storedResources: STORED_PROJECT,
+    });
+    await assertRejects(
+      () =>
+        model.methods.delete.execute(
+          { id: 6, confirm_name: "example-project" },
+          context,
+        ),
+      Error,
+      "not this model's recorded project",
+    );
+    assertEquals(a.calls.length, 0);
+  } finally {
+    a.restore();
+  }
+});
+
+Deno.test("delete refuses a live project whose name differs", async () => {
+  const a = api((m) => (m === "GET" ? ok({ id: 5, name: "renamed" }) : null));
+  try {
+    const { context } = createModelTestContext({
+      globalArgs: GLOBALS,
+      storedResources: STORED_PROJECT,
+    });
+    await assertRejects(
+      () =>
+        model.methods.delete.execute(
+          { confirm_name: "example-project" },
+          context,
+        ),
+      Error,
+      "refusing",
+    );
+    assertEquals(a.calls.some((c) => c.method === "DELETE"), false);
+  } finally {
+    a.restore();
+  }
+});
+
+Deno.test("delete of an already-gone recorded project records not_found", async () => {
+  const a = api(() => gone());
+  try {
+    const { context, getWrittenResources } = createModelTestContext({
+      globalArgs: GLOBALS,
+      storedResources: STORED_PROJECT,
+    });
+    await model.methods.delete.execute(
+      { confirm_name: "example-project" },
+      context,
+    );
+    assertEquals(
+      (getWrittenResources()[0].data as { status: string }).status,
+      "not_found",
+    );
+    assertEquals(a.calls.some((c) => c.method === "DELETE"), false);
+  } finally {
+    a.restore();
+  }
+});

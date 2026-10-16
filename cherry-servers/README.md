@@ -26,12 +26,13 @@ image, billing cycle, SSH keys, optional user data).
 
 ### `@randybias/cherry-servers/projects`
 
-| Method   | Description                                                     |
-| -------- | --------------------------------------------------------------- |
-| `create` | Create the project, or adopt one with the same name in the team |
-| `get`    | Fetch a project by ID (read-only)                               |
-| `sync`   | Refresh stored state; records `not_found` when gone (read-only) |
-| `list`   | Store every project in the team (read-only)                     |
+| Method   | Description                                                        |
+| -------- | ------------------------------------------------------------------ |
+| `create` | Create the project, or adopt one with the same name in the team    |
+| `get`    | Fetch a project by ID (read-only)                                  |
+| `sync`   | Refresh stored state; records `not_found` when gone (read-only)    |
+| `list`   | Store every project in the team (read-only)                        |
+| `delete` | Delete the recorded, empty project after a name check; confirm 404 |
 
 ### `@randybias/cherry-servers/ssh-keys`
 
@@ -51,8 +52,12 @@ image, billing cycle, SSH keys, optional user data).
 ## Workflows
 
 - `cherry-servers-create-server`: create, then `wait_ready`. Takes the generic
-  server model's name plus the server's inputs (hostname, project, plan, region,
-  image, cycle, SSH keys).
+  server model's name plus the server's inputs: hostname, project, plan, region,
+  image, cycle, SSH keys, and optionally `os_partition_size`, `spot_market` and
+  `tags`. For cloud-init and a marker check, name a vault and the keys in it
+  (`secrets_vault`, `user_data_key`, `ssh_private_key_key`) and set
+  `marker_path`; workflow inputs are stored in plain text, so the values
+  themselves never pass through them.
 - `cherry-servers-delete-server`: `sync`, then `delete` of the recorded server
   for a hostname.
 
@@ -90,18 +95,26 @@ inputs:
     hostname: { type: string }
     plan: { type: string }
     region: { type: string }
-    image: { type: string }
     cycle: { type: string, enum: ["hourly", "monthly", "annually"] }
-    ssh_keys: { type: array, items: { type: integer } }
+    image: { type: string, default: null }
+    ssh_keys: { type: array, items: { type: integer }, default: null }
+    os_partition_size: { type: integer, default: null }
+    spot_market: { type: boolean, default: null }
+    user_data: { type: string, default: null }
+    tags: { type: object, default: null }
   required: ["hostname"]
 globalArguments:
   project_id: ${{ inputs.project_id }}
   hostname: ${{ inputs.hostname }}
   plan: ${{ inputs.plan }}
   region: ${{ inputs.region }}
-  image: ${{ inputs.image }}
   cycle: ${{ inputs.cycle }}
+  image: ${{ inputs.image }}
   ssh_keys: ${{ inputs.ssh_keys }}
+  os_partition_size: ${{ inputs.os_partition_size }}
+  spot_market: ${{ inputs.spot_market }}
+  user_data: ${{ inputs.user_data }}
+  tags: ${{ inputs.tags }}
   token: ${{ vault.get("default", "CHERRY_TOKEN") }}
 ```
 
@@ -119,9 +132,11 @@ swamp model method run cherry-server wait_ready --input hostname=web-1 \
 ```
 
 Read a server's state with
-`data.latest("cherry-server", "web-1").attributes.public_ipv4`. Methods that
-only read or wait need just `hostname` (plus `project_id` for `list`); swamp
-skips global arguments whose inputs are not given.
+`data.latest("cherry-server", "web-1").attributes.public_ipv4`. Give every
+optional input a `default: null`, as above: swamp fails a method that reads a
+global argument whose input was not given, and the model treats null as not set.
+`get`, `sync`, `wait_ready` and `delete` then need just `hostname`, and `list`
+needs `project_id` as well.
 
 Marker checks need the private key. Pass it with `--stdin` (or wire it from a
 vault), never with `--input`, which puts it on the command line:
@@ -139,8 +154,10 @@ echoes method arguments there, including ones marked sensitive.
 
 - The API token is sent only in the `Authorization` header. It comes from the
   `token` global argument (wire it to a vault) or `CHERRY_AUTH_TOKEN`.
-- Every API request times out after 30 seconds. A timed-out order may still have
-  been placed; run `create` again and it adopts the server by hostname.
+- Every API request times out after 30 seconds. Reads and deletes are retried on
+  a timeout or a transient gateway error (502 to 504, Cloudflare's 520 to 524);
+  orders never are. A timed-out order may still have been placed; run `create`
+  again and it adopts the server by hostname.
 - Stored server state is an allowlist. Provider responses also contain root and
   BMC passwords; those are never written to swamp data. User data is never
   stored either, only its SHA-256.
@@ -149,7 +166,9 @@ echoes method arguments there, including ones marked sensitive.
   hostname at the same moment can both place an order. A recorded server id is
   adopted only while its hostname and project still match.
 - `delete` acts only on the server this model recorded. With no record it
-  refuses, and an `id` other than the recorded one is refused.
+  refuses, an `id` other than the recorded one is refused, and so is a live
+  server whose hostname or project differs from the record. Project `delete`
+  also refuses a project that still holds servers.
 - `cycle` has no default. Monthly and annual cycles are charged upfront from the
   account balance.
 - `wait_ready` judges readiness from the server, because the API can report a
@@ -158,8 +177,10 @@ echoes method arguments there, including ones marked sensitive.
   ignore the operator's `~/.ssh/config` and default keys. Invalid input or a
   rejected key fails at once instead of retrying until the timeout.
 - Host keys: `strict` checks against `known_hosts` entries for the server's
-  address and port; `accept-new` records the keys on first success and enforces
-  them on later runs; `insecure` records without enforcing.
+  address and port, as OpenSSH does: every key of a pinned type must match, key
+  types with no entry are ignored, and at least one key must match; `accept-new`
+  records the keys on first success and enforces them on later runs; `insecure`
+  records without enforcing.
 - Data names: server state is stored under the hostname, readiness evidence
   under `<hostname>-readiness`, e.g.
   `data.latest("cherry-server", "web-1").attributes.public_ipv4`.

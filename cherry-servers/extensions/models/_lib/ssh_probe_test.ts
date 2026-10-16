@@ -51,6 +51,24 @@ Deno.test("checkHostKeys strict passes on match and fails on mismatch", () => {
   assertThrows(() => checkHostKeys([], "strict", [KEY]), Error, "no host keys");
 });
 
+Deno.test("checkHostKeys strict ignores unpinned key types, as OpenSSH does", () => {
+  const RSA = { type: "ssh-rsa", key: "AAAAB3NzaC1yc2EAAAADAQABFakeRsa" };
+  // Only ed25519 is pinned: the RSA key is ignored and only KEY is trusted.
+  assertEquals(checkHostKeys([RSA, KEY], "strict", [KEY]), [KEY]);
+  // A pinned type that differs still fails.
+  assertThrows(
+    () => checkHostKeys([RSA, OTHER], "strict", [KEY]),
+    Error,
+    "mismatch for ssh-ed25519",
+  );
+  // Nothing observed is of a pinned type.
+  assertThrows(
+    () => checkHostKeys([RSA], "strict", [KEY]),
+    Error,
+    "is pinned",
+  );
+});
+
 Deno.test("checkHostKeys accept-new and insecure never throw", () => {
   checkHostKeys([OTHER], "accept-new", [KEY]);
   checkHostKeys([], "insecure");
@@ -110,7 +128,7 @@ Deno.test("fingerprints parses ssh-keygen output", async () => {
 });
 
 /** Scripted runner for the marker check. */
-function markerRunner(sshCode: number) {
+function markerRunner(sshCode: number, sshStderr = "") {
   const calls: { cmd: string; args: string[]; stdin?: string }[] = [];
   const run: CommandRunner = (cmd, args, options) => {
     calls.push({ cmd, args, stdin: options?.stdin });
@@ -123,7 +141,7 @@ function markerRunner(sshCode: number) {
       });
     }
     if (cmd === "ssh") {
-      return Promise.resolve({ code: sshCode, stdout: "", stderr: "" });
+      return Promise.resolve({ code: sshCode, stdout: "", stderr: sshStderr });
     }
     return Promise.resolve({ code: 0, stdout: "", stderr: "" });
   };
@@ -169,6 +187,18 @@ Deno.test("checkMarker throws on connection or auth failure", async () => {
   const { run, calls } = markerRunner(255);
   await assertRejects(() => checkMarker(run, MARKER_OPTS), Error, "exit 255");
   assertEquals(calls.at(-1)?.args, ["-k"]);
+});
+
+Deno.test("checkMarker says when the server rejected the key", async () => {
+  const { run } = markerRunner(
+    255,
+    "root@192.0.2.10: Permission denied (publickey).",
+  );
+  await assertRejects(
+    () => checkMarker(run, MARKER_OPTS),
+    Error,
+    "the server rejected the private key",
+  );
 });
 
 Deno.test("checkMarker refuses to run without pinned host keys", async () => {

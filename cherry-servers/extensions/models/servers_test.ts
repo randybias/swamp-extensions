@@ -967,3 +967,211 @@ Deno.test("adopt by hostname keeps the user data hash only for the same id", asy
     }
   }
 });
+
+/**
+ * Global arguments as swamp hands them over when some definition inputs were
+ * not given: reading an unresolved field throws, so a method must not touch it.
+ */
+function partialGlobals(given: Record<string, unknown>) {
+  const target: Record<string, unknown> = { ...given };
+  for (const field of ["project_id", "plan", "region", "image", "cycle"]) {
+    if (field in given) continue;
+    Object.defineProperty(target, field, {
+      enumerable: true,
+      get() {
+        throw new Error(`Unresolved expression in globalArguments.${field}`);
+      },
+    });
+  }
+  return target;
+}
+
+Deno.test("delete needs only the hostname and guards on the recorded project", async () => {
+  let deleted = false;
+  const a = api((method) => {
+    if (method === "DELETE") {
+      deleted = true;
+      return new Response(null, { status: 204 });
+    }
+    return deleted ? gone() : ok(rawServer());
+  });
+  try {
+    const { context, getWrittenResources } = createModelTestContext({
+      globalArgs: partialGlobals({ hostname: "node-1", token: "test-token" }),
+      storedResources: {
+        "node-1": { ...STORED["node-1"], project_id: 1001 },
+      },
+    });
+    await model.methods.delete.execute({ confirm_hostname: "node-1" }, context);
+    assertEquals(
+      (getWrittenResources()[0].data as { status: string }).status,
+      "deleted",
+    );
+  } finally {
+    a.restore();
+  }
+});
+
+Deno.test("delete refuses when the live project differs from the recorded one", async () => {
+  const a = api((method) => method === "GET" ? ok(rawServer()) : null);
+  try {
+    const { context } = createModelTestContext({
+      // The global project matches the live server; the record does not.
+      globalArgs: GLOBALS,
+      storedResources: {
+        "node-1": { ...STORED["node-1"], project_id: 2002 },
+      },
+    });
+    await assertRejects(
+      () =>
+        model.methods.delete.execute({ confirm_hostname: "node-1" }, context),
+      Error,
+      "not 2002",
+    );
+    assertEquals(a.calls.some((c) => c.method === "DELETE"), false);
+  } finally {
+    a.restore();
+  }
+});
+
+Deno.test("sync, get and wait_ready read only the global arguments they need", async () => {
+  const a = api(() => ok(rawServer()));
+  try {
+    const { context } = createModelTestContext({
+      globalArgs: partialGlobals({ hostname: "node-1", token: "test-token" }),
+      storedResources: STORED,
+    });
+    await model.methods.sync.execute({}, context);
+    await model.methods.get.execute({ id: 501 }, context);
+  } finally {
+    a.restore();
+  }
+});
+
+Deno.test("null optional arguments are treated as not given", async () => {
+  const a = api((method) =>
+    method === "GET" ? ok([]) : ok(rawServer({ status: "pending" }), 201)
+  );
+  try {
+    const { context } = createModelTestContext({
+      globalArgs: {
+        ...GLOBALS,
+        image: null,
+        ssh_keys: null,
+        user_data: null,
+        os_partition_size: null,
+        spot_market: null,
+        tags: null,
+      },
+    });
+    await model.methods.create.execute({}, context);
+    const post = a.calls.find((c) => c.method === "POST");
+    assertEquals(post?.body, {
+      plan: "test-plan",
+      region: "test-region",
+      hostname: "node-1",
+      cycle: "hourly",
+    });
+  } finally {
+    a.restore();
+  }
+  assertEquals(
+    model.globalArguments.safeParse({ ...GLOBALS, os_partition_size: null })
+      .success,
+    true,
+  );
+});
+
+Deno.test("get and list keep the stored user data hash for the same server", async () => {
+  const stored = {
+    "node-1": { ...STORED["node-1"], user_data_sha256: "abc123" },
+  };
+  for (const [id, want] of [[501, "abc123"], [777, undefined]] as const) {
+    const a = api((_m, url) =>
+      url.pathname.endsWith("/servers")
+        ? ok([rawServer({ id })])
+        : ok(rawServer({ id }))
+    );
+    try {
+      for (const run of ["get", "list"] as const) {
+        const { context, getWrittenResources } = createModelTestContext({
+          globalArgs: GLOBALS,
+          storedResources: stored,
+        });
+        if (run === "get") {
+          await model.methods.get.execute({ id }, context);
+        } else {
+          await model.methods.list.execute({}, context);
+        }
+        const data = getWrittenResources()[0].data as Record<string, unknown>;
+        assertEquals(data.user_data_sha256, want, `${run} id ${id}`);
+      }
+    } finally {
+      a.restore();
+    }
+  }
+});
+
+Deno.test("sync keeps a deleted server recorded as deleted", async () => {
+  const a = api(() => gone());
+  try {
+    const { context, getWrittenResources } = createModelTestContext({
+      globalArgs: GLOBALS,
+      storedResources: {
+        "node-1": { id: 501, hostname: "node-1", status: "deleted" },
+      },
+    });
+    await model.methods.sync.execute({}, context);
+    assertEquals(
+      (getWrittenResources()[0].data as { status: string }).status,
+      "deleted",
+    );
+  } finally {
+    a.restore();
+  }
+});
+
+Deno.test("wait_ready keeps polling through API server errors", async () => {
+  let n = 0;
+  const a = api(() => {
+    n++;
+    // Five 500s exhaust one request's retries; the next poll succeeds.
+    return n <= 5
+      ? new Response('{"code":500,"message":"Something went wrong"}', {
+        status: 500,
+      })
+      : ok(rawServer());
+  });
+  const run: CommandRunner = (cmd) =>
+    Promise.resolve(
+      cmd === "ssh-keyscan"
+        ? { code: 0, stdout: `192.0.2.10 ${KEY_LINE}\n`, stderr: "" }
+        : { code: 0, stdout: "256 SHA256:fake x (ED25519)\n", stderr: "" },
+    );
+  let t = 0;
+  const prev = setProbeDeps({
+    run,
+    banner: () => Promise.resolve("SSH-2.0-OpenSSH_9.6\r\n"),
+    now: () => (t += 1000),
+  });
+  try {
+    const { context, getWrittenResources } = createModelTestContext({
+      globalArgs: GLOBALS,
+      storedResources: STORED,
+    });
+    await model.methods.wait_ready.execute(
+      {
+        host_key_policy: "accept-new",
+        port: 22,
+        ssh_user: "root",
+        timeout_seconds: 600,
+        poll_interval_seconds: 1,
+      },
+      context,
+    );
+    assertEquals(getWrittenResources().length, 2);
+  } finally {
+    setProbeDeps(prev);
+    a.restore();
+  }
+});

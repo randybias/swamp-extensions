@@ -44,6 +44,32 @@ inputs:
       type: integer
       default: 2700
       description: Readiness timeout in seconds
+    os_partition_size:
+      type: integer
+      description: OS partition size in GB (bare metal); the rest of the disk stays unallocated
+    spot_market:
+      type: boolean
+      default: false
+      description: Order as an interruptible spot server
+    tags:
+      type: object
+      description: Key/value tags for the server
+    secrets_vault:
+      type: string
+      default: ""
+      description: Vault holding the user data and private key named below
+    user_data_key:
+      type: string
+      default: ""
+      description: Key in secrets_vault whose value is the cloud-init user data; empty for none
+    ssh_private_key_key:
+      type: string
+      default: ""
+      description: Key in secrets_vault whose value is the private key for the marker check
+    marker_path:
+      type: string
+      default: ""
+      description: File whose existence marks first-boot setup as finished; needs ssh_private_key_key
   required:
     - server_model
     - hostname
@@ -71,6 +97,10 @@ jobs:
             image: ${{ inputs.image }}
             cycle: ${{ inputs.cycle }}
             ssh_keys: ${{ inputs.ssh_keys }}
+            os_partition_size: "${{ has(inputs.os_partition_size) ? inputs.os_partition_size : null }}"
+            spot_market: ${{ inputs.spot_market }}
+            tags: "${{ has(inputs.tags) ? dyn(inputs.tags) : dyn(null) }}"
+            user_data: '${{ inputs.user_data_key == "" ? dyn(null) : dyn(vault.get(inputs.secrets_vault, inputs.user_data_key)) }}'
       - name: wait-ready
         description: Wait for an SSH banner and acceptable host keys
         dependsOn:
@@ -86,3 +116,5 @@ jobs:
             host_key_policy: ${{ inputs.host_key_policy }}
             known_hosts: ${{ inputs.known_hosts }}
             timeout_seconds: ${{ inputs.timeout_seconds }}
+            marker_path: '${{ inputs.marker_path == "" ? dyn(null) : dyn(inputs.marker_path) }}'
+            ssh_private_key: '${{ inputs.ssh_private_key_key == "" ? dyn(null) : dyn(vault.get(inputs.secrets_vault, inputs.ssh_private_key_key)) }}'

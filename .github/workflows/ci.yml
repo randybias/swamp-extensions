@@ -1,0 +1,40 @@
+name: ci
+on:
+  pull_request:
+  push:
+    branches: [main]
+permissions:
+  contents: read
+jobs:
+  gates:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: denoland/setup-deno@v2
+        with:
+          deno-version: v2.9.x
+      - name: Install swamp, gitleaks, yq
+        run: bash scripts/ci-install.sh
+      - name: Script tests
+        run: deno task test && bash scripts/gates_test.sh
+      - name: Gates per changed extension
+        env:
+          SWAMP_API_KEY: ${{ secrets.SWAMP_API_KEY }}
+          SWAMP_SIGNIN_TOKEN: ${{ secrets.SWAMP_SIGNIN_TOKEN }}
+          LEAK_DENYLIST: ${{ secrets.LEAK_DENYLIST }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+        run: |
+          set -uo pipefail
+          # Discovery runs on its own so a failure fails the job instead of gating nothing.
+          exts=$(bash scripts/changed-extensions.sh "$BASE_SHA" "$GITHUB_SHA") || exit 2
+          echo "extensions to gate: ${exts:-none}"
+          rc=0
+          for ext in $exts; do
+            echo "::group::$ext"
+            (cd "$ext" && { [ -f .swamp.yaml ] || swamp repo init --quiet --tool none; })
+            bash scripts/gates.sh "$ext" || rc=1
+            echo "::endgroup::"
+          done
+          exit $rc

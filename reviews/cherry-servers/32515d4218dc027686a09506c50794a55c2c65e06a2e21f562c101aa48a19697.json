@@ -1,0 +1,82 @@
+{
+  "extension": "@randybias/cherry-servers",
+  "version": "2026.10.16.1",
+  "reviewedAt": "2026-10-16T11:55:59Z",
+  "dimensions": [
+    {
+      "id": "credentials-secrets",
+      "verdict": "pass",
+      "note": "Token is a sensitive global arg or CHERRY_AUTH_TOKEN, sent only in the Authorization header (tested). user_data and ssh_private_key are sensitive; user_data is stored only as SHA-256; the private key reaches a temporary ssh-agent over stdin, never argv (tested). Server state is an allowlist; the API returns root/BMC passwords, which are dropped (tested). Provider error bodies are never echoed: only a safe-character code and a message that passes safeMessage(), which withholds anything with digits, quotes, colons, = or sensitive words (adversarial cases from two codex seats are tests). Known external issue: the swamp CLI echoes method arguments, including sensitive ones, in method run --json stdout; README tells users to pass keys with --stdin and not capture that output."
+    },
+    {
+      "id": "logging-quality",
+      "verdict": "pass",
+      "note": "Every method logs with structured placeholders: create on entry, adopt, order; get/sync/list results; wait_ready per poll with the reason; delete before and after. No secrets in log fields."
+    },
+    {
+      "id": "error-handling",
+      "verdict": "pass",
+      "note": "CherryApiError for every non-2xx except handled 404, for invalid JSON, for request and body timeouts (30s AbortSignal; a timed-out write says it may have been applied). 429 retried with backoff. ProbeConfigError marks non-retryable probe failures (bad input, rejected key, missing ssh tool, no agent) and wait_ready stops at once on it; transient SSH errors retry until the deadline."
+    },
+    {
+      "id": "testing-completeness",
+      "verdict": "issue",
+      "note": "98 unit tests cover every method, including failure paths and injection. Live: read-only lists, projects create, ssh-keys create, servers create, wait_ready (accept-new with marker) and an idempotent create re-run that adopted the server (LOGBOOK 2026-10-16). Not yet live: servers and ssh-keys delete. Run on a throwaway hourly server before relying on them."
+    },
+    {
+      "id": "idempotency-resilience",
+      "verdict": "issue",
+      "note": "create adopts by recorded id (only while hostname and project match) then by exact hostname, and refuses on duplicates; verified live that a re-run does not order again. listAll fails closed when paging cannot be proven complete. Residual: the guard is per model, so two different models ordering the same hostname at the same moment can both order. Documented in README and source; not guarded."
+    },
+    {
+      "id": "api-contracts",
+      "verdict": "pass",
+      "note": "Built against Cherry Servers v1: /projects/{id}/servers, /servers/{id}, /teams/{id}/projects, /ssh-keys, /plans, /teams/{id}/plans. Pricing unit (Hourly, 1 month) is normalised to the cycle enum and the string None is not stored as termination_date, both seen live."
+    },
+    {
+      "id": "resource-management",
+      "verdict": "pass",
+      "note": "Banner socket closed on timeout; temp known_hosts file removed and ssh-agent killed in finally (tested, including on ssh-add rejection); response bodies cancelled on 404/429; fetch carries an abort signal."
+    },
+    {
+      "id": "published-surface-hygiene",
+      "verdict": "pass",
+      "note": "Manifest description is two sentences; README has method tables for all four types, a Dependencies section, the live-tested line and the sensitive-input note. Fixtures use RFC 5737 addresses and placeholder keys. Leak scan, gitleaks and fixture guard pass. Nothing from .swamp, vaults or LOGBOOK is packaged. README Example uses the factory form (one generic definition with an inputs schema, two servers from it), and the workflows take the server inputs instead of assuming a model per server."
+    },
+    {
+      "id": "schema-strictness",
+      "verdict": "pass",
+      "note": "Global arguments and stored resources are strictObject. Method argument schemas are non-strict by necessity, because swamp merges global arguments into them (verified live). Hostname, slugs, ssh_user and marker_path carry grammars in zod (tested)."
+    },
+    {
+      "id": "lifetime-gc",
+      "verdict": "pass",
+      "note": "Server, readiness, project and key state: lifetime infinite, garbageCollection 10. Plans: lifetime 1d, garbageCollection 5, because stock is a snapshot."
+    },
+    {
+      "id": "crud-completeness",
+      "verdict": "pass",
+      "note": "servers: create/get/sync/list/wait_ready/delete. projects: create/get/sync/list (no delete by design: projects hold billing history). ssh-keys: create/sync/list/delete. plans: list."
+    },
+    {
+      "id": "preflight-checks",
+      "verdict": "pass",
+      "note": "delete requires a recorded resource, refuses another id, and checks the live hostname/label and project before calling DELETE, then verifies 404. wait_ready validates policy, known_hosts and key presence before polling; strict with no matching entry names the address."
+    },
+    {
+      "id": "instance-names",
+      "verdict": "pass",
+      "note": "Server state under the hostname, readiness under <hostname>-readiness, projects under the name, keys under the label, plans under the slug; instanceName strips path separators and traversal."
+    },
+    {
+      "id": "data-access",
+      "verdict": "pass",
+      "note": "Methods read only their own model state via readResource; wiring between models is by CEL in global arguments (used live: project_id and ssh_keys from data.latest). Verified live with a generic inputs-driven definition: one definition holds each server under its hostname."
+    },
+    {
+      "id": "version-upgrades",
+      "verdict": "na",
+      "note": "First version; no prior stored data to migrate."
+    }
+  ]
+}

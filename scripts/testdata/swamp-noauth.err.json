@@ -1,0 +1,6 @@
+{
+  "error": "swamp requires a swamp-club.com account to run.",
+  "code": "auth_gate_blocked",
+  "reason": { "kind": "no_credential" },
+  "temporary": false
+}

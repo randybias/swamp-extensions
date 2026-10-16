@@ -1,0 +1,88 @@
+id: f2244add-07a2-4285-9cb6-260073f790ea
+name: "@randybias/cherry-servers-create-server"
+description: Order a server or adopt an existing one, then wait until SSH answers
+version: 1
+inputs:
+  properties:
+    server_model:
+      type: string
+      description: Name of a generic model of type @randybias/cherry-servers/servers whose global arguments read these inputs
+    hostname:
+      type: string
+      description: Server hostname; keys the stored data
+    project_id:
+      type: integer
+      description: Cherry Servers project ID
+    plan:
+      type: string
+      description: Plan slug
+    region:
+      type: string
+      description: Region slug
+    image:
+      type: string
+      description: Operating system image slug
+    cycle:
+      type: string
+      enum: ["hourly", "monthly", "annually"]
+      description: Billing cycle; monthly and annually are charged upfront
+    ssh_keys:
+      type: array
+      items:
+        type: integer
+      default: []
+      description: SSH key IDs to install for root
+    host_key_policy:
+      type: string
+      enum: ["strict", "accept-new", "insecure"]
+      description: Host-key policy for the readiness check
+    known_hosts:
+      type: string
+      default: ""
+      description: Expected host keys in known_hosts format, required for strict
+    timeout_seconds:
+      type: integer
+      default: 2700
+      description: Readiness timeout in seconds
+  required:
+    - server_model
+    - hostname
+    - project_id
+    - plan
+    - region
+    - image
+    - cycle
+    - host_key_policy
+jobs:
+  - name: provision
+    description: Order the server and wait for it to answer SSH
+    steps:
+      - name: create
+        description: Order or adopt the server via the Cherry Servers API
+        task:
+          type: model_method
+          modelIdOrName: ${{ inputs.server_model }}
+          methodName: create
+          inputs:
+            hostname: ${{ inputs.hostname }}
+            project_id: ${{ inputs.project_id }}
+            plan: ${{ inputs.plan }}
+            region: ${{ inputs.region }}
+            image: ${{ inputs.image }}
+            cycle: ${{ inputs.cycle }}
+            ssh_keys: ${{ inputs.ssh_keys }}
+      - name: wait-ready
+        description: Wait for an SSH banner and acceptable host keys
+        dependsOn:
+          - step: create
+            condition:
+              type: succeeded
+        task:
+          type: model_method
+          modelIdOrName: ${{ inputs.server_model }}
+          methodName: wait_ready
+          inputs:
+            hostname: ${{ inputs.hostname }}
+            host_key_policy: ${{ inputs.host_key_policy }}
+            known_hosts: ${{ inputs.known_hosts }}
+            timeout_seconds: ${{ inputs.timeout_seconds }}

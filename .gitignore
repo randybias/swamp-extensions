@@ -1,0 +1,6 @@
+# swamp runtime state inside each extension
+*/.swamp/
+*/.swamp-sources.yaml
+*/vaults/
+# local tool output
+.gates/

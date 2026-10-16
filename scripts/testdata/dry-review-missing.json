@@ -1,0 +1,32 @@
+{
+  "status": "dry_run",
+  "contentHash": "53728f0193ff8084bbe59f422d458e88b91f50cf604a1a0c0f02a5335c297a98",
+  "registryChecks": [
+    {
+      "name": "authentication",
+      "status": "passed"
+    },
+    {
+      "name": "reserved-collective",
+      "status": "passed"
+    },
+    {
+      "name": "collective-membership",
+      "status": "passed"
+    },
+    {
+      "name": "private-entitlement",
+      "status": "passed"
+    },
+    {
+      "name": "version-exists",
+      "status": "passed"
+    }
+  ],
+  "unresolvedWarnings": [
+    {
+      "ruleId": "adversarial-review-report",
+      "file": "/x/review.json"
+    }
+  ]
+}

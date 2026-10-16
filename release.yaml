@@ -1,0 +1,11 @@
+# Release policy per extension. Lives outside every extension dir so it never
+# changes an archive's contentHash.
+#   channel: beta until a live run passes; then stable
+#   ci:      false until the first push; then true
+#   published: version -> contentHash, recorded with every push; a published
+#              version may only be re-gated with exactly that hash
+cherry-servers:
+  channel: beta
+  ci: true
+  published:
+    "2026.10.16.1": 32515d4218dc027686a09506c50794a55c2c65e06a2e21f562c101aa48a19697

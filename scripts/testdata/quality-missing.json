@@ -1,0 +1,46 @@
+{
+  "status": "passed",
+  "allPassed": false,
+  "factors": [
+    {
+      "id": "has-readme",
+      "status": "earned"
+    },
+    {
+      "id": "readme-example",
+      "status": "earned"
+    },
+    {
+      "id": "rich-readme",
+      "status": "earned"
+    },
+    {
+      "id": "symbols-docs",
+      "status": "earned"
+    },
+    {
+      "id": "fast-check",
+      "status": "earned"
+    },
+    {
+      "id": "description",
+      "status": "earned"
+    },
+    {
+      "id": "platforms",
+      "status": "earned"
+    },
+    {
+      "id": "has-license",
+      "status": "missing"
+    },
+    {
+      "id": "repository-verified",
+      "status": "provisional"
+    },
+    {
+      "id": "dependency-trust",
+      "status": "earned"
+    }
+  ]
+}

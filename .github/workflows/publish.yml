@@ -1,0 +1,49 @@
+name: publish
+on:
+  push:
+    branches: [main]
+permissions:
+  contents: read
+concurrency:
+  group: publish
+  cancel-in-progress: false
+jobs:
+  publish:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: denoland/setup-deno@v2
+        with:
+          deno-version: v2.9.x
+      - name: Install swamp, gitleaks, yq
+        run: bash scripts/ci-install.sh
+      - name: Publish changed versions
+        env:
+          SWAMP_API_KEY: ${{ secrets.SWAMP_API_KEY }}
+          SWAMP_SIGNIN_TOKEN: ${{ secrets.SWAMP_SIGNIN_TOKEN }}
+          LEAK_DENYLIST: ${{ secrets.LEAK_DENYLIST }}
+          BEFORE_SHA: ${{ github.event.before }}
+        run: |
+          set -euo pipefail
+          # Discovery runs on its own so a failure fails the job; an unknown or all-zero
+          # before-SHA (first push, force push) considers every extension.
+          exts=$(bash scripts/changed-extensions.sh "$BEFORE_SHA" "$GITHUB_SHA")
+          echo "extensions to consider: ${exts:-none}"
+          for ext in $exts; do
+            m="$ext/manifest.yaml"
+            if [ "$(yq -r ".\"$ext\".ci // false" release.yaml)" != true ]; then
+              echo "skip $ext: CI publishing not enabled in release.yaml"; continue
+            fi
+            name=$(yq -r .name "$m"); ver=$(yq -r .version "$m")
+            # Published on any channel counts: a beta-only release leaves currentPublished null.
+            if swamp extension version "$name" --json |
+              jq -e --arg v "$ver" '[.currentPublished, (.channels // {} | .[].latest)] | index($v) != null' >/dev/null; then
+              echo "skip $ext: $ver already published"; continue
+            fi
+            (cd "$ext" && { [ -f .swamp.yaml ] || swamp repo init --quiet --tool none; })
+            bash scripts/gates.sh "$ext"
+            channel=$(yq -r ".\"$ext\".channel" release.yaml)
+            (cd "$ext" && swamp extension push manifest.yaml --channel "$channel" --yes --json)
+          done

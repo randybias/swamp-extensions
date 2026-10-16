@@ -1,0 +1,41 @@
+id: 51317e42-18f5-45bb-9f9c-6fb03973c383
+name: "@randybias/cherry-servers-delete-server"
+description: Delete a model's recorded server after checking its hostname and project match
+version: 1
+inputs:
+  properties:
+    server_model:
+      type: string
+      description: Name of a generic model of type @randybias/cherry-servers/servers whose global arguments read these inputs
+    hostname:
+      type: string
+      description: Hostname of the recorded server to delete
+    confirm_hostname:
+      type: string
+      description: Hostname the server must have, as a guard
+  required: ["server_model", "hostname", "confirm_hostname"]
+jobs:
+  - name: teardown
+    description: Refresh state, then delete the server and confirm it is gone
+    steps:
+      - name: sync
+        description: Refresh stored server state from the API
+        task:
+          type: model_method
+          modelIdOrName: ${{ inputs.server_model }}
+          methodName: sync
+          inputs:
+            hostname: ${{ inputs.hostname }}
+      - name: delete
+        description: Delete the server and confirm the API returns 404
+        dependsOn:
+          - step: sync
+            condition:
+              type: succeeded
+        task:
+          type: model_method
+          modelIdOrName: ${{ inputs.server_model }}
+          methodName: delete
+          inputs:
+            hostname: ${{ inputs.hostname }}
+            confirm_hostname: ${{ inputs.confirm_hostname }}

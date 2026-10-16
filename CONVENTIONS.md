@@ -196,6 +196,29 @@ Built and tested against <target system> <exact version>.
 - Recorded command output used as a fixture must be sanitized and should keep
   the real *shape* of the output.
 
+### Live end-to-end testing
+
+Unit tests are never a substitute for actual use. An extension is not
+finished, and is never promoted to `stable`, until every model method and
+every workflow it ships has run live, end to end:
+
+- **The whole lifecycle,** in order, on a throwaway resource:
+  1. create;
+  2. read, get and sync;
+  3. update, where the model has it;
+  4. re-run, which must adopt the existing resource without creating a second;
+  5. delete;
+  6. delete again, which must be a clean no-op.
+- **Every workflow** runs from its real entry point, with the inputs a
+  consumer would pass, not just the model methods underneath it.
+- **Failure paths that can be triggered for real** also run live. Examples are
+  a wrong ID, a bad credential and an unreachable host.
+- **Afterwards,** confirm with the provider's own API that nothing is left
+  behind.
+
+Throwaway resources, such as an hourly server or a scratch DNS record, are the
+default target. The spend is part of the job, not a reason to skip the test.
+
 ## 9. Gates and review
 
 A change is ready to merge only when `scripts/gates.sh <ext>` passes. The
@@ -244,6 +267,8 @@ Review rules:
   - The README states only the exact versions tested there.
   - A version that hasn't been tested live is published to the `beta` channel
     and promoted later.
+  - Promotion to `stable` needs a `pass` for every method and workflow in the
+    live end-to-end matrix (§8). A `skip` or `untested` cell blocks it.
 
 ## 11. Publishing
 

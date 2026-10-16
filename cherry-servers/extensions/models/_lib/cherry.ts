@@ -119,7 +119,9 @@ export function summarize(text: string): string {
     const code = String(parsed.code ?? "");
     if (
       (typeof parsed.code === "string" || typeof parsed.code === "number") &&
-      /^[A-Za-z0-9_.-]{1,40}$/.test(code)
+      // Numeric status codes or short lowercase/underscore words only: a
+      // reflected token cannot pass.
+      /^(?:\d{1,5}|[a-z_]{1,32})$/.test(code)
     ) {
       parts.push(`code ${code}`);
     }
@@ -188,7 +190,9 @@ export async function request(
           }s; the request may still have been applied`,
       );
     }
-    if (resp.status === 429 && attempt < MAX_ATTEMPTS) {
+    // An order is never resent, even after a 429: run create again, which
+    // adopts the server if the order went through.
+    if (resp.status === 429 && idempotent && attempt < MAX_ATTEMPTS) {
       await resp.body?.cancel();
       const retryAfter = Number(resp.headers.get("retry-after"));
       const waitMs = Number.isFinite(retryAfter) && retryAfter > 0

@@ -345,3 +345,31 @@ Deno.test("a GET with no response is retried, then reported", async () => {
     setSleep(previousSleep);
   }
 });
+
+Deno.test("an order is never resent after a 429", async () => {
+  const f = scriptFetch([new Response("slow down", { status: 429 })]);
+  try {
+    await assertRejects(
+      () => request("POST", "/projects/1/servers", { token: "t", body: {} }),
+      CherryApiError,
+      "429",
+    );
+    assertEquals(f.calls.length, 1);
+  } finally {
+    f.restore();
+  }
+});
+
+Deno.test("summarize drops a provider code that could be a reflected token", () => {
+  for (const code of ["AbC123xyzTOKEN", "a1b2c3", "Bearer"]) {
+    assertEquals(
+      summarize(JSON.stringify({ code, message: "Bad request." })),
+      "Bad request.",
+      code,
+    );
+  }
+  assertEquals(
+    summarize(JSON.stringify({ code: 422, message: "Bad request." })),
+    "code 422: Bad request.",
+  );
+});

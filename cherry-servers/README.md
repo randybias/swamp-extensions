@@ -138,17 +138,25 @@ global argument whose input was not given, and the model treats null as not set.
 `get`, `sync`, `wait_ready` and `delete` then need just `hostname`, and `list`
 needs `project_id` as well.
 
-Marker checks need the private key. Pass it with `--stdin` (or wire it from a
-vault), never with `--input`, which puts it on the command line:
+Marker checks need the private key. Keep it in a vault and pass a reference,
+which swamp resolves at run time and never prints:
 
 ```bash
-jq -n --rawfile k ./web-1-key \
-  '{hostname: "web-1", host_key_policy: "accept-new", marker_path: "/var/lib/cloud/instance/boot-finished", ssh_private_key: $k}' |
-  swamp model method run cherry-server wait_ready --stdin --literal-inputs
+swamp model method run cherry-server wait_ready --input hostname=web-1 \
+  --input host_key_policy=accept-new \
+  --input marker_path=/var/lib/cloud/instance/boot-finished \
+  --input 'ssh_private_key=${{ vault.get("default", "WEB_1_SSH_KEY") }}' --json
 ```
 
-Don't capture or log the `--json` output of that run: the swamp CLI currently
-echoes method arguments there, including ones marked sensitive.
+User data works the same way: give `user_data` as a vault reference. The create
+workflow takes the vault and key names (`secrets_vault`, `user_data_key`,
+`ssh_private_key_key`), never the values. Don't pass either as a literal value,
+with `--input` or with `--stdin`: the swamp CLI currently prints method
+arguments, including ones marked sensitive and ones read from stdin
+([swamp-club lab 3555](https://swamp-club.com/lab/3555)).
+
+SSH keys are installed when a server is deployed, which can be well after the
+order. Don't delete a key while servers that use it are still deploying.
 
 ## How it works
 
@@ -165,6 +173,10 @@ echoes method arguments there, including ones marked sensitive.
   project. The guard is per model: two different models ordering the same
   hostname at the same moment can both place an order. A recorded server id is
   adopted only while its hostname and project still match.
+- `create` for an SSH key adopts an existing key with the same material even
+  under another label; `delete` then refuses, because it never deletes a key
+  whose live label differs from this model's. Delete such a key under its own
+  label.
 - `delete` acts only on the server this model recorded. With no record it
   refuses, an `id` other than the recorded one is refused, and so is a live
   server whose hostname or project differs from the record. Project `delete`

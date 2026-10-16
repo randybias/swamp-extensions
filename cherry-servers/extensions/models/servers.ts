@@ -225,6 +225,22 @@ function keepUserDataSha(
     : {};
 }
 
+/**
+ * Refuses to overwrite a record whose server has since moved to another
+ * project or hostname: the recorded project and hostname are what delete
+ * guards on, so a refresh must not rebind them. `get` re-adopts deliberately.
+ */
+function assertSameBinding(stored: ServerState, live: ServerState): void {
+  if (
+    live.hostname !== stored.hostname ||
+    (stored.project_id !== undefined && live.project_id !== stored.project_id)
+  ) {
+    throw new Error(
+      `Server ${stored.id} is now ${live.hostname} in project ${live.project_id}, not the recorded ${stored.hostname} in project ${stored.project_id}; not recording it. Run get to adopt it deliberately.`,
+    );
+  }
+}
+
 async function sha256Hex(text: string): Promise<string> {
   const digest = await crypto.subtle.digest(
     "SHA-256",
@@ -525,6 +541,7 @@ export const model = {
             status: stored.status === "deleted" ? "deleted" : "not_found",
             observed_at: new Date().toISOString(),
           });
+        if (live) assertSameBinding(stored, state);
         context.logger.info("Server {id} status {status}", {
           id: stored.id,
           status: state.status,
@@ -625,6 +642,7 @@ export const model = {
           const state = toState(live, {
             user_data_sha256: stored.user_data_sha256,
           });
+          assertSameBinding(stored, state);
           const address = state.public_ipv4;
           if (!address) {
             lastReason = "no public IPv4 assigned yet";
@@ -697,8 +715,10 @@ export const model = {
                   port: args.port,
                   ssh_banner: banner,
                   host_key_policy: args.host_key_policy,
-                  host_keys: await fingerprints(deps.run, observed),
-                  known_hosts: observed.map((k) =>
+                  // Only verified keys are recorded: a key of a type strict
+                  // checking ignored must never become trusted later.
+                  host_keys: await fingerprints(deps.run, trusted),
+                  known_hosts: trusted.map((k) =>
                     `${address} ${k.type} ${k.key}`
                   ),
                   ...(args.marker_path

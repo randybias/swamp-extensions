@@ -1177,3 +1177,67 @@ Deno.test("wait_ready keeps polling through API server errors", async () => {
     a.restore();
   }
 });
+
+Deno.test("readiness records only the host keys strict checking verified", async () => {
+  const a = api(() => ok(rawServer()));
+  const RSA = "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABFakeUnpinnedRsaKey0000";
+  const p = probe({ keyLine: `${KEY_LINE}\n192.0.2.10 ${RSA}` });
+  try {
+    const { context, getWrittenResources } = createModelTestContext({
+      globalArgs: GLOBALS,
+      storedResources: STORED,
+    });
+    await model.methods.wait_ready.execute(
+      {
+        host_key_policy: "strict",
+        known_hosts: `192.0.2.10 ${KEY_LINE}`,
+        port: 22,
+        ssh_user: "root",
+        timeout_seconds: 600,
+        poll_interval_seconds: 15,
+      },
+      context,
+    );
+    const data = getWrittenResources().find((r) => r.specName === "readiness")
+      ?.data as { known_hosts: string[] };
+    assertEquals(data.known_hosts, [`192.0.2.10 ${KEY_LINE}`]);
+  } finally {
+    p.restore();
+    a.restore();
+  }
+});
+
+Deno.test("sync and wait_ready refuse to rebind a server that moved project", async () => {
+  const stored = { "node-1": { ...STORED["node-1"], project_id: 1001 } };
+  for (const run of ["sync", "wait_ready"] as const) {
+    const a = api(() => ok(rawServer({ project: { id: 2002 } })));
+    const p = probe({});
+    try {
+      const { context, getWrittenResources } = createModelTestContext({
+        globalArgs: GLOBALS,
+        storedResources: stored,
+      });
+      await assertRejects(
+        () =>
+          run === "sync"
+            ? model.methods.sync.execute({}, context)
+            : model.methods.wait_ready.execute(
+              {
+                host_key_policy: "accept-new",
+                port: 22,
+                ssh_user: "root",
+                timeout_seconds: 600,
+                poll_interval_seconds: 15,
+              },
+              context,
+            ),
+        Error,
+        "not recording it",
+      );
+      assertEquals(getWrittenResources().length, 0, run);
+    } finally {
+      p.restore();
+      a.restore();
+    }
+  }
+});

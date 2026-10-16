@@ -156,10 +156,14 @@ arguments, including ones marked sensitive and ones read from stdin
 ([swamp-club lab 3555](https://swamp-club.com/lab/3555)).
 
 On bare metal, port 22 first answers from Cherry's provisioning environment,
-which has its own host keys and does not accept yours. Set `marker_path` (for
-example `/var/lib/cloud/instance/boot-finished`) so readiness means the
-installed system; without one, `wait_ready` also waits for the API to stop
-reporting the server as deploying, which can take several minutes longer.
+which has its own host keys and does not accept yours, and the public IP can
+change while the API still reports the server as deploying, even after the
+installed system has booted. `wait_ready` therefore needs the API to report the
+server deployed and active as well as SSH and the marker, and records the
+address from that same check. Read the address from the state after
+`wait_ready`, never from `create`. Set `marker_path` (for example
+`/var/lib/cloud/instance/boot-finished`) so readiness also means first-boot
+setup has finished.
 
 ## How it works
 
@@ -186,11 +190,14 @@ reporting the server as deploying, which can take several minutes longer.
   also refuses a project that still holds servers.
 - `cycle` has no default. Monthly and annual cycles are charged upfront from the
   account balance.
-- `wait_ready` judges readiness from the server, because the API can report a
-  server as active minutes after SSH answers, or before setup has finished.
-  Marker checks load the private key into a temporary `ssh-agent` over stdin and
-  ignore the operator's `~/.ssh/config` and default keys. Invalid input or a
-  rejected key fails at once instead of retrying until the timeout.
+- `wait_ready` needs both the API and the server: the API must report the server
+  deployed and active, and the server must answer SSH on that address with
+  acceptable host keys (and show the marker). Neither alone is enough: the API
+  can report active before setup has finished, and during deploy SSH can be the
+  provisioning environment on an address that later changes. Marker checks load
+  the private key into a temporary `ssh-agent` over stdin and ignore the
+  operator's `~/.ssh/config` and default keys. Invalid input or a rejected key
+  fails at once instead of retrying until the timeout.
 - Host keys: `strict` checks against `known_hosts` entries for the server's
   address and port, as OpenSSH does: every key of a pinned type must match, key
   types with no entry are ignored, and at least one key must match; `accept-new`

@@ -590,7 +590,7 @@ export const model = {
 
     wait_ready: {
       description:
-        "Wait until the server answers SSH with acceptable host keys and, if marker_path is set, the marker file exists. Does not trust the API's active state, which can lag real boot by several minutes. Stores readiness evidence.",
+        "Wait until the API reports the server deployed and active, it answers SSH on that address with acceptable host keys and, if marker_path is set, the marker file exists. The API alone is not trusted (it can report active before setup finishes) and neither is SSH alone (during deploy it can be the provisioning environment, and the address can still change). Stores readiness evidence.",
       arguments: WaitReadyArgs,
       execute: async (
         rawArgs: z.infer<typeof WaitReadyArgs>,
@@ -658,14 +658,16 @@ export const model = {
             } catch (e) {
               lastReason = `ssh not answering: ${(e as Error).message}`;
             }
-            // Bare metal is installed from a provisioning environment that
-            // runs its own sshd. Without a marker check, SSH counts only once
-            // the API has finished deploying.
-            const deploying = state.status === "deploying" ||
-              state.state === "provisioning";
-            if (banner && args.marker_path === undefined && deploying) {
-              lastReason =
-                "SSH answers but the API still reports deploying; without marker_path this may be the provisioning environment";
+            // While the API reports anything but deployed and active, SSH can
+            // be Cherry's provisioning environment (its own sshd and host
+            // keys), and on bare metal the public IP can still change after
+            // the installed system has booted. Only a final API state counts.
+            const final = state.status === "deployed" &&
+              (state.state === undefined || state.state === "active");
+            if (banner && !final) {
+              lastReason = `SSH answers but the API reports ${state.status}${
+                state.state ? `/${state.state}` : ""
+              }; the address and host keys are not final yet`;
             } else if (banner) {
               const observed = await scanHostKeys(deps.run, address, args.port);
               if (observed.length === 0) {

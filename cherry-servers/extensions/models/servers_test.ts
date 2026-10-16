@@ -466,7 +466,14 @@ Deno.test("wait_ready requires a private key for a marker check", async () => {
 });
 
 Deno.test("wait_ready polls until SSH answers, then records evidence", async () => {
-  const a = api(() => ok(rawServer({ state: "provisioning" })));
+  let n = 0;
+  const a = api(() =>
+    ok(
+      ++n <= 3
+        ? rawServer({ status: "deploying", state: "provisioning" })
+        : rawServer(),
+    )
+  );
   const p = probe({ bannerAfter: 2 });
   try {
     const { context, getWrittenResources } = createModelTestContext({
@@ -491,7 +498,8 @@ Deno.test("wait_ready polls until SSH answers, then records evidence", async () 
     assertExists(readiness);
     const data = readiness.data as Record<string, unknown>;
     assertEquals(data.address, "192.0.2.10");
-    assertEquals(data.api_state, "provisioning");
+    assertEquals(data.api_status, "deployed");
+    assertEquals(data.api_state, "active");
     assertEquals((data.host_keys as unknown[]).length, 1);
     assertEquals(JSON.stringify(data).includes("PRIVATE-KEY"), false);
   } finally {
@@ -1287,6 +1295,53 @@ Deno.test("without a marker, SSH during deploy is not readiness", async () => {
       ?.data as { api_status: string };
     assertEquals(data.api_status, "deployed");
     assertEquals(n, 3);
+  } finally {
+    p.restore();
+    a.restore();
+  }
+});
+
+Deno.test("readiness records the address of the final API state, not a deploy address", async () => {
+  let n = 0;
+  const deployIp = [{ address: "203.0.113.7", type: "primary-ip" }];
+  const a = api(() =>
+    ok(
+      ++n <= 2
+        ? rawServer({
+          status: "deploying",
+          state: "provisioning",
+          ip_addresses: deployIp,
+        })
+        : rawServer(),
+    )
+  );
+  const p = probe({});
+  try {
+    const { context, getWrittenResources } = createModelTestContext({
+      globalArgs: GLOBALS,
+      storedResources: STORED,
+    });
+    await model.methods.wait_ready.execute(
+      {
+        host_key_policy: "accept-new",
+        port: 22,
+        ssh_user: "root",
+        marker_path: "/var/lib/cloud/instance/boot-finished",
+        ssh_private_key: "PRIVATE-KEY-PLACEHOLDER",
+        timeout_seconds: 600,
+        poll_interval_seconds: 15,
+      },
+      context,
+    );
+    const written = getWrittenResources();
+    const ready = written.find((r) => r.specName === "readiness")?.data as {
+      address: string;
+    };
+    const state = written.find((r) => r.specName === "state")?.data as {
+      public_ipv4: string;
+    };
+    assertEquals(ready.address, "192.0.2.10");
+    assertEquals(state.public_ipv4, "192.0.2.10");
   } finally {
     p.restore();
     a.restore();

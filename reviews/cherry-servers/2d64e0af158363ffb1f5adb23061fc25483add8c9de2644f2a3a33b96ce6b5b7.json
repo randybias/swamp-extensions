@@ -1,0 +1,90 @@
+{
+  "extension": "@randybias/cherry-servers",
+  "version": "2026.10.16.3",
+  "reviewedAt": "2026-10-16T19:48:34Z",
+  "dimensions": [
+    {
+      "id": "credentials-secrets",
+      "verdict": "pass",
+      "note": "Token is a sensitive global arg or CHERRY_AUTH_TOKEN, sent only in the Authorization header. user_data and ssh_private_key are sensitive; user_data is stored only as SHA-256; the private key reaches a temporary ssh-agent over stdin, never argv. Server state is an allowlist (root/BMC passwords dropped). Provider errors keep only numeric codes and messages of two or more short plain words (codex rounds 1 to 3; residual: a secret made only of short ordinary words could pass, accepted because operators need provider messages). The create workflow takes vault and key names, never values (workflow inputs are stored in plain text). Live leak scan of .swamp after the full matrix: zero hits for the API token, the private key, user data (plain and base64) and canaries. Known external issue, swamp-club lab 3555: the CLI prints method arguments including sensitive and --stdin ones; README now says to pass secrets as vault references, verified live to resolve and never print."
+    },
+    {
+      "id": "logging-quality",
+      "verdict": "pass",
+      "note": "Every method logs with structured placeholders: create on entry, adopt, order; get/sync/list results; wait_ready per poll with the reason; delete before and after. No secrets in log fields."
+    },
+    {
+      "id": "error-handling",
+      "verdict": "pass",
+      "note": "CherryApiError for every non-2xx except handled 404. GET and DELETE retry 429, 500, 502-504, 520-524 and no-response; POST never retries (an order may have gone through; create re-run adopts). wait_ready keeps polling through API 5xx, no response and network errors (Cherry returned 521 and 500 during the live run), and fails hard on 4xx, host-key mismatch and ProbeConfigError. A rejected key in the marker check is named as such."
+    },
+    {
+      "id": "testing-completeness",
+      "verdict": "pass",
+      "note": "130 unit tests. Live end to end (CONVENTIONS section 8) on throwaway hourly servers in a scratch project: VPS, bare metal one-disk and two-disk with os_partition_size, spot. Every method and both workflows from their entry points; adopt by recorded id and by hostname from a fresh model; get/sync/list; delete guards (wrong hostname, id, project, name, label, non-empty project) with no DELETE sent; delete, repeat delete; bad credential (401); unreachable port; provider-side checks (404s, empty project, team and key lists back to baseline). Readiness recorded keys equal an ssh-keyscan of the final IP on metal and VPS. Not live: the annually cycle (a year charged upfront); monthly and hourly were."
+    },
+    {
+      "id": "idempotency-resilience",
+      "verdict": "pass",
+      "note": "create adopts by recorded id (only while hostname and project match) then by exact hostname, and refuses on duplicates; verified live, including from a fresh model. sync and wait_ready refuse to rebind a server that moved project or hostname, and never add a project to a record without one (codex). Readiness needs the API at deployed/active plus SSH and the marker, and records address and keys from that poll: live, bare metal changed public IP and host keys during deploy after the installed OS had booted. Deletes are kind action, because swamp tombstones every record of a model after a delete-kind method, which broke the one-definition-many-servers pattern (verified live, fixed and re-verified). Residual: the create guard is per model (documented)."
+    },
+    {
+      "id": "api-contracts",
+      "verdict": "pass",
+      "note": "Built against Cherry Servers v1: /projects/{id}/servers, /servers/{id}, /teams/{id}/projects, /ssh-keys, /plans, /teams/{id}/plans. Pricing unit (Hourly, 1 month) is normalised to the cycle enum and the string None is not stored as termination_date, both seen live."
+    },
+    {
+      "id": "resource-management",
+      "verdict": "pass",
+      "note": "Banner socket closed on timeout; temp known_hosts file removed and ssh-agent killed in finally (tested, including on ssh-add rejection); response bodies cancelled on 404/429; fetch carries an abort signal."
+    },
+    {
+      "id": "published-surface-hygiene",
+      "verdict": "pass",
+      "note": "Manifest description unchanged. README: method tables incl. project delete; workflow inputs incl. vault key names; factory example with default: null for optional inputs; secret guidance via vault references with lab 3555; bare-metal readiness and IP caveat; tested-live line. Release notes must say the wait-ready and delete workflows did not work in 2026.10.16.1 and 2026.10.16.2. Fixtures RFC 5737; leak scan, gitleaks and fixture guard pass."
+    },
+    {
+      "id": "schema-strictness",
+      "verdict": "pass",
+      "note": "Global arguments and stored resources are strictObject. Method argument schemas are non-strict by necessity, because swamp merges global arguments into them (verified live). Hostname, slugs, ssh_user and marker_path carry grammars in zod (tested)."
+    },
+    {
+      "id": "lifetime-gc",
+      "verdict": "pass",
+      "note": "Server, readiness, project and key state: lifetime infinite, garbageCollection 10. Plans: lifetime 1d, garbageCollection 5, because stock is a snapshot."
+    },
+    {
+      "id": "crud-completeness",
+      "verdict": "pass",
+      "note": "servers: create/get/sync/list/wait_ready/delete. projects: create/get/sync/list/delete (recorded only, name check, refuses a project that still holds servers; no force flag by design). ssh-keys: create/sync/list/delete. plans: list."
+    },
+    {
+      "id": "preflight-checks",
+      "verdict": "pass",
+      "note": "delete requires a recorded resource, refuses another id, and checks the live hostname/label and project before calling DELETE, then verifies 404. wait_ready validates policy, known_hosts and key presence before polling; strict with no matching entry names the address."
+    },
+    {
+      "id": "instance-names",
+      "verdict": "pass",
+      "note": "Server state under the hostname, readiness under <hostname>-readiness, projects under the name, keys under the label, plans under the slug; instanceName strips path separators and traversal."
+    },
+    {
+      "id": "data-access",
+      "verdict": "pass",
+      "note": "Methods read only their own model state via readResource; wiring between models is by CEL in global arguments (used live: project_id and ssh_keys from data.latest). Verified live with a generic inputs-driven definition: one definition holds each server under its hostname."
+    },
+    {
+      "id": "version-upgrades",
+      "verdict": "pass",
+      "note": "All four models at 2026.10.16.3 with identity upgrades (schemas only widen: optional arguments accept null; projects add delete and the deleted status). upgrades_test.ts checks the last toVersion equals version, attributes are unchanged and a 2026.10.16.2 servers definition validates; the live test repo ran from definitions at 2026.10.16.2."
+    }
+  ],
+  "panel": {
+    "in-session": "Claude Opus 5.5, ocr delegate scope 42dbf3b..1f72348: Medium (wait_ready ended on no-response/network poll) and Low (dyn() missing) fixed.",
+    "codex-1": "codex-cli 0.162.1, read-only scratch dir, delta 42dbf3b..662cfa8: 2 High, 2 Medium, all fixed (9be06a1). First attempt hung on stdin and was rerun with stdin closed.",
+    "codex-2": "delta 662cfa8..9be06a1: 2 fixed, 1 High (legacy record rebind) and 1 Medium (word codes) fixed in 89e7c77.",
+    "codex-3": "delta 9be06a1..89e7c77: both fixed; 1 Medium (single-word token in message) fixed in 6d41810, multi-word residual accepted.",
+    "gemini": "gemini-cli 0.63.0 on the personal key, plan (read-only) mode: no findings in 5 of 6 areas; 1 Medium (key adopted under another label cannot be deleted under this label) disposed as a documented safe refusal. Two earlier attempts failed on auth and folder trust.",
+    "ocr-llm": "not run this round"
+  }
+}

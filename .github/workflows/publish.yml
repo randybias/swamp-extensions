@@ -45,5 +45,8 @@ jobs:
             (cd "$ext" && { [ -f .swamp.yaml ] || swamp repo init --quiet --tool none; })
             bash scripts/gates.sh "$ext"
             channel=$(yq -r ".\"$ext\".channel" release.yaml)
-            (cd "$ext" && swamp extension push manifest.yaml --channel "$channel" --yes --json)
+            notes=$(yq -r ".\"$ext\".notes.\"$ver\" // \"\"" release.yaml)
+            args=(--channel "$channel" --yes --json)
+            [ -n "$notes" ] && args+=(--release-notes "$notes")
+            (cd "$ext" && swamp extension push manifest.yaml "${args[@]}")
           done

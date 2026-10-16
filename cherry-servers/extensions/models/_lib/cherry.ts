@@ -95,14 +95,18 @@ const SENSITIVE_WORDS =
 
 /**
  * Returns a provider error message only when it is short plain prose that
- * cannot carry a value: letters, spaces and `.,()'-` only, no digits, quotes,
- * colons or `=`, and no sensitive words. Anything else is withheld whole,
+ * cannot carry a value: letters, spaces and `.,()'-` only, at least two words
+ * of at most 16 letters, no digits, quotes, colons or `=`, and no sensitive
+ * words. Anything else is withheld whole,
  * because partial redaction of arbitrary text cannot be made complete.
  */
 export function safeMessage(message: string): string | undefined {
   const m = message.replace(/\s+/g, " ").trim();
   if (m === "" || m.length > 120) return undefined;
   if (!/^[A-Za-z .,()'-]+$/.test(m)) return undefined;
+  // Prose has at least two words, none of them token-length.
+  const words = m.split(/[ .,()'-]+/).filter((w) => w !== "");
+  if (words.length < 2 || words.some((w) => w.length > 16)) return undefined;
   if (SENSITIVE_WORDS.test(m)) return undefined;
   return m;
 }
@@ -119,7 +123,8 @@ export function summarize(text: string): string {
     const code = String(parsed.code ?? "");
     if (
       (typeof parsed.code === "string" || typeof parsed.code === "number") &&
-      /^[A-Za-z0-9_.-]{1,40}$/.test(code)
+      // Numeric codes only: a reflected token cannot pass.
+      /^\d{1,5}$/.test(code)
     ) {
       parts.push(`code ${code}`);
     }
@@ -132,8 +137,12 @@ export function summarize(text: string): string {
   }
 }
 
+const TRANSIENT = new Set([500, 502, 503, 504, 520, 521, 522, 523, 524]);
+
 /**
- * Sends one API request. Returns the parsed JSON body, or `null` for a 404.
+ * Sends one API request. GET and DELETE are retried on transient gateway
+ * errors and on no response; POST never is, since an order may have gone
+ * through. Returns the parsed JSON body, or `null` for a 404.
  * Throws {@link CherryApiError} on any other non-2xx status.
  */
 export async function request(
@@ -153,6 +162,7 @@ export async function request(
     headers["Content-Type"] = "application/json";
   }
 
+  const idempotent = method === "GET" || method === "DELETE";
   for (let attempt = 1;; attempt++) {
     let resp: Response;
     try {
@@ -165,6 +175,11 @@ export async function request(
         signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
       });
     } catch (e) {
+      // A read, or a delete by id, is safe to repeat after no response.
+      if (idempotent && attempt < MAX_ATTEMPTS) {
+        await sleepImpl(500 * 2 ** (attempt - 1));
+        continue;
+      }
       if ((e as Error).name !== "TimeoutError") throw e;
       // A timed-out write may still have been applied by the API.
       throw new CherryApiError(
@@ -178,13 +193,22 @@ export async function request(
           }s; the request may still have been applied`,
       );
     }
-    if (resp.status === 429 && attempt < MAX_ATTEMPTS) {
+    // An order is never resent, even after a 429: run create again, which
+    // adopts the server if the order went through.
+    if (resp.status === 429 && idempotent && attempt < MAX_ATTEMPTS) {
       await resp.body?.cancel();
       const retryAfter = Number(resp.headers.get("retry-after"));
       const waitMs = Number.isFinite(retryAfter) && retryAfter > 0
         ? retryAfter * 1000
         : 500 * 2 ** (attempt - 1);
       await sleepImpl(waitMs);
+      continue;
+    }
+    // Server, gateway and availability errors (Cloudflare's 52x included)
+    // are treated as transient; only requests that are safe to repeat are retried.
+    if (TRANSIENT.has(resp.status) && idempotent && attempt < MAX_ATTEMPTS) {
+      await resp.body?.cancel();
+      await sleepImpl(500 * 2 ** (attempt - 1));
       continue;
     }
     if (resp.status === 404) {

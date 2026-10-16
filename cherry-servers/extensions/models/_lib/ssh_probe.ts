@@ -188,28 +188,43 @@ export function keysForHost(
 }
 
 /**
- * Applies the host-key policy. `strict` requires every observed key to be in
- * `expected` and at least one to be observed. `accept-new` and `insecure`
- * accept what was observed here; callers implement trust-on-first-use for
- * `accept-new` by passing previously recorded keys as `strict`.
+ * Applies the host-key policy and returns the keys to trust for later SSH
+ * connections. `strict` follows OpenSSH: every observed key of a type that
+ * `expected` pins must match a pinned key, types it does not pin are ignored,
+ * and at least one observed key must match; only matching keys are returned.
+ * `accept-new` and `insecure` return what was observed; callers implement
+ * trust-on-first-use for `accept-new` by passing previously recorded keys as
+ * `strict`.
  */
 export function checkHostKeys(
   observed: HostKey[],
   policy: HostKeyPolicy,
   expected: HostKey[] = [],
-): void {
-  if (policy !== "strict") return;
+): HostKey[] {
+  if (policy !== "strict") return observed;
   if (expected.length === 0) {
     throw new Error("host_key_policy strict requires known_hosts");
   }
   if (observed.length === 0) {
     throw new Error("no host keys observed to verify");
   }
+  const pinnedTypes = new Set(expected.map((e) => e.type));
+  const trusted: HostKey[] = [];
   for (const k of observed) {
+    if (!pinnedTypes.has(k.type)) continue;
     if (!expected.some((e) => e.type === k.type && e.key === k.key)) {
       throw new Error(`host key mismatch for ${k.type}`);
     }
+    trusted.push(k);
   }
+  if (trusted.length === 0) {
+    throw new Error(
+      `none of the host's key types (${
+        observed.map((k) => k.type).join(", ")
+      }) is pinned in known_hosts`,
+    );
+  }
+  return trusted;
 }
 
 /** Scans the host's public keys with ssh-keyscan. */
@@ -329,7 +344,18 @@ export async function checkMarker(
     ], { env });
     if (res.code === 0) return true;
     if (res.code === 1) return false;
-    throw new Error(`ssh marker check failed (exit ${res.code})`);
+    // Retried by the caller: first boot can restart sshd, and keys can land
+    // after sshd starts. The reason says which failure it was.
+    const why = /Permission denied/i.test(res.stderr)
+      ? "the server rejected the private key"
+      : /Host key verification failed/i.test(res.stderr)
+      ? "host key verification failed"
+      : /Connection (refused|timed out|closed|reset)|timed out/i.test(
+          res.stderr,
+        )
+      ? "connection failed"
+      : "ssh failed";
+    throw new Error(`ssh marker check failed (exit ${res.code}): ${why}`);
   } finally {
     if (knownHosts) await Deno.remove(knownHosts).catch(() => {});
     await run("ssh-agent", ["-k"], { env }).catch(() => undefined);

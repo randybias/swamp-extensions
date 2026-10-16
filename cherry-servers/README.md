@@ -3,10 +3,11 @@
 [Swamp](https://github.com/swamp-club/swamp) extension for the
 [Cherry Servers](https://www.cherryservers.com) API: bare-metal and VPS servers,
 projects, SSH keys and live plan stock. Built against the Cherry Servers v1 REST
-API. Exercised live so far: the read-only `list` calls; `projects create`,
-`ssh-keys create`, and on a VPS order `servers create`, `wait_ready` and an
-idempotent `create` re-run that adopted the server. `delete` is covered by unit
-tests only and has not yet been run against a real server.
+API. Every method and both workflows have run live, end to end, on throwaway
+hourly servers: a VPS, bare metal with one and two disks, and a spot server,
+including adopt on re-run, repeat deletes, the delete guards, bad credentials
+and an unreachable port. Not run live: the `annually` billing cycle, which is
+charged a year upfront; `monthly` and `hourly` were.
 
 ## Models
 
@@ -26,12 +27,13 @@ image, billing cycle, SSH keys, optional user data).
 
 ### `@randybias/cherry-servers/projects`
 
-| Method   | Description                                                     |
-| -------- | --------------------------------------------------------------- |
-| `create` | Create the project, or adopt one with the same name in the team |
-| `get`    | Fetch a project by ID (read-only)                               |
-| `sync`   | Refresh stored state; records `not_found` when gone (read-only) |
-| `list`   | Store every project in the team (read-only)                     |
+| Method   | Description                                                        |
+| -------- | ------------------------------------------------------------------ |
+| `create` | Create the project, or adopt one with the same name in the team    |
+| `get`    | Fetch a project by ID (read-only)                                  |
+| `sync`   | Refresh stored state; records `not_found` when gone (read-only)    |
+| `list`   | Store every project in the team (read-only)                        |
+| `delete` | Delete the recorded, empty project after a name check; confirm 404 |
 
 ### `@randybias/cherry-servers/ssh-keys`
 
@@ -51,8 +53,12 @@ image, billing cycle, SSH keys, optional user data).
 ## Workflows
 
 - `cherry-servers-create-server`: create, then `wait_ready`. Takes the generic
-  server model's name plus the server's inputs (hostname, project, plan, region,
-  image, cycle, SSH keys).
+  server model's name plus the server's inputs: hostname, project, plan, region,
+  image, cycle, SSH keys, and optionally `os_partition_size`, `spot_market` and
+  `tags`. For cloud-init and a marker check, name a vault and the keys in it
+  (`secrets_vault`, `user_data_key`, `ssh_private_key_key`) and set
+  `marker_path`; workflow inputs are stored in plain text, so the values
+  themselves never pass through them.
 - `cherry-servers-delete-server`: `sync`, then `delete` of the recorded server
   for a hostname.
 
@@ -90,18 +96,26 @@ inputs:
     hostname: { type: string }
     plan: { type: string }
     region: { type: string }
-    image: { type: string }
     cycle: { type: string, enum: ["hourly", "monthly", "annually"] }
-    ssh_keys: { type: array, items: { type: integer } }
+    image: { type: string, default: null }
+    ssh_keys: { type: array, items: { type: integer }, default: null }
+    os_partition_size: { type: integer, default: null }
+    spot_market: { type: boolean, default: null }
+    user_data: { type: string, default: null }
+    tags: { type: object, default: null }
   required: ["hostname"]
 globalArguments:
   project_id: ${{ inputs.project_id }}
   hostname: ${{ inputs.hostname }}
   plan: ${{ inputs.plan }}
   region: ${{ inputs.region }}
-  image: ${{ inputs.image }}
   cycle: ${{ inputs.cycle }}
+  image: ${{ inputs.image }}
   ssh_keys: ${{ inputs.ssh_keys }}
+  os_partition_size: ${{ inputs.os_partition_size }}
+  spot_market: ${{ inputs.spot_market }}
+  user_data: ${{ inputs.user_data }}
+  tags: ${{ inputs.tags }}
   token: ${{ vault.get("default", "CHERRY_TOKEN") }}
 ```
 
@@ -119,28 +133,47 @@ swamp model method run cherry-server wait_ready --input hostname=web-1 \
 ```
 
 Read a server's state with
-`data.latest("cherry-server", "web-1").attributes.public_ipv4`. Methods that
-only read or wait need just `hostname` (plus `project_id` for `list`); swamp
-skips global arguments whose inputs are not given.
+`data.latest("cherry-server", "web-1").attributes.public_ipv4`. Give every
+optional input a `default: null`, as above: swamp fails a method that reads a
+global argument whose input was not given, and the model treats null as not set.
+`get`, `sync`, `wait_ready` and `delete` then need just `hostname`, and `list`
+needs `project_id` as well.
 
-Marker checks need the private key. Pass it with `--stdin` (or wire it from a
-vault), never with `--input`, which puts it on the command line:
+Marker checks need the private key. Keep it in a vault and pass a reference,
+which swamp resolves at run time and never prints:
 
 ```bash
-jq -n --rawfile k ./web-1-key \
-  '{hostname: "web-1", host_key_policy: "accept-new", marker_path: "/var/lib/cloud/instance/boot-finished", ssh_private_key: $k}' |
-  swamp model method run cherry-server wait_ready --stdin --literal-inputs
+swamp model method run cherry-server wait_ready --input hostname=web-1 \
+  --input host_key_policy=accept-new \
+  --input marker_path=/var/lib/cloud/instance/boot-finished \
+  --input 'ssh_private_key=${{ vault.get("default", "WEB_1_SSH_KEY") }}' --json
 ```
 
-Don't capture or log the `--json` output of that run: the swamp CLI currently
-echoes method arguments there, including ones marked sensitive.
+User data works the same way: give `user_data` as a vault reference. The create
+workflow takes the vault and key names (`secrets_vault`, `user_data_key`,
+`ssh_private_key_key`), never the values. Don't pass either as a literal value,
+with `--input` or with `--stdin`: the swamp CLI currently prints method
+arguments, including ones marked sensitive and ones read from stdin
+([swamp-club lab 3555](https://swamp-club.com/lab/3555)).
+
+On bare metal, port 22 first answers from Cherry's provisioning environment,
+which has its own host keys and does not accept yours, and the public IP can
+change while the API still reports the server as deploying, even after the
+installed system has booted. `wait_ready` therefore needs the API to report the
+server deployed and active as well as SSH and the marker, and records the
+address from that same check. Read the address from the state after
+`wait_ready`, never from `create`. Set `marker_path` (for example
+`/var/lib/cloud/instance/boot-finished`) so readiness also means first-boot
+setup has finished.
 
 ## How it works
 
 - The API token is sent only in the `Authorization` header. It comes from the
   `token` global argument (wire it to a vault) or `CHERRY_AUTH_TOKEN`.
-- Every API request times out after 30 seconds. A timed-out order may still have
-  been placed; run `create` again and it adopts the server by hostname.
+- Every API request times out after 30 seconds. Reads and deletes are retried on
+  a timeout or a transient gateway error (502 to 504, Cloudflare's 520 to 524);
+  orders never are. A timed-out order may still have been placed; run `create`
+  again and it adopts the server by hostname.
 - Stored server state is an allowlist. Provider responses also contain root and
   BMC passwords; those are never written to swamp data. User data is never
   stored either, only its SHA-256.
@@ -148,18 +181,29 @@ echoes method arguments there, including ones marked sensitive.
   project. The guard is per model: two different models ordering the same
   hostname at the same moment can both place an order. A recorded server id is
   adopted only while its hostname and project still match.
+- `create` for an SSH key adopts an existing key with the same material even
+  under another label; `delete` then refuses, because it never deletes a key
+  whose live label differs from this model's. Delete such a key under its own
+  label.
 - `delete` acts only on the server this model recorded. With no record it
-  refuses, and an `id` other than the recorded one is refused.
+  refuses, an `id` other than the recorded one is refused, and so is a live
+  server whose hostname or project differs from the record. Project `delete`
+  also refuses a project that still holds servers.
 - `cycle` has no default. Monthly and annual cycles are charged upfront from the
   account balance.
-- `wait_ready` judges readiness from the server, because the API can report a
-  server as active minutes after SSH answers, or before setup has finished.
-  Marker checks load the private key into a temporary `ssh-agent` over stdin and
-  ignore the operator's `~/.ssh/config` and default keys. Invalid input or a
-  rejected key fails at once instead of retrying until the timeout.
+- `wait_ready` needs both the API and the server: the API must report the server
+  deployed and active, and the server must answer SSH on that address with
+  acceptable host keys (and show the marker). Neither alone is enough: the API
+  can report active before setup has finished, and during deploy SSH can be the
+  provisioning environment on an address that later changes. Marker checks load
+  the private key into a temporary `ssh-agent` over stdin and ignore the
+  operator's `~/.ssh/config` and default keys. Invalid input or a rejected key
+  fails at once instead of retrying until the timeout.
 - Host keys: `strict` checks against `known_hosts` entries for the server's
-  address and port; `accept-new` records the keys on first success and enforces
-  them on later runs; `insecure` records without enforcing.
+  address and port, as OpenSSH does: every key of a pinned type must match, key
+  types with no entry are ignored, and at least one key must match; `accept-new`
+  records the keys on first success and enforces them on later runs; `insecure`
+  records without enforcing.
 - Data names: server state is stored under the hostname, readiness evidence
   under `<hostname>-readiness`, e.g.
   `data.latest("cherry-server", "web-1").attributes.public_ipv4`.

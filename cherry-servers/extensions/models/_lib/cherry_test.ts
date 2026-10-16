@@ -274,8 +274,8 @@ Deno.test("summarize keeps short plain-prose provider messages", () => {
 
 Deno.test("summarize drops a code with unsafe characters", () => {
   assertEquals(
-    summarize(JSON.stringify({ code: "x\nsecret=1", message: "Nope" })),
-    "Nope",
+    summarize(JSON.stringify({ code: "x\nsecret=1", message: "Not allowed" })),
+    "Not allowed",
   );
 });
 
@@ -295,4 +295,95 @@ Deno.test("a stalled response body raises CherryApiError", async () => {
   } finally {
     f.restore();
   }
+});
+
+Deno.test("GET and DELETE retry transient gateway errors; POST does not", async () => {
+  for (const method of ["GET", "DELETE"]) {
+    const f = scriptFetch([
+      new Response("origin down", { status: 521 }),
+      new Response("bad gateway", { status: 502 }),
+      json(200, { ok: true }),
+    ]);
+    try {
+      assertEquals(await request(method, "/servers/1", { token: "t" }), {
+        ok: true,
+      });
+      assertEquals(f.calls.length, 3);
+    } finally {
+      f.restore();
+    }
+  }
+  const f = scriptFetch([new Response("origin down", { status: 521 })]);
+  try {
+    await assertRejects(
+      () => request("POST", "/projects/1/servers", { token: "t", body: {} }),
+      CherryApiError,
+      "521",
+    );
+    assertEquals(f.calls.length, 1);
+  } finally {
+    f.restore();
+  }
+});
+
+Deno.test("a GET with no response is retried, then reported", async () => {
+  let n = 0;
+  const previous = setFetch(() => {
+    n++;
+    return Promise.reject(new DOMException("timed out", "TimeoutError"));
+  });
+  const previousSleep = setSleep(() => Promise.resolve());
+  try {
+    const err = await assertRejects(
+      () => request("GET", "/servers/1", { token: "t" }),
+      CherryApiError,
+    );
+    assertStringIncludes(err.message, "no response within");
+    assertEquals(n, 5);
+  } finally {
+    setFetch(previous);
+    setSleep(previousSleep);
+  }
+});
+
+Deno.test("an order is never resent after a 429", async () => {
+  const f = scriptFetch([new Response("slow down", { status: 429 })]);
+  try {
+    await assertRejects(
+      () => request("POST", "/projects/1/servers", { token: "t", body: {} }),
+      CherryApiError,
+      "429",
+    );
+    assertEquals(f.calls.length, 1);
+  } finally {
+    f.restore();
+  }
+});
+
+Deno.test("summarize drops a provider code that could be a reflected token", () => {
+  for (
+    const code of [
+      "AbC123xyzTOKEN",
+      "a1b2c3",
+      "Bearer",
+      "abcdefghijklmnopqrstuvwx",
+    ]
+  ) {
+    assertEquals(
+      summarize(JSON.stringify({ code, message: "Bad request." })),
+      "Bad request.",
+      code,
+    );
+  }
+  assertEquals(
+    summarize(JSON.stringify({ code: 422, message: "Bad request." })),
+    "code 422: Bad request.",
+  );
+});
+
+Deno.test("safeMessage withholds single words and token-length words", () => {
+  assertEquals(safeMessage("abcdefghijklmnopqrstuvwx"), undefined);
+  assertEquals(safeMessage("Forbidden"), undefined);
+  assertEquals(safeMessage("Invalid abcdefghijklmnopqrstuvwx"), undefined);
+  assertEquals(safeMessage("Region not available."), "Region not available.");
 });

@@ -11,6 +11,7 @@
 
 import { z } from "npm:zod@4.3.6";
 import {
+  CherryApiError,
   instanceName,
   listAll,
   request,
@@ -50,31 +51,34 @@ const GlobalArgsSchema = z.strictObject({
   ),
   region: z.string().regex(SLUG_RE).describe("Region slug."),
   image: z.string().regex(SLUG_RE).describe("Operating system image slug.")
-    .optional(),
+    .nullish(),
   cycle: z.enum(["hourly", "monthly", "annually"]).describe(
     "Billing cycle. Non-hourly cycles are charged upfront from the account balance.",
   ),
   ssh_keys: z.array(z.number().int().positive()).describe(
     "IDs of SSH keys to install for the root user.",
-  ).optional(),
+  ).nullish(),
   user_data: z.string().max(65536).meta({ sensitive: true }).describe(
     "Cloud-init user data or a shell script, as plain text. Never stored; only its SHA-256 is recorded.",
-  ).optional(),
+  ).nullish(),
   os_partition_size: z.number().int().positive().describe(
     "Size of the OS partition in GB, leaving the rest of the disk unallocated.",
-  ).optional(),
+  ).nullish(),
   spot_market: z.boolean().describe("Order as an interruptible spot server.")
-    .optional(),
+    .nullish(),
   tags: z.record(
     z.string().regex(/^[A-Za-z0-9._-]{1,64}$/),
     z.string().max(255),
-  ).describe("Key/value tags attached to the server.").optional(),
+  ).describe("Key/value tags attached to the server.").nullish(),
   token: z.string().meta({ sensitive: true }).describe(
     "Cherry Servers API token; overrides CHERRY_AUTH_TOKEN. Wire with a vault.get(...) expression.",
-  ).optional(),
+  ).nullish(),
 });
 
-type GlobalArgs = z.infer<typeof GlobalArgsSchema>;
+/** `T` with null removed from every field; see `withoutNulls`. */
+type NoNull<T> = { [K in keyof T]: Exclude<T[K], null> };
+
+type GlobalArgs = NoNull<z.infer<typeof GlobalArgsSchema>>;
 
 const IpSchema = z.strictObject({
   address: z.string(),
@@ -208,6 +212,38 @@ export function toState(
   );
 }
 
+/**
+ * The stored user-data hash to carry onto a fresh read of server `id`: the API
+ * never returns user data, so only a record of the same server can supply it.
+ */
+function keepUserDataSha(
+  recorded: ServerState | null,
+  id: number,
+): Partial<ServerState> {
+  return recorded?.id === id && recorded.user_data_sha256
+    ? { user_data_sha256: recorded.user_data_sha256 }
+    : {};
+}
+
+/**
+ * Refuses to overwrite a record whose server has since moved to another
+ * project or hostname: the recorded project and hostname are what delete
+ * guards on, so a refresh must not rebind them. `get` re-adopts deliberately.
+ */
+function assertSameBinding(stored: ServerState, live: ServerState): void {
+  // A record without a project never gains one from a refresh, so delete
+  // keeps falling back to the explicit project_id for it.
+  if (stored.project_id === undefined) delete live.project_id;
+  if (
+    live.hostname !== stored.hostname ||
+    (stored.project_id !== undefined && live.project_id !== stored.project_id)
+  ) {
+    throw new Error(
+      `Server ${stored.id} is now ${live.hostname} in project ${live.project_id}, not the recorded ${stored.hostname} in project ${stored.project_id}; not recording it. Run get to adopt it deliberately.`,
+    );
+  }
+}
+
 async function sha256Hex(text: string): Promise<string> {
   const digest = await crypto.subtle.digest(
     "SHA-256",
@@ -279,13 +315,28 @@ export function setProbeDeps(deps: ProbeDeps): ProbeDeps {
 // deno-lint-ignore no-explicit-any
 type Ctx = any;
 
+/**
+ * Reads null as undefined, so an optional argument a workflow passes as null
+ * (it cannot leave a key out) is treated the same as one never given. Fields
+ * are read lazily: swamp fails a method only when it reads a global argument
+ * whose expression did not resolve, so the arguments are never enumerated.
+ */
+export function withoutNulls<T extends object>(o: T): NoNull<T> {
+  return new Proxy(o, {
+    get(target, key, receiver) {
+      const v = Reflect.get(target, key, receiver);
+      return v === null ? undefined : v;
+    },
+  }) as NoNull<T>;
+}
+
 const WaitReadyArgs = z.object({
   host_key_policy: z.enum(["strict", "accept-new", "insecure"]).describe(
     "strict: keys must match known_hosts; accept-new: trust on first use, then enforce the recorded keys; insecure: record without enforcing.",
   ),
   known_hosts: z.string().max(16384).describe(
     "Expected host keys in known_hosts or ssh-keyscan format; required for strict.",
-  ).optional(),
+  ).nullish(),
   port: z.number().int().min(1).max(65535).default(22).describe(
     "SSH port.",
   ),
@@ -294,13 +345,13 @@ const WaitReadyArgs = z.object({
     "marker_path must not contain ..",
   ).describe(
     "Absolute path of a file whose existence marks first-boot setup as finished.",
-  ).optional(),
+  ).nullish(),
   ssh_user: z.string().regex(USER_RE).default("root").describe(
     "User for the marker check.",
   ),
   ssh_private_key: z.string().meta({ sensitive: true }).describe(
     "Private key for the marker check, loaded into a temporary ssh-agent over stdin.",
-  ).optional(),
+  ).nullish(),
   timeout_seconds: z.number().int().min(10).max(7200).default(2700).describe(
     "Give up after this many seconds.",
   ),
@@ -311,11 +362,17 @@ const WaitReadyArgs = z.object({
 /** Model definition for `@randybias/cherry-servers/servers`. */
 export const model = {
   type: "@randybias/cherry-servers/servers",
-  version: "2026.10.16.2",
+  version: "2026.10.16.3",
   upgrades: [
     {
       toVersion: "2026.10.16.2",
       description: "Version bump for the public release; no schema changes",
+      upgradeAttributes: (old: Record<string, unknown>) => old,
+    },
+    {
+      toVersion: "2026.10.16.3",
+      description:
+        "Optional global and wait_ready arguments accept null as not given; delete guards on the recorded project; existing attributes are unchanged",
       upgradeAttributes: (old: Record<string, unknown>) => old,
     },
   ],
@@ -341,7 +398,7 @@ export const model = {
         "Order the server, or adopt an existing one with the same hostname in the project. Idempotent: a re-run never places a second order. Returns as soon as the order is accepted; use wait_ready to wait for SSH.",
       arguments: z.object({}),
       execute: async (_args: Record<string, never>, context: Ctx) => {
-        const g = context.globalArgs as GlobalArgs;
+        const g = withoutNulls(context.globalArgs) as GlobalArgs;
         const name = instanceName(g.hostname);
         context.logger.info("Ensuring server {hostname} in project {project}", {
           hostname: g.hostname,
@@ -441,11 +498,14 @@ export const model = {
         id: z.number().int().positive().describe("Server ID."),
       }),
       execute: async (args: { id: number }, context: Ctx) => {
-        const g = context.globalArgs as GlobalArgs;
+        const g = withoutNulls(context.globalArgs) as GlobalArgs;
         const live = await requestExisting("GET", `/servers/${args.id}`, {
           token: g.token,
         }) as Raw;
-        const state = toState(live);
+        const recorded = await context.readResource(
+          instanceName(str(live.hostname) ?? String(live.id)),
+        ) as ServerState | null;
+        const state = toState(live, keepUserDataSha(recorded, Number(live.id)));
         context.logger.info("Server {id} is {hostname}, status {status}", {
           id: state.id,
           hostname: state.hostname,
@@ -465,7 +525,7 @@ export const model = {
         "READ-ONLY. Refresh stored state from the API; records status not_found instead of failing when the server is gone.",
       arguments: z.object({}),
       execute: async (_args: Record<string, never>, context: Ctx) => {
-        const g = context.globalArgs as GlobalArgs;
+        const g = withoutNulls(context.globalArgs) as GlobalArgs;
         const name = instanceName(g.hostname);
         const stored = await context.readResource(name) as ServerState | null;
         if (!stored) {
@@ -480,9 +540,11 @@ export const model = {
             id: stored.id,
             hostname: stored.hostname,
             project_id: stored.project_id,
-            status: "not_found",
+            // A server this model deleted stays recorded as deleted.
+            status: stored.status === "deleted" ? "deleted" : "not_found",
             observed_at: new Date().toISOString(),
           });
+        if (live) assertSameBinding(stored, state);
         context.logger.info("Server {id} status {status}", {
           id: stored.id,
           status: state.status,
@@ -497,7 +559,7 @@ export const model = {
         "READ-ONLY. List every server in the project and store one state record per hostname.",
       arguments: z.object({}),
       execute: async (_args: Record<string, never>, context: Ctx) => {
-        const g = context.globalArgs as GlobalArgs;
+        const g = withoutNulls(context.globalArgs) as GlobalArgs;
         const items = await listAll(`/projects/${g.project_id}/servers`, {
           token: g.token,
         });
@@ -507,7 +569,13 @@ export const model = {
         });
         const dataHandles = [];
         for (const item of items) {
-          const state = toState(item);
+          const recorded = await context.readResource(
+            instanceName(str(item.hostname) ?? String(item.id)),
+          ) as ServerState | null;
+          const state = toState(
+            item,
+            keepUserDataSha(recorded, Number(item.id)),
+          );
           dataHandles.push(
             await context.writeResource(
               "state",
@@ -522,13 +590,14 @@ export const model = {
 
     wait_ready: {
       description:
-        "Wait until the server answers SSH with acceptable host keys and, if marker_path is set, the marker file exists. Does not trust the API's active state, which can lag real boot by several minutes. Stores readiness evidence.",
+        "Wait until the API reports the server deployed and active, it answers SSH on that address with acceptable host keys and, if marker_path is set, the marker file exists. The API alone is not trusted (it can report active before setup finishes) and neither is SSH alone (during deploy it can be the provisioning environment, and the address can still change). Stores readiness evidence.",
       arguments: WaitReadyArgs,
       execute: async (
-        args: z.infer<typeof WaitReadyArgs>,
+        rawArgs: z.infer<typeof WaitReadyArgs>,
         context: Ctx,
       ) => {
-        const g = context.globalArgs as GlobalArgs;
+        const args = withoutNulls(rawArgs);
+        const g = withoutNulls(context.globalArgs) as GlobalArgs;
         const name = instanceName(g.hostname);
         if (args.host_key_policy === "strict" && !args.known_hosts) {
           throw new Error("host_key_policy strict requires known_hosts");
@@ -550,13 +619,33 @@ export const model = {
         const deadline = started + args.timeout_seconds * 1000;
         let lastReason = "not polled yet";
         while (deps.now() < deadline) {
-          const live = await request("GET", `/servers/${stored.id}`, {
-            token: g.token,
-          }) as Raw | null;
+          let live: Raw | null;
+          try {
+            live = await request("GET", `/servers/${stored.id}`, {
+              token: g.token,
+            }) as Raw | null;
+          } catch (e) {
+            // One bad poll must not end a wait of up to two hours: no
+            // response, a 5xx or a network failure is retried; a 4xx is not.
+            const transient = e instanceof CherryApiError
+              ? e.status === 0 || e.status >= 500
+              : e instanceof TypeError;
+            if (!transient) throw e;
+            lastReason = e instanceof CherryApiError
+              ? `API unavailable (${e.status || "no response"})`
+              : "API unreachable";
+            context.logger.info("Server {id} not ready: {reason}", {
+              id: stored.id,
+              reason: lastReason,
+            });
+            await sleep(args.poll_interval_seconds * 1000);
+            continue;
+          }
           if (!live) throw new Error(`Server ${stored.id} no longer exists`);
           const state = toState(live, {
             user_data_sha256: stored.user_data_sha256,
           });
+          assertSameBinding(stored, state);
           const address = state.public_ipv4;
           if (!address) {
             lastReason = "no public IPv4 assigned yet";
@@ -569,7 +658,17 @@ export const model = {
             } catch (e) {
               lastReason = `ssh not answering: ${(e as Error).message}`;
             }
-            if (banner) {
+            // While the API reports anything but deployed and active, SSH can
+            // be Cherry's provisioning environment (its own sshd and host
+            // keys), and on bare metal the public IP can still change after
+            // the installed system has booted. Only a final API state counts.
+            const final = state.status === "deployed" &&
+              (state.state === undefined || state.state === "active");
+            if (banner && !final) {
+              lastReason = `SSH answers but the API reports ${state.status}${
+                state.state ? `/${state.state}` : ""
+              }; the address and host keys are not final yet`;
+            } else if (banner) {
               const observed = await scanHostKeys(deps.run, address, args.port);
               if (observed.length === 0) {
                 lastReason = "ssh answered but keyscan returned no host keys";
@@ -591,7 +690,7 @@ export const model = {
                   }`,
                 );
               }
-              checkHostKeys(
+              const trusted = checkHostKeys(
                 observed,
                 pinned.length > 0 ? "strict" : args.host_key_policy,
                 expected,
@@ -604,7 +703,7 @@ export const model = {
                     port: args.port,
                     user: args.ssh_user,
                     privateKey: args.ssh_private_key!,
-                    hostKeys: observed,
+                    hostKeys: trusted,
                     markerPath: args.marker_path,
                   });
                   if (!markerOk) lastReason = "marker file not present yet";
@@ -629,8 +728,10 @@ export const model = {
                   port: args.port,
                   ssh_banner: banner,
                   host_key_policy: args.host_key_policy,
-                  host_keys: await fingerprints(deps.run, observed),
-                  known_hosts: observed.map((k) =>
+                  // Only verified keys are recorded: a key of a type strict
+                  // checking ignored must never become trusted later.
+                  host_keys: await fingerprints(deps.run, trusted),
+                  known_hosts: trusted.map((k) =>
                     `${address} ${k.type} ${k.key}`
                   ),
                   ...(args.marker_path
@@ -671,8 +772,13 @@ export const model = {
     },
 
     delete: {
+      // One definition holds many servers, projects or keys (one record per
+      // name). Swamp treats a "delete" kind as deleting the whole model and
+      // tombstones every record it holds, so this is declared an action: it
+      // marks only the record it deleted.
+      kind: "action" as const,
       description:
-        "DESTRUCTIVE. Delete this model's recorded server and confirm the API no longer returns it. Refuses unless the live server's hostname and project both match, and refuses an id other than the recorded one; an already-deleted recorded server is stored as not_found.",
+        "DESTRUCTIVE. Delete this model's recorded server and confirm the API no longer returns it. Refuses unless the live server's hostname and its recorded project both match, and refuses an id other than the recorded one; an already-deleted recorded server is stored as not_found.",
       arguments: z.object({
         id: z.number().int().positive().describe(
           "Server ID; defaults to the recorded server and must match it when both exist.",
@@ -685,7 +791,7 @@ export const model = {
         args: { id?: number; confirm_hostname: string },
         context: Ctx,
       ) => {
-        const g = context.globalArgs as GlobalArgs;
+        const g = withoutNulls(context.globalArgs) as GlobalArgs;
         const name = instanceName(g.hostname);
         if (args.confirm_hostname !== g.hostname) {
           throw new Error(
@@ -706,6 +812,15 @@ export const model = {
           );
         }
         const id = stored.id;
+        // The guard is the project the server was recorded in, so delete
+        // needs only the hostname; project_id is read only for an old record
+        // without one.
+        const project = stored.project_id ?? g.project_id;
+        if (project === undefined) {
+          throw new Error(
+            "The recorded server has no project; pass project_id to delete it",
+          );
+        }
         const live = await request("GET", `/servers/${id}`, {
           token: g.token,
         }) as Raw | null;
@@ -717,7 +832,7 @@ export const model = {
             StateSchema.parse({
               id,
               hostname: g.hostname,
-              project_id: g.project_id,
+              project_id: project,
               // A server this model already deleted stays recorded as deleted.
               status: stored.status === "deleted" ? "deleted" : "not_found",
               observed_at: new Date().toISOString(),
@@ -731,9 +846,9 @@ export const model = {
             `Server ${id} is named ${current.hostname}, not ${args.confirm_hostname}; refusing to delete`,
           );
         }
-        if (current.project_id !== g.project_id) {
+        if (current.project_id !== project) {
           throw new Error(
-            `Server ${id} is in project ${current.project_id}, not ${g.project_id}; refusing to delete`,
+            `Server ${id} is in project ${current.project_id}, not ${project}; refusing to delete`,
           );
         }
         context.logger.info("Deleting server {id} ({hostname})", {

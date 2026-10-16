@@ -95,14 +95,18 @@ const SENSITIVE_WORDS =
 
 /**
  * Returns a provider error message only when it is short plain prose that
- * cannot carry a value: letters, spaces and `.,()'-` only, no digits, quotes,
- * colons or `=`, and no sensitive words. Anything else is withheld whole,
+ * cannot carry a value: letters, spaces and `.,()'-` only, at least two words
+ * of at most 16 letters, no digits, quotes, colons or `=`, and no sensitive
+ * words. Anything else is withheld whole,
  * because partial redaction of arbitrary text cannot be made complete.
  */
 export function safeMessage(message: string): string | undefined {
   const m = message.replace(/\s+/g, " ").trim();
   if (m === "" || m.length > 120) return undefined;
   if (!/^[A-Za-z .,()'-]+$/.test(m)) return undefined;
+  // Prose has at least two words, none of them token-length.
+  const words = m.split(/[ .,()'-]+/).filter((w) => w !== "");
+  if (words.length < 2 || words.some((w) => w.length > 16)) return undefined;
   if (SENSITIVE_WORDS.test(m)) return undefined;
   return m;
 }

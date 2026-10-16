@@ -274,8 +274,8 @@ Deno.test("summarize keeps short plain-prose provider messages", () => {
 
 Deno.test("summarize drops a code with unsafe characters", () => {
   assertEquals(
-    summarize(JSON.stringify({ code: "x\nsecret=1", message: "Nope" })),
-    "Nope",
+    summarize(JSON.stringify({ code: "x\nsecret=1", message: "Not allowed" })),
+    "Not allowed",
   );
 });
 
@@ -379,4 +379,11 @@ Deno.test("summarize drops a provider code that could be a reflected token", () 
     summarize(JSON.stringify({ code: 422, message: "Bad request." })),
     "code 422: Bad request.",
   );
+});
+
+Deno.test("safeMessage withholds single words and token-length words", () => {
+  assertEquals(safeMessage("abcdefghijklmnopqrstuvwx"), undefined);
+  assertEquals(safeMessage("Forbidden"), undefined);
+  assertEquals(safeMessage("Invalid abcdefghijklmnopqrstuvwx"), undefined);
+  assertEquals(safeMessage("Region not available."), "Region not available.");
 });

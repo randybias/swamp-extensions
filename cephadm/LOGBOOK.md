@@ -153,6 +153,14 @@ Not packaged. Notes for whoever maintains this extension.
   are protected even when acknowledged) but a missing efibootmgr does not block
   the host. Rule 3a now covers the partitions of any protected node (a multipath
   device), `PARTTYPENAME` is dropped (util-linux 2.34 lacks it), and the GUID
-  lowercasing is pinned by a test. Not modelled: GRUB in the MBR gap of an msdos
-  disk. Left as is: a foreign array named `/dev/md/<host>:0` fails the
-  array-path grammar in `validate.ts` and aborts the wipe (fail-closed).
+  lowercasing is pinned by a test. Left as is: a foreign array named
+  `/dev/md/<host>:0` fails the array-path grammar in `validate.ts` and aborts
+  the wipe (fail-closed).
+- 2026-10-17 guard r8: EFI entries in `HD(n,MBR,0x<sig>,...)` form map to the
+  dos PARTUUID (`<sig padded to 8>-<n as 2 hex>`) and BootNext counts, so an
+  acknowledged msdos ESP, or a booted 0x0c partition, is protected. Sector 0 of
+  every candidate disk is read (`dd bs=512 count=1 | od`, exactly 512 bytes or
+  unverifiable); a non-zero code area with 55 AA refuses as `boot-partition`
+  (`mbr-boot-code`), lifted only by that disk's acknowledgement. A partition
+  with no readable type is a `boot-partition` refusal too. A serial listed twice
+  in `dataDevices` is refused. New tests pin the `some` and `continue` mutants.

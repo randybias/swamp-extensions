@@ -1,4 +1,5 @@
 import { assertEquals, assertRejects } from "jsr:@std/assert@1.0.19";
+import { sector0 } from "./boot_fixtures.ts";
 import { PhaseError } from "./errors.ts";
 import { listByIdCommand } from "./resolve.ts";
 import type { CommandResult, RunOptions, SshSession } from "./ssh.ts";
@@ -128,6 +129,12 @@ function probeAnswer(
   const hit = names.find(([c]) => c === command);
   if (hit) {
     const answer = over[hit[1]] ?? HEALTHY[hit[1]];
+    return typeof answer === "function" ? answer(command) : answer;
+  }
+  const mbr = /^dd if='(.+)' bs=512 count=1 status=none \| od -An -v -tx1$/
+    .exec(command);
+  if (mbr) {
+    const answer = over[`mbr:${mbr[1]}`] ?? done(sector0());
     return typeof answer === "function" ? answer(command) : answer;
   }
   const examine = /^mdadm --examine '(.+)'$/.exec(command);
@@ -946,4 +953,49 @@ Deno.test("the acknowledgement never lifts a protection from the root topology",
     PhaseError,
     "wipe.boot-protected",
   );
+});
+
+Deno.test("a serial listed twice in dataDevices is refused before any probe", async () => {
+  const { session, calls } = routedSession(discover, "192.0.2.10", {});
+  await assertRejects(
+    () =>
+      wipeDiskToRaw({ ...deps, session }, {
+        dataDevices: [
+          { serial: "SN0001", acknowledgeBootPartitions: true },
+          { serial: "SN0001", acknowledgeBootPartitions: false },
+        ],
+        excludeDevices: [],
+        dryRun: true,
+      }),
+    PhaseError,
+    "wipe.conflict",
+  );
+  assertEquals(calls.some((c) => NO_DESTRUCTIVE.test(c.command)), false);
+});
+
+Deno.test("MBR boot code on a candidate disk is refused unless its serial is acknowledged", async () => {
+  const probes: Probes = {
+    ...bootDiskProbes(),
+    "mbr:/dev/nvme0n1": done(sector0({ code: true })),
+    lsblk: guardLsblk(
+      guardRow("sda", "disk", {}, [
+        guardRow("sda1", "part", { fstype: "ext4", mountpoints: ["/"] }),
+      ]),
+      guardRow("nvme0n1", "disk", {}, [
+        guardRow("nvme0n1p1", "part", {
+          parttype: "0fc63daf-8483-4772-8e79-3d69d8477de4",
+        }),
+      ]),
+    ),
+  };
+  await refusedWith(probes, "wipe.boot-partition");
+  // The same disk with an empty sector 0 is not refused for boot code.
+  const quiet: Probes = { ...probes, "mbr:/dev/nvme0n1": done(sector0()) };
+  const { session } = routedSession(discover, "192.0.2.10", quiet);
+  const record = await wipeDiskToRaw({ ...deps, session }, {
+    dataDevices: [{ serial: "SN0001" }],
+    excludeDevices: [],
+    dryRun: true,
+  });
+  assertEquals(record.dryRun, true);
 });

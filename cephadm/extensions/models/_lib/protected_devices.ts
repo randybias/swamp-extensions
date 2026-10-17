@@ -83,6 +83,8 @@ export interface ProbeInputs {
   efibootmgr: CommandProbe;
   /** `mdadm --examine <path>` for every path in {@link examineTargets}. */
   mdExamine: Record<string, CommandProbe>;
+  /** {@link mbrReadCommand} for every path in {@link mbrTargets}. */
+  mbr: Record<string, CommandProbe>;
 }
 
 /** Why a device is protected. */
@@ -171,6 +173,41 @@ export function mdExamineCommand(path: string): string {
     throw new Error("not a plain /dev device path");
   }
   return `mdadm --examine '${path}'`;
+}
+
+/**
+ * Reads sector 0 of a whole disk as 512 hex bytes. The read is one sector and
+ * read-only; {@link parseMbrSector} insists on exactly 512 bytes, so a failed
+ * or short `dd` is never mistaken for an empty sector (no `pipefail` needed).
+ */
+export function mbrReadCommand(path: string): string {
+  if (!isDevicePath(path)) {
+    throw new Error("not a plain /dev device path");
+  }
+  return `dd if='${path}' bs=512 count=1 status=none | od -An -v -tx1`;
+}
+
+/**
+ * Sector 0 as 512 byte values, or null unless the probe produced exactly that.
+ */
+export function parseMbrSector(
+  probe: CommandProbe | undefined,
+): number[] | null {
+  if (!probe || probe.code !== 0) return null;
+  const tokens = probe.stdout.split(/\s+/).filter((t) => t !== "");
+  if (tokens.length !== 512) return null;
+  const bytes: number[] = [];
+  for (const t of tokens) {
+    if (!/^[0-9a-f]{2}$/.test(t)) return null;
+    bytes.push(parseInt(t, 16));
+  }
+  return bytes;
+}
+
+/** True for a sector 0 a BIOS would execute: 55 aa plus any boot code byte. */
+function hasMbrBootCode(sector: number[]): boolean {
+  if (sector[510] !== 0x55 || sector[511] !== 0xaa) return false;
+  return sector.slice(0, 440).some((b) => b !== 0);
 }
 
 /**
@@ -584,21 +621,32 @@ function parseFindmnt(probe: CommandProbe): Mount[] {
 
 /**
  * The PARTUUIDs of the partitions the current and ordered EFI boot entries
- * point at, from `efibootmgr -v` (`HD(n,GPT,<partuuid>,...)`), lowercased.
+ * point at (BootCurrent, BootNext and BootOrder), from `efibootmgr -v`
+ * (`HD(n,GPT,<partuuid>,...)` or `HD(n,MBR,0x<signature>,...)`), lowercased.
  */
 export function efiBootPartuuids(text: string): string[] {
   const wanted = new Set<string>();
   const current = /^BootCurrent:\s*([0-9A-Fa-f]{4})/m.exec(text)?.[1];
   if (current) wanted.add(current.toUpperCase());
+  const next = /^BootNext:\s*([0-9A-Fa-f]{4})/m.exec(text)?.[1];
+  if (next) wanted.add(next.toUpperCase());
   const order = /^BootOrder:\s*(\S+)/m.exec(text)?.[1] ?? "";
   for (const id of order.split(",")) {
     if (/^[0-9A-Fa-f]{4}$/.test(id)) wanted.add(id.toUpperCase());
   }
   const out = new Set<string>();
   for (const line of text.split("\n")) {
-    const m = /^Boot([0-9A-Fa-f]{4})\*?\s.*HD\(\d+,GPT,([0-9A-Fa-f-]{36})[,)]/
-      .exec(line);
-    if (m && wanted.has(m[1].toUpperCase())) out.add(m[2].toLowerCase());
+    const head = /^Boot([0-9A-Fa-f]{4})\*?\s/.exec(line);
+    if (!head || !wanted.has(head[1].toUpperCase())) continue;
+    const gpt = /HD\(\d+,GPT,([0-9A-Fa-f-]{36})[,)]/.exec(line);
+    if (gpt) out.add(gpt[1].toLowerCase());
+    // An msdos-labelled disk: libblkid's PARTUUID is <signature>-<number>, both
+    // hex, the signature padded to 8 digits (efivar may print it unpadded).
+    const dos = /HD\((\d+),MBR,0x([0-9A-Fa-f]{1,8})[,)]/.exec(line);
+    if (dos) {
+      const n = parseInt(dos[1], 10).toString(16).padStart(2, "0");
+      out.add(`${dos[2].padStart(8, "0").toLowerCase()}-${n}`);
+    }
   }
   return [...out];
 }
@@ -1268,6 +1316,38 @@ export function examineTargets(
   return [...out].sort();
 }
 
+/**
+ * The whole disks whose sector 0 {@link assess} needs: every disk in or above
+ * a candidate. Returns an empty list when the host cannot be read.
+ */
+export function mbrTargets(
+  probes: Pick<ProbeInputs, "lsblk" | "links" | "blkid">,
+  candidates: string[],
+): string[] {
+  let graph: Graph;
+  let resolver: Resolver;
+  try {
+    graph = parseLsblkGraph(probes.lsblk, probes.blkid);
+    resolver = new Resolver(graph, probes.links);
+  } catch {
+    return [];
+  }
+  const out = new Set<string>();
+  for (const c of candidates) {
+    const path = resolver.resolve(c);
+    if (!path) continue;
+    for (
+      const p of [
+        ...subtree(graph, path),
+        ...closure(graph, path, (n) => n.parents),
+      ]
+    ) {
+      if (graph.nodes.get(p)?.type === "disk" && isDevicePath(p)) out.add(p);
+    }
+  }
+  return [...out].sort();
+}
+
 /** Merges two protected sets; a device protected by either stays protected. */
 export function unionProtected(a: ProtectedSet, b: ProtectedSet): ProtectedSet {
   const devices: ProtectedDevices = {};
@@ -1317,6 +1397,7 @@ function conflict(
   const uuids = new Set(set.arrayUuids);
   const vgs = new Set(set.volumeGroups);
   const pools = new Set(set.pools);
+  const acknowledged = new Set(options.bootAcknowledged ?? []);
   for (const candidate of candidates) {
     const path = resolver.resolve(candidate);
     if (!path) {
@@ -1339,24 +1420,40 @@ function conflict(
       }
       const node = graph.nodes.get(p)!;
       const probe = input.mdExamine[p];
-      // A boot-type partition anywhere is refused unless its disk was named:
-      // the firmware's boot device cannot be found from the root topology
-      // (GRUB on a SATA disk with / on NVMe, an unmounted fallback ESP).
-      if (node.type === "part" && BOOT_PART_TYPES.has(node.parttype)) {
+      // Boot evidence anywhere is refused unless its disk was named: the
+      // firmware's boot device cannot be found from the root topology (GRUB on
+      // a SATA disk with / on NVMe, an unmounted fallback ESP, boot code in an
+      // msdos MBR gap). An unreadable partition type cannot rule a boot type
+      // out, so it counts too.
+      let bootEvidence: Record<string, unknown> | null = null;
+      if (
+        node.type === "part" &&
+        (node.parttype === "" || BOOT_PART_TYPES.has(node.parttype))
+      ) {
+        bootEvidence = { partition: p, partitionType: node.parttype };
+      } else if (node.type === "disk") {
+        const sector = parseMbrSector(input.mbr[p]);
+        if (sector === null) {
+          return {
+            code: "unverifiable",
+            message: "the first sector of a candidate disk could not be read",
+            detail: { device: path, disk: p },
+          };
+        }
+        if (hasMbrBootCode(sector)) {
+          bootEvidence = { disk: p, evidence: "mbr-boot-code" };
+        }
+      }
+      if (bootEvidence !== null) {
         const roots = [...closure(graph, p, (n) => n.parents)].filter((q) =>
           (graph.nodes.get(q)?.parents.size ?? 0) === 0
         );
-        const acknowledged = new Set(options.bootAcknowledged ?? []);
         if (!roots.every((q) => acknowledged.has(q))) {
           return {
             code: "boot-partition",
             message:
-              "the device holds a boot partition (BIOS boot, EFI System or similar); acknowledge its serial to wipe it",
-            detail: {
-              device: path,
-              partition: p,
-              partitionType: node.parttype,
-            },
+              "the device holds boot code or a boot partition (BIOS boot, EFI System, MBR boot code or similar); acknowledge its serial to wipe it",
+            detail: { device: path, ...bootEvidence },
           };
         }
       }

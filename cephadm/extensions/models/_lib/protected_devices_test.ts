@@ -13,6 +13,7 @@ import {
   unionProtected,
   volumeGroupOf,
 } from "./protected_devices.ts";
+import { withMbr } from "./boot_fixtures.ts";
 
 // --- fixture builders (synthetic names only) --------------------------------
 
@@ -130,6 +131,7 @@ function plain(overrides: Partial<ProbeInputs> = {}): ProbeInputs {
     efi: { code: 1, stdout: "" },
     efibootmgr: missing,
     mdExamine: {},
+    mbr: {},
     ...overrides,
   };
 }
@@ -140,7 +142,7 @@ function withExamine(input: ProbeInputs, candidates: string[]): ProbeInputs {
   for (const path of examineTargets(input, candidates)) {
     mdExamine[path] ??= NO_SB;
   }
-  return { ...input, mdExamine };
+  return withMbr({ ...input, mdExamine }, candidates);
 }
 
 function refusal(

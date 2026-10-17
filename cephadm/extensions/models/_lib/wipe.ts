@@ -32,6 +32,8 @@ import {
   isDevicePath,
   LINKS_COMMAND,
   LSBLK_COMMAND,
+  mbrReadCommand,
+  mbrTargets,
   mdExamineCommand,
   parseExamineUuid,
   type ProbeInputs,
@@ -295,6 +297,10 @@ async function collectProbes(
   ) {
     mdExamine[path] = await command(mdExamineCommand(path), true);
   }
+  const mbr: Record<string, CommandProbe> = {};
+  for (const path of mbrTargets({ lsblk, links, blkid }, candidates)) {
+    mbr[path] = await command(mbrReadCommand(path), true);
+  }
   return {
     lsblk,
     findmnt: await command(FINDMNT_COMMAND, false),
@@ -308,6 +314,7 @@ async function collectProbes(
     efi: await command(EFI_COMMAND, false),
     efibootmgr: await command(EFIBOOTMGR_COMMAND, true),
     mdExamine,
+    mbr,
   };
 }
 
@@ -544,6 +551,14 @@ export async function wipeDiskToRaw(
         },
       );
     }
+  }
+
+  // A serial listed twice could carry different acknowledgements.
+  if (
+    new Set(args.dataDevices.map((d) => d.serial)).size !==
+      args.dataDevices.length
+  ) {
+    fail("wipe.conflict", "a serial appears twice in dataDevices", {});
   }
 
   // Gate 2: resolve every serial.

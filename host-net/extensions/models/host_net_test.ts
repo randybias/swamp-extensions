@@ -34,7 +34,12 @@ interface Fake {
 }
 
 function fakeRun(
-  opts: { links?: unknown[]; armCode?: number; markerJson?: string } = {},
+  opts: {
+    links?: unknown[];
+    armCode?: number;
+    restoreCode?: number;
+    markerJson?: string;
+  } = {},
 ): Fake {
   const calls: string[] = [];
   const run: CommandRunner = (cmd, args, _options = {}) => {
@@ -216,9 +221,10 @@ Deno.test("apply arms before it writes or applies", async () => {
   assertEquals(armAt >= 0, true);
   assertEquals(armAt < applyAt, true);
   assertEquals(armAt < mtuAt || mtuAt < 0, true);
+  // Ownership is written to the config record only at commit.
   const written = ctx.getWrittenResources();
+  assertEquals(written.length, 1);
   assertEquals(written[0].specName, "revert");
-  assertEquals(written[1].specName, "config");
   assertEquals(String(written[0].data.token), "0000000000000000");
 });
 
@@ -266,7 +272,13 @@ Deno.test("remove arms before deleting and deletes only created devices", async 
   const ctx = createModelTestContext({
     globalArgs: {},
     storedResources: {
-      "config-root@192.0.2.20:22": { devices: ["enp1s0.100"] },
+      "config-root@192.0.2.20:22": {
+        devices: ["enp1s0.100"],
+        backend: "netplan",
+        bridgeType: "linux",
+        configSha256: "a".repeat(64),
+        contentSha256: "b".repeat(64),
+      },
     },
   });
   await m.methods.remove.execute(
@@ -492,5 +504,163 @@ Deno.test("commit refuses an expired, a fired, and a missing revert", async () =
       ),
     Error,
     "already fired",
+  );
+});
+
+/** Runs one apply and returns the FULL owned set recorded in the revert. */
+async function ownedFor(
+  net: Record<string, unknown>,
+  config?: Record<string, unknown>,
+): Promise<string[]> {
+  const fake = fakeRun();
+  const m = modelWith(fake);
+  const ctx = createModelTestContext({
+    globalArgs: {},
+    storedResources: config ? { "config-root@192.0.2.20:22": config } : {},
+  });
+  await m.methods.apply.execute(
+    m.methods.apply.arguments.parse({ ...NET, ...net }),
+    ctx.context as never,
+  );
+  const rev = ctx.getWrittenResources().find((w) => w.specName === "revert")!;
+  return (rev.data.owned as string[]) ?? [];
+}
+
+const RECORD = {
+  backend: "netplan",
+  bridgeType: "linux",
+  configSha256: "a".repeat(64),
+  contentSha256: "different",
+};
+
+Deno.test("the owned set is the union of previous ownership and the new delta", async () => {
+  assertEquals(
+    await ownedFor({
+      vlans: [{ id: 100, link: "enp1s0", addresses: ["198.51.100.10/24"] }],
+    }),
+    ["enp1s0.100"],
+  );
+  assertEquals(
+    await ownedFor({
+      vlans: [
+        { id: 100, link: "enp1s0", addresses: ["198.51.100.10/24"] },
+        { id: 200, link: "enp1s0", addresses: ["198.51.100.20/24"] },
+      ],
+    }, { ...RECORD, devices: ["enp1s0.100"] }),
+    ["enp1s0.100", "enp1s0.200"],
+  );
+  // Dropping VLAN 100 from the inputs gives up its ownership.
+  assertEquals(
+    await ownedFor({
+      vlans: [{ id: 200, link: "enp1s0", addresses: ["198.51.100.20/24"] }],
+    }, { ...RECORD, devices: ["enp1s0.100", "enp1s0.200"] }),
+    ["enp1s0.200"],
+  );
+});
+
+Deno.test("an MTU-only apply owns no devices but records the files/MUTs", async () => {
+  const owned = await ownedFor({
+    mode: "takeover",
+    management_change_ack: true,
+    ethernets: [{ name: "enp1s0", mtu: 9000 }],
+    vlans: [],
+  }, { ...RECORD, devices: [] });
+  assertEquals(owned, []);
+});
+
+Deno.test("remove proceeds when only files are owned (MTU-only apply)", async () => {
+  const fake = fakeRun();
+  const m = modelWith(fake);
+  const ctx = createModelTestContext({
+    globalArgs: {},
+    storedResources: {
+      "config-root@192.0.2.20:22": {
+        ...RECORD,
+        devices: [],
+        ownedFiles: [{
+          path: "/etc/netplan/90-host-net.yaml",
+          preExisted: false,
+        }],
+        parentMtus: [{ name: "enp1s0", mtu: 1500 }],
+      },
+    },
+  });
+  const out = await m.methods.remove.execute(
+    m.methods.remove.arguments.parse({
+      ...NET,
+      mode: "takeover",
+      management_change_ack: true,
+      ethernets: [{ name: "enp1s0", mtu: 9000 }],
+    }),
+    ctx.context as never,
+  ) as { result: { commit_required?: boolean } };
+  assertEquals(out.result.commit_required, true);
+  assertEquals(fake.calls.some((c) => c.includes("systemd-run")), true);
+});
+
+Deno.test("revert_now records a failed restore before throwing", async () => {
+  const fake = fakeRun({
+    restoreCode: 1,
+    markerJson: JSON.stringify({
+      token: "0000000000000000",
+      result: "fail",
+      fired_at: 1760400001,
+    }),
+  });
+  const m = modelWith(fake);
+  const ctx = createModelTestContext({
+    globalArgs: {},
+    storedResources: {
+      "revert-root@192.0.2.20:22": {
+        token: "0000000000000000",
+        armedAt: new Date(1_760_400_000_000).toISOString(),
+        expiresAt: new Date(1_760_400_300_000).toISOString(),
+      },
+    },
+  });
+  await assertRejects(
+    () =>
+      m.methods.revert_now.execute(
+        m.methods.revert_now.arguments.parse({
+          ...SSH,
+          token: "0000000000000000",
+        }),
+        ctx.context as never,
+      ),
+    Error,
+    "reported fail",
+  );
+  const written = ctx.getWrittenResources().find((w) =>
+    w.specName === "revert"
+  )!;
+  assertEquals(written.data.result, "fail");
+  assertEquals(typeof written.data.firedAt, "string");
+});
+
+Deno.test("a match_mac bridge member that resolves to management is refused", async () => {
+  const fake = fakeRun({
+    links: [{
+      ifname: "enp1s0",
+      mtu: 1500,
+      operstate: "UP",
+      address: "02:00:00:00:00:05",
+      linkinfo: { info_kind: "ether" },
+    }],
+  });
+  const m = modelWith(fake);
+  const ctx = createModelTestContext({ globalArgs: {} });
+  await assertRejects(
+    () =>
+      m.methods.apply.execute(
+        m.methods.apply.arguments.parse({
+          ...NET,
+          ethernets: [{ name: "eth9", match_mac: "02:00:00:00:00:05" }],
+          vlans: [],
+          bridge: { name: "br0", interfaces: ["eth9"] },
+        }),
+        ctx.context as never,
+      ),
+    Error,
+    "enslaves the management interface",
   );
 });

@@ -28,12 +28,7 @@ import {
   type VlanSpec,
 } from "./_lib/validate.ts";
 import { renderConfig, type RenderResult } from "./_lib/render.ts";
-import {
-  assertArmBeforeApply,
-  planApply,
-  planRemove,
-  type Step,
-} from "./_lib/plan.ts";
+import { assertArmBeforeApply, planApply, type Step } from "./_lib/plan.ts";
 import {
   type LiveState,
   managementCidrs,
@@ -53,9 +48,26 @@ import {
   restorePath,
   type RevertContext,
   revertDir,
-  stagedDir,
   unitName,
 } from "./_lib/revert.ts";
+
+/**
+ * Ownership and desired state (single-sourced):
+ *
+ * 1. Ownership lives in the `config` record and is the FULL set host-net has
+ *    created and still owns: `devices` (virtual devices), `ownedFiles` (each
+ *    with a `preExisted` flag) and `parentMtus` (pre-change MTUs). It is
+ *    written ONLY at commit, never by an apply's delta.
+ * 2. An apply computes `owned = (previous owned ∩ declared) ∪ created` and
+ *    parks it in the pending `revert` record; a revert that fires leaves the
+ *    committed config record untouched.
+ * 3. The identical-config no-op compares the LIVE read-back against the NEW
+ *    desired render (and requires that render to be the committed one), never
+ *    against the previous record.
+ * 4. `remove` derives every device, file and MTU from the `config` record
+ *    alone, never from the caller's inputs, proceeds when only files/MTUs are
+ *    owned, and never touches a file recorded as pre-existing.
+ */
 
 /** Model type version; must equal the manifest version. */
 export const VERSION = "2026.10.17.1";
@@ -169,8 +181,16 @@ const ConfigSchema = z.strictObject({
   bridgeType: z.string(),
   mode: z.string(),
   managementInterface: z.string(),
+  bridge: z.string().optional(),
   devices: z.array(z.string()),
+  ownedFiles: z.array(
+    z.strictObject({ path: z.string(), preExisted: z.boolean() }),
+  ).optional(),
+  parentMtus: z.array(
+    z.strictObject({ name: z.string(), mtu: z.number() }),
+  ).optional(),
   configSha256: z.string(),
+  contentSha256: z.string().optional(),
   committedAt: z.string().optional(),
 });
 
@@ -182,7 +202,17 @@ const RevertSchema = z.strictObject({
   armedSha256: z.string(),
   contentSha256: z.string().optional(),
   operation: z.string().optional(),
-  devices: z.array(z.string()).optional(),
+  /** The full owned set after this change commits. */
+  owned: z.array(z.string()).optional(),
+  /** The devices this change itself creates (restored/deleted on revert). */
+  created: z.array(z.string()).optional(),
+  createdBridges: z.array(z.string()).optional(),
+  ownedFiles: z.array(z.string()).optional(),
+  parentMtus: z.array(
+    z.strictObject({ name: z.string(), mtu: z.number() }),
+  ).optional(),
+  backend: z.string().optional(),
+  bridgeType: z.string().optional(),
   committedAt: z.string().optional(),
   cancelledAt: z.string().optional(),
   firedAt: z.string().optional(),
@@ -330,35 +360,69 @@ function configOf(args: Parsed): NetConfig {
  * marker, then starts the timer), and only then persists the model's revert
  * record — before the caller writes or applies anything.
  */
+/** What one arm needs to persist and to build the restore context. */
+interface ArmInput {
+  /** Config backend. */
+  backend: "netplan" | "networkd";
+  /** Bridge implementation. */
+  bridgeType: "linux" | "ovs";
+  /** The full owned set this change leaves behind (committed later). */
+  owned: string[];
+  /** The devices this change itself creates (deleted on revert). */
+  created: string[];
+  /** Subset of created that are OVS bridges. */
+  createdBridges: string[];
+  /** The files this change owns. */
+  ownedFiles: string[];
+  /** Parent MTUs this change raises, with the pre-change value. */
+  parentMtus: { name: string; mtu: number }[];
+  /** The rendered config identity. */
+  armedSha256: string;
+  /** SHA-256 over the owned file contents only. */
+  contentSha256: string;
+  /** `apply` or `remove`. */
+  operation: "apply" | "remove";
+}
+
+function revertContext(token: string, input: ArmInput): RevertContext {
+  return {
+    token,
+    backend: input.backend,
+    bridgeType: input.bridgeType,
+    created: input.created,
+    createdBridges: input.createdBridges,
+    ownedFiles: input.ownedFiles,
+    parentMtus: input.parentMtus,
+  };
+}
+
+/**
+ * Arms the host-side revert from one host script, then persists a pending
+ * revert record that carries the FULL owned set (for the config record at
+ * commit), the delta this change creates, the owned files and the parent
+ * MTUs. The config record is written only at commit.
+ */
 async function armRevert(
   deps: HostNetDeps,
   target: SshTarget,
   context: MethodContext,
-  cfg: NetConfig,
-  render: RenderResult,
   token: string,
   revertAfterS: number,
-  created: string[],
-  parentMtus: { name: string; mtu: number }[],
-  operation: "apply" | "remove",
-): Promise<
-  { handle: { name: string }; expiresAt: string; contentSha256: string }
-> {
-  const ctx = capturedOf(cfg, render, token, created, parentMtus);
+  input: ArmInput,
+): Promise<{ handle: { name: string }; expiresAt: string }> {
   const key = targetKey(target);
   const expiresAt = new Date(deps.now() + revertAfterS * 1000).toISOString();
-  const contentSha256 = await contentDigest(render.files);
   const res = await run(
     deps,
     target,
     [
       "sh",
       "-c",
-      renderArmScript(ctx, {
+      renderArmScript(revertContext(token, input), {
         revertAfterS,
-        armedSha256: render.sha256,
-        contentSha256,
-        operation,
+        armedSha256: input.armedSha256,
+        contentSha256: input.contentSha256,
+        operation: input.operation,
       }),
     ],
     "the revert arm",
@@ -374,13 +438,19 @@ async function armRevert(
     token,
     armedAt: new Date(deps.now()).toISOString(),
     expiresAt,
-    armedSha256: render.sha256,
-    contentSha256,
-    operation,
-    devices: created,
+    armedSha256: input.armedSha256,
+    contentSha256: input.contentSha256,
+    operation: input.operation,
+    owned: input.owned,
+    created: input.created,
+    createdBridges: input.createdBridges,
+    ownedFiles: input.ownedFiles,
+    parentMtus: input.parentMtus,
+    backend: input.backend,
+    bridgeType: input.bridgeType,
     result: "pending",
   });
-  return { handle, expiresAt, contentSha256 };
+  return { handle, expiresAt };
 }
 
 async function probeLive(
@@ -423,50 +493,51 @@ async function contentDigest(files: RenderResult["files"]): Promise<string> {
   );
 }
 
-function capturedOf(
-  cfg: NetConfig,
-  render: RenderResult,
-  token: string,
-  created: string[],
-  parentMtus: { name: string; mtu: number }[],
-): RevertContext {
-  return {
-    token,
-    backend: cfg.backend,
-    bridgeType: cfg.bridgeType,
-    created,
-    createdBridges: cfg.bridgeType === "ovs" && cfg.bridge !== undefined &&
-        created.includes(cfg.bridge.name)
-      ? [cfg.bridge.name]
-      : [],
-    ownedFiles: render.files.map((f) => f.path),
-    parentMtus,
-  };
-}
-
 /** The guarded apply script: it applies only while this token still guards. */
 function shq(value: string): string {
   return `'${value.replace(/'/g, `'\\''`)}'`;
 }
 
 /** The guarded apply script: it applies only while this token still guards. */
-function guardedApplyScript(
-  ctx: RevertContext,
-  files: RenderResult["files"],
-): string {
+/** What a guarded apply/remove moves into place and runs after the guard. */
+interface GuardOpts {
+  /** Files staged as `<path>.host-net-new`, moved into place on success. */
+  stagedFiles?: RenderResult["files"];
+  /** MTU commands run after the guard checks pass. */
+  mtuCommands?: string[][];
+  /** Files removed after the guard checks pass (never pre-existing ones). */
+  removeFiles?: string[];
+}
+
+/**
+ * The guarded apply/remove script: it mutates only while this token still
+ * guards the change (current marker, snapshot present, unexpired, timer
+ * active). It moves staged files into place, runs the MTU commands and removes
+ * the given files; a guard refusal removes any staged files and exits non-zero.
+ */
+function guardedApplyScript(ctx: RevertContext, opts: GuardOpts = {}): string {
   const apply = ctx.backend === "netplan"
     ? "netplan apply"
     : "networkctl reload && networkctl reconfigure";
-  const moves = files.map((f) => {
-    const base = f.path.split("/").pop() ?? f.path;
-    return `mv -f ${shq(`${stagedDir(ctx.token)}/${base}`)} ${shq(f.path)}`;
-  }).join("\n");
+  const staged = opts.stagedFiles ?? [];
+  const stagedPath = (p: string) => `${p}.host-net-new`;
+  const moves = staged.map((f) =>
+    `mv -f ${shq(stagedPath(f.path))} ${shq(f.path)}`
+  ).join("\n");
+  const cleanup = staged.map((f) => `rm -f ${shq(stagedPath(f.path))}`).join(
+    "\n",
+  );
+  const mtus = (opts.mtuCommands ?? []).map((argv) => argv.map(shq).join(" "))
+    .join("\n");
+  const removes = (opts.removeFiles ?? []).map((p) => `rm -f ${shq(p)}`).join(
+    "\n",
+  );
   return [
     "set -eu",
     `exec 9>${LOCK_PATH}`,
     "flock -w 30 9 || { echo 'lock busy' >&2; exit 75; }",
     `DIR=${shq(revertDir(ctx.token))}`,
-    `cleanup() { rm -rf "$DIR/staged"; }`,
+    `cleanup() { ${cleanup || "true"}; }`,
     `[ -f ${CURRENT_PATH} ] || { cleanup; echo 'superseded' >&2; exit 70; }`,
     `ctok=; cexp=0; read ctok cexp _ < ${CURRENT_PATH} || true`,
     `[ "$ctok" = ${
@@ -477,8 +548,9 @@ function guardedApplyScript(
     `[ "$(systemctl is-active ${
       shq(unitName(ctx.token))
     }.timer || true)" = active ] || { cleanup; echo 'timer gone' >&2; exit 73; }`,
+    mtus,
     moves,
-    "cleanup",
+    removes,
     apply,
   ].filter((l) => l !== "").join("\n");
 }
@@ -530,24 +602,37 @@ function verifyAgainst(
 }
 
 /** Reads the managed files back and digests their contents for commit. */
+/** Digests the live content of `paths`; a missing file reads as absent. */
+async function liveContentShaPaths(
+  deps: HostNetDeps,
+  target: SshTarget,
+  paths: string[],
+): Promise<string> {
+  const parts: string[] = [];
+  for (const path of [...paths].sort()) {
+    const res = await sshExec(deps, target, [
+      "sh",
+      "-c",
+      'if [ -f "$1" ]; then cat -- "$1"; fi',
+      "sh",
+      path,
+    ]);
+    parts.push(`${path}\0${res.stdout}`);
+  }
+  return await sha256Hex(parts.join("\0"));
+}
+
+/** Digests the live content of the rendered files. */
 async function liveContentSha(
   deps: HostNetDeps,
   target: SshTarget,
   render: RenderResult,
 ): Promise<string> {
-  const parts: string[] = [];
-  for (
-    const file of render.files.slice().sort((a, b) => a.path < b.path ? -1 : 1)
-  ) {
-    const res = await run(
-      deps,
-      target,
-      ["sh", "-c", 'cat -- "$1"', "sh", file.path],
-      `read ${file.path}`,
-    );
-    parts.push(`${file.path}\0${res.stdout}`);
-  }
-  return await sha256Hex(parts.join("\0"));
+  return await liveContentShaPaths(
+    deps,
+    target,
+    render.files.map((f) => f.path),
+  );
 }
 
 /** Builds the model with overridable dependencies. */
@@ -625,20 +710,34 @@ export function createModel(overrides: Partial<HostNetDeps> = {}) {
         if (cfg.bridgeType === "ovs" && !live.hasOvs) {
           throw new HostNetConfigError("ovs-vsctl is not present on the host");
         }
-        // A match_mac that resolves to the management NIC touches management.
+        // A match_mac that resolves to the management NIC touches management,
+        // whether it sets that NIC's MTU or enslaves it into the bridge.
+        const mgmtNames = new Set<string>([cfg.managementInterface]);
         for (const e of cfg.ethernets) {
-          const touchesMgmt = (e.name !== "" &&
-            e.name === cfg.managementInterface) ||
-            (e.matchMac !== undefined &&
-              live.links.some((l) =>
-                l.mac === e.matchMac && l.name === cfg.managementInterface
-              ));
           if (
-            touchesMgmt && e.mtu !== undefined &&
-            !(cfg.mode === "takeover" && cfg.managementChangeAck)
+            e.matchMac !== undefined &&
+            live.links.some((l) =>
+              l.mac === e.matchMac && l.name === cfg.managementInterface
+            )
+          ) {
+            mgmtNames.add(e.name);
+          }
+        }
+        const takeover = cfg.mode === "takeover" && cfg.managementChangeAck;
+        for (const e of cfg.ethernets) {
+          if (
+            e.name !== "" && mgmtNames.has(e.name) &&
+            e.mtu !== undefined && !takeover
           ) {
             throw new HostNetConfigError(
               "the change touches the management interface; use mode takeover with management_change_ack",
+            );
+          }
+        }
+        for (const member of cfg.bridge?.interfaces ?? []) {
+          if (mgmtNames.has(member) && !takeover) {
+            throw new HostNetConfigError(
+              "the change enslaves the management interface; use mode takeover with management_change_ack",
             );
           }
         }
@@ -710,13 +809,14 @@ export function createModel(overrides: Partial<HostNetDeps> = {}) {
             );
           }
         }
-        // An identical live config arms nothing and writes nothing.
+        const desiredContentSha = await contentDigest(render.files);
+        // No-op only when the NEW desired config is both recorded and live.
         if (
-          config !== null && typeof config.contentSha256 === "string" &&
+          config !== null && config.contentSha256 === desiredContentSha &&
           [...owned].every((name) => liveNames.has(name))
         ) {
           const liveSha = await liveContentSha(deps, target, render);
-          if (liveSha === config.contentSha256) {
+          if (liveSha === desiredContentSha) {
             return {
               result: {
                 host: args.host,
@@ -735,6 +835,18 @@ export function createModel(overrides: Partial<HostNetDeps> = {}) {
           }
         }
         const created = render.created.filter((name) => !liveNames.has(name));
+        // The FULL owned set after commit: previous ownership of still-declared
+        // devices, plus everything this change creates.
+        const ownedSet = [
+          ...new Set([
+            ...[...owned].filter((name) => render.created.includes(name)),
+            ...created,
+          ]),
+        ];
+        const createdBridges = cfg.bridgeType === "ovs" &&
+            cfg.bridge !== undefined && created.includes(cfg.bridge.name)
+          ? [cfg.bridge.name]
+          : [];
         const parentMtus = cfg.ethernets
           .filter((e) => e.mtu !== undefined)
           .map((e) => ({
@@ -742,38 +854,38 @@ export function createModel(overrides: Partial<HostNetDeps> = {}) {
             mtu: live.links.find((l) => l.name === e.name)?.mtu ?? 0,
           }))
           .filter((p) => p.mtu > 0);
-        const ctx = capturedOf(cfg, render, token, created, parentMtus);
         const plan = planApply(cfg, {
           token,
           revertAfterS: args.revert_after_s,
           writtenPaths: render.files.map((f) => f.path),
         });
         assertArmBeforeApply(plan);
-        const {
-          handle: revertHandle,
-          expiresAt,
-          contentSha256,
-        } = await armRevert(
+        const mtuArgvs = plan.filter((s) =>
+          s.kind === "mtu" && s.argv !== undefined
+        ).map((s) => s.argv!);
+        const armInput: ArmInput = {
+          backend: cfg.backend,
+          bridgeType: cfg.bridgeType,
+          owned: ownedSet,
+          created,
+          createdBridges,
+          ownedFiles: render.files.map((f) => f.path),
+          parentMtus,
+          armedSha256: render.sha256,
+          contentSha256: desiredContentSha,
+          operation: "apply",
+        };
+        const { handle: revertHandle, expiresAt } = await armRevert(
           deps,
           target,
           context,
-          cfg,
-          render,
           token,
           args.revert_after_s,
-          created,
-          parentMtus,
-          "apply",
+          armInput,
         );
-        for (const step of plan) {
-          if (step.kind === "mtu" && step.argv !== undefined) {
-            await run(deps, target, step.argv, step.description);
-          }
-        }
         for (const file of render.files) {
-          const base = file.path.split("/").pop() ?? file.path;
           await sshUpload(deps, target, {
-            path: `${stagedDir(token)}/${base}`,
+            path: `${file.path}.host-net-new`,
             content: file.content,
             mode: file.mode,
           });
@@ -781,27 +893,20 @@ export function createModel(overrides: Partial<HostNetDeps> = {}) {
         await run(
           deps,
           target,
-          ["sh", "-c", guardedApplyScript(ctx, render.files)],
+          [
+            "sh",
+            "-c",
+            guardedApplyScript(revertContext(token, armInput), {
+              stagedFiles: render.files,
+              mtuCommands: mtuArgvs,
+            }),
+          ],
           "the guarded apply",
         );
         const after = await probeLive(deps, target);
         const verify = verifyAgainst(live, after, cfg, created);
-        const configHandle = await context.writeResource(
-          "config",
-          `config-${targetKey(args)}`,
-          {
-            target: targetKey(args),
-            backend: cfg.backend,
-            bridgeType: cfg.bridgeType,
-            mode: cfg.mode,
-            managementInterface: cfg.managementInterface,
-            devices: created,
-            configSha256: render.sha256,
-            contentSha256,
-          },
-        );
         return {
-          dataHandles: [revertHandle, configHandle],
+          dataHandles: [revertHandle],
           result: {
             host: args.host,
             revert_token: token,
@@ -819,7 +924,6 @@ export function createModel(overrides: Partial<HostNetDeps> = {}) {
       arguments: CommitArgs,
       execute: async (args: Parsed, context: MethodContext) => {
         const cfg = configOf(args);
-        const render = await renderConfig(cfg);
         const key = await resolveKey(deps, context, args.ssh_key_ref);
         const target: SshTarget = { ...targetOf(args), private_key: key };
         const recorded = await context.readResource(
@@ -861,24 +965,44 @@ export function createModel(overrides: Partial<HostNetDeps> = {}) {
           );
         }
         const isRemove = recorded.operation === "remove";
+        const ownedFiles = Array.isArray(recorded.ownedFiles)
+          ? recorded.ownedFiles as string[]
+          : [];
+        // The arm snapshot manifest records which owned files pre-existed.
+        const manifestPath = `${revertDir(recorded.token)}/owned.txt`;
+        const manifestOut = await sshExec(deps, target, [
+          "sh",
+          "-c",
+          `if [ -f ${shq(manifestPath)} ]; then cat ${shq(manifestPath)}; fi`,
+        ]);
+        const preExisted = new Map<string, boolean>();
+        for (const line of manifestOut.stdout.split("\n")) {
+          const [path, state] = line.split("\t");
+          if (path && state) preExisted.set(path, state === "present");
+        }
         if (isRemove) {
-          // A remove commits only when the owned files and devices are gone.
-          for (const file of render.files) {
-            const exists = await sshExec(deps, target, [
-              "sh",
-              "-c",
-              'test -e "$1"',
-              "sh",
-              file.path,
-            ]);
-            if (exists.exit_code === 0) {
+          for (const path of ownedFiles) {
+            if (preExisted.get(path) === true) continue; // never touch a pre-existing file
+            const res = await run(
+              deps,
+              target,
+              [
+                "sh",
+                "-c",
+                'if [ -e "$1" ]; then echo present; else echo absent; fi',
+                "sh",
+                path,
+              ],
+              `the removal check for ${path}`,
+            );
+            if (res.stdout.trim() !== "absent") {
               throw new HostNetConfigError(
-                `the owned file ${file.path} is still present; refusing to commit`,
+                `the owned file ${path} is still present; refusing to commit`,
               );
             }
           }
           const liveNames = new Set(live.links.map((l) => l.name));
-          for (const name of (recorded.devices as string[] | undefined) ?? []) {
+          for (const name of (recorded.owned as string[] | undefined) ?? []) {
             if (liveNames.has(name)) {
               throw new HostNetConfigError(
                 `device ${name} is still present; refusing to commit`,
@@ -886,7 +1010,7 @@ export function createModel(overrides: Partial<HostNetDeps> = {}) {
             }
           }
         } else if (typeof recorded.contentSha256 === "string") {
-          const liveSha = await liveContentSha(deps, target, render);
+          const liveSha = await liveContentShaPaths(deps, target, ownedFiles);
           if (liveSha !== recorded.contentSha256) {
             throw new HostNetConfigError(
               "the live config no longer matches the armed config; refusing to commit",
@@ -907,16 +1031,41 @@ export function createModel(overrides: Partial<HostNetDeps> = {}) {
             committedAt: new Date(deps.now()).toISOString(),
           },
         );
+        const committedAt = new Date(deps.now()).toISOString();
         if (isRemove) {
           await context.writeResource("config", `config-${targetKey(args)}`, {
             target: targetKey(args),
-            backend: cfg.backend,
-            bridgeType: cfg.bridgeType,
+            backend: recorded.backend ?? cfg.backend,
+            bridgeType: recorded.bridgeType ?? cfg.bridgeType,
             mode: cfg.mode,
             managementInterface: cfg.managementInterface,
+            bridge: cfg.bridge?.name ?? "",
             devices: [],
+            ownedFiles: [],
+            parentMtus: [],
             configSha256: "",
             contentSha256: "",
+            committedAt,
+          });
+        } else {
+          await context.writeResource("config", `config-${targetKey(args)}`, {
+            target: targetKey(args),
+            backend: recorded.backend ?? cfg.backend,
+            bridgeType: recorded.bridgeType ?? cfg.bridgeType,
+            mode: cfg.mode,
+            managementInterface: cfg.managementInterface,
+            bridge: cfg.bridge?.name ?? "",
+            devices: (recorded.owned as string[] | undefined) ?? [],
+            ownedFiles: ownedFiles.map((path) => ({
+              path,
+              preExisted: preExisted.get(path) === true,
+            })),
+            parentMtus: (recorded.parentMtus as
+              | { name: string; mtu: number }[]
+              | undefined) ?? [],
+            configSha256: recorded.armedSha256 ?? "",
+            contentSha256: recorded.contentSha256 ?? "",
+            committedAt,
           });
         }
         return {
@@ -1026,68 +1175,86 @@ export function createModel(overrides: Partial<HostNetDeps> = {}) {
         "DESTRUCTIVE. Remove the managed devices and config files, restoring MTUs in reverse order, under the same armed-revert protocol as apply. A second remove with nothing managed is a clean no-op.",
       arguments: RemoveArgs,
       execute: async (args: Parsed, context: MethodContext) => {
-        const cfg = configOf(args);
-        const render = await renderConfig(cfg);
         const key = await resolveKey(deps, context, args.ssh_key_ref);
         const target: SshTarget = { ...targetOf(args), private_key: key };
         const token = (deps.token ?? randomToken)();
         const live = await probeLive(deps, target);
-        const recorded = await context.readResource(
+        const pendingRevert = await context.readResource(
           `revert-${targetKey(args)}`,
         );
-        if (isPending(recorded, deps.now())) {
+        if (isPending(pendingRevert, deps.now())) {
           throw new HostNetConfigError(
             "a revert is already armed for this host",
           );
         }
-        const liveNames = new Set(live.links.map((l) => l.name));
-        // Ownership comes only from the config record; remove never infers it.
+        // Remove derives every target from the persisted owned set, never from
+        // the caller's inputs.
         const config = await context.readResource(
           `config-${targetKey(args)}`,
         );
-        const owned = new Set(
-          config !== null && Array.isArray(config.devices)
-            ? config.devices as string[]
-            : [],
-        );
-        const created = [...owned].filter((name) => liveNames.has(name));
-        if (created.length === 0) {
+        const devices = config !== null && Array.isArray(config.devices)
+          ? config.devices as string[]
+          : [];
+        const recordFiles = config !== null && Array.isArray(config.ownedFiles)
+          ? config.ownedFiles as { path: string; preExisted: boolean }[]
+          : [];
+        const recordMtus = config !== null && Array.isArray(config.parentMtus)
+          ? config.parentMtus as { name: string; mtu: number }[]
+          : [];
+        if (
+          devices.length === 0 && recordFiles.length === 0 &&
+          recordMtus.length === 0
+        ) {
           return {
             result: {
               host: args.host,
               removed: [],
-              note: "nothing owned by this model is live",
+              note: "nothing owned by this model",
             },
           };
         }
-        const parentMtus = cfg.ethernets
-          .filter((e) => e.mtu !== undefined)
-          .map((e) => ({
-            name: e.name,
-            mtu: live.links.find((l) => l.name === e.name)?.mtu ?? 0,
-          }))
-          .filter((p) => p.mtu > 0);
-        const ctx = capturedOf(cfg, render, token, created, parentMtus);
-        const plan = planRemove(cfg);
-        assertArmBeforeApply(plan);
+        const backend = typeof config?.backend === "string"
+          ? config.backend as "netplan" | "networkd"
+          : args.backend;
+        const bridgeType = typeof config?.bridgeType === "string"
+          ? config.bridgeType as "linux" | "ovs"
+          : args.bridge_type;
+        if (backend !== args.backend || bridgeType !== args.bridge_type) {
+          throw new HostNetConfigError(
+            "the remove inputs disagree with the recorded config",
+          );
+        }
+        const liveNames = new Set(live.links.map((l) => l.name));
+        // The arm snapshots the owned files, so its restore re-creates the
+        // devices; the delta to delete on revert is empty.
+        const armInput: ArmInput = {
+          backend,
+          bridgeType,
+          owned: devices,
+          created: [],
+          createdBridges: [],
+          ownedFiles: recordFiles.map((o) => o.path),
+          parentMtus: recordMtus,
+          armedSha256: String(config?.configSha256 ?? ""),
+          contentSha256: String(config?.contentSha256 ?? ""),
+          operation: "remove",
+        };
         const { handle: revertHandle } = await armRevert(
           deps,
           target,
           context,
-          cfg,
-          render,
           token,
           args.revert_after_s,
-          created,
-          parentMtus,
-          "remove",
+          armInput,
         );
-        const bridgeName = cfg.bridge?.name;
+        const bridgeName = typeof config?.bridge === "string"
+          ? config.bridge
+          : "";
         const ordered = [
-          ...(bridgeName !== undefined && created.includes(bridgeName)
+          ...(bridgeName !== "" && devices.includes(bridgeName)
             ? [bridgeName]
             : []),
-          ...created.filter((n) => n !== bridgeName),
+          ...devices.filter((n) => n !== bridgeName),
         ];
         for (const name of ordered) {
           if (liveNames.has(name)) {
@@ -1099,18 +1266,29 @@ export function createModel(overrides: Partial<HostNetDeps> = {}) {
             );
           }
         }
-        for (const file of render.files) {
-          await run(
-            deps,
-            target,
-            ["rm", "-f", "--", file.path],
-            `remove ${file.path}`,
-          );
-        }
+        // Never remove a file host-net did not create.
+        const removeFiles = recordFiles.filter((o) => !o.preExisted).map(
+          (o) => o.path,
+        );
         await run(
           deps,
           target,
-          ["sh", "-c", guardedApplyScript(ctx, [])],
+          [
+            "sh",
+            "-c",
+            guardedApplyScript(revertContext(token, armInput), {
+              removeFiles,
+              mtuCommands: recordMtus.map((p) => [
+                "ip",
+                "link",
+                "set",
+                "dev",
+                p.name,
+                "mtu",
+                String(p.mtu),
+              ]),
+            }),
+          ],
           "the guarded remove apply",
         );
         return {
@@ -1118,7 +1296,7 @@ export function createModel(overrides: Partial<HostNetDeps> = {}) {
           result: {
             host: args.host,
             remove_token: token,
-            removed: created,
+            removed: ordered,
             commit_required: true,
           },
         };
@@ -1147,12 +1325,11 @@ export function createModel(overrides: Partial<HostNetDeps> = {}) {
         if (typeof recorded.firedAt === "string") {
           throw new HostNetConfigError("this revert already fired");
         }
-        await run(
-          deps,
-          target,
-          [restorePath(args.token), args.token],
-          "the revert_now restore",
-        );
+        // Allow a non-zero exit so a failed restore is still recorded.
+        const restoreRes = await sshExec(deps, target, [
+          restorePath(args.token),
+          args.token,
+        ]);
         // The restore's superseded path exits 0 without running; only a marker
         // with a fired_at proves it actually restored.
         const markerOut = await run(
@@ -1172,7 +1349,9 @@ export function createModel(overrides: Partial<HostNetDeps> = {}) {
             "the restore was superseded; nothing fired",
           );
         }
-        const result = marker.result === "fail" ? "fail" : "pass";
+        const result = marker.result === "fail" || restoreRes.exit_code !== 0
+          ? "fail"
+          : "pass";
         await context.writeResource("revert", `revert-${targetKey(args)}`, {
           ...recorded,
           firedAt: new Date(deps.now()).toISOString(),

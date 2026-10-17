@@ -139,3 +139,28 @@ object in a test, with `resolveSecret` left undefined.
 - **LOW** — `flock -w 30` everywhere so a held lock exits non-zero instead of
   blocking; the dead `armArgv`/`revertNowArgv`/`disarmArgv` builders are gone.
 - 83 unit tests; gates 0-6 pass offline. Live jumbo cells remain `blocked`.
+
+## Round-3 review (ownership and desired state, single-sourced)
+
+Design invariants (also a comment block in `host_net.ts`):
+
+- The `config` record holds the FULL owned set (`devices`, `ownedFiles` with a
+  `preExisted` flag, `parentMtus`) and is written **only at commit**, never by
+  one apply's delta.
+- An apply computes `owned = (previous owned ∩ declared) ∪ created` and parks it
+  in the pending `revert` record; a reverted apply leaves committed ownership
+  untouched.
+- The identical-config no-op compares the **live read-back against the NEW
+  desired render**, and only when that render is the committed one — so an edit
+  (netplan MTU change, networkd add-unit) is never silently ignored.
+- `remove` derives every device, file and MTU from the `config` record alone,
+  proceeds when only files/MTUs are owned (an MTU-only apply), and never removes
+  a file recorded as pre-existing.
+
+Other fixes: config files stage as `<path>.host-net-new` in the target dir; MTU
+commands run inside the guarded apply/remove; remove-commit prints
+present/absent via `run()` (an ssh 255 is not absence); the match_mac guard also
+refuses enslaving the management NIC into a bridge; the restore restores files
+before MTUs and aborts on a `cp` failure; `revert_now` records a failed restore
+before throwing. Tests cover apply A, A+B, B-only, MTU-only apply→remove, and a
+match_mac bridge member. 88 unit tests; gates 0-6 pass offline.

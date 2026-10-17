@@ -145,20 +145,21 @@ fi
 # 1. delete only the devices this change created (bridge before its ports).
 for dev in ${bridges} ${others}; do ip link delete dev "$dev" 2>/dev/null || true; done
 ${ovsDelete}
-# 2. restore the parent MTUs this change raised.
-${parentLines}
-# 3. restore exactly the owned files recorded in the manifest.
+# 2. restore exactly the owned files recorded in the manifest. A copy failure
+#    must abort the restore (set -e does not catch an AND-list failure).
 if [ -f "$DIR/owned.txt" ]; then
   while IFS="$(printf '\\t')" read -r p state; do
     [ -n "$p" ] || continue
     b="$(basename "$p")"
     if [ "$state" = present ] && [ -f "$SNAP/$b" ]; then
-      cp -a "$SNAP/$b" "$p.host-net-new" && mv -f "$p.host-net-new" "$p"
+      cp -a "$SNAP/$b" "$p.host-net-new" && mv -f "$p.host-net-new" "$p" || exit 1
     else
       rm -f "$p"
     fi
   done < "$DIR/owned.txt"
 fi
+# 3. restore the parent MTUs this change raised, after the files.
+${parentLines}
 # 4. apply the restored configuration.
 ${applyCmd}
 # 5. record the outcome; only a non-empty default route is a pass.

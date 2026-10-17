@@ -23,7 +23,7 @@
 import { z } from "npm:zod@4.3.6";
 
 /** DNS-1123 label (cluster and namespace names). */
-export const LABEL_RE = /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/;
+const LABEL_RE = /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/;
 /** DNS-1123 subdomain (node names). */
 const SUBDOMAIN_RE = /^[a-z0-9](?:[a-z0-9.-]{0,251}[a-z0-9])?$/;
 const HOST_RE =
@@ -33,7 +33,7 @@ const DURATION_RE = /^\d{1,3}(m|h)$/;
 const IP_RE = /^(?:(?:\d{1,3}\.){3}\d{1,3}|[0-9a-fA-F:]{2,45})$/;
 
 /** A node as the caller describes it. */
-export const NodeSpecSchema = z.strictObject({
+const NodeSpecSchema = z.strictObject({
   name: z.string().regex(SUBDOMAIN_RE, "not a DNS-1123 subdomain").describe(
     "Node name, e.g. ctrl-1.",
   ),
@@ -49,7 +49,7 @@ export const NodeSpecSchema = z.strictObject({
 });
 
 /** An observed node from `get`/`sync`, compared against the desired set. */
-export const ObservedNodeSchema = z.strictObject({
+const ObservedNodeSchema = z.strictObject({
   name: z.string(),
   role: z.enum(["controller", "worker"]).nullable(),
   ready: z.boolean(),
@@ -109,6 +109,50 @@ export class PlanError extends Error {
   }
 }
 
+/** The operation a plan describes. */
+type PlanOperation = "create" | "add" | "remove" | "upgrade";
+
+/** The token role a node joins as (a controller_worker is a controller). */
+function tokenRole(node: NodeSpec): "controller" | "worker" {
+  return node.role === "worker" ? "worker" : "controller";
+}
+
+/** The mint -> install -> wait -> invalidate sequence that joins one node. */
+function joinSteps(fromController: string, node: NodeSpec): PlanStep[] {
+  const role = tokenRole(node);
+  return [
+    {
+      kind: "mint_token",
+      node: fromController,
+      role,
+      reason: `mint a ${role} token for ${node.name} from ${fromController}`,
+    },
+    {
+      kind: "install_with_token",
+      node: node.name,
+      role,
+      reason: `join ${node.name} as ${node.role}`,
+    },
+    {
+      kind: "wait_joined",
+      node: node.name,
+      reason: `${node.name} must be Ready before the next node joins`,
+    },
+    {
+      kind: "invalidate_token",
+      node: fromController,
+      role,
+      reason: `invalidate the token used by ${node.name}`,
+    },
+  ];
+}
+
+/** Infers the operation; `plan` has no explicit selector input. */
+function inferOperation(input: PlanInput): PlanOperation {
+  if (input.target_version) return "upgrade";
+  return input.observed.length > 0 ? "add" : "create";
+}
+
 function minorOf(version: string): number {
   const m = /^v?(\d+)\.(\d+)\./.exec(version);
   if (!m) throw new PlanError(`cannot read a Kubernetes minor from ${version}`);
@@ -152,10 +196,9 @@ function byRoleOrder(nodes: NodeSpec[]): NodeSpec[] {
 
 /** Builds the ordered steps for a cluster that does not exist yet. */
 function createPlan(nodes: NodeSpec[]): PlanStep[] {
-  const ordered = byRoleOrder(nodes);
-  const [first, ...rest] = ordered;
+  const [first, ...rest] = byRoleOrder(nodes);
   if (!first) throw new PlanError("no nodes");
-  const steps: PlanStep[] = [
+  return [
     {
       kind: "install_first_controller",
       node: first.name,
@@ -166,36 +209,8 @@ function createPlan(nodes: NodeSpec[]): PlanStep[] {
       node: first.name,
       reason: "the first controller must be Ready before the next node joins",
     },
+    ...rest.flatMap((n) => joinSteps(first.name, n)),
   ];
-  for (const n of rest) {
-    const role = n.role === "worker" ? "worker" : "controller";
-    steps.push(
-      {
-        kind: "mint_token",
-        node: first.name,
-        role,
-        reason: `mint a ${role} token for ${n.name} from ${first.name}`,
-      },
-      {
-        kind: "install_with_token",
-        node: n.name,
-        role,
-        reason: `join ${n.name} as ${n.role}`,
-      },
-      {
-        kind: "wait_joined",
-        node: n.name,
-        reason: `${n.name} must be Ready before the next node joins`,
-      },
-      {
-        kind: "invalidate_token",
-        node: first.name,
-        role,
-        reason: `invalidate the token used by ${n.name}`,
-      },
-    );
-  }
-  return steps;
 }
 
 /** Builds add-node steps for nodes observed to be absent. */
@@ -212,32 +227,7 @@ function addPlan(input: PlanInput, nodes: NodeSpec[]): PlanStep[] {
     input.observed.find((o) => o.role === "controller")?.name ??
       nodes.find((n) => n.role !== "worker")?.name;
   if (!controller) throw new PlanError("no controller to mint from");
-  const steps: PlanStep[] = [];
-  for (const n of byRoleOrder(missing)) {
-    const role = n.role === "worker" ? "worker" : "controller";
-    steps.push(
-      {
-        kind: "mint_token",
-        node: controller,
-        role,
-        reason: `mint a ${role} token for ${n.name} from ${controller}`,
-      },
-      {
-        kind: "install_with_token",
-        node: n.name,
-        role,
-        reason: `join ${n.name}`,
-      },
-      { kind: "wait_joined", node: n.name, reason: `${n.name} must be Ready` },
-      {
-        kind: "invalidate_token",
-        node: controller,
-        role,
-        reason: `invalidate the token used by ${n.name}`,
-      },
-    );
-  }
-  return steps;
+  return byRoleOrder(missing).flatMap((n) => joinSteps(controller, n));
 }
 
 /** Builds remove-node steps: drain, detach, reset. */
@@ -331,14 +321,14 @@ function upgradePlan(input: PlanInput, nodes: NodeSpec[]): PlanStep[] {
 export function plan(raw: z.input<typeof PlanInputSchema>): PlanStep[] {
   const input = PlanInputSchema.parse(raw);
   const nodes = assertTopology(input);
-  const operation = input.target_version
-    ? "upgrade"
-    : input.observed.length > 0
-    ? "add"
-    : "create";
-  if (operation === "create") return createPlan(nodes);
-  if (operation === "upgrade") return upgradePlan(input, nodes);
-  return addPlan(input, nodes);
+  switch (inferOperation(input)) {
+    case "upgrade":
+      return upgradePlan(input, nodes);
+    case "add":
+      return addPlan(input, nodes);
+    default:
+      return createPlan(nodes);
+  }
 }
 
 /** Plans the removal of one node (drain -> detach -> reset). */

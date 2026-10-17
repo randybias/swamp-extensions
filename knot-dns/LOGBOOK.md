@@ -228,3 +228,23 @@ the `local2` image plus `iproute2 psmisc procps`).
   `_lib/listen.ts`; shell fragments (`shq`, lock wrapper, restart, wait, query)
   live once in `_lib/fragments.ts`. `_lib/ssh.ts` stays at its vendored size so
   it remains byte-identical to ssh-host.
+
+## Round 4 (live: fresh Ubuntu 24.04, 11/13)
+
+- HIGH install: `knot-dnssecutils` (kzonecheck) is installed; exit 127 is a
+  `tool_missing` error, not "kzonecheck rejected the zone". The resolver path
+  adds the CZ.NIC repository for real (pinned key fingerprint, apt priority 100
+  so Knot DNS stays 3.3.4 while knot-resolver6 6.5.0 comes from CZ.NIC; checked
+  in a fresh ubuntu:24.04 under dash), verifies kresctl/kresd and the major
+  versions, and leaves the resolver service stopped (its package config would
+  fight knotd for 127.0.0.1:53). The key fingerprint is unverified against a
+  second public source.
+- HIGH apply_resolver self-test: the name is the caller's `test_name`, else a
+  name the upstream serves (see README), so a parent forward to an authoritative
+  that serves only children no longer rolls back.
+- MEDIUM: `allow_transfer` takes the CIDR grammar, `notify_secondaries`
+  `ADDR[@port]`; a failed apply_resolver removes its staged file (EXIT trap in
+  the script, best-effort remove if the script was never reached); `outcome`
+  records persist install/apply/remove results.
+- Quality: install and the resolver methods moved out of knot_dns.ts
+  (`install.ts`, `resolver_methods.ts`, shared `runtime.ts`).

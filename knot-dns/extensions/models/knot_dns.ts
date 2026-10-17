@@ -13,28 +13,32 @@
 
 import { z } from "npm:zod@4.3.6";
 import {
-  denoDeps,
   exec as sshExec,
   sha256Hex,
-  type SshDeps,
   type SshTarget,
   upload as sshUpload,
 } from "./_lib/ssh.ts";
 import { KnotError, resolveSecret } from "./_lib/vault.ts";
 import {
-  applyResolverScript,
+  type Ctx,
+  deps,
+  instanceName,
+  recordOutcome,
+  servedApexes,
+  setDeps,
+  sshTarget,
+} from "./_lib/runtime.ts";
+import { resolverMethods } from "./_lib/resolver_methods.ts";
+import {
   applyZoneScript,
   between,
-  discoverZonesScript,
   finalizeZoneScript,
   getDsScript,
-  installScript,
   kskSubmittedScript,
   observeScript,
   parseKeyValues,
   parseServed,
   portCheckScript,
-  removeResolverScript,
   removeZoneScript,
   resolverObserveScript,
   restoreZoneScript,
@@ -48,12 +52,11 @@ import {
   otherZoneListens,
 } from "./_lib/listen.ts";
 import {
-  ApplyResolverArgs,
   ApplyZoneArgs,
   DsSchema,
   InstallArgs,
   ObservationSchema,
-  RemoveResolverArgs,
+  OutcomeSchema,
   RemoveZoneArgs,
   SshOnlyArgs,
   StateResolverSchema,
@@ -63,8 +66,8 @@ import {
   ZoneOnlyArgs,
 } from "./_lib/schemas.ts";
 import { mapScriptError } from "./_lib/errors.ts";
+import { installScript } from "./_lib/install.ts";
 import { parseDsLines } from "./_lib/parse.ts";
-import { renderResolverYaml } from "./_lib/resolver.ts";
 import {
   canonicalRecords,
   declaredTuples,
@@ -77,42 +80,7 @@ import {
   type ZoneRecord,
 } from "./_lib/zone.ts";
 
-/** Cap on captured remote output. */
-const MAX_OUTPUT_BYTES = 16 * 1024 * 1024;
-/** Live resolver configuration path. */
-const RESOLVER_YAML = "/etc/knot-resolver/config.yaml";
-/** Staged resolver configuration path. */
-const RESOLVER_YAML_STAGED = "/etc/knot-resolver/.config.yaml.staged";
-/** Backup of the package's resolver configuration. */
-const RESOLVER_PACKAGE_BACKUP = "/etc/knot-resolver/config.yaml.package";
-
-// deno-lint-ignore no-explicit-any
-type Ctx = any;
-
-let deps: SshDeps = denoDeps;
-
-/** Replaces the injected transport dependencies (tests only). */
-export function setDeps(d: Partial<SshDeps>): SshDeps {
-  const prev = deps;
-  deps = { ...deps, ...d };
-  return prev;
-}
-
-type SshInput = z.infer<typeof SshOnlyArgs>["ssh"];
-
-async function sshTarget(context: Ctx, ssh: SshInput): Promise<SshTarget> {
-  const key = await resolveSecret(context.vaultService, ssh.ssh_key_ref);
-  return {
-    host: ssh.host,
-    port: ssh.port,
-    user: ssh.user,
-    host_key_policy: "strict",
-    host_keys: ssh.host_keys,
-    private_key: key,
-    connect_timeout_s: ssh.connect_timeout_s,
-    max_output_bytes: MAX_OUTPUT_BYTES,
-  };
-}
+export { instanceName, setDeps };
 
 /** Builds the declared records: explicit records plus apex NS from `ns[]`. */
 export function zoneRecords(a: {
@@ -151,12 +119,6 @@ function configFor(
     allowTransfer: a.allow_transfer,
     tsigKeyNames: a.tsig_keys.map((k) => k.name),
   });
-}
-
-/** Instance name for a set of identity parts; kind keeps resources distinct. */
-export async function instanceName(parts: string[]): Promise<string> {
-  const digest = (await sha256Hex(parts.join("\0"))).slice(0, 16);
-  return `knot_${digest}`;
 }
 
 async function renderTsigFragment(
@@ -256,11 +218,7 @@ async function observe(
   verbose: boolean,
 ) {
   const target = await sshTarget(context, a.ssh);
-  const disc = await sshExec(deps, target, ["sh", "-c", discoverZonesScript()]);
-  if (disc.exit_code !== 0) throw mapScriptError(disc.stderr, disc.exit_code);
-  const apexes = disc.stdout.split("\n").map((l) => l.trim()).filter((l) =>
-    l.endsWith(".")
-  );
+  const apexes = await servedApexes(target);
   const zones: z.infer<typeof ObservationSchema>["zones"] = [];
   if (apexes.length > 0) {
     const res = await sshExec(deps, target, [
@@ -329,7 +287,7 @@ async function observe(
 /** Model definition for `@randybias/knot-dns`. */
 export const model = {
   type: "@randybias/knot-dns",
-  version: "2026.10.17.2",
+  version: "2026.10.17.3",
   description:
     "Manage authoritative Knot DNS zones and a Knot Resolver 6 recursive resolver over SSH, validating every candidate with the vendor tools before it reaches the service.",
   globalArguments: z.strictObject({}),
@@ -349,6 +307,13 @@ export const model = {
     observation: {
       description: "Last live observation of managed zones and the resolver",
       schema: ObservationSchema,
+      lifetime: "infinite" as const,
+      garbageCollection: 10,
+    },
+    outcome: {
+      description:
+        "What the last install, apply or remove did (changed, removed, versions)",
+      schema: OutcomeSchema,
       lifetime: "infinite" as const,
       garbageCollection: 10,
     },
@@ -374,10 +339,18 @@ export const model = {
           installScript({ resolver: a.resolver }),
         ]);
         if (res.exit_code !== 0) {
-          throw new KnotError("tool_failed", "install failed");
+          throw mapScriptError(res.stderr, res.exit_code);
         }
         const kv = parseKeyValues(res.stdout);
+        const handle = await recordOutcome(context, {
+          action: "install",
+          host: a.ssh.host,
+          knot_version: kv.knot_version ?? "",
+          ...(kv.kresd_version ? { kresd_version: kv.kresd_version } : {}),
+          observed_at: new Date().toISOString(),
+        });
         return {
+          dataHandles: [handle],
           result: {
             host: a.ssh.host,
             knot_version: kv.knot_version ?? "",
@@ -509,8 +482,19 @@ export const model = {
           requested_listen: a.listen,
           listen: listens,
         });
+        const outcome = await recordOutcome(context, {
+          action: "apply_zone",
+          host: a.ssh.host,
+          zone,
+          changed: kv.changed === "yes",
+          added: diff.added.length,
+          removed: diff.removed.length,
+          serial: kv.serial ?? "",
+          dnssec: a.dnssec !== "off" ? "on" : "off",
+          observed_at: new Date().toISOString(),
+        });
         return {
-          dataHandles: [handle],
+          dataHandles: [handle, outcome],
           result: {
             zone,
             changed: kv.changed === "yes",
@@ -577,8 +561,15 @@ export const model = {
           record_count: 0,
           dnssec: false,
         });
+        const outcome = await recordOutcome(context, {
+          action: "remove_zone",
+          host: a.ssh.host,
+          zone,
+          removed: kv.removed === "yes",
+          observed_at: new Date().toISOString(),
+        });
         return {
-          dataHandles: [handle],
+          dataHandles: [handle, outcome],
           result: { zone, removed: kv.removed === "yes" },
         };
       },
@@ -636,128 +627,7 @@ export const model = {
       },
     },
 
-    render_resolver: {
-      description:
-        "READ-ONLY. Render the Knot Resolver 6 config.yaml and its sha256 without touching any host.",
-      arguments: ApplyResolverArgs,
-      execute: async (
-        args: z.input<typeof ApplyResolverArgs>,
-        _context: Ctx,
-      ) => {
-        const a = ApplyResolverArgs.parse(args);
-        const yaml = renderResolverYaml(a.resolver);
-        return { result: { yaml, sha256: await sha256Hex(yaml) } };
-      },
-    },
-
-    apply_resolver: {
-      kind: "action" as const,
-      description:
-        "DESTRUCTIVE. Validate with kresctl, back up the package config, atomically swap the resolver config.yaml, reload and verify a test query, restoring the previous config on failure. Idempotent: an unchanged render is a no-op.",
-      arguments: ApplyResolverArgs,
-      execute: async (
-        args: z.input<typeof ApplyResolverArgs>,
-        context: Ctx,
-      ) => {
-        const a = ApplyResolverArgs.parse(args);
-        const yaml = renderResolverYaml(a.resolver);
-        const sha = await sha256Hex(yaml);
-        const target = await sshTarget(context, a.ssh);
-        await sshUpload(deps, target, {
-          path: RESOLVER_YAML_STAGED,
-          content: yaml,
-          mode: "0644",
-        });
-        const res = await sshExec(deps, target, [
-          "sh",
-          "-c",
-          applyResolverScript({
-            liveYaml: RESOLVER_YAML,
-            packageBackup: RESOLVER_PACKAGE_BACKUP,
-            stagedYaml: RESOLVER_YAML_STAGED,
-            testListen: a.resolver.listen[0],
-            // A forwarded subtree exercises the forward path, which is what
-            // a bad forward option breaks; otherwise the root.
-            testName: a.resolver.forwards[0]?.subtree ?? ".",
-          }),
-        ]);
-        if (res.exit_code !== 0) {
-          throw mapScriptError(res.stderr, res.exit_code);
-        }
-        const kv = parseKeyValues(res.stdout);
-        const handle = await context.writeResource(
-          "resolver",
-          await instanceName(["resolver", a.ssh.host]),
-          {
-            host: a.ssh.host,
-            status: "applied",
-            rendered_sha256: sha,
-            listen: a.resolver.listen,
-            forwards: a.resolver.forwards.map((f) => f.subtree),
-            applied_at: new Date().toISOString(),
-          },
-        );
-        return {
-          dataHandles: [handle],
-          result: {
-            host: a.ssh.host,
-            changed: kv.changed === "yes",
-            listen: a.resolver.listen,
-            forwards: a.resolver.forwards.map((f) => f.subtree),
-          },
-        };
-      },
-    },
-
-    remove_resolver: {
-      kind: "action" as const,
-      description:
-        "DESTRUCTIVE. Stop and disable the recursive resolver, restore the package configuration, and fail if the service cannot be stopped. Refuses a host whose resolver this model did not apply unless remove_ack is set.",
-      arguments: RemoveResolverArgs,
-      execute: async (
-        args: z.input<typeof RemoveResolverArgs>,
-        context: Ctx,
-      ) => {
-        const a = RemoveResolverArgs.parse(args);
-        const target = await sshTarget(context, a.ssh);
-        const stored = await context.readResource(
-          await instanceName(["resolver", a.ssh.host]),
-        ) as z.infer<typeof StateResolverSchema> | null;
-        if (stored?.status !== "applied" && !a.remove_ack) {
-          throw new KnotError(
-            "invalid_input",
-            "this model did not apply a resolver on this host; pass remove_ack to proceed",
-          );
-        }
-        const res = await sshExec(deps, target, [
-          "sh",
-          "-c",
-          removeResolverScript({
-            liveYaml: RESOLVER_YAML,
-            packageBackup: RESOLVER_PACKAGE_BACKUP,
-          }),
-        ]);
-        if (res.exit_code !== 0) {
-          throw mapScriptError(res.stderr, res.exit_code);
-        }
-        const kv = parseKeyValues(res.stdout);
-        const handle = await context.writeResource(
-          "resolver",
-          await instanceName(["resolver", a.ssh.host]),
-          {
-            host: a.ssh.host,
-            status: "removed",
-            rendered_sha256: "",
-            listen: [],
-            forwards: [],
-          },
-        );
-        return {
-          dataHandles: [handle],
-          result: { removed: kv.removed === "yes" },
-        };
-      },
-    },
+    ...resolverMethods,
 
     get: {
       description:

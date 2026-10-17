@@ -1,10 +1,10 @@
+import { installScript, VENDOR_KEY_FINGERPRINT } from "./install.ts";
 import { assert, assertEquals } from "jsr:@std/assert@1.0.19";
 import {
   applyResolverScript,
   applyZoneScript,
   discoverZonesScript,
   getDsScript,
-  installScript,
   observeScript,
   parseKeyValues,
   removeResolverScript,
@@ -160,4 +160,31 @@ Deno.test("parseKeyValues reads simple output", () => {
     parseKeyValues("noise\nchanged=yes\nserial=123\n"),
     { changed: "yes", serial: "123" },
   );
+});
+
+Deno.test("install brings every tool the model runs, from the archive, and verifies them", async () => {
+  const plain = installScript({ resolver: false });
+  // kzonecheck ships in knot-dnssecutils, not in knot or knot-dnsutils.
+  assert(plain.includes("knot knot-dnsutils knot-dnssecutils"));
+  assert(plain.includes('echo "TOOL_MISSING $t" >&2; exit 127'));
+  assert(plain.includes("UNEXPECTED_VERSION knot"));
+  assert(
+    !plain.includes("pkg.labs.nic.cz"),
+    "no vendor repo without a resolver",
+  );
+  assertEquals(await shSyntax(plain), 0);
+  const withResolver = installScript({ resolver: true });
+  // The vendor key is checked against a pinned fingerprint before it is trusted.
+  assert(withResolver.includes(VENDOR_KEY_FINGERPRINT));
+  assert(
+    withResolver.indexOf("KEY_MISMATCH") <
+      withResolver.indexOf("install -m 0644"),
+    "the fingerprint check precedes trusting the key",
+  );
+  // The repository is pinned below the archive so knot is not upgraded.
+  assert(withResolver.includes("Pin-Priority: 100"));
+  assert(withResolver.includes("knot-resolver6"));
+  assert(!withResolver.includes("|| apt-get install -y -qq knot-resolver"));
+  assert(withResolver.includes('echo "kresd_version=$rv"'));
+  assertEquals(await shSyntax(withResolver), 0);
 });

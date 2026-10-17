@@ -1,6 +1,6 @@
 manifestVersion: 1
 name: "@randybias/knot-dns"
-version: "2026.10.17.2"
+version: "2026.10.17.3"
 description: "Manage authoritative Knot DNS zones and a Knot Resolver 6 recursive resolver over SSH. Every candidate zone file, Knot config fragment and resolver config is rendered deterministically and validated by the vendor tools before it reaches the live service; secrets stay in the vault and reach the host over stdin."
 license: Apache-2.0
 repository: https://github.com/randybias/swamp-extensions

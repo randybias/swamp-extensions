@@ -3,6 +3,7 @@ import {
   CidrSchema,
   ForwardSchema,
   ListenAddressSchema,
+  pickTestQuery,
   renderResolverYaml,
   ResolverSchema,
   splitListen,
@@ -101,4 +102,53 @@ Deno.test("resolver YAML escapes scalar content", () => {
   });
   const yaml = renderResolverYaml(input);
   assert(yaml.includes('subtree: "example.test."'));
+});
+
+Deno.test("the self-test asks a name the forwarded upstream actually serves", () => {
+  const input = (forwards: unknown[], test_name?: string) =>
+    ResolverSchema.parse({
+      listen: ["127.0.0.3@53"],
+      forwards,
+      ...(test_name ? { test_name } : {}),
+    });
+  const fwd = (subtree: string) => ({
+    subtree,
+    servers: ["127.0.0.1"],
+    authoritative: true,
+  });
+  // The parent is forwarded, only children are served: ask a served child.
+  assertEquals(
+    pickTestQuery(input([fwd("example.test.")]), [
+      "a.example.test.",
+      "b.example.test.",
+    ]),
+    "a.example.test.",
+  );
+  // The forwarded subtree is itself served: ask it, even if a child is listed first.
+  assertEquals(
+    pickTestQuery(input([fwd("a.example.test.")]), [
+      "x.a.example.test.",
+      "a.example.test.",
+    ]),
+    "a.example.test.",
+  );
+  // The caller's name always wins.
+  assertEquals(
+    pickTestQuery(input([fwd("example.test.")], "www.a.example.test."), [
+      "a.example.test.",
+    ]),
+    "www.a.example.test.",
+  );
+  // Nothing served overlaps (an external forward): the subtree, as before.
+  assertEquals(
+    pickTestQuery(input([fwd("corp.example.")]), ["a.example.test."]),
+    "corp.example.",
+  );
+  // No forwards at all: the root.
+  assertEquals(pickTestQuery(input([]), ["a.example.test."]), ".");
+  // A name outside the subtree is not mistaken for a child.
+  assertEquals(
+    pickTestQuery(input([fwd("example.test.")]), ["badexample.test."]),
+    "example.test.",
+  );
 });

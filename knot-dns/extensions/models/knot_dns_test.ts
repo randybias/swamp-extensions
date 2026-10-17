@@ -1,6 +1,8 @@
 import { assert, assertEquals, assertRejects } from "jsr:@std/assert@1.0.19";
 import { createModelTestContext } from "jsr:@swamp-club/swamp-testing@0.20261014.55";
 import { instanceName, model } from "./knot_dns.ts";
+import { applyResolverScript } from "./_lib/scripts.ts";
+import { fakeHost } from "./_lib/test_support.ts";
 
 const ZONE_ARGS = {
   ssh: {
@@ -27,7 +29,7 @@ const ZONE_ARGS = {
 
 Deno.test("model is a plain object with the expected type and methods", () => {
   assertEquals(model.type, "@randybias/knot-dns");
-  assertEquals(model.version, "2026.10.17.2");
+  assertEquals(model.version, "2026.10.17.3");
   const methods = Object.keys(model.methods);
   assertEquals(
     methods.sort(),
@@ -247,4 +249,173 @@ Deno.test("the zone schema rejects a newline smuggled in domain rdata", () => {
     }).success,
     false,
   );
+});
+
+const RESOLVER_ARGS = {
+  ssh: ZONE_ARGS.ssh,
+  resolver: {
+    listen: ["127.0.0.3@53"],
+    forwards: [{
+      subtree: "example.test.",
+      servers: ["127.0.0.1"],
+      authoritative: true,
+      dnssec: false,
+    }],
+  },
+};
+
+/** A context whose vault answers the SSH key. */
+function vaultContext() {
+  const c = createModelTestContext({ globalArgs: {} });
+  (c.context as { vaultService?: unknown }).vaultService = {
+    get: () => Promise.resolve("PLACEHOLDER-KEY"),
+    put: () => Promise.resolve(),
+  };
+  return c;
+}
+
+Deno.test("apply_resolver tests a name the upstream serves, and records what it did", async () => {
+  const host = fakeHost((command) =>
+    command.includes("50-managed-*.conf")
+      ? { stdout: "a.example.test.\nb.example.test.\n" }
+      : command.includes("kresctl")
+      ? { stdout: "changed=yes\n" }
+      : {}
+  );
+  try {
+    const c = vaultContext();
+    const out = await model.methods.apply_resolver.execute(
+      RESOLVER_ARGS as never,
+      c.context,
+    ) as { result: { changed: boolean } };
+    assertEquals(out.result.changed, true);
+    // The script queries the served child, not the forwarded parent (which
+    // the upstream REFUSES), so a correct config is not rolled back.
+    const script = host.commands.find((cmd) => cmd.includes("kresctl"))!;
+    assert(script.includes("a.example.test."), script);
+    assert(!script.includes("'example.test.' SOA"), script);
+    const records = c.getWrittenResources();
+    assertEquals(records.map((r) => r.specName), ["resolver", "outcome"]);
+    assertEquals(records[1].data, {
+      action: "apply_resolver",
+      host: "ns1.example.test",
+      changed: true,
+      listen: ["127.0.0.3@53"],
+      forwards: ["example.test."],
+      test_name: "a.example.test.",
+      observed_at: (records[1].data as { observed_at: string }).observed_at,
+    });
+  } finally {
+    host.restore();
+  }
+});
+
+Deno.test("a failed apply_resolver removes the staged file and records nothing", async () => {
+  const host = fakeHost((command) =>
+    command.includes("kresctl") ? { code: 4, stderr: "KRESCTL_FAILED\n" } : {}
+  );
+  try {
+    const c = vaultContext();
+    const e = await assertRejects(() =>
+      model.methods.apply_resolver.execute(RESOLVER_ARGS as never, c.context)
+    ) as { code?: string };
+    assertEquals(e.code, "tool_failed");
+    assert(
+      host.commands.some((cmd) =>
+        cmd.includes("'rm' '-f' '--'") &&
+        cmd.includes("/etc/knot-resolver/.config.yaml.staged")
+      ),
+    );
+    assertEquals(c.getWrittenResources().length, 0);
+  } finally {
+    host.restore();
+  }
+});
+
+Deno.test("the resolver script removes its staged file on every exit", () => {
+  const script = applyResolverScript({
+    liveYaml: "/l",
+    packageBackup: "/p",
+    stagedYaml: "/s",
+    testListen: "127.0.0.3@53",
+    testName: "a.example.test.",
+  });
+  // The script runs inside `flock ... sh -c '<inner>'`, so quotes are escaped.
+  assert(/trap .*rm -f "\$st".* EXIT/.test(script), script);
+  assert(script.indexOf("trap") < script.indexOf("kresctl validate"));
+});
+
+Deno.test("allow_transfer and notify_secondaries take addresses, never free text", () => {
+  const schema = model.methods.render_zone.arguments;
+  for (
+    const [field, value] of [
+      ["allow_transfer", '127.0.0.1"\n    action: update'],
+      ["allow_transfer", "any"],
+      ["allow_transfer", "192.0.2.0/33"],
+      ["notify_secondaries", "ns2.example.test"],
+      ["notify_secondaries", "192.0.2.1@99999"],
+      ["notify_secondaries", "192.0.2.1\nx"],
+    ] as const
+  ) {
+    assertEquals(
+      schema.safeParse({ ...ZONE_ARGS, [field]: [value] }).success,
+      false,
+      `${field}: ${value}`,
+    );
+  }
+  for (
+    const [field, value] of [
+      ["allow_transfer", "192.0.2.0/24"],
+      ["allow_transfer", "2001:db8::/32"],
+      ["notify_secondaries", "192.0.2.1"],
+      ["notify_secondaries", "192.0.2.1@853"],
+    ] as const
+  ) {
+    assertEquals(
+      schema.safeParse({ ...ZONE_ARGS, [field]: [value] }).success,
+      true,
+      `${field}: ${value}`,
+    );
+  }
+});
+
+Deno.test("install records its versions as an outcome", async () => {
+  const host = fakeHost(() => ({
+    stdout:
+      "knot_version=knotc (Knot DNS), version 3.3.4\nkresd_version=Knot Resolver, version 6.5.0\n",
+  }));
+  try {
+    const c = vaultContext();
+    await model.methods.install.execute(
+      { ssh: ZONE_ARGS.ssh, resolver: true } as never,
+      c.context,
+    );
+    const [record] = c.getWrittenResources();
+    assertEquals(record.specName, "outcome");
+    assertEquals((record.data as { action: string }).action, "install");
+    assertEquals(
+      (record.data as { kresd_version: string }).kresd_version,
+      "Knot Resolver, version 6.5.0",
+    );
+  } finally {
+    host.restore();
+  }
+});
+
+Deno.test("an install whose tool check fails is a tool_missing error", async () => {
+  const host = fakeHost(() => ({
+    code: 127,
+    stderr: "TOOL_MISSING kzonecheck\n",
+  }));
+  try {
+    const e = await assertRejects(() =>
+      model.methods.install.execute(
+        { ssh: ZONE_ARGS.ssh } as never,
+        vaultContext().context,
+      )
+    ) as { code?: string };
+    assertEquals(e.code, "tool_missing");
+  } finally {
+    host.restore();
+  }
 });

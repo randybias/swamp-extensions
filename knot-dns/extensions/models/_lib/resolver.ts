@@ -66,6 +66,9 @@ export const ResolverSchema = z.strictObject({
   listen_any_ack: z.boolean().default(false).describe(
     "Acknowledge binding a wildcard address (0.0.0.0/::).",
   ),
+  test_name: FqdnSchema.optional().describe(
+    "Name the self-test asks the resolver for (SOA). Default: chosen from the forwards and the zones served on the host.",
+  ),
 });
 
 /** Parsed resolver inputs. */
@@ -136,4 +139,32 @@ export function renderResolverYaml(input: ResolverInput): string {
   lines.push('      - "::/0"');
   lines.push("    answer: refused");
   return `${lines.join("\n")}\n`;
+}
+
+/** True when `name` is `zone` or below it (both fully qualified). */
+function isAtOrBelow(name: string, zone: string): boolean {
+  if (zone === ".") return true;
+  return name === zone || name.endsWith(`.${zone}`);
+}
+
+/**
+ * Picks the self-test name so a correct configuration never fails its own
+ * test. A forward to an authoritative server answers REFUSED (a resolver turns
+ * that into SERVFAIL) for any name outside the zones that server serves, so
+ * the name must be one it serves: the caller's `test_name`, else the forwarded
+ * subtree itself or a zone served on this host below it. A forward that no
+ * served zone overlaps is external: its subtree is asked as before.
+ */
+export function pickTestQuery(
+  input: ResolverInput,
+  servedApexes: string[],
+): string {
+  if (input.test_name) return input.test_name;
+  for (const f of input.forwards) {
+    if (f.subtree === ".") continue;
+    const served = servedApexes.find((apex) => apex === f.subtree) ??
+      servedApexes.find((apex) => isAtOrBelow(apex, f.subtree));
+    if (served) return served;
+  }
+  return input.forwards[0]?.subtree ?? ".";
 }

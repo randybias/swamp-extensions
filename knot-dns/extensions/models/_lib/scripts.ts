@@ -80,39 +80,6 @@ function restoreLine(backupVar: string, path: string): string {
   return `if [ -f "${backupVar}" ]; then mv "${backupVar}" ${path}; else rm -f ${path}; fi`;
 }
 
-/** Script that installs Knot (and optionally Knot Resolver 6) and the include. */
-export function installScript(opts: { resolver: boolean }): string {
-  const lines = [
-    "set -eu",
-    "export DEBIAN_FRONTEND=noninteractive",
-    "if ! command -v knotc >/dev/null 2>&1; then apt-get update -qq; apt-get install -y -qq knot; fi",
-    "if ! command -v kdig >/dev/null 2>&1; then apt-get update -qq; apt-get install -y -qq knot-dnsutils; fi",
-    `mkdir -p ${shq(KNOT_CONF_DIR)} ${shq(ZONE_DIR)}`,
-    "command -v chown >/dev/null 2>&1 && chown knot:knot /var/lib/knot/zones 2>/dev/null || true",
-    `touch ${shq(KNOT_CONF)}`,
-    `if ! grep -qF ${shq(INCLUDE_LINE)} ${
-      shq(KNOT_CONF)
-    }; then printf '%s\\n' ${shq(INCLUDE_LINE)} >> ${shq(KNOT_CONF)}; fi`,
-  ];
-  if (opts.resolver) {
-    lines.push(
-      "if ! command -v kresctl >/dev/null 2>&1; then",
-      "  apt-get install -y -qq knot-resolver6 || apt-get install -y -qq knot-resolver",
-      "fi",
-      "mkdir -p /etc/knot-resolver",
-      "systemctl enable --now knot-resolver 2>/dev/null || true",
-    );
-  }
-  lines.push(
-    "systemctl enable --now knot 2>/dev/null || true",
-    "kv=$(knotc --version 2>/dev/null | head -1 || true)",
-    'echo "knot_version=$kv"',
-    "rv=$(command -v kresd >/dev/null 2>&1 && kresd --version 2>/dev/null | head -1 || true)",
-    'echo "kresd_version=$rv"',
-  );
-  return lines.join("\n");
-}
-
 /**
  * Precheck that each requested listen address/port is free or held by Knot.
  * `ss -H` drops the header; `-p` adds the owning process, which is how a
@@ -234,6 +201,7 @@ export function applyZoneScript(
     `[ -f "$zst" ] || { echo STAGE_MISSING >&2; exit 3; }`,
     `[ -f "$fst" ] || { echo STAGE_MISSING >&2; exit 3; }`,
     `command -v kdig >/dev/null 2>&1 || { echo KDIG_MISSING >&2; exit 3; }`,
+    `command -v kzonecheck >/dev/null 2>&1 || { echo KZONECHECK_MISSING >&2; exit 3; }`,
     `kzonecheck -o "$apex" "$zst" || { echo KZONECHECK_FAILED >&2; exit 4; }`,
     "listen_diff",
     ...CONF_CHECK_LINES,
@@ -377,14 +345,20 @@ export function applyResolverScript(opts: {
     QUERY_OK_FN,
     `live=${shq(opts.liveYaml)}; st=${shq(opts.stagedYaml)}`,
     `pkg=${shq(opts.packageBackup)}`,
+    // The staged file is removed on every exit: a failed run leaves nothing.
+    `trap 'rm -f "$st"' EXIT`,
     `[ -f "$st" ] || { echo STAGE_MISSING >&2; exit 3; }`,
     `command -v kdig >/dev/null 2>&1 || { echo KDIG_MISSING >&2; exit 3; }`,
+    `command -v kresctl >/dev/null 2>&1 || { echo KRESCTL_MISSING >&2; exit 3; }`,
     `kresctl validate "$st" || { echo KRESCTL_FAILED >&2; exit 4; }`,
     `if [ -f "$live" ] && [ ! -f "$pkg" ]; then cp -a "$live" "$pkg"; fi`,
     "changed=yes",
     `if [ -f "$live" ] && cmp -s "$live" "$st"; then changed=no; fi`,
     "b=$(mktemp)",
     'cp -a "$live" "$b" 2>/dev/null || true',
+    // install leaves the service disabled so it cannot fight knotd for the
+    // package's default listen address.
+    "systemctl enable knot-resolver >/dev/null 2>&1 || true",
     'if [ "$changed" = yes ]; then',
     '  mv "$st" "$live"',
     "  if ! systemctl reload knot-resolver 2>/dev/null && ! systemctl restart knot-resolver 2>/dev/null; then",

@@ -6,7 +6,7 @@
 
 import { z } from "npm:zod@4.3.6";
 import { HOST_RE, USER_RE } from "./ssh.ts";
-import { ResolverSchema } from "./resolver.ts";
+import { CidrSchema, ListenAddressSchema, ResolverSchema } from "./resolver.ts";
 import {
   DnssecSchema,
   FqdnSchema,
@@ -72,8 +72,10 @@ const ZoneShape = {
   listen_any_ack: z.boolean().default(false).describe(
     "Acknowledge binding a wildcard address (0.0.0.0/::).",
   ),
-  notify_secondaries: z.array(z.string().min(1).max(64)).max(64).default([]),
-  allow_transfer: z.array(z.string().min(1).max(64)).max(64).default([]),
+  // Same grammars as the resolver's: an address[@port] to notify, a CIDR or
+  // address allowed to transfer; nothing else reaches the rendered config.
+  notify_secondaries: z.array(ListenAddressSchema).max(64).default([]),
+  allow_transfer: z.array(CidrSchema).max(64).default([]),
   tsig_keys: z.array(TsigKeySchema).max(16).default([]),
 };
 
@@ -156,3 +158,53 @@ export const DsSchema = z.strictObject({
   ds: z.array(z.string()),
   observed_at: z.string(),
 });
+
+/**
+ * What an action did, kept as a record because the CLI shows resources, not a
+ * method's result. One record per (action, host[, zone]); the latest wins.
+ */
+export const OutcomeSchema = z.discriminatedUnion("action", [
+  z.strictObject({
+    action: z.literal("install"),
+    host: z.string(),
+    knot_version: z.string(),
+    kresd_version: z.string().optional(),
+    observed_at: z.string(),
+  }),
+  z.strictObject({
+    action: z.literal("apply_zone"),
+    host: z.string(),
+    zone: z.string(),
+    changed: z.boolean(),
+    added: z.number().int(),
+    removed: z.number().int(),
+    serial: z.string(),
+    dnssec: z.enum(["on", "off"]),
+    observed_at: z.string(),
+  }),
+  z.strictObject({
+    action: z.literal("remove_zone"),
+    host: z.string(),
+    zone: z.string(),
+    removed: z.boolean(),
+    observed_at: z.string(),
+  }),
+  z.strictObject({
+    action: z.literal("apply_resolver"),
+    host: z.string(),
+    changed: z.boolean(),
+    listen: z.array(z.string()),
+    forwards: z.array(z.string()),
+    test_name: z.string(),
+    observed_at: z.string(),
+  }),
+  z.strictObject({
+    action: z.literal("remove_resolver"),
+    host: z.string(),
+    removed: z.boolean(),
+    observed_at: z.string(),
+  }),
+]);
+
+/** One action outcome. */
+export type Outcome = z.infer<typeof OutcomeSchema>;

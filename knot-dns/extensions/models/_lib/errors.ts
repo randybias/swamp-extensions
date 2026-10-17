@@ -17,6 +17,49 @@ export function mapScriptError(stderr: string, exit: number): KnotError {
   if (stderr.includes("STAGE_MISSING")) {
     return new KnotError("invalid_input", "staged files are missing");
   }
+  const missing = /TOOL_MISSING (\S+)/.exec(stderr)?.[1];
+  if (missing !== undefined) {
+    return new KnotError(
+      "tool_missing",
+      `${missing} is not installed; run install first`,
+    );
+  }
+  if (stderr.includes("KZONECHECK_MISSING")) {
+    return new KnotError(
+      "tool_missing",
+      "kzonecheck is not installed (package knot-dnssecutils); run install first",
+    );
+  }
+  if (stderr.includes("KRESCTL_MISSING")) {
+    return new KnotError(
+      "tool_missing",
+      "kresctl is not installed (Knot Resolver 6); run install with resolver true",
+    );
+  }
+  if (stderr.includes("KEY_MISMATCH")) {
+    return new KnotError(
+      "invalid_input",
+      "the package repository's signing key does not have the pinned fingerprint; nothing was trusted",
+    );
+  }
+  if (stderr.includes("KEY_FETCH_FAILED")) {
+    return new KnotError(
+      "tool_failed",
+      "could not fetch the repository signing key",
+    );
+  }
+  if (stderr.includes("UNSUPPORTED_OS")) {
+    return new KnotError(
+      "invalid_input",
+      "this host's OS release has no codename",
+    );
+  }
+  if (stderr.includes("UNEXPECTED_VERSION")) {
+    return new KnotError(
+      "verify_failed",
+      "an installed tool is not the major version this model is written for",
+    );
+  }
   if (stderr.includes("KZONECHECK_FAILED")) {
     return new KnotError("tool_failed", "kzonecheck rejected the zone");
   }
@@ -73,6 +116,11 @@ export function mapScriptError(stderr: string, exit: number): KnotError {
   }
   if (stderr.includes("NO_BACKUP")) {
     return new KnotError("reload_failed", "the backup directory is missing");
+  }
+  // 127 is the shell's "command not found": say so, instead of blaming the
+  // tool's verdict.
+  if (exit === 127) {
+    return new KnotError("tool_missing", "a required tool is not installed");
   }
   return new KnotError("tool_failed", `remote command failed (exit ${exit})`);
 }

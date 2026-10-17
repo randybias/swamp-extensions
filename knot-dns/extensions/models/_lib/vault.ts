@@ -37,6 +37,7 @@ export type KnotErrorCode =
   | "invalid_input"
   | "transport"
   | "tool_failed"
+  | "tool_missing"
   | "reload_failed"
   | "rollback_failed"
   | "verify_failed"

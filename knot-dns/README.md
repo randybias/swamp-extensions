@@ -38,8 +38,19 @@ destructive.
 ## Dependencies
 
 A Debian or Ubuntu host reachable over SSH, with `apt-get` and `systemctl`.
-`install` adds the package repository line for Knot Resolver 6 when
-`resolver: true`. The SSH key and any TSIG secret are read from a swamp vault.
+`install` installs `knot`, `knot-dnsutils` and `knot-dnssecutils` (which ships
+`kzonecheck`) from the distribution archive and fails unless `knotc`, `kdig`,
+`kzonecheck` and `keymgr` exist and Knot is the 3.x line. With `resolver: true`
+it also adds the CZ.NIC Labs package repository (the Ubuntu 24.04 archive has
+Knot Resolver 5, which has no `kresctl`): the signing key is refused unless its
+fingerprint is the pinned `9C71D59C D4CE8BD2 966A7A3E AB6A3031 24019B64`, the
+repository is pinned at apt priority 100 so Knot DNS stays at the archive
+version while `knot-resolver6` (and its own library versions) come from CZ.NIC,
+and `kresctl`/`kresd` must be 6.x afterwards. The fingerprint was read from
+https://pkg.labs.nic.cz/gpg and could not be cross-checked against a second
+public source: confirm it against the vendor's installation page. The resolver
+service is left stopped and disabled until `apply_resolver` writes its
+configuration. The SSH key and any TSIG secret are read from a swamp vault.
 
 ## Install
 
@@ -89,6 +100,14 @@ Changing the authoritative listen addresses restarts knotd (Knot ignores listen
 changes on reload) and the apply then queries every listen address with `kdig`
 (`install` adds `knot-dnsutils`). Forwards always render an explicit `dnssec`
 setting, because Knot Resolver 6 validates by default.
+
+`apply_resolver` proves the new configuration with an SOA query on the
+resolver's own listen address. An authoritative upstream answers REFUSED (the
+resolver reports SERVFAIL) for names outside the zones it serves, so the name is
+the caller's `resolver.test_name`, else the forwarded subtree when this host
+serves it, else a zone this host serves below the subtree, else the subtree.
+Every action also persists an `outcome` record (`changed`, `removed`, versions)
+because the CLI shows resources, not a method's result.
 
 ## License
 

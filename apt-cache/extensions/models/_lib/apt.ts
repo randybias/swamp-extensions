@@ -54,6 +54,20 @@ export const DISTRO_KEY_RE = /^(debian|ubuntu|ubuntu-ports|debian-security)$/;
 export const FRAGMENT_PATH = "/etc/apt-cacher-ng/zzzz-apt-cache.conf";
 /** Directory holding the managed fragment and backend files. */
 export const ACNG_CONF_DIR = "/etc/apt-cacher-ng";
+/** The port the package's default configuration listens on. */
+export const DEFAULT_ACNG_PORT = 3142;
+
+/**
+ * The fragment written BEFORE the package is installed. The package starts the
+ * daemon on every address (0.0.0.0 and [::]) as soon as it is installed, which
+ * would be an open proxy on the public address until apply_server runs; this
+ * fragment sorts after acng.conf and keeps that first start on loopback.
+ * apply_server replaces it with the real listen addresses.
+ */
+export function renderBootstrapFragment(): string {
+  return "# managed by swamp apt-cache: loopback only until apply_server\nBindAddress: 127.0.0.1\n";
+}
+
 /** Absolute path of the client apt snippet. */
 export const CLIENT_SNIPPET_PATH = "/etc/apt/apt.conf.d/90apt-cache-proxy";
 /** Directory holding the client auto-detect script. */

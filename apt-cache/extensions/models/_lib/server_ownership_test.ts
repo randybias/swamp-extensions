@@ -221,3 +221,132 @@ Deno.test("a tampered record cannot make apply remove an arbitrary path", async 
   assertEquals(box.files.get("/etc/passwd")?.content, "root\n");
   assertEquals(box.fake.removed.includes("/etc/passwd"), false);
 });
+
+// --- install: never an open proxy, lists refreshed first --------------------
+
+/**
+ * A box for install_server: the package is "absent" until the install command
+ * runs, then present; `ss` reports `listeners` once it is installed.
+ */
+function installBox(initialListeners: string) {
+  let installed = false;
+  let listeners = initialListeners;
+  const box: Box = boxFake({}, (command) => {
+    if (command.includes("debconf-set-selections")) {
+      installed = true;
+      return {};
+    }
+    if (command.includes("-f=${Status}")) {
+      return installed
+        ? { code: 0, stdout: "install ok installed\n" }
+        : { code: 1, stdout: "" };
+    }
+    if (command.includes("-f=${Version}")) {
+      return { code: 0, stdout: "3.7.4-1\n" };
+    }
+    if (command.includes("'ss'")) {
+      return {
+        code: 0,
+        stdout:
+          `State Recv-Q Send-Q Local Address:Port Peer Address:Port\n${listeners}`,
+      };
+    }
+    return serverResponder(command);
+  });
+  return { box, listen: (lines: string) => (listeners = lines) };
+}
+
+const installArgs = () =>
+  model.methods.install_server.arguments.parse({ ssh: SSH });
+const LOOPBACK_ONLY = "LISTEN 0 250 127.0.0.1:3142 0.0.0.0:*\n";
+
+Deno.test("install_server refreshes the lists, then writes the loopback fragment, then installs", async () => {
+  const { box } = installBox(LOOPBACK_ONLY);
+  useFake(box.fake);
+  const c = ctx();
+  await model.methods.install_server.execute(installArgs(), c.context);
+  const at = (needle: string) =>
+    box.fake.commands.findIndex((cmd) => cmd.includes(needle));
+  const update = at("'update'");
+  const fragment = box.fake.uploads.findIndex((u) => u.path === FRAGMENT);
+  const install = at("debconf-set-selections");
+  assertEquals(update >= 0 && install >= 0 && fragment >= 0, true);
+  // The fragment upload is a command too: find it by its script marker.
+  const uploadAt = at(".ssh-host-upload");
+  assertEquals(update < uploadAt && uploadAt < install, true);
+  assertEquals(
+    box.files.get(FRAGMENT)?.content.includes("BindAddress: 127.0.0.1"),
+    true,
+  );
+  // The record owns the bootstrap fragment, so apply treats it as its own.
+  const record = c.getWrittenResources()[0].data as {
+    managed_files: Record<string, string>;
+  };
+  assertEquals(Object.keys(record.managed_files), [FRAGMENT]);
+});
+
+Deno.test("a wildcard listener after install stops the daemon and fails without state", async () => {
+  const { box } = installBox(
+    "LISTEN 0 250 0.0.0.0:3142 0.0.0.0:*\nLISTEN 0 250 [::]:3142 [::]:*\n",
+  );
+  useFake(box.fake);
+  const c = ctx();
+  const e = await assertRejects(
+    () => model.methods.install_server.execute(installArgs(), c.context),
+    Error,
+    "listens on",
+  ) as { code?: string };
+  assertEquals(e.code, "open_listener");
+  assertEquals(
+    box.fake.commands.some((cmd) => cmd.includes("'systemctl' 'stop'")),
+    true,
+  );
+  assertEquals(c.getWrittenResources().length, 0);
+});
+
+Deno.test("a failing apt-get update stops install before anything is written or installed", async () => {
+  const box = boxFake({}, (command) => {
+    if (command.includes("-f=${Status}")) return { code: 1, stdout: "" };
+    if (command.includes("'update'")) {
+      return {
+        code: 100,
+        stderr: "E: Failed to fetch http://mirror.example.test",
+      };
+    }
+    return serverResponder(command);
+  });
+  useFake(box.fake);
+  const c = ctx();
+  await assertRejects(
+    () => model.methods.install_server.execute(installArgs(), c.context),
+    Error,
+    "apt-get update failed (exit 100)",
+  );
+  assertEquals(box.files.has(FRAGMENT), false);
+  assertEquals(
+    box.fake.commands.some((cmd) => cmd.includes("debconf-set-selections")),
+    false,
+  );
+  assertEquals(c.getWrittenResources().length, 0);
+});
+
+Deno.test("install, apply, remove: the bootstrap fragment is the model's own and is deleted, not 'restored'", async () => {
+  const { box, listen } = installBox(LOOPBACK_ONLY);
+  useFake(box.fake);
+  const c = ctx();
+  await model.methods.install_server.execute(installArgs(), c.context);
+  listen("LISTEN 0 250 192.0.2.20:3142 0.0.0.0:*\n");
+  await model.methods.apply_server.execute(applyArgsOf(), c.context);
+  assertEquals(box.files.has(`${FRAGMENT}.apt-cache.bak`), false);
+  const live = box.files.get(FRAGMENT)?.content ?? "";
+  assertEquals(live.includes("loopback only until apply_server"), false);
+  assertEquals(live.includes("192.0.2.20"), true);
+  await model.methods.remove_server.execute(
+    model.methods.remove_server.arguments.parse({
+      ssh: SSH,
+      confirm_host: "192.0.2.20",
+    }),
+    c.context,
+  );
+  assertEquals(box.files.has(FRAGMENT), false);
+});

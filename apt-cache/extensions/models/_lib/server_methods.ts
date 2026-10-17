@@ -51,7 +51,6 @@ import {
 import {
   type ApplyServerArgs,
   type GetArgs,
-  type InstallServerArgs,
   ObservationSchema,
   type RemoveServerArgs,
   RenderSchema,
@@ -142,61 +141,6 @@ function assertServerArgs(args: {
       }
     }
   }
-}
-
-/** Install apt-cacher-ng non-interactively, or adopt it when present. */
-export async function installServer(
-  args: InstallServerArgs,
-  context: Ctx,
-) {
-  const key = await resolveKey(context, args.ssh.ssh_key_ref);
-  const t = targetOf(args.ssh, key);
-  const status = await exec(deps, t, [
-    "dpkg-query",
-    "-W",
-    "-f=${Status}",
-    "apt-cacher-ng",
-  ]);
-  if (!/install ok installed/.test(status.stdout)) {
-    context.logger.info("Installing apt-cacher-ng on {host}", { host: t.host });
-    requireOk(
-      await exec(deps, t, [
-        "sh",
-        "-c",
-        "set -e; " +
-        "printf '%s\\n' 'apt-cacher-ng apt-cacher-ng/tunnelenable boolean false' | debconf-set-selections; " +
-        "DEBIAN_FRONTEND=noninteractive apt-get install -y apt-cacher-ng",
-      ]),
-      "apt-get install apt-cacher-ng",
-    );
-  }
-  const version = requireOk(
-    await exec(deps, t, [
-      "dpkg-query",
-      "-W",
-      "-f=${Version}",
-      "apt-cacher-ng",
-    ]),
-    "dpkg-query apt-cacher-ng",
-  ).stdout.trim();
-  // Preserve the ownership map from a prior apply: install only adds the
-  // package, and dropping the map would leave remove_server unable to clean up.
-  const prior = await context.readResource(serverName(t)) as
-    | ServerState
-    | null;
-  const handle = await context.writeResource(
-    "server",
-    serverName(t),
-    ServerStateSchema.parse({
-      target: targetKey(t),
-      host: t.host,
-      installed: true,
-      version,
-      managed_files: prior?.managed_files,
-      observed_at: iso(deps.now()),
-    }),
-  );
-  return { dataHandles: [handle], result: { host: t.host, version } };
 }
 
 /** Render the managed fragment and backend files with their digests. */

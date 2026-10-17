@@ -240,6 +240,8 @@ export async function unconfigureClient(
       await exec(deps, t, ["rm", "-f", "--", DETECT_PATH]),
       "rm auto-detect script",
     );
+    // Leave no empty script directory behind; a non-empty one is not ours.
+    await exec(deps, t, ["rmdir", "--", DETECT_DIR]);
     if ((await readRemoteFile(deps, t, CLIENT_SNIPPET_PATH)) !== null) {
       throw new AptCacheError(
         "verify_failed",

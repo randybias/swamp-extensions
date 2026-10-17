@@ -304,3 +304,21 @@ uploads.
   paths, unconfigure_client with a failing rm, log_corrupt code; the ownership
   tests moved to `server_ownership_test.ts`; test_support dedupes agent replies,
   upload bytes and response normalisation.
+
+## Round 6 (live: fresh Cherry Ubuntu 24.04)
+
+- HIGH: install failed with "Unable to locate package" on the stock image (no
+  package lists). `install_server` runs a bounded `apt-get update` first (300 s,
+  30 s per fetch); its error is surfaced.
+- HIGH: the package starts apt-cacher-ng on 0.0.0.0 and [::] straight after
+  install, an open proxy on the public address until apply_server. The
+  loopback-only bootstrap fragment (`BindAddress: 127.0.0.1`, sorted after
+  acng.conf) is written BEFORE the package is installed and recorded as the
+  model's own, so apply_server replaces it and remove deletes it. After install
+  `ss` must show no wildcard listener on 3142, else the daemon is stopped and
+  the install fails with `open_listener`. Checked in a fresh ubuntu:24.04 with
+  stale lists, running the model's argv: the listeners ever seen during install
+  and first start were 127.0.0.1:3142 only; the same flow without the fragment
+  showed 0.0.0.0:3142 and [::]:3142. (A policy-rc.d deny was not used: it would
+  leave an enabled service that starts open on the next boot.)
+- LOW: unconfigure_client removes the script directory when empty.

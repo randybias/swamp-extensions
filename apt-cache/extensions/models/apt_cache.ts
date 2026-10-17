@@ -35,12 +35,12 @@ import {
 import {
   applyServer,
   getServer,
-  installServer,
   removeServer,
   renderServer,
   statsServer,
   syncServer,
 } from "./_lib/server_methods.ts";
+import { installServer } from "./_lib/server_install.ts";
 import {
   clientGet,
   configureClient,

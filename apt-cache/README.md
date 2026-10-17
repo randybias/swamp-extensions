@@ -20,18 +20,18 @@ written by `install_server` and `apply_server`; client records by
 `configure_client`; every read-only method writes an observation resource,
 because swamp does not persist a method's `result`.
 
-| Method               | Kind      | Description                                                                                                 |
-| -------------------- | --------- | ----------------------------------------------------------------------------------------------------------- |
-| `install_server`     | action    | Install apt-cacher-ng non-interactively, or adopt it when already installed, and read its version           |
-| `render_server`      | read-only | Render the managed fragment and backend files for the given inputs without touching a host                  |
-| `apply_server`       | action    | Write the fragment, backends and optional admin auth, restart, and verify the service and its listen socket |
-| `remove_server`      | action    | **DESTRUCTIVE.** Stop, disable and purge apt-cacher-ng and remove the managed files; cache only with an ack |
-| `get`                | read-only | Read service state, listen sockets, config digest, cache size and filesystem free space                     |
-| `sync`               | read-only | Re-render and compare with the live fragment; flag an edited file or a widened `PassThroughPattern`         |
-| `stats`              | read-only | Read the request log for hit/miss counts and bytes over a window, plus cache size and free space            |
-| `configure_client`   | action    | Write the managed apt snippet (and optional auto-detect script) on a client and verify it                   |
-| `client_get`         | read-only | Report the effective `Acquire::*::Proxy` values, whether the managed snippet is in force, and conflicts     |
-| `unconfigure_client` | action    | Remove the managed snippet and auto-detect script and verify apt no longer uses the managed proxy           |
+| Method               | Kind      | Description                                                                                                            |
+| -------------------- | --------- | ---------------------------------------------------------------------------------------------------------------------- |
+| `install_server`     | action    | Refresh the package lists, install apt-cacher-ng non-interactively on loopback only, or adopt it, and read its version |
+| `render_server`      | read-only | Render the managed fragment and backend files for the given inputs without touching a host                             |
+| `apply_server`       | action    | Write the fragment, backends and optional admin auth, restart, and verify the service and its listen socket            |
+| `remove_server`      | action    | **DESTRUCTIVE.** Stop, disable and purge apt-cacher-ng and remove the managed files; cache only with an ack            |
+| `get`                | read-only | Read service state, listen sockets, config digest, cache size and filesystem free space                                |
+| `sync`               | read-only | Re-render and compare with the live fragment; flag an edited file or a widened `PassThroughPattern`                    |
+| `stats`              | read-only | Read the request log for hit/miss counts and bytes over a window, plus cache size and free space                       |
+| `configure_client`   | action    | Write the managed apt snippet (and optional auto-detect script) on a client and verify it                              |
+| `client_get`         | read-only | Report the effective `Acquire::*::Proxy` values, whether the managed snippet is in force, and conflicts                |
+| `unconfigure_client` | action    | Remove the managed snippet and auto-detect script and verify apt no longer uses the managed proxy                      |
 
 ## The HTTPS policy is required and has no default
 

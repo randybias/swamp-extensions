@@ -341,6 +341,13 @@ Deno.test("unconfigure_client removes once then no-ops", async () => {
   );
   assertEquals(out.result.removed, true);
   assertEquals(box.files.has("/etc/apt/apt.conf.d/90apt-cache-proxy"), false);
+  // The now-empty script directory goes too (rmdir refuses a non-empty one).
+  assertEquals(
+    box.fake.commands.some((cmd) =>
+      cmd.includes("'rmdir'") && cmd.includes("/usr/local/lib/apt-cache")
+    ),
+    true,
+  );
 
   const empty = boxFake();
   useFake(empty.fake);

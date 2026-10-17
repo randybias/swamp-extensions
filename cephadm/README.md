@@ -19,6 +19,42 @@ and stored state is keyed by host.
 | `cephVerifyPackageSource` | Check that each apt mirror and the cephadm URL resolve and answer       |
 | `wipeDiskToRaw`           | Tear down LVM, md-RAID, filesystem and partition state on named disks   |
 
+## Workflows
+
+The catalog runs against a model definition named `cephadm`. Every mutating
+workflow asks for approval, then proves its effect with an independent read-back
+and reports a failure without remediating. Every workflow requires an explicit
+`port` and a `strictHostKeyChecking` of `yes` or `no`.
+
+| Workflow                        | Description                                                              |
+| ------------------------------- | ------------------------------------------------------------------------ |
+| `cephadm-prep-host`             | Install packages, pinned cephadm and time sync on one host               |
+| `cephadm-wipe-disks`            | Wipe one host's named data disks to raw, with a dry-run mode             |
+| `cephadm-bootstrap-cluster`     | Bootstrap a new cluster on one host and prove the first mon is in quorum |
+| `cephadm-distribute-key`        | Install the cluster public key on hosts and prove cephadm can reach them |
+| `cephadm-add-host`              | Register one host with the orchestrator and read the host list back      |
+| `cephadm-apply-mon`             | Converge mons to an explicit host list and wait for quorum to settle     |
+| `cephadm-apply-mgr`             | Converge mgr daemons to an explicit host list after a placement check    |
+| `cephadm-apply-osds`            | Apply OSDs on named disks or all available ones, then prove the counts   |
+| `cephadm-create-pool`           | Create or converge a replicated or erasure-coded pool and verify it      |
+| `cephadm-create-fs`             | Create or adopt a CephFS volume with MDS daemons on named hosts          |
+| `cephadm-apply-mds`             | Place a filesystem's MDS daemons on an explicit list of hosts            |
+| `cephadm-create-csi-user`       | Create or converge a client entity's caps and prove that it exists       |
+| `cephadm-get-conn-bundle`       | Capture the cluster's non-secret client connection facts                 |
+| `cephadm-fetch-csi-key`         | Read one client entity's key into a vaulted record                       |
+| `cephadm-delete-fs`             | Delete one CephFS volume and its pools after a typed confirmation        |
+| `cephadm-remove-osds`           | Remove OSDs by id after a health gate and prove the remaining counts     |
+| `cephadm-inventory-rgw-buckets` | List RGW buckets with per-bucket stats and flag any that cannot be read  |
+| `cephadm-verify-health`         | Check cluster health against an allowlist of warning checks              |
+| `cephadm-verify-host-prep`      | Check one host's packages, cephadm version and time-sync service         |
+| `cephadm-verify-mgr`            | Check that the mgr count matches and one mgr is active                   |
+| `cephadm-verify-mon-quorum`     | Check that the mon count matches and every mon is in quorum              |
+| `cephadm-verify-osds`           | Check OSD up and in counts and the CRUSH failure domain                  |
+
+Read-only workflows halt on a failed verdict; mutating ones write evidence and
+never roll back. `cephadm-fetch-csi-key` vaults the key it reads and no workflow
+reads that field.
+
 ## Dependencies
 
 - A control machine with the OpenSSH client (`ssh`).

@@ -1,0 +1,191 @@
+id: 29cb4eb8-610f-4e90-96cc-232c8e3052a2
+name: "@randybias/cephadm-remove-osds"
+description: Remove OSDs by id after a health gate and prove the remaining counts
+version: 1
+inputs:
+  properties:
+    host:
+      type: string
+      description: Admin host where ceph runs
+    port:
+      type: integer
+      description: SSH port on the admin host
+    sshUser:
+      type: string
+      description: SSH login user on the admin host
+    keyPath:
+      type: string
+      default: ""
+      description: Absolute local path to a private key; empty uses the runner default
+    strictHostKeyChecking:
+      type: string
+      enum: ["yes", "no"]
+      description: Host-key policy, yes strict or no explicitly insecure
+    osdIds:
+      type: array
+      items:
+        type: integer
+      description: OSD ids to remove
+    zap:
+      type: boolean
+      description: Zap the OSD disks as part of removal
+    expectedUp:
+      type: integer
+      description: Expected OSD up count after removal
+    expectedIn:
+      type: integer
+      description: Expected OSD in count after removal
+    expectedFailureDomain:
+      type: string
+      description: Expected CRUSH failure domain, such as host
+    allowedWarnings:
+      type: array
+      items:
+        type: string
+      description: Health check names tolerated; empty means only HEALTH_OK passes
+    osdSettleMs:
+      type: integer
+      default: 1800000
+      description: Settle budget in milliseconds for the OSD read-back
+    osdPollIntervalMs:
+      type: integer
+      default: 15000
+      description: Backoff ceiling in milliseconds between OSD polls
+  required:
+    - host
+    - port
+    - sshUser
+    - strictHostKeyChecking
+    - osdIds
+    - zap
+    - expectedUp
+    - expectedIn
+    - expectedFailureDomain
+    - allowedWarnings
+jobs:
+  - name: remove
+    description: Gate on cluster health, approve, then remove the OSDs
+    steps:
+      - name: gate-health
+        description: Read cluster health against the warning allowlist
+        task:
+          type: model_method
+          modelIdOrName: cephadm
+          methodName: cephVerifyHealth
+          inputs:
+            host: ${{ inputs.host }}
+            port: ${{ inputs.port }}
+            sshUser: ${{ inputs.sshUser }}
+            keyPath: '${{ inputs.keyPath == "" ? dyn(null) : dyn(inputs.keyPath) }}'
+            strictHostKeyChecking: ${{ inputs.strictHostKeyChecking }}
+            wantOk: true
+            allowedWarnings: ${{ inputs.allowedWarnings }}
+            throwOnFail: false
+      - name: assert-health
+        description: Assert cluster health is acceptable before removing OSDs
+        dependsOn:
+          - step: gate-health
+            condition:
+              type: succeeded
+        task:
+          type: assert
+          expr: >-
+            data.latest("cephadm", "cephVerifyHealth-" + inputs.host).attributes.pass == true
+          message: >-
+            Expected HEALTH_OK or only allowlisted warnings, observed
+            detail=${{ data.latest("cephadm", "cephVerifyHealth-" + inputs.host).attributes.detail }}
+          severity: high
+      - name: approve
+        description: Approve removing the listed OSD ids
+        dependsOn:
+          - step: assert-health
+            condition:
+              type: succeeded
+        task:
+          type: manual_approval
+          prompt: >-
+            Remove OSDs ${{ inputs.osdIds }} with zap=${{ inputs.zap }} on
+            ${{ inputs.host }}. The pre-check record is
+            cephVerifyHealth-${{ inputs.host }}. Removal cannot be undone.
+          timeout: 3600
+      - name: remove-osds
+        description: Drain, remove and optionally zap the OSDs via the orchestrator
+        dependsOn:
+          - step: approve
+            condition:
+              type: succeeded
+        task:
+          type: model_method
+          modelIdOrName: cephadm
+          methodName: cephRemoveOsds
+          inputs:
+            host: ${{ inputs.host }}
+            port: ${{ inputs.port }}
+            sshUser: ${{ inputs.sshUser }}
+            keyPath: '${{ inputs.keyPath == "" ? dyn(null) : dyn(inputs.keyPath) }}'
+            strictHostKeyChecking: ${{ inputs.strictHostKeyChecking }}
+            osdIds: ${{ inputs.osdIds }}
+            zap: ${{ inputs.zap }}
+  - name: prove
+    description: Wait for the OSD counts to settle and assert the remainder
+    dependsOn:
+      - job: remove
+        condition:
+          type: succeeded
+    steps:
+      - name: verify-osds
+        description: Wait for the remaining OSD up and in counts via ceph
+        task:
+          type: model_method
+          modelIdOrName: cephadm
+          methodName: cephVerifyOsd
+          inputs:
+            host: ${{ inputs.host }}
+            port: ${{ inputs.port }}
+            sshUser: ${{ inputs.sshUser }}
+            keyPath: '${{ inputs.keyPath == "" ? dyn(null) : dyn(inputs.keyPath) }}'
+            strictHostKeyChecking: ${{ inputs.strictHostKeyChecking }}
+            expectedUp: ${{ inputs.expectedUp }}
+            expectedIn: ${{ inputs.expectedIn }}
+            expectedFailureDomain: ${{ inputs.expectedFailureDomain }}
+            osdSettleMs: ${{ inputs.osdSettleMs }}
+            osdPollIntervalMs: ${{ inputs.osdPollIntervalMs }}
+            throwOnFail: false
+      - name: assert-osds
+        description: Assert the remaining OSD counts and failure domain
+        dependsOn:
+          - step: verify-osds
+            condition:
+              type: succeeded
+        task:
+          type: assert
+          expr: >-
+            data.latest("cephadm", "cephVerifyOsd-" + inputs.host).attributes.pass == true
+          message: >-
+            Expected up=${{ inputs.expectedUp }} in=${{ inputs.expectedIn }}
+            failureDomain=${{ inputs.expectedFailureDomain }} after removal,
+            observed pass=${{ data.latest("cephadm", "cephVerifyOsd-" + inputs.host).attributes.pass }}
+          severity: high
+  - name: report-failure
+    description: Report that nothing was rolled back or retried
+    dependsOn:
+      - job: prove
+        condition:
+          type: or
+          conditions:
+            - type: failed
+            - type: skipped
+    steps:
+      - name: report-failure
+        description: State that the run changed nothing and was not remediated
+        allowFailure: true
+        task:
+          type: assert
+          expr: "true"
+          message: >-
+            Nothing was rolled back, retried or remediated. A run that stopped
+            at the pre-gate or approval changed nothing. Any host in maintenance
+            is still in maintenance. Read the failing method's error from the
+            method-summary report before re-running. A destructive workflow must
+            not be re-run as a debugging instrument.
+          severity: low

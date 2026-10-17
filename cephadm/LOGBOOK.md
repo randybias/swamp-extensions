@@ -242,3 +242,34 @@ a secret. Fixtures are synthetic only (RFC 5737 addresses, `.test` names).
 - The SQLite `pvs`/`mdadm` discovery, the atomic mdadm.conf rewrite and the
   boot-protection gate are unit-tested with scripted sessions; the live twin
   checks in the spec's [twin] items still apply.
+
+- 2026-10-17: group 08 workflow catalog complete: all 22 workflows from
+  `docs/specs/cephadm/08-workflows.md` §2 under
+  `extensions/workflows/<name>/workflow.yaml`, listed in the manifest, and a
+  `extensions/workflows/catalog_test.ts` covering §1.8 (D60 manifest-vs-disk,
+  naming, 40-90 char descriptions, `cephadm`/`cephadm-*` instances, D57 port and
+  host-key enum, the mutating gate shape, no `data.latest` in approval prompts,
+  and every `cephVerify*` read-back passing `throwOnFail: false`). Every
+  workflow validates with `swamp workflow validate`.
+- Real gaps found while authoring, where the method spec wins over 08:
+  - `cephadm-apply-mds` adds an `expectedDataPoolSize` input: §2.11 omits it,
+    but `cephVerifyPool` requires `expectedSize`. The MDS sub-check uses
+    expectedActive 1 and expectedStandby 0 (the spec gives no counts).
+  - `cephadm-add-host` proves hostname presence only: the
+    `cephHostMaintenanceState` record's `hosts[]` carries hostname, status,
+    nooutFlag and out, but no address, so §2.5's address comparison cannot be
+    made from that record.
+  - `cephadm-distribute-key` re-reads with the single `port` input because
+    `cephVerifyKeyDistributed` takes one port while the distribution uses
+    per-host ports; its multi-host record key is the sorted `host:port` list, so
+    the input documents that `hosts[]` must already be sorted (08 Unresolved 4).
+  - `cephadm-apply-osds` does not expose `crushRuleName`: `cephApplyOsd` has no
+    such argument (only `cephVerifyOsd` does, and the spec's prove call does not
+    pass it).
+  - No workflow depends on d4's four S3-plane methods. The only RGW workflow,
+    `cephadm-inventory-rgw-buckets`, uses the already-present
+    `cephRgwBucketInventory`; the ensure/policy/versioning methods have no
+    workflow by §2.23.
+  - `cephHostMaintenanceState`, `cephCephadmCheckHost` and `cephGetConnBundle`
+    are plain reads with no `throwOnFail`; the gate-shape test requires it only
+    on `cephVerify*` calls.

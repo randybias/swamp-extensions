@@ -1,0 +1,127 @@
+id: 2be833ce-0314-4aed-846b-5a04e0fbb804
+name: "@randybias/cephadm-add-host"
+description: Register one host with the orchestrator and read the host list back
+version: 1
+inputs:
+  properties:
+    adminHost:
+      type: string
+      description: Admin host where ceph runs
+    port:
+      type: integer
+      description: SSH port on the admin host
+    sshUser:
+      type: string
+      description: SSH login user on the admin host
+    keyPath:
+      type: string
+      default: ""
+      description: Absolute local path to a private key; empty uses the runner default
+    strictHostKeyChecking:
+      type: string
+      enum: ["yes", "no"]
+      description: Host-key policy, yes strict or no explicitly insecure
+    fsid:
+      type: string
+      description: Expected cluster fsid, an RFC 4122 UUID
+    host:
+      type: string
+      description: Hostname cephadm will register
+    addr:
+      type: string
+      description: IPv4 address cephadm will use for the host
+  required:
+    - adminHost
+    - port
+    - sshUser
+    - strictHostKeyChecking
+    - fsid
+    - host
+    - addr
+jobs:
+  - name: add
+    description: Approve and register the host with the orchestrator
+    steps:
+      - name: approve
+        description: Approve registering the named host at the named address
+        task:
+          type: manual_approval
+          prompt: >-
+            Register ${{ inputs.host }} at ${{ inputs.addr }} on fsid
+            ${{ inputs.fsid }} through ${{ inputs.adminHost }}. This changes
+            orchestrator host state.
+          timeout: 3600
+      - name: host-add
+        description: Register the host and read the orchestrator host list
+        dependsOn:
+          - step: approve
+            condition:
+              type: succeeded
+        task:
+          type: model_method
+          modelIdOrName: cephadm
+          methodName: cephHostAdd
+          inputs:
+            adminHost: ${{ inputs.adminHost }}
+            port: ${{ inputs.port }}
+            sshUser: ${{ inputs.sshUser }}
+            keyPath: '${{ inputs.keyPath == "" ? dyn(null) : dyn(inputs.keyPath) }}'
+            strictHostKeyChecking: ${{ inputs.strictHostKeyChecking }}
+            fsid: ${{ inputs.fsid }}
+            host: ${{ inputs.host }}
+            addr: ${{ inputs.addr }}
+  - name: prove
+    description: Read the host list back and assert the host is present
+    dependsOn:
+      - job: add
+        condition:
+          type: succeeded
+    steps:
+      - name: read-maintenance-state
+        description: Read orchestrator host state single-shot via ceph
+        task:
+          type: model_method
+          modelIdOrName: cephadm
+          methodName: cephHostMaintenanceState
+          inputs:
+            host: ${{ inputs.adminHost }}
+            port: ${{ inputs.port }}
+            sshUser: ${{ inputs.sshUser }}
+            keyPath: '${{ inputs.keyPath == "" ? dyn(null) : dyn(inputs.keyPath) }}'
+            strictHostKeyChecking: ${{ inputs.strictHostKeyChecking }}
+      - name: assert-host-present
+        description: Assert the host list contains the registered hostname
+        dependsOn:
+          - step: read-maintenance-state
+            condition:
+              type: succeeded
+        task:
+          type: assert
+          expr: >-
+            data.latest("cephadm", "cephHostMaintenanceState-" + inputs.adminHost).attributes.hosts.exists(h, h.hostname == inputs.host)
+          message: >-
+            Expected host ${{ inputs.host }} in the orchestrator host list,
+            observed hosts=${{ data.latest("cephadm", "cephHostMaintenanceState-" + inputs.adminHost).attributes.hosts }}
+          severity: high
+  - name: report-failure
+    description: Report that nothing was rolled back or retried
+    dependsOn:
+      - job: prove
+        condition:
+          type: or
+          conditions:
+            - type: failed
+            - type: skipped
+    steps:
+      - name: report-failure
+        description: State that the run changed nothing and was not remediated
+        allowFailure: true
+        task:
+          type: assert
+          expr: "true"
+          message: >-
+            Nothing was rolled back, retried or remediated. A run that stopped
+            at approval changed nothing. Any host in maintenance is still in
+            maintenance. Read the failing method's error from the
+            method-summary report before re-running.
+          severity: low

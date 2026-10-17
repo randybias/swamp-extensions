@@ -1,0 +1,168 @@
+id: ad0b99fb-073f-4e09-aac2-51282e1ac092
+name: "@randybias/cephadm-create-pool"
+description: Create or converge a replicated or erasure-coded pool and verify it
+version: 1
+inputs:
+  properties:
+    host:
+      type: string
+      description: Admin host where ceph runs
+    port:
+      type: integer
+      description: SSH port on the admin host
+    sshUser:
+      type: string
+      description: SSH login user on the admin host
+    keyPath:
+      type: string
+      default: ""
+      description: Absolute local path to a private key; empty uses the runner default
+    strictHostKeyChecking:
+      type: string
+      enum: ["yes", "no"]
+      description: Host-key policy, yes strict or no explicitly insecure
+    name:
+      type: string
+      description: Pool name
+    scheme:
+      type: string
+      enum: ["replicated", "erasure"]
+      description: Redundancy scheme
+    application:
+      type: string
+      description: Application tag, such as rbd or cephfs
+    failureDomain:
+      type: string
+      description: CRUSH failure domain, such as host
+    size:
+      type: integer
+      description: Replica count, replicated scheme only
+    erasureProfile:
+      type: object
+      properties:
+        k:
+          type: integer
+        m:
+          type: integer
+      required: ["k", "m"]
+      description: EC data and coding chunks, erasure scheme only
+  required:
+    - host
+    - port
+    - sshUser
+    - strictHostKeyChecking
+    - name
+    - scheme
+    - application
+    - failureDomain
+jobs:
+  - name: create
+    description: Check the scheme inputs, approve, then create the pool
+    steps:
+      - name: assert-scheme-inputs
+        description: Assert the scheme and its one matching size input
+        task:
+          type: assert
+          expr: >-
+            inputs.scheme == "replicated"
+              ? (has(inputs.size) && !has(inputs.erasureProfile))
+              : (has(inputs.erasureProfile) && !has(inputs.size))
+          message: >-
+            Expected replicated to carry size and no erasureProfile, or erasure
+            to carry erasureProfile and no size. Observed scheme=${{ inputs.scheme }}
+            size=${{ inputs.size }} erasureProfile=${{ inputs.erasureProfile }}
+          severity: high
+      - name: approve
+        description: Approve creating or converging the named pool
+        dependsOn:
+          - step: assert-scheme-inputs
+            condition:
+              type: succeeded
+        task:
+          type: manual_approval
+          prompt: >-
+            Create or converge pool ${{ inputs.name }} with scheme
+            ${{ inputs.scheme }}, size ${{ inputs.size }} or profile
+            ${{ inputs.erasureProfile }} on ${{ inputs.host }}. This changes
+            cluster data placement.
+          timeout: 3600
+      - name: create-pool
+        description: Create or converge the pool through ceph
+        dependsOn:
+          - step: approve
+            condition:
+              type: succeeded
+        task:
+          type: model_method
+          modelIdOrName: cephadm
+          methodName: cephCreatePool
+          inputs:
+            host: ${{ inputs.host }}
+            port: ${{ inputs.port }}
+            sshUser: ${{ inputs.sshUser }}
+            keyPath: '${{ inputs.keyPath == "" ? dyn(null) : dyn(inputs.keyPath) }}'
+            strictHostKeyChecking: ${{ inputs.strictHostKeyChecking }}
+            name: ${{ inputs.name }}
+            scheme: ${{ inputs.scheme }}
+            size: "${{ has(inputs.size) ? dyn(inputs.size) : dyn(null) }}"
+            erasureProfile: "${{ has(inputs.erasureProfile) ? dyn(inputs.erasureProfile) : dyn(null) }}"
+            application: ${{ inputs.application }}
+            failureDomain: ${{ inputs.failureDomain }}
+  - name: prove
+    description: Read the pool back and assert its shape
+    dependsOn:
+      - job: create
+        condition:
+          type: succeeded
+    steps:
+      - name: verify-pool
+        description: Read the pool size, PGs and EC shape via ceph, single-shot
+        task:
+          type: model_method
+          modelIdOrName: cephadm
+          methodName: cephVerifyPool
+          inputs:
+            host: ${{ inputs.host }}
+            port: ${{ inputs.port }}
+            sshUser: ${{ inputs.sshUser }}
+            keyPath: '${{ inputs.keyPath == "" ? dyn(null) : dyn(inputs.keyPath) }}'
+            strictHostKeyChecking: ${{ inputs.strictHostKeyChecking }}
+            poolName: ${{ inputs.name }}
+            expectedSize: '${{ inputs.scheme == "replicated" ? inputs.size : inputs.erasureProfile.k + inputs.erasureProfile.m }}'
+            throwOnFail: false
+      - name: assert-pool
+        description: Assert the pool shape matches the request
+        dependsOn:
+          - step: verify-pool
+            condition:
+              type: succeeded
+        task:
+          type: assert
+          expr: >-
+            data.latest("cephadm", "cephVerifyPool-" + inputs.host + "-" + inputs.name).attributes.pass == true
+          message: >-
+            Expected pool ${{ inputs.name }} to match scheme ${{ inputs.scheme }},
+            observed pass=${{ data.latest("cephadm", "cephVerifyPool-" + inputs.host + "-" + inputs.name).attributes.pass }}
+          severity: high
+  - name: report-failure
+    description: Report that nothing was rolled back or retried
+    dependsOn:
+      - job: prove
+        condition:
+          type: or
+          conditions:
+            - type: failed
+            - type: skipped
+    steps:
+      - name: report-failure
+        description: State that the run changed nothing and was not remediated
+        allowFailure: true
+        task:
+          type: assert
+          expr: "true"
+          message: >-
+            Nothing was rolled back, retried or remediated. A run that stopped
+            at the pre-gate or approval changed nothing. Any host in maintenance
+            is still in maintenance. Read the failing method's error from the
+            method-summary report before re-running.
+          severity: low

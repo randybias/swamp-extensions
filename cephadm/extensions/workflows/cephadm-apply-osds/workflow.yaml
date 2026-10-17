@@ -1,0 +1,242 @@
+id: caa80663-efdc-49fd-8330-7bd850fc0589
+name: "@randybias/cephadm-apply-osds"
+description: Apply OSDs on named disks or all available ones, then prove the counts
+version: 1
+inputs:
+  properties:
+    adminHost:
+      type: string
+      description: Admin host where ceph orch runs
+    port:
+      type: integer
+      description: SSH port on the admin host
+    sshUser:
+      type: string
+      description: SSH login user on the admin host
+    keyPath:
+      type: string
+      default: ""
+      description: Absolute local path to a private key; empty uses the runner default
+    strictHostKeyChecking:
+      type: string
+      enum: ["yes", "no"]
+      description: Host-key policy, yes strict or no explicitly insecure
+    expectedUpAfter:
+      type: integer
+      description: Expected OSD up count after the apply
+    expectedInAfter:
+      type: integer
+      description: Expected OSD in count after the apply
+    expectedFailureDomain:
+      type: string
+      description: Expected CRUSH failure domain, such as host
+    allAvailableDevices:
+      type: boolean
+      default: false
+      description: Claim every empty device fleet-wide; needs a non-empty exclude list
+    excludeDevices:
+      type: array
+      items:
+        type: object
+        properties:
+          serial:
+            type: string
+          reason:
+            type: string
+        required: ["serial"]
+      default: []
+      description: Serials that must never be claimed
+    targetHost:
+      type: string
+      default: ""
+      description: By-serial mode, the disk owner's registered name; empty means fleet-wide mode
+    targetAddr:
+      type: string
+      default: ""
+      description: How the control host reaches the target; empty defaults to targetHost
+    targetPort:
+      type: integer
+      description: SSH port for targetAddr; required whenever targetHost is set
+    dataDevices:
+      type: array
+      items:
+        type: object
+        properties:
+          serial:
+            type: string
+          sizeBytes:
+            type: integer
+          devHint:
+            type: string
+        required: ["serial"]
+      default: []
+      description: By-serial mode, disks to turn into OSDs
+    osdSettleMs:
+      type: integer
+      default: 1800000
+      description: Settle budget in milliseconds for the OSD read-back
+    osdPollIntervalMs:
+      type: integer
+      default: 15000
+      description: Backoff ceiling in milliseconds between OSD polls
+  required:
+    - adminHost
+    - port
+    - sshUser
+    - strictHostKeyChecking
+    - expectedUpAfter
+    - expectedInAfter
+    - expectedFailureDomain
+jobs:
+  - name: apply
+    description: Check the mode and claimability, approve, then apply the OSDs
+    steps:
+      - name: assert-mode
+        description: Assert exactly one OSD selection mode is fully specified
+        task:
+          type: assert
+          expr: >-
+            inputs.allAvailableDevices == true
+              ? (inputs.targetHost == "" && size(inputs.excludeDevices) > 0)
+              : (inputs.targetHost != "" && has(inputs.targetPort) && size(inputs.dataDevices) > 0)
+          message: >-
+            Expected one complete OSD mode: fleet-wide needs a non-empty
+            excludeDevices; by-serial needs targetHost, targetPort and
+            dataDevices. Observed allAvailableDevices=${{ inputs.allAvailableDevices }}
+            targetHost=${{ inputs.targetHost }} targetPort=${{ inputs.targetPort }}
+            dataDevices=${{ inputs.dataDevices }} excludeDevices=${{ inputs.excludeDevices }}
+          severity: high
+      - name: gate-osd-claimable
+        description: Judge the requested devices without claiming them
+        dependsOn:
+          - step: assert-mode
+            condition:
+              type: succeeded
+        task:
+          type: model_method
+          modelIdOrName: cephadm
+          methodName: cephVerifyOsdClaimable
+          inputs:
+            host: ${{ inputs.adminHost }}
+            port: ${{ inputs.port }}
+            sshUser: ${{ inputs.sshUser }}
+            keyPath: '${{ inputs.keyPath == "" ? dyn(null) : dyn(inputs.keyPath) }}'
+            strictHostKeyChecking: ${{ inputs.strictHostKeyChecking }}
+            allAvailableDevices: ${{ inputs.allAvailableDevices }}
+            excludeDevices: ${{ inputs.excludeDevices }}
+            targetHost: ${{ inputs.targetHost }}
+            dataDevices: ${{ inputs.dataDevices }}
+            throwOnFail: false
+      - name: assert-osd-claimable
+        description: Assert the selected devices are claimable
+        dependsOn:
+          - step: gate-osd-claimable
+            condition:
+              type: succeeded
+        task:
+          type: assert
+          expr: >-
+            data.latest("cephadm", "cephVerifyOsdClaimable-" + inputs.adminHost).attributes.pass == true
+          message: >-
+            Expected the OSD selection to be claimable, observed
+            reasons=${{ data.latest("cephadm", "cephVerifyOsdClaimable-" + inputs.adminHost).attributes.detail.reasons }}
+          severity: high
+      - name: approve
+        description: Approve applying OSDs in the selected mode
+        dependsOn:
+          - step: assert-osd-claimable
+            condition:
+              type: succeeded
+        task:
+          type: manual_approval
+          prompt: >-
+            Apply OSDs with allAvailableDevices=${{ inputs.allAvailableDevices }},
+            targetHost=${{ inputs.targetHost }}, targetPort=${{ inputs.targetPort }},
+            dataDevices=${{ inputs.dataDevices }} through
+            ${{ inputs.adminHost }}. The pre-check record is
+            cephVerifyOsdClaimable-${{ inputs.adminHost }}.
+          timeout: 3600
+      - name: apply-osds
+        description: Apply the OSD service through the orchestrator
+        dependsOn:
+          - step: approve
+            condition:
+              type: succeeded
+        task:
+          type: model_method
+          modelIdOrName: cephadm
+          methodName: cephApplyOsd
+          inputs:
+            adminHost: ${{ inputs.adminHost }}
+            port: ${{ inputs.port }}
+            sshUser: ${{ inputs.sshUser }}
+            keyPath: '${{ inputs.keyPath == "" ? dyn(null) : dyn(inputs.keyPath) }}'
+            strictHostKeyChecking: ${{ inputs.strictHostKeyChecking }}
+            allAvailableDevices: ${{ inputs.allAvailableDevices }}
+            excludeDevices: ${{ inputs.excludeDevices }}
+            targetHost: ${{ inputs.targetHost }}
+            targetAddr: '${{ inputs.targetAddr == "" ? dyn(inputs.targetHost) : dyn(inputs.targetAddr) }}'
+            targetPort: "${{ has(inputs.targetPort) ? dyn(inputs.targetPort) : dyn(null) }}"
+            dataDevices: ${{ inputs.dataDevices }}
+  - name: prove
+    description: Wait for the OSD counts to settle and assert them
+    dependsOn:
+      - job: apply
+        condition:
+          type: succeeded
+    steps:
+      - name: verify-osds
+        description: Wait for OSD up and in counts and the failure domain via ceph
+        task:
+          type: model_method
+          modelIdOrName: cephadm
+          methodName: cephVerifyOsd
+          inputs:
+            host: ${{ inputs.adminHost }}
+            port: ${{ inputs.port }}
+            sshUser: ${{ inputs.sshUser }}
+            keyPath: '${{ inputs.keyPath == "" ? dyn(null) : dyn(inputs.keyPath) }}'
+            strictHostKeyChecking: ${{ inputs.strictHostKeyChecking }}
+            expectedUp: ${{ inputs.expectedUpAfter }}
+            expectedIn: ${{ inputs.expectedInAfter }}
+            expectedFailureDomain: ${{ inputs.expectedFailureDomain }}
+            osdSettleMs: ${{ inputs.osdSettleMs }}
+            osdPollIntervalMs: ${{ inputs.osdPollIntervalMs }}
+            throwOnFail: false
+      - name: assert-osds
+        description: Assert the OSD counts and failure domain match
+        dependsOn:
+          - step: verify-osds
+            condition:
+              type: succeeded
+        task:
+          type: assert
+          expr: >-
+            data.latest("cephadm", "cephVerifyOsd-" + inputs.adminHost).attributes.pass == true
+          message: >-
+            Expected up=${{ inputs.expectedUpAfter }} in=${{ inputs.expectedInAfter }}
+            failureDomain=${{ inputs.expectedFailureDomain }}, observed
+            pass=${{ data.latest("cephadm", "cephVerifyOsd-" + inputs.adminHost).attributes.pass }}
+          severity: high
+  - name: report-failure
+    description: Report that nothing was rolled back or retried
+    dependsOn:
+      - job: prove
+        condition:
+          type: or
+          conditions:
+            - type: failed
+            - type: skipped
+    steps:
+      - name: report-failure
+        description: State that the run changed nothing and was not remediated
+        allowFailure: true
+        task:
+          type: assert
+          expr: "true"
+          message: >-
+            Nothing was rolled back, retried or remediated. A run that stopped
+            at the pre-gate or approval changed nothing. Any host in maintenance
+            is still in maintenance. Read the failing method's error from the
+            method-summary report before re-running.
+          severity: low

@@ -1,0 +1,59 @@
+id: c5ecb33e-44d3-4e5d-b1a9-3ba5f31aeb3c
+name: "@randybias/cephadm-verify-osds"
+description: Check OSD up and in counts and the CRUSH failure domain
+version: 1
+inputs:
+  properties:
+    host:
+      type: string
+      description: Admin host, hostname or IPv4
+    port:
+      type: integer
+      description: SSH port on the admin host
+    sshUser:
+      type: string
+      description: SSH login user on the admin host
+    keyPath:
+      type: string
+      default: ""
+      description: Absolute local path to a private key; empty uses the runner default
+    strictHostKeyChecking:
+      type: string
+      enum: ["yes", "no"]
+      description: Host-key policy, yes strict or no explicitly insecure
+    expectedUp:
+      type: integer
+      description: Expected OSD up count
+    expectedIn:
+      type: integer
+      description: Expected OSD in count
+    expectedFailureDomain:
+      type: string
+      description: Expected CRUSH failure domain, such as host
+  required:
+    - host
+    - port
+    - sshUser
+    - strictHostKeyChecking
+    - expectedUp
+    - expectedIn
+    - expectedFailureDomain
+jobs:
+  - name: verify
+    description: Read OSD counts and the failure domain, halting on failure
+    steps:
+      - name: verify-osds
+        description: Check OSD up and in counts and failure domain via ceph
+        task:
+          type: model_method
+          modelIdOrName: cephadm
+          methodName: cephVerifyOsd
+          inputs:
+            host: ${{ inputs.host }}
+            port: ${{ inputs.port }}
+            sshUser: ${{ inputs.sshUser }}
+            keyPath: '${{ inputs.keyPath == "" ? dyn(null) : dyn(inputs.keyPath) }}'
+            strictHostKeyChecking: ${{ inputs.strictHostKeyChecking }}
+            expectedUp: ${{ inputs.expectedUp }}
+            expectedIn: ${{ inputs.expectedIn }}
+            expectedFailureDomain: ${{ inputs.expectedFailureDomain }}

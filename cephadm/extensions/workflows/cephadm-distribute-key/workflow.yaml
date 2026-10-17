@@ -1,0 +1,179 @@
+id: 70eb27e6-f5ec-435d-a020-ba9f25796cfd
+name: "@randybias/cephadm-distribute-key"
+description: Install the cluster public key on hosts and prove cephadm can reach them
+version: 1
+inputs:
+  properties:
+    adminHost:
+      type: string
+      description: Admin host used for the per-host reachability checks
+    port:
+      type: integer
+      description: SSH port used for the admin host and the key read-back
+    sshUser:
+      type: string
+      description: SSH login user on every host
+    keyPath:
+      type: string
+      default: ""
+      description: Absolute local path to a private key; empty uses the runner default
+    strictHostKeyChecking:
+      type: string
+      enum: ["yes", "no"]
+      description: Host-key policy, yes strict or no explicitly insecure
+    cephPubKey:
+      type: string
+      description: Cluster public key line to install, keytype and blob only
+    hosts:
+      type: array
+      items:
+        type: object
+        properties:
+          host:
+            type: string
+          port:
+            type: integer
+        required: ["host", "port"]
+      description: Targets each with its own port, sorted by host:port ascending
+  required:
+    - adminHost
+    - port
+    - sshUser
+    - strictHostKeyChecking
+    - cephPubKey
+    - hosts
+jobs:
+  - name: distribute
+    description: Approve and append the cluster key on every listed host
+    steps:
+      - name: approve
+        description: Approve installing the cluster key on the listed hosts
+        task:
+          type: manual_approval
+          prompt: >-
+            Append the cluster public key to authorized_keys on
+            ${{ inputs.hosts }} using ${{ inputs.sshUser }}. This changes each
+            host's authorized_keys and a real run cannot be undone.
+          timeout: 3600
+      - name: distribute-key
+        description: Append the cluster public key on each host via SSH
+        dependsOn:
+          - step: approve
+            condition:
+              type: succeeded
+        task:
+          type: model_method
+          modelIdOrName: cephadm
+          methodName: cephDistributeKey
+          inputs:
+            sshUser: ${{ inputs.sshUser }}
+            keyPath: '${{ inputs.keyPath == "" ? dyn(null) : dyn(inputs.keyPath) }}'
+            strictHostKeyChecking: ${{ inputs.strictHostKeyChecking }}
+            cephPubKey: ${{ inputs.cephPubKey }}
+            hosts: ${{ inputs.hosts }}
+  - name: prove-key
+    description: Re-read authorized_keys on every host and assert the key is there
+    dependsOn:
+      - job: distribute
+        condition:
+          type: succeeded
+    steps:
+      - name: verify-key-distributed
+        description: Re-read authorized_keys per host via a fresh SSH connection
+        task:
+          type: model_method
+          modelIdOrName: cephadm
+          methodName: cephVerifyKeyDistributed
+          inputs:
+            port: ${{ inputs.port }}
+            sshUser: ${{ inputs.sshUser }}
+            keyPath: '${{ inputs.keyPath == "" ? dyn(null) : dyn(inputs.keyPath) }}'
+            strictHostKeyChecking: ${{ inputs.strictHostKeyChecking }}
+            hosts: ${{ inputs.hosts.map(h, h.host) }}
+            cephPubKey: ${{ inputs.cephPubKey }}
+            throwOnFail: false
+      - name: assert-key-distributed
+        description: Assert the key is present on every host
+        dependsOn:
+          - step: verify-key-distributed
+            condition:
+              type: succeeded
+        task:
+          type: assert
+          expr: >-
+            data.latest("cephadm",
+            "cephVerifyKeyDistributed-" +
+            inputs.hosts.map(h, h.host + ":" + string(h.port)).join(",")).attributes.pass == true
+          message: >-
+            Expected the cluster key to be present on every listed host;
+            observed pass=${{ data.latest("cephadm", "cephVerifyKeyDistributed-" + inputs.hosts.map(h, h.host + ":" + string(h.port)).join(",")).attributes.pass }},
+            missing=${{ data.latest("cephadm", "cephVerifyKeyDistributed-" + inputs.hosts.map(h, h.host + ":" + string(h.port)).join(",")).attributes.detail.missingHosts }},
+            absent=${{ data.latest("cephadm", "cephVerifyKeyDistributed-" + inputs.hosts.map(h, h.host + ":" + string(h.port)).join(",")).attributes.detail.absentOn }},
+            unreadable=${{ data.latest("cephadm", "cephVerifyKeyDistributed-" + inputs.hosts.map(h, h.host + ":" + string(h.port)).join(",")).attributes.detail.unreadableOn }}
+          severity: high
+  - name: check-hosts
+    description: Ask cephadm on the admin host to check each listed host
+    dependsOn:
+      - job: prove-key
+        condition:
+          type: succeeded
+    steps:
+      - name: check-host
+        description: Check cephadm reachability for one host on a per-item instance
+        forEach:
+          item: hostItem
+          in: ${{ inputs.hosts }}
+        task:
+          type: model_method
+          modelIdOrName: cephadm-checkhost-${{ self.hostItem.host }}
+          methodName: cephCephadmCheckHost
+          inputs:
+            host: ${{ inputs.adminHost }}
+            port: ${{ inputs.port }}
+            sshUser: ${{ inputs.sshUser }}
+            keyPath: '${{ inputs.keyPath == "" ? dyn(null) : dyn(inputs.keyPath) }}'
+            strictHostKeyChecking: ${{ inputs.strictHostKeyChecking }}
+            hostName: ${{ self.hostItem.host }}
+  - name: assert-hosts
+    description: Assert cephadm reachability from the per-item check records
+    dependsOn:
+      - job: check-hosts
+        condition:
+          type: succeeded
+    steps:
+      - name: assert-host-reachable
+        description: Assert one host's cephadm check from its per-item instance
+        forEach:
+          item: hostItem
+          in: ${{ inputs.hosts }}
+        task:
+          type: assert
+          expr: >-
+            data.latest("cephadm-checkhost-" + self.hostItem.host,
+            "cephCephadmCheckHost-" + inputs.adminHost + "-" + self.hostItem.host).attributes.ok == true
+          message: >-
+            Expected cephadm check-host to succeed for ${{ self.hostItem.host }},
+            observed detail=${{ data.latest("cephadm-checkhost-" + self.hostItem.host, "cephCephadmCheckHost-" + inputs.adminHost + "-" + self.hostItem.host).attributes.detail }}
+          severity: high
+  - name: report-failure
+    description: Report that nothing was rolled back or retried
+    dependsOn:
+      - job: assert-hosts
+        condition:
+          type: or
+          conditions:
+            - type: failed
+            - type: skipped
+    steps:
+      - name: report-failure
+        description: State that the run changed nothing and was not remediated
+        allowFailure: true
+        task:
+          type: assert
+          expr: "true"
+          message: >-
+            Nothing was rolled back, retried or remediated. A run that stopped
+            at approval changed nothing. Any host in maintenance is still in
+            maintenance. Read the failing method's error from the
+            method-summary report before re-running.
+          severity: low

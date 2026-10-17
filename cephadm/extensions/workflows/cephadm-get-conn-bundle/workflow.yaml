@@ -1,0 +1,44 @@
+id: a58154c3-a7f6-47ab-a507-05f5356f98f2
+name: "@randybias/cephadm-get-conn-bundle"
+description: Capture the cluster's non-secret client connection facts
+version: 1
+inputs:
+  properties:
+    host:
+      type: string
+      description: Admin host, hostname or IPv4
+    port:
+      type: integer
+      description: SSH port on the admin host
+    sshUser:
+      type: string
+      description: SSH login user on the admin host
+    keyPath:
+      type: string
+      default: ""
+      description: Absolute local path to a private key; empty uses the runner default
+    strictHostKeyChecking:
+      type: string
+      enum: ["yes", "no"]
+      description: Host-key policy, yes strict or no explicitly insecure
+  required:
+    - host
+    - port
+    - sshUser
+    - strictHostKeyChecking
+jobs:
+  - name: capture
+    description: Read fsid, mon endpoints, pools, filesystems and client names
+    steps:
+      - name: get-conn-bundle
+        description: Capture the non-secret connection bundle via ceph
+        task:
+          type: model_method
+          modelIdOrName: cephadm
+          methodName: cephGetConnBundle
+          inputs:
+            host: ${{ inputs.host }}
+            port: ${{ inputs.port }}
+            sshUser: ${{ inputs.sshUser }}
+            keyPath: '${{ inputs.keyPath == "" ? dyn(null) : dyn(inputs.keyPath) }}'
+            strictHostKeyChecking: ${{ inputs.strictHostKeyChecking }}

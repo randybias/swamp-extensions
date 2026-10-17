@@ -1,0 +1,133 @@
+id: 65906dbc-3d95-43d4-afb7-b320ed8c045b
+name: "@randybias/cephadm-create-fs"
+description: Create or adopt a CephFS volume with MDS daemons on named hosts
+version: 1
+inputs:
+  properties:
+    host:
+      type: string
+      description: Admin host where ceph runs
+    port:
+      type: integer
+      description: SSH port on the admin host
+    sshUser:
+      type: string
+      description: SSH login user on the admin host
+    keyPath:
+      type: string
+      default: ""
+      description: Absolute local path to a private key; empty uses the runner default
+    strictHostKeyChecking:
+      type: string
+      enum: ["yes", "no"]
+      description: Host-key policy, yes strict or no explicitly insecure
+    name:
+      type: string
+      description: CephFS volume name
+    placement:
+      type: array
+      items:
+        type: string
+      description: Hostnames that must run MDS daemons, unique
+    expectedDataPoolSize:
+      type: integer
+      description: Expected data pool replica count, read back afterwards
+  required:
+    - host
+    - port
+    - sshUser
+    - strictHostKeyChecking
+    - name
+    - placement
+    - expectedDataPoolSize
+jobs:
+  - name: create
+    description: Approve and create or adopt the CephFS volume
+    steps:
+      - name: approve
+        description: Approve creating the volume with MDS on the listed hosts
+        task:
+          type: manual_approval
+          prompt: >-
+            Create or adopt CephFS volume ${{ inputs.name }} with MDS on
+            ${{ inputs.placement }} through ${{ inputs.host }}. This creates
+            pools and daemons.
+          timeout: 3600
+      - name: create-fs
+        description: Create or adopt the volume and place its MDS via ceph
+        dependsOn:
+          - step: approve
+            condition:
+              type: succeeded
+        task:
+          type: model_method
+          modelIdOrName: cephadm
+          methodName: cephCreateFs
+          inputs:
+            host: ${{ inputs.host }}
+            port: ${{ inputs.port }}
+            sshUser: ${{ inputs.sshUser }}
+            keyPath: '${{ inputs.keyPath == "" ? dyn(null) : dyn(inputs.keyPath) }}'
+            strictHostKeyChecking: ${{ inputs.strictHostKeyChecking }}
+            name: ${{ inputs.name }}
+            placement: ${{ inputs.placement }}
+  - name: prove
+    description: Read the data pool and MDS state, then assert the volume
+    dependsOn:
+      - job: create
+        condition:
+          type: succeeded
+    steps:
+      - name: verify-pool
+        description: Check the data pool and an active MDS via ceph
+        task:
+          type: model_method
+          modelIdOrName: cephadm
+          methodName: cephVerifyPool
+          inputs:
+            host: ${{ inputs.host }}
+            port: ${{ inputs.port }}
+            sshUser: ${{ inputs.sshUser }}
+            keyPath: '${{ inputs.keyPath == "" ? dyn(null) : dyn(inputs.keyPath) }}'
+            strictHostKeyChecking: ${{ inputs.strictHostKeyChecking }}
+            poolName: "cephfs.${{ inputs.name }}.data"
+            expectedSize: ${{ inputs.expectedDataPoolSize }}
+            mds: '${{ dyn({"fsName": inputs.name, "expectedActive": 1, "expectedStandby": 0}) }}'
+            throwOnFail: false
+      - name: assert-fs
+        description: Assert the volume data pool and active MDS
+        dependsOn:
+          - step: verify-pool
+            condition:
+              type: succeeded
+        task:
+          type: assert
+          expr: >-
+            data.latest("cephadm", "cephVerifyPool-" + inputs.host + "-cephfs." + inputs.name + ".data").attributes.pass == true
+          message: >-
+            Expected volume ${{ inputs.name }} to have an active MDS and size
+            ${{ inputs.expectedDataPoolSize }}, observed
+            pass=${{ data.latest("cephadm", "cephVerifyPool-" + inputs.host + "-cephfs." + inputs.name + ".data").attributes.pass }}
+          severity: high
+  - name: report-failure
+    description: Report that nothing was rolled back or retried
+    dependsOn:
+      - job: prove
+        condition:
+          type: or
+          conditions:
+            - type: failed
+            - type: skipped
+    steps:
+      - name: report-failure
+        description: State that the run changed nothing and was not remediated
+        allowFailure: true
+        task:
+          type: assert
+          expr: "true"
+          message: >-
+            Nothing was rolled back, retried or remediated. A run that stopped
+            at approval changed nothing. Any host in maintenance is still in
+            maintenance. Read the failing method's error from the
+            method-summary report before re-running.
+          severity: low

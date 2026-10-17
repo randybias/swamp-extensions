@@ -371,3 +371,123 @@ the triage checks, no Critical/High. `_lib/ssh.ts` is the canonical blob
   the redacted digest and that every smuggle form is refused. Legacy 17.2
   records (has_helm_values undefined) report config drift unknown rather than a
   false "config changed".
+
+## Prior art
+
+Swept at merge prep (2026.10.17.3) with `swamp extension search` on the stable
+and beta channels (k0s, kubernetes, k8s, cluster, k3s) and the first-party
+`@swamp/*` listing. The registry has no k0s package.
+
+- `@shelson/k3s@2026.09.28.1`: a different distribution. It runs
+  `curl -sfL https://get.k3s.io | sh -` with no SHA pin, uses
+  `StrictHostKeyChecking=accept-new`, and offers install, status, kubeconfig and
+  uninstall. No upgrade, role, HA config, manifest or Helm reconciliation.
+- `@rjeschmi/vm`: has a k3s install step inside a VM package; no k0s.
+- Talos/Omni packages (`@dataverket`, `@magistr`, `@mccormick`) cover Talos
+  only.
+- Other Kubernetes hits manage a cluster that already exists or a different kind
+  of cluster, not a k0s install on a host: `@swamp/kubernetes` and `@john/k8s`
+  (API objects), `@twonines/k8s-fleet`, `@bixu/k8s/exec`,
+  `@evrardjp/kind-cluster-pool` (kind), `@sntxrr/scaleway-kapsule` and
+  `@swamp/aws/eks` (managed services), `@rjeschmi/helm-chart`.
+
+Verdict: NONE (adjacent only), so there is nothing to adopt or file upstream.
+
+## 2026-10-17: live e2e (2026.10.17.3)
+
+Target: `<bm1>` (Cherry bare metal, Ubuntu 24.04, root, strict host-key pins,
+SSH key from vault), single node, pod 10.244.0.0/16, service 10.96.0.0/12. k0s
+v1.36.3+k0s.2 and v1.36.4+k0s.1 amd64, SHA-256 from the official
+`sha256sums.txt`. Heads: lane/d3-k0s-cluster-3 `8d63885` (first matrix, with the
+published 2026.10.17.2 as the baseline for cell 1 and the render comparison) and
+`a101b99` (re-check of the fail-closed drift fix and the vault-sourced host).
+Receipt = first 16 hex of sha256 of the console output with timestamps stripped.
+Addresses, node names and vault names are redacted.
+
+| Cell                                                             | Result | Detail                                                                                                    | Head      | Receipt          |
+| ---------------------------------------------------------------- | ------ | --------------------------------------------------------------------------------------------------------- | --------- | ---------------- |
+| 1 reset a v1.36.4 node with the published 17.2                   | PASS   | no unit, binary, /var/lib/k0s or /etc/k0s afterwards                                                      | 17.2      | -                |
+| 2a render_config byte-identical to 17.2 (same inputs)            | PASS   | equal content sha256                                                                                      | `8d63885` | ebdbcf1909f044c4 |
+| 2b install single v1.36.3+k0s.2                                  | PASS   | state config_sha256 equals the render digest                                                              | `8d63885` | 332069dda2fd74a3 |
+| 2c wait_ready                                                    | PASS   | ready after 71 s                                                                                          | `8d63885` | d9d9f857fcbebd9f |
+| 6 upgrade with a bad SHA-256                                     | PASS   | refused before any stop; service PID and version unchanged                                                | `8d63885` | d374b17a75790975 |
+| 8 reset while an upgrade holds the lock                          | PASS   | refused: /run/k0s-upgrade.lock exists                                                                     | `8d63885` | 36e56f5bea7a13a8 |
+| 4 upgrade again to the same version                              | PASS   | no-op, service PID unchanged                                                                              | `8d63885` | c922a5639d98de9f |
+| 5 downgrade v1.36.4 -> v1.36.3                                   | PASS   | refused, nothing stopped                                                                                  | `8d63885` | c596d2b43bd0cb51 |
+| 3 upgrade v1.36.3 -> v1.36.4 with the pinned SHA-256             | PASS   | new service PID, version v1.36.4+k0s.1                                                                    | `8d63885` | 84e031e7f3d6217a |
+| 3c previous binary kept as k0s.old during the swap               | PASS   | seen while the upgrade ran; removed after success (kept only for a rollback)                              | `8d63885` | 0ad0f9edf6c5728e |
+| 3b node Ready after the upgrade                                  | PASS   | Ready v1.36.4+k0s                                                                                         | `8d63885` | b24d6d33736ecd56 |
+| 7 two upgrades started together (separate definitions)           | PASS   | exactly one ran; the other was refused by the host lock                                                   | `8d63885` | 8f8a22b018a17386 |
+| reset (record said v1.36.3, host was v1.36.4)                    | PASS   | no unit, /var/lib/k0s gone                                                                                | `8d63885` | d7a757a71543618f |
+| 9 install controller_worker + no_taints                          | PASS   | ExecStart `controller --enable-worker=true --no-taints=true`; node Ready, no taints                       | `8d63885` | 6fc055d9b8373938 |
+| 10 reset                                                         | PASS   | no unit, binary, netif or process; /var/lib/k0s, /etc/k0s, /run/k0s gone                                  | `8d63885` | ac02a552442de127 |
+| R1 install single v1.36.3 with the host from vault.get           | PASS   | record keyed by the real host (not masked), has_helm_values=false; node Ready                             | `a101b99` | 522112610715a218 |
+| R2 sync, unedited k0s.yaml                                       | PASS   | drift clean: status config_sha256 equals the record                                                       | `a101b99` | c3684ff607a933aa |
+| R3 sync after a canonical on-host edit (telemetry false -> true) | PASS   | drift detected: a different, real hash                                                                    | `a101b99` | 0c1891c49c4b4570 |
+| R4a sync with a list-item authPass (`- authPass: x`)             | PASS   | drift unknown, config_sha256 null                                                                         | `a101b99` | fa8f1afd33a57360 |
+| R4b sync with a flow-map authPass (`{ authPass: x }`)            | PASS   | drift unknown, config_sha256 null                                                                         | `a101b99` | fa8f1afd33a57360 |
+| R4c sync with a quoted-key authPass (`"authPass": x`)            | PASS   | drift unknown, config_sha256 null                                                                         | `a101b99` | 0b97ee3145726aa1 |
+| R5 sync after restoring the file                                 | PASS   | drift clean again                                                                                         | `a101b99` | 9d094cb65bc7c8f9 |
+| R6 sync after apply_helm with chart values                       | PASS   | drift unknown, config_sha256 null (the on-host `values:` key makes the script refuse)                     | `a101b99` | 0b97ee3145726aa1 |
+| R7 upgrade v1.36.3 -> v1.36.4 with the host from vault.get       | PASS   | new service PID, version v1.36.4+k0s.1; record updated                                                    | `a101b99` | 43d3aa7dce75046a |
+| R8 reset with the host from vault.get (the lab 3585 case)        | PASS   | no "Secret ...~~\*\*\*~~... not found"; no unit, binary or process; /var/lib/k0s, /etc/k0s, /run/k0s gone | `a101b99` | 3a85b7a4da727db6 |
+| R9 reset again (host from vault.get)                             | PASS   | clean no-op ("No k0s service")                                                                            | `a101b99` | 5f8c58c1cae8a9bf |
+
+15 of 15 on `8d63885` and 11 of 11 on `a101b99`. Cells 7 and 8 were first run
+against one model definition; swamp serialises two runs of one definition behind
+its own datastore lock, so they were redone with separate definitions so that
+the host-side lock decides. Final: `<bm1>` is reset and the e2e vault entries
+are deleted.
+
+## 2026-10-17: merge prep and known residuals (2026.10.17.3)
+
+Review: a chain of triage rounds over the 17.3 lane ending with `109ad61` CLEAN,
+`9a11d94` routed (one High: the status config_sha256 could be a hash over secret
+bytes, through Helm values or a non-canonical authPass form), and `a101b99` (the
+fail-closed fix with a real-`sh` test), self-reviewed at merge prep against
+TRIAGE 4b-4h: no new context use, no parser differential (the script refuses any
+authPass line it cannot redact), no hash on argv (the digest is computed on the
+node and only the digest returns), no killable remote command, TOFU unchanged.
+No Critical/High. `_lib/ssh.ts` is the canonical blob `fe0139f0`. No code change
+at merge prep.
+
+Decisions:
+
+- **Upgrade is its own action.** It takes a pinned version and SHA-256, refuses
+  a downgrade and a Kubernetes minor skip, verifies the staged binary before
+  anything stops, takes a host lock (`/run/k0s-upgrade.lock`, also honoured by
+  reset), and on any failure puts the previous binary back and waits for health.
+  `k0s.old` exists only for that rollback.
+- **New inputs are off by default.** controller_worker, no_taints, the
+  controller join_token, etcd.peerAddress and the HA k0s.yaml inputs
+  (api.externalAddress, nodeLocalLoadBalancing, controlPlaneLoadBalancing) all
+  default off, so an unset render and install argv are byte-identical to
+  2026.10.17.2 (live cell 2a).
+- **No secret-derived hash is stored.** `config_file_sha256` (a hash of the real
+  k0s.yaml, which carries the plaintext keepalived authPass) is removed. Drift
+  uses a node-side, fail-closed hash with authPass redacted, and only for
+  records that prove there are no Helm values; anything it cannot prove safe is
+  "drift unknown", never a hash.
+- **The record is keyed by the real host.** A host supplied through `vault.get`
+  is not masked in the data name, so install, upgrade and reset work on it (live
+  R1, R7, R8).
+
+Residuals:
+
+- MEDIUM: config drift for an install with Helm values is always unknown. sync
+  hashes the on-host k0s.yaml only when the record says has_helm_values=false,
+  and the node script refuses a file with a `values:` key. apply_helm does not
+  update has_helm_values, so the script's refusal is what kept R6 unknown.
+- LOW: `k0s.old` is removed after a successful upgrade; it is kept only when a
+  rollback fails, so there is no manual roll-back copy afterwards.
+- MEDIUM (documented in the README): a 2026.10.17.2 record whose host came from
+  the vault stays unreadable (swamp-club lab 3585): the host was stored masked
+  and swamp cannot resolve the record. Recover by running `install` again to
+  adopt the host and write a fresh record.
+- MEDIUM (backlog above): the host-side binary download
+  (`binary_source:
+  host-download`) is not implemented; the binary is still
+  pushed from the control host over SSH, which is slow over a lossy link.
+- LOW: a canonical authPass line (CPLB set) was not exercised live; it is
+  covered by the real-`sh` unit test (canonical digest equals the redacted
+  render digest).

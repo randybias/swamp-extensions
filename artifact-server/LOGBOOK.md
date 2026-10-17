@@ -196,3 +196,44 @@ After the review rounds, one deliberate simplification pass:
   implementation byte for byte.
 - **Default served root** — `/srv/artifacts`, overridable per call and validated
   as an absolute path that is neither `/` nor contains `.`/`..` segments.
+
+## Live e2e 2026-10-17, 2026.10.17.1 (run sp-20261017)
+
+A throwaway Ubuntu 24.04 VPS (`<vps2>`), root `/srv/e2e-artifacts`, listening on
+the private address only (`<vps2-private>:8443`), provided TLS (a throwaway
+self-signed leaf) and basic auth, strict host-key pins, every secret a vault
+reference, a temporary nft guard on the public interface, and `ss`/`ps` samplers
+on the host throughout. Addresses and hostnames are redacted.
+
+Round 1, d8a643a: 12 of 12 cells passed (install with TLS and basic auth, small
+blob round trip, a 200 MB blob, host-side pinned fetch, publish_bundle and refs,
+verify detecting a flipped byte, plan_prune/prune with planted symlinks, `/etc`
+refused, a failed credential write rolled back, get/sync persisted, uninstall
+twice, an argv scan with 0 hits for the password or its hash). It found two
+Highs: `apt-get install nginx` brought the package default site up on
+`0.0.0.0:80` and `[::]:80` for about 60 s, and inline uploads crash swamp itself
+(out of memory) above about 150 MiB, far below the schema caps. Both are fixed
+in the live fixes above.
+
+| Round   | Cells | Result                                                                                                                                                                                                                                                                               |
+| ------- | ----- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| d8a643a | 12    | 12 pass, 2 Highs found (default-site wildcard listener during install; swamp OOM on large inline uploads)                                                                                                                                                                            |
+| 3cbf14d | 6     | 5 pass, 1 FAIL: no wildcard listener in 835 samples, but the systemd mask left nginx disabled, so it did not survive a reboot. Fixed in 7b9e4f1 (`systemctl enable` plus an `is-enabled` assertion)                                                                                  |
+| 7b9e4f1 | 5     | 5 pass: fresh install with no wildcard listener in 860 samples, enabled and active on the configured address only; a real reboot (nginx back, enabled, private address only, 128 MiB blob served); exactly 128 MiB as base64; second uninstall a no-op; `bundles/<hex>` link refused |
+
+Every round cleaned up to the baseline package list and listeners; the scratch
+vault keys and key copies were deleted afterwards.
+
+Residuals on 2026.10.17.1 (beta):
+
+- `bundles/` itself as a symlink is not refused: plan_prune and prune succeed
+  with an empty plan (`find` does not follow its starting symlink). Nothing
+  outside the root is touched.
+- `apt-get purge nginx` leaves the `multi-user.target.wants/nginx.service` link
+  that install's `systemctl enable` created, because the package does not track
+  it. Purging nginx is outside the model.
+- Inline uploads are capped at 128 MiB because swamp holds the payload in memory
+  before the method runs. Use the host-side pinned `fetch` for larger files.
+- The `config` resource keeps `removed_default_site` after uninstall, so if the
+  operator removes the default site after one uninstall, a later uninstall
+  restores it again.

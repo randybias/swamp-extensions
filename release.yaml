@@ -15,6 +15,7 @@ kea-dhcp:
 artifact-server:
   channel: beta
   ci: false
+  published: {}
 
 azure-vm:
   channel: beta

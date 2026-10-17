@@ -316,12 +316,21 @@ function resolveContent(
 }
 
 /**
- * The per-target suffix for stored data. Length-prefixed, labeled components
- * make it unambiguous: `h2-ab-p22-u3-x-y` and `h5-ab-22-p3-u2-y` differ, so two
- * different targets can never share a stored record (and a TOFU pin).
+ * The host+port key. Length-prefixed and labeled so it is unambiguous. This is
+ * the known_hosts identity: a host key belongs to a host and port, not to the
+ * user who happened to connect first, so every user on that host/port shares
+ * one pin.
+ */
+function hostPortKey(args: TargetArgs): string {
+  return `h${args.host.length}-${args.host}-p${args.port}`;
+}
+
+/**
+ * The per-target suffix for execution evidence (exec/upload): host, port and
+ * user, so two users on one host keep separate records.
  */
 function instanceSuffix(args: TargetArgs): string {
-  return `h${args.host.length}-${args.host}-p${args.port}-u${args.user.length}-${args.user}`;
+  return `${hostPortKey(args)}-u${args.user.length}-${args.user}`;
 }
 
 /** The keys recorded by an earlier `insecure_tofu` connection, if any. */
@@ -342,7 +351,7 @@ async function pinnedTarget(
   const target = toTarget(args);
   if (args.host_key_policy !== "insecure_tofu") return target;
   const stored = await context.readResource(
-    `connection-${instanceSuffix(args)}`,
+    `connection-${hostPortKey(args)}`,
   ) as RecordedKeys | null;
   const keys = stored?.host_keys ?? [];
   if (keys.length === 0) return target;
@@ -408,7 +417,7 @@ async function commitPin(
   if (!pending || pending.length === 0) return;
   await context.writeResource(
     "connection",
-    `connection-${instanceSuffix(args)}`,
+    `connection-${hostPortKey(args)}`,
     ConnectionSchema.parse({
       host: args.host,
       port: args.port,
@@ -585,7 +594,7 @@ export function createModel(deps: SshDeps = denoDeps): SshHostModel {
           });
           const handle = await context.writeResource(
             "connection",
-            `connection-${instanceSuffix(args)}`,
+            `connection-${hostPortKey(args)}`,
             ConnectionSchema.parse({
               host: args.host,
               port: args.port,

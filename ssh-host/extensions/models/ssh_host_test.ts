@@ -28,7 +28,8 @@ const KEY = "QUFBQUFB";
 const PRIVATE_KEY = "PLACEHOLDER-PRIVATE-KEY-MATERIAL";
 const KEY_LINE = `${HOST} ssh-ed25519 ${KEY}`;
 // Length-prefixed, labeled target key used for stored instance names.
-const SUFFIX = `h${HOST.length}-${HOST}-p22-u4-root`;
+const HOSTPORT = `h${HOST.length}-${HOST}-p22`;
+const SUFFIX = `${HOSTPORT}-u4-root`;
 
 const STRICT = {
   host: HOST,
@@ -570,7 +571,7 @@ Deno.test("wait_connection records reachability and accepted keys", async () => 
   assertEquals(value.reachable, true);
   assertEquals(value.host_keys[0].sha256.startsWith("SHA256:"), true);
   assertEquals(written[0].specName, "connection");
-  assertEquals(written[0].name, `connection-${SUFFIX}`);
+  assertEquals(written[0].name, `connection-${HOSTPORT}`);
   assertEquals(written[0].data.reachable, true);
 });
 
@@ -632,7 +633,7 @@ Deno.test("insecure_tofu records the first keys and pins them on later runs", as
   // First use scanned and recorded the keys, then pinned them for the run.
   assertEquals(calls.some((c) => c.cmd === "ssh-keyscan"), true);
   const connection = written.find((w) => w.specName === "connection");
-  assertEquals(connection?.name, `connection-${SUFFIX}`);
+  assertEquals(connection?.name, `connection-${HOSTPORT}`);
   const firstSsh = calls.filter((c) => c.cmd === "ssh").at(-1);
   assertEquals(firstSsh?.args.includes("StrictHostKeyChecking=yes"), true);
   assert(connection);
@@ -641,7 +642,7 @@ Deno.test("insecure_tofu records the first keys and pins them on later runs", as
   const calls2: Call[] = [];
   const deps2 = fakeDeps(fakeRun(calls2));
   const m2 = createModel(deps2);
-  const stored = { [`connection-${SUFFIX}`]: connection.data };
+  const stored = { [`connection-${HOSTPORT}`]: connection.data };
   const { context: context2, written: written2 } = testContext(stored);
   await m2.methods.exec.execute(args, context2);
   assertEquals(calls2.some((c) => c.cmd === "ssh-keyscan"), false);
@@ -681,6 +682,34 @@ Deno.test("a first-use TOFU scan does not persist a pin when auth fails", async 
   assertEquals(written.length, 0);
 });
 
+Deno.test("a second user on a pinned host:port verifies against the shared pin", async () => {
+  const calls: Call[] = [];
+  const deps = fakeDeps(fakeRun(calls));
+  const m = createModel(deps);
+  const { context, written } = testContext({
+    [`connection-${HOSTPORT}`]: {
+      host_keys: [{ type: "ssh-ed25519", key: KEY }],
+    },
+  });
+  await m.methods.exec.execute({
+    ...STRICT,
+    user: "deploy",
+    host_key_policy: "insecure_tofu",
+    host_keys: undefined,
+    argv: ["true"],
+  }, context);
+  // The host:port pin is reused: no first-use scan and strict verification.
+  assertEquals(calls.some((c) => c.cmd === "ssh-keyscan"), false);
+  assertEquals(
+    calls.find((c) => c.cmd === "ssh")?.args.includes(
+      "StrictHostKeyChecking=yes",
+    ),
+    true,
+  );
+  // The second user does not rewrite the shared pin.
+  assertEquals(written.some((w) => w.specName === "connection"), false);
+});
+
 Deno.test("insecure_tofu refuses a changed key on a later run", async () => {
   const calls: Call[] = [];
   const deps = fakeDeps(fakeRun(calls, {
@@ -692,7 +721,7 @@ Deno.test("insecure_tofu refuses a changed key on a later run", async () => {
   }));
   const m = createModel(deps);
   const { context } = testContext({
-    [`connection-${SUFFIX}`]: {
+    [`connection-${HOSTPORT}`]: {
       host_keys: [{ type: "ssh-ed25519", key: "QkJCQkJC" }],
     },
   });

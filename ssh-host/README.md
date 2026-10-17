@@ -84,11 +84,12 @@ swamp CLI echoes method arguments, sensitive ones included, in `--json` output
 - `host_key_policy` is required, with no silent default. `strict` verifies the
   host against the pinned `host_keys` lines (the only accepted set) and refuses
   a mismatch without trusting a new key. `insecure_tofu` records the first keys
-  it sees, keyed by host, port and user, and pins exactly those on every later
-  run: a changed key is refused. Each line is `ssh-keyscan` format, either bare
-  `type key` or with a host field naming this target (port 22 as `host`,
-  otherwise `[host]:port`); a supplied set that matches no host/port is refused,
-  never silently downgraded to trust-on-first-use.
+  it sees, keyed by host and port as `known_hosts` is, and pins exactly those on
+  every later run and for every user on that host:port; a changed key is
+  refused. Each line is `ssh-keyscan` format, either bare `type key` or with a
+  host field naming this target (port 22 as `host`, otherwise `[host]:port`); a
+  supplied set that matches no host/port is refused, never silently downgraded
+  to trust-on-first-use.
 - `exec` takes a command and its arguments as an array. Each element is quoted
   as one literal word before it is sent, so `;`, `$()`, backticks and newlines
   inside an element can never become a second command. `argv` can still run a
@@ -115,10 +116,11 @@ swamp CLI echoes method arguments, sensitive ones included, in `--json` output
 - Credentials never touch the command line. A private key is loaded into a
   short-lived `ssh-agent` over stdin; a password goes through a temporary
   askpass helper and an environment variable. Neither appears in a spawned argv.
-- Stored data is keyed unambiguously by host, port and user with length-prefixed
-  components, so a target's identity can never be confused with another's:
-  `exec-h17-web-1.example.com-p22-u4-root`, and likewise `upload-…` and
-  `connection-…`. The definition name is never part of the key.
+- Stored data uses length-prefixed, labeled keys so a target's identity can
+  never be confused with another's. The host-key pin is one record per host and
+  port (`connection-h17-web-1.example.com-p22`), shared by every user; execution
+  evidence is per user (`exec-h17-web-1.example.com-p22-u4-root` and likewise
+  `upload-…`). The definition name is never part of the key.
 - On Ubuntu 24.04, `sshd` is socket-activated: a cloud-init that changes the SSH
   port must restart `ssh.socket`, or the new port never accepts a connection.
 

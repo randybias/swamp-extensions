@@ -175,3 +175,14 @@ for this round.
   `runRemote` and `waitConnection`; only a run with no `host_keys` at all may
   take the first-use accept-new path. Tests cover the refusal in both paths.
   This is the canonical `_lib/ssh.ts` sha for k0s/zfs/libvirt to resync.
+
+## Review ledger: round-6 verification triage (pin keyed by host+port)
+
+- HIGH (TOFU pin keyed by user): the pin record was keyed by host+port+user, so
+  a second user on an already-pinned host:port looked like a first use and
+  accepted any key. The pin is now keyed by host+port only
+  (`connection-h<len>-<host>-p<port>`), matching `known_hosts` semantics and the
+  spec's "state is keyed by host"; every user on that host:port is verified
+  strictly against the shared pin. Per-user execution evidence keeps the user in
+  its key (`exec-…-u<len>-<user>`, `upload-…`). A test pins as one user and
+  proves a second user gets strict verification with no scan and no pin rewrite.

@@ -206,6 +206,8 @@ const StatusSchema = z.strictObject({
       expiry: z.string().nullable(),
     }),
   ),
+  in_sync: z.boolean().nullable(),
+  diffs: z.array(z.string()),
   observed_at: z.string(),
 });
 
@@ -388,38 +390,52 @@ export function createModel(deps: Partial<Deps> = {}) {
     ),
   ];
 
-  /** Reads the live cluster in one pass. */
+  /**
+   * Reads the live cluster in one pass. k0s 1.36 does not label worker Nodes,
+   * so a Node's role comes from the cluster instead: a member of etcd (or a
+   * ControlNode) is a controller, anything else is a worker. The k0s version
+   * falls back to the kubelet version the Node reports.
+   */
   const observe = async (target: SshTarget) => {
-    const nodes = parseClusterNodes(
-      (await run(d, target, nodeListArgs())).stdout,
-    );
     const etcd_members = parseEtcdMembers(
       (await run(d, target, etcdMemberListArgs())).stdout,
     );
+    const controlNodes = parseItemNames(
+      (await run(d, target, controlNodeListArgs())).stdout,
+    );
+    const memberNames = new Set([
+      ...etcd_members.map((m) => m.name),
+      ...controlNodes,
+    ]);
+    const nodes = parseClusterNodes(
+      (await run(d, target, nodeListArgs())).stdout,
+    ).map((node) => ({
+      ...node,
+      role: memberNames.has(node.name)
+        ? "controller" as const
+        : "worker" as const,
+      k0s_version: node.k0s_version ?? node.kubelet_version,
+    }));
     const tokens = await listTokens(target);
     return { nodes, etcd_members, tokens };
   };
 
-  /** Writes the live status record. */
-  const writeStatus = async (
+  /** Persists one live observation, with the drift a sync computed. */
+  const persistStatus = (
     context: Ctx,
     clusterName: string,
-    target: SshTarget,
-  ) => {
-    const live = await observe(target);
-    const handle = await context.writeResource(
-      "status",
-      `${clusterName}-status`,
-      {
-        cluster_name: clusterName,
-        nodes: live.nodes,
-        etcd_members: live.etcd_members,
-        tokens: live.tokens,
-        observed_at: d.now().toISOString(),
-      },
-    );
-    return { handle, live };
-  };
+    live: Awaited<ReturnType<typeof observe>>,
+    drift: { in_sync: boolean | null; diffs: string[] },
+  ) =>
+    context.writeResource("status", `${clusterName}-status`, {
+      cluster_name: clusterName,
+      nodes: live.nodes,
+      etcd_members: live.etcd_members,
+      tokens: live.tokens,
+      in_sync: drift.in_sync,
+      diffs: drift.diffs,
+      observed_at: d.now().toISOString(),
+    });
 
   /** Polls until `node` is joined and healthy. */
   const waitJoined = async (
@@ -875,10 +891,15 @@ export function createModel(deps: Partial<Deps> = {}) {
         arguments: ClusterArgs,
         execute: async (args: z.input<typeof ClusterArgs>, context: Ctx) => {
           const parsed = ClusterArgs.parse(args);
-          const { handle, live } = await writeStatus(
+          const live = await observe(targetOf(parsed.ssh));
+          const handle = await persistStatus(
             context,
             parsed.cluster_name,
-            targetOf(parsed.ssh),
+            live,
+            {
+              in_sync: null,
+              diffs: [],
+            },
           );
           return {
             dataHandles: [handle],
@@ -901,11 +922,7 @@ export function createModel(deps: Partial<Deps> = {}) {
         arguments: ClusterArgs,
         execute: async (args: z.input<typeof ClusterArgs>, context: Ctx) => {
           const parsed = ClusterArgs.parse(args);
-          const { handle, live } = await writeStatus(
-            context,
-            parsed.cluster_name,
-            targetOf(parsed.ssh),
-          );
+          const live = await observe(targetOf(parsed.ssh));
           const recorded = await context.readResource(parsed.cluster_name);
           const diffs: string[] = [];
           if (!recorded) {
@@ -940,6 +957,12 @@ export function createModel(deps: Partial<Deps> = {}) {
               }
             }
           }
+          const handle = await persistStatus(
+            context,
+            parsed.cluster_name,
+            live,
+            { in_sync: diffs.length === 0, diffs },
+          );
           return {
             dataHandles: [handle],
             result: {

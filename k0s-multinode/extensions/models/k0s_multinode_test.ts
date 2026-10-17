@@ -359,15 +359,16 @@ Deno.test("detach_node refuses a 3->2 controller removal without confirm", async
   );
 });
 
-Deno.test("get and sync report live membership and flag an unknown node", async () => {
+Deno.test("get and sync derive the role and persist the drift", async () => {
   const transport = makeTransport((argv) => {
-    if (argv[2] === "get") return { stdout: NODE_JSON };
+    if (argv[3] === "nodes") return { stdout: NODE_JSON };
+    if (argv[3] === "controlnodes") {
+      return { stdout: JSON.stringify({ items: [] }) };
+    }
     if (argv[1] === "etcd") {
       return {
         stdout: JSON.stringify({
-          members: {
-            "ctrl-1": "https://192.0.2.11:2380",
-          },
+          members: { "ctrl-1": "https://192.0.2.11:2380" },
         }),
       };
     }
@@ -375,18 +376,20 @@ Deno.test("get and sync report live membership and flag an unknown node", async 
     return undefined;
   });
   const model = createModel(deps(transport));
-  const getArgs = model.methods.get.arguments.parse({
-    cluster_name: "k0s-lab",
-    ssh: SSH,
-  });
+  const getCtx = createModelTestContext();
   const got = await model.methods.get.execute(
-    getArgs,
-    createModelTestContext().context,
+    model.methods.get.arguments.parse({ cluster_name: "k0s-lab", ssh: SSH }),
+    getCtx.context,
   );
   assertEquals(got.result.nodes.length, 1);
   assertEquals(got.result.etcd_members.length, 1);
+  // get does not judge drift; the persisted status says so explicitly.
+  const getStatus = getCtx.getWrittenResources().find((r) =>
+    r.specName === "status"
+  )!.data as Record<string, unknown>;
+  assertEquals(getStatus.in_sync, null);
 
-  const { context } = createModelTestContext({
+  const syncCtx = createModelTestContext({
     storedResources: {
       "k0s-lab": {
         cluster_name: "k0s-lab",
@@ -397,18 +400,48 @@ Deno.test("get and sync report live membership and flag an unknown node", async 
       },
     },
   } as never);
-  const syncArgs = model.methods.sync.arguments.parse({
-    cluster_name: "k0s-lab",
-    ssh: SSH,
-  });
-  const synced = await model.methods.sync.execute(syncArgs, context);
+  const synced = await model.methods.sync.execute(
+    model.methods.sync.arguments.parse({ cluster_name: "k0s-lab", ssh: SSH }),
+    syncCtx.context,
+  );
   assertEquals(synced.result.in_sync, false);
-  assertEquals(
-    (synced.result.diffs as string[]).some((d) => d.includes("unknown node")),
-    true,
+  const diffs = synced.result.diffs as string[];
+  assertEquals(diffs.some((d) => d.includes("unknown node")), true);
+  assertEquals(diffs.some((d) => d.includes("worker-1")), true);
+  // The drift is written to status so it is visible without method results.
+  const syncStatus = syncCtx.getWrittenResources().find((r) =>
+    r.specName === "status"
+  )!.data as Record<string, unknown>;
+  assertEquals(syncStatus.in_sync, false);
+  assertEquals(syncStatus.diffs, diffs);
+});
+
+Deno.test("get derives a worker role and version from the real worker Node shape", async () => {
+  // k0s 1.36 puts no node.k0sproject.io/role or version label on worker Nodes.
+  const worker = JSON.stringify({
+    items: [{
+      metadata: { name: "worker-1", labels: {} },
+      spec: {},
+      status: {
+        nodeInfo: { kubeletVersion: "v1.31.2" },
+        conditions: [{ type: "Ready", status: "True" }],
+      },
+    }],
+  });
+  const transport = makeTransport((argv) => {
+    if (argv[3] === "nodes") return { stdout: worker };
+    if (argv[3] === "controlnodes") {
+      return { stdout: JSON.stringify({ items: [] }) };
+    }
+    if (argv[1] === "etcd") return { stdout: JSON.stringify({ members: {} }) };
+    return undefined;
+  });
+  const model = createModel(deps(transport));
+  const out = await model.methods.get.execute(
+    model.methods.get.arguments.parse({ cluster_name: "k0s-lab", ssh: SSH }),
+    createModelTestContext().context,
   );
-  assertEquals(
-    (synced.result.diffs as string[]).some((d) => d.includes("worker-1")),
-    true,
-  );
+  const node = out.result.nodes[0];
+  assertEquals(node.role, "worker");
+  assertEquals(node.k0s_version, "v1.31.2");
 });

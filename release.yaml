@@ -116,5 +116,8 @@ host-net:
 
 libvirt:
   channel: beta
-  ci: false
-  published: {}
+  ci: true
+  published:
+    2026.10.17.1: 4e9eb385d28a61f2aac6a6a7ca5cc54cc7e4298537ed5f1d86d00ae4c1f9cf94
+  notes:
+    2026.10.17.1: 'First release, beta. Manage libvirt/KVM over SSH with virsh: define and undefine virtual networks (including the default), clone a golden volume per node, define domains that boot from the clone with optional data disks and a seed ISO, control power, and capture the serial console under a hard timeout into a sensitive resource (only its byte count and SHA-256 are returned). Disks render as type=''file'' so stock Ubuntu AppArmor allows them, and domains carry ACPI so shutdown works. undefine_domain with remove_volumes deletes only the recorded root volume (data disks are detached and kept; read-only media kept unless remove_attached_media), and refuses before any destroy when the record is missing, the root is not attached or the recorded uuid differs. Host keys are strict only; the SSH key is a vault reference. Live end to end on one bare-metal Ubuntu 24.04 host with libvirt 10.0: 15 of 15 cells on the final head, including the four that failed on the first live run (start on a stock host, shutdown, console on a running and on a shut-off domain) and the golden-image flow; the first run passed 37 of 41 cells covering networks, volumes, power, injection and transport refusals and a cloud-init seed boot. Residual: virsh define --validate is not used (renders are checked with virt-xml-validate in tests when present); a detach failure during undefine with remove_volumes leaves the guest destroyed and partly detached; define_domain records the named volume as the root whenever it is attached, so name the real boot volume. Also, the swamp CLI prints literal sensitive arguments (swamp-club lab 3555), so pass the key as a vault reference.'

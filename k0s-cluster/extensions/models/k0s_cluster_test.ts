@@ -17,6 +17,7 @@ import type { SshTransport } from "./_lib/transport.ts";
 import {
   createModel,
   type K0sDeps,
+  publicShaScript,
   ResetCleanupError,
   ResetStateError,
   targetId,
@@ -1259,7 +1260,7 @@ Deno.test("reset persists the binary-removal outcome in state", async () => {
   );
 });
 
-Deno.test("reset tolerates a stored record whose host is masked", async () => {
+Deno.test("reset ignores a legacy config_file_sha256 field and a masked host", async () => {
   const fake = makeDeps({
     exec: (argv) => {
       if (
@@ -2802,6 +2803,65 @@ Deno.test("a keepalived VIP stores no hash over the secret-bearing config", asyn
     assertEquals(JSON.stringify(data).includes(secret), false);
     assertEquals("config_file_sha256" in data, false);
   }
+});
+
+Deno.test("the drift script redacts a canonical authPass and refuses to hash a secret", async () => {
+  const dir = await Deno.makeTempDir();
+  const file = `${dir}/k0s.yaml`;
+  const run = async (text: string) => {
+    await Deno.writeTextFile(file, text);
+    const out = await new Deno.Command("sh", {
+      args: ["-c", publicShaScript(file)],
+      stdout: "piped",
+      stderr: "piped",
+    }).output();
+    return {
+      code: out.code,
+      hash: new TextDecoder().decode(out.stdout).trim().split(/\s+/)[0],
+    };
+  };
+  const lines = [
+    "apiVersion: k0s.k0sproject.io/v1beta1",
+    "spec:",
+    "  network:",
+    "    controlPlaneLoadBalancing:",
+    "      keepalived:",
+    "        vrrpInstances:",
+    "          - virtualIPs: [192.0.2.10/24]",
+    '            authPass: "abc\\"123"',
+    "",
+  ];
+  const withSecret = lines.join("\n");
+  const canonical = await run(withSecret);
+  assertEquals(canonical.code, 0);
+  assertEquals(canonical.hash.length, 64);
+  const redacted = await run(
+    lines.map((l) => l.replace(/authPass:.*/, "authPass: REDACTED")).join("\n"),
+  );
+  assertEquals(canonical.hash, redacted.hash);
+  const smuggle = (replacement: string) =>
+    lines.map((l) => l.includes("authPass:") ? replacement : l).join("\n");
+  const cases: Record<string, string> = {
+    "list item": "          - authPass: x",
+    "flow map": "          {authPass: x}",
+    "quoted key": '          "authPass": x',
+    "block scalar": "            authPass: >-\n              x",
+  };
+  for (const [name, form] of Object.entries(cases)) {
+    assertEquals(
+      (await run(smuggle(form))).code === 0,
+      false,
+      `accepted a ${name} authPass`,
+    );
+  }
+  const helm = await run(
+    withSecret.replace(
+      "  network:",
+      "  helm:\n    values:\n      secret: x\n  network:",
+    ),
+  );
+  assertEquals(helm.code === 0, false, "accepted helm values");
+  await Deno.remove(dir, { recursive: true });
 });
 
 Deno.test("drift sees an on-host config edit with CPLB set, without a secret-derived hash", async () => {

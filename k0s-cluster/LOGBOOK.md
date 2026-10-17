@@ -351,3 +351,23 @@ the triage checks, no Critical/High. `_lib/ssh.ts` is the canonical blob
   authPass be brute-forced. The field is removed entirely; drift detection
   relies on config_sha256, which is over the redacted render. A CPLB install
   test asserts no written state contains the authPass or a config_file_sha256.
+
+- 2026-10-17 (17.3): live repro (lab 3585): a 17.2 record whose host was stored
+  from a vault ref (`{vault, key}`, so the host read back as `***`) crashed in
+  swamp's vault resolution before the method body ran. The offline test "reset
+  ignores a legacy config_file_sha256 field and a masked host" cannot reproduce
+  that resolution step (createModelTestContext does not resolve vaults), so it
+  only proves the methods tolerate a masked host and an unknown legacy field;
+  the live crash is recorded here.
+
+- 2026-10-17 (17.3): drift restored without a secret-derived hash. sync hashes
+  the on-host k0s.yaml only when the record says `has_helm_values === false`,
+  via a fixed fail-closed node script (publicShaScript): it exits non-zero (so
+  drift is unknown) on an unreadable file, any authPass line that is not a
+  canonical `<indent>authPass: <scalar>` (list item, flow map, quoted key and
+  block scalar are all refused), or any helm `values:` key; otherwise it
+  replaces each canonical authPass value with REDACTED and hashes the result. A
+  real-`sh` test runs the script text and asserts the canonical digest equals
+  the redacted digest and that every smuggle form is refused. Legacy 17.2
+  records (has_helm_values undefined) report config drift unknown rather than a
+  false "config changed".

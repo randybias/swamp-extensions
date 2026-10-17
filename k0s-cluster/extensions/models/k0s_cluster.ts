@@ -710,24 +710,41 @@ function publicRender(input: K0sConfigInput): string {
     ...input,
     helm: input.helm.map((chart) => ({ ...chart, values: undefined })),
     control_plane_load_balancing: input.control_plane_load_balancing
-      ? { ...input.control_plane_load_balancing, auth_pass: "REDACTED" }
+      ? { ...input.control_plane_load_balancing, auth_pass: REDACTED_SECRET }
       : undefined,
   });
 }
 
 /**
- * Hash of the on-host k0s.yaml with every authPass value replaced by the fixed
- * placeholder, so drift can be compared without the secret leaving the host or
- * a secret-derived hash being stored. The sed runs on the node.
+ * Hash of the on-host k0s.yaml with every canonical authPass value replaced by
+ * the fixed placeholder, so drift can be compared without the secret leaving
+ * the host or a secret-derived hash being stored. The script runs on the node
+ * and fails closed (no digest, so drift is unknown) whenever it cannot prove
+ * the file has no secret it is about to hash: an unreadable file, a
+ * non-canonical or block authPass line, or a helm `values:` key.
  */
+export function publicShaScript(configPath: string): string {
+  return [
+    `f='${configPath.replaceAll("'", "'\\''")}'`,
+    `[ -r "$f" ] || exit 3`,
+    `grep -n authPass "$f" | grep -qvE '^[0-9]+:[[:space:]]*authPass:[[:space:]]+[^|>]' && exit 4`,
+    `grep -qE '^[[:space:]]*values:' "$f" && exit 5`,
+    `tmp=$(mktemp) || exit 6`,
+    `trap 'rm -f "$tmp"' EXIT`,
+    `sed -E 's/^([[:space:]]*authPass:).*/\\1 ${REDACTED_SECRET}/' "$f" > "$tmp" || exit 7`,
+    `sha256sum "$tmp"`,
+  ].join("; ");
+}
+
 async function remotePublicSha(
   deps: K0sDeps,
   target: SshTarget,
 ): Promise<string | null> {
-  const script =
-    `sed -E 's/^([[:space:]]*authPass:).*/\\1 ${REDACTED_SECRET}/' ` +
-    `${K0S_CONFIG_PATH} | sha256sum`;
-  const result = await deps.ssh.exec(target, ["sh", "-c", script]);
+  const result = await deps.ssh.exec(target, [
+    "sh",
+    "-c",
+    publicShaScript(K0S_CONFIG_PATH),
+  ]);
   return ok(result) ? parseSha256(result.stdout) : null;
 }
 
@@ -929,7 +946,7 @@ async function readLive(
     node: nodes.find((node) => node.ready) ?? nodes[0] ?? null,
     nodes,
     system_pods: pods,
-    config_sha256: installed ? await remotePublicSha(deps, target) : null,
+    config_sha256: null,
     stacks: installed ? await remoteStacks(deps, target) : [],
     helm_releases: installed
       ? (await remoteHelmReleases(deps, target)).map((release) => ({
@@ -1588,8 +1605,6 @@ function buildK0sModel(deps: K0sDeps) {
                 `the staged k0s binary on ${target.host} does not match the pinned SHA-256; removed it before stopping anything`,
               );
             }
-            // Whether the old binary was moved aside; a rollback must restart
-            // an untouched binary rather than move a missing backup over it.
             /**
              * Puts the previous binary back when the host still has one, starts
              * or restarts the unit and waits for health. It asks the host
@@ -1634,10 +1649,10 @@ function buildK0sModel(deps: K0sDeps) {
                 }
               }
               if (!recovered) {
+                // A successful mv put the good binary at the real path; with
+                // no backup the original was already there.
                 throw new Error(
-                  `ROLLBACK FAILED on ${target.host}: the previous binary is at ${
-                    hasBackup ? backupPath : K0S_BINARY_PATH
-                  } and the unit may be down`,
+                  `ROLLBACK FAILED on ${target.host}: the good binary is at ${K0S_BINARY_PATH} and the unit may be down`,
                 );
               }
               return hasBackup;
@@ -1777,8 +1792,8 @@ function buildK0sModel(deps: K0sDeps) {
           } finally {
             const unlocked = await deps.ssh.exec(target, ["rmdir", lockDir]);
             if (!ok(unlocked)) {
-              context.logger.info(
-                "WARNING: {lock} could not be removed on {host} (exit {code}); the next upgrade or reset will refuse until it is removed",
+              context.logger.warn(
+                "{lock} could not be removed on {host} (exit {code}); remove it if it still exists, or the next upgrade or reset will refuse",
                 { lock: lockDir, host: target.host, code: unlocked.exit_code },
               );
             }
@@ -2235,8 +2250,17 @@ function buildK0sModel(deps: K0sDeps) {
             args.ssh,
           );
           const now = deps.now();
-          const status = await readLive(deps, target, now);
           const stored = await context.readResource(targetId(target));
+          // Hash the on-host config only when the record proves there are no
+          // helm values, so a health-ish status hash never covers a Helm
+          // secret; otherwise config_sha256 stays null (drift unknown).
+          const liveSha = stored !== null && stored.has_helm_values === false
+            ? await remotePublicSha(deps, target)
+            : null;
+          const status = StatusSchema.parse({
+            ...(await readLive(deps, target, now)),
+            config_sha256: liveSha,
+          });
           const diffs: string[] = [];
           if (!stored) {
             diffs.push("no recorded install; run install first");
@@ -2257,7 +2281,7 @@ function buildK0sModel(deps: K0sDeps) {
             // from the recorded hash, so that case is reported as unknown
             // rather than silently clean.
             if (stored.config_sha256) {
-              if (stored.has_helm_values) {
+              if (stored.has_helm_values !== false) {
                 diffs.push(
                   "config drift unknown: helm values are not part of the recorded hash",
                 );

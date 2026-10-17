@@ -188,6 +188,6 @@ Deno.test("the CDI custom resource is a minimal deterministic document", () => {
   assertEquals(doc.apiVersion, "cdi.kubevirt.io/v1beta1");
   assertEquals(doc.kind, "CDI");
   assertEquals((doc.metadata as { name: string }).name, CDI_CR_NAME);
-  assertEquals((doc.metadata as { namespace: string }).namespace, "cdi");
+  assertEquals("namespace" in (doc.metadata as object), false);
   assertEquals(doc.spec, {});
 });

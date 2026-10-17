@@ -142,3 +142,38 @@ schema/secret checks, and the failure-mode table above.
   that a running workload blocks the delete only under the default
   `BlockUninstallIfWorkloadsExist`; `RemoveWorkloads` lets upstream delete the
   running VMs.
+
+## Round 2 review fixes
+
+- **HIGH CDI record match.** Uninstall required only that the CDI inputs were
+  present, not that they matched the record; a mismatched version would delete
+  the CDI CR and another manifest's objects. It now requires
+  `a.cdi_version === prior.cdi_version` and
+  `a.cdi_operator_manifest_sha256 === prior.cdi_operator_sha256` before any
+  fetch or delete (`invalid_input` otherwise). `get`/`sync`/`wait_ready` no
+  longer overwrite the recorded `cdi_version`; the observed version is kept in a
+  new `observed_cdi_version` field.
+- **HIGH independent CDI cleanup.** When KubeVirt was already gone, uninstall
+  returned `not_found` before touching CDI and then cleared
+  `cdi_installed_by_model`. KubeVirt and CDI cleanup are now decided separately:
+  if the record owns CDI and any CDI object remains (the `cdi` CR, the `cdi`
+  namespace or the `cdis.cdi.kubevirt.io` CRD), the CDI manifest is fetched,
+  verified and deleted even with KubeVirt absent; the flag is cleared only after
+  that delete succeeds.
+- **HIGH CDI ownership at install.** Install now reads the CDI CR/CRD before
+  applying. An existing CDI with no ownership record is adopted without claiming
+  it (flag false, no apply). A prior true flag with its version and digest is
+  preserved when install runs again without `install_cdi`.
+- **HIGH HTTP URL grammar.** `isHttpUrl` keeps the strict grammar again
+  (`^https?://[A-Za-z0-9._~:/%+,;=!$&'()*-]+$`) and still parses with `URL` and
+  rejects a username or password, so `?`, `#`, `@`, backslash, whitespace and
+  encoded userinfo are all refused and cannot reach the spec, rendered YAML or
+  state.
+- **MEDIUM fetch before first apply.** Install fetches and verifies the CDI
+  manifest before the first KubeVirt apply, so a CDI fetch/SHA failure no longer
+  leaves an untracked KubeVirt install.
+- **MEDIUM CDI delete bound.** `delete cdi cdi` now carries
+  `--timeout=${timeout_s}s`.
+- **LOW.** `renderCdiCr` no longer sets `metadata.namespace` on the
+  cluster-scoped CR; uninstall persists `status: "not_found"` after a successful
+  delete; the unused `installed_by_model` state field is removed.

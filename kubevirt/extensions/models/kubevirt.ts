@@ -205,6 +205,7 @@ const OperatorStateSchema = z.strictObject({
   context: z.string(),
   kubevirt_version: z.string().optional(),
   cdi_version: z.string().optional(),
+  observed_cdi_version: z.string().optional(),
   operator_sha256: z.string().optional(),
   cr_sha256: z.string().optional(),
   phase: z.string().optional(),
@@ -214,7 +215,6 @@ const OperatorStateSchema = z.strictObject({
   schedulable_nodes: z.array(z.string()).default([]),
   kvm_nodes: z.array(z.string()).default([]),
   outdated_vmis: z.number().int().default(0),
-  installed_by_model: z.boolean().optional(),
   cdi_installed_by_model: z.boolean().optional(),
   cdi_operator_sha256: z.string().optional(),
   status: z.enum(["present", "not_found"]),
@@ -326,6 +326,28 @@ async function operatorObjectsRemain(kubectl: Kubectl): Promise<boolean> {
   return crd !== null;
 }
 
+/**
+ * True when any CDI object this model would have installed still exists: the
+ * `cdi` custom resource, the `cdi` namespace or the `cdis.cdi.kubevirt.io`
+ * CRD. Used so CDI cleanup runs even when KubeVirt is already gone.
+ */
+async function cdiObjectsRemain(kubectl: Kubectl): Promise<boolean> {
+  const cr = await kubectlJson<unknown>(kubectl, ["get", "cdi", CDI_CR_NAME]);
+  if (cr) return true;
+  const ns = await kubectlJson<unknown>(kubectl, [
+    "get",
+    "namespace",
+    CDI_NAMESPACE,
+  ]);
+  if (ns) return true;
+  const crd = await kubectlJson<unknown>(kubectl, [
+    "get",
+    "crd",
+    "cdis.cdi.kubevirt.io",
+  ]);
+  return crd !== null;
+}
+
 function cdiReady(cdi: CdiCr | null): boolean {
   return cdi?.status?.phase === "Deployed" &&
     conditionTrue(cdi.status?.conditions, "Available");
@@ -393,6 +415,7 @@ interface StateExtra {
   operator_sha256?: string;
   cr_sha256?: string;
   cdi_version?: string;
+  observed_cdi_version?: string;
   cdi_operator_sha256?: string;
   cdi_installed_by_model?: boolean;
   use_emulation?: boolean;
@@ -409,13 +432,16 @@ function stateOf(
   extra: StateExtra = {},
 ): OperatorState {
   const version = cr?.status?.observedKubeVirtVersion ?? a.kubevirt_version;
-  const cdiVersion = extra.cdi_version ?? a.cdi_version;
+  const cdiVersion = extra.cdi_version;
   const operatorSha = extra.operator_sha256 ?? a.operator_manifest_sha256;
   return OperatorStateSchema.parse({
     cluster_fp: fp,
     context: a.context ?? "current-context",
     ...(version ? { kubevirt_version: version } : {}),
     ...(cdiVersion ? { cdi_version: cdiVersion } : {}),
+    ...(extra.observed_cdi_version
+      ? { observed_cdi_version: extra.observed_cdi_version }
+      : {}),
     ...(operatorSha ? { operator_sha256: operatorSha } : {}),
     ...(extra.cr_sha256 ? { cr_sha256: extra.cr_sha256 } : {}),
     ...(extra.cdi_operator_sha256
@@ -525,7 +551,9 @@ export const model = {
         const d = currentDeps();
         const fm = await fieldManager(context.definition.name);
         const fp = await clusterFingerprint16(a.kubeconfig, a.context);
-        const facts = await withCluster(
+        const prior = await readPrior(context, a);
+        // 1. Refuse a different installed version before fetching anything.
+        await withCluster(
           d,
           a.kubeconfig,
           a.context,
@@ -539,18 +567,78 @@ export const model = {
                 `KubeVirt ${installed} is installed; use upgrade to move to ${a.kubevirt_version}`,
               );
             }
-            const opUrl = manifestUrl(
-              a.manifest_base_url,
-              KUBEVIRT_REPO.org,
-              KUBEVIRT_REPO.repo,
-              a.kubevirt_version,
-              KUBEVIRT_OPERATOR_ASSET,
-            );
-            const opManifest = await fetchVerifiedManifest(
-              d,
-              opUrl,
-              a.operator_manifest_sha256,
-            );
+          },
+        );
+        // 2. Fetch and verify every requested manifest before the first apply.
+        const opUrl = manifestUrl(
+          a.manifest_base_url,
+          KUBEVIRT_REPO.org,
+          KUBEVIRT_REPO.repo,
+          a.kubevirt_version,
+          KUBEVIRT_OPERATOR_ASSET,
+        );
+        const opManifest = await fetchVerifiedManifest(
+          d,
+          opUrl,
+          a.operator_manifest_sha256,
+        );
+        // 3. Plan CDI. Never claim a CDI this model did not install: an
+        // existing CDI with no ownership record is adopted, not erased later.
+        let cdiOwned = prior?.cdi_installed_by_model ?? false;
+        let cdiVersion = prior?.cdi_version;
+        let cdiSha = prior?.cdi_operator_sha256;
+        let cdiManifest: string | undefined;
+        if (a.install_cdi && a.cdi_version && a.cdi_operator_manifest_sha256) {
+          const wantVersion = a.cdi_version;
+          const wantSha = a.cdi_operator_manifest_sha256;
+          const planned = await withCluster(
+            d,
+            a.kubeconfig,
+            a.context,
+            CDI_NAMESPACE,
+            async (kubectl) => {
+              const exists = await cdiObjectsRemain(kubectl);
+              if (exists && prior?.cdi_installed_by_model !== true) {
+                context.logger.info(
+                  "CDI exists and is not owned by this model; adopting it",
+                  {},
+                );
+                return { owned: false as const };
+              }
+              const cdiUrl = manifestUrl(
+                a.manifest_base_url,
+                CDI_REPO.org,
+                CDI_REPO.repo,
+                wantVersion,
+                CDI_OPERATOR_ASSET,
+              );
+              const manifest = await fetchVerifiedManifest(d, cdiUrl, wantSha);
+              return {
+                owned: true as const,
+                manifest,
+                version: wantVersion,
+                sha: wantSha,
+              };
+            },
+          );
+          if (planned.owned) {
+            cdiOwned = true;
+            cdiVersion = planned.version;
+            cdiSha = planned.sha;
+            cdiManifest = planned.manifest;
+          } else {
+            cdiOwned = false;
+            cdiVersion = prior?.cdi_version;
+            cdiSha = prior?.cdi_operator_sha256;
+          }
+        }
+        // 4. Apply KubeVirt.
+        const facts = await withCluster(
+          d,
+          a.kubeconfig,
+          a.context,
+          KUBEVIRT_NAMESPACE,
+          async (kubectl) => {
             const apply = (body: string) =>
               kubectlText(
                 kubectl,
@@ -580,30 +668,16 @@ export const model = {
             return { cr, nodes, crSha: await sha256Hex(crYaml) };
           },
         );
-        // CDI lives in its own namespace; the operator manifest ships the
-        // operator and CRDs but not the custom resource, so apply both.
-        if (a.install_cdi && a.cdi_version && a.cdi_operator_manifest_sha256) {
-          const cdiVersion = a.cdi_version;
-          const cdiSha = a.cdi_operator_manifest_sha256;
+        // 5. Apply CDI if planned.
+        if (cdiManifest) {
+          const body = cdiManifest;
           await withCluster(
             d,
             a.kubeconfig,
             a.context,
             CDI_NAMESPACE,
             async (kubectl) => {
-              const cdiUrl = manifestUrl(
-                a.manifest_base_url,
-                CDI_REPO.org,
-                CDI_REPO.repo,
-                cdiVersion,
-                CDI_OPERATOR_ASSET,
-              );
-              const cdiManifest = await fetchVerifiedManifest(
-                d,
-                cdiUrl,
-                cdiSha,
-              );
-              const apply = (body: string) =>
+              const apply = (text: string) =>
                 kubectlText(
                   kubectl,
                   [
@@ -614,9 +688,9 @@ export const model = {
                     "-f",
                     "-",
                   ],
-                  body,
+                  text,
                 );
-              await apply(cdiManifest);
+              await apply(body);
               await apply(renderCdiCr());
             },
           );
@@ -631,12 +705,9 @@ export const model = {
           {
             operator_sha256: a.operator_manifest_sha256,
             cr_sha256: facts.crSha,
-            ...(a.install_cdi
-              ? {
-                cdi_installed_by_model: true,
-                cdi_operator_sha256: a.cdi_operator_manifest_sha256,
-              }
-              : {}),
+            cdi_version: cdiVersion,
+            cdi_operator_sha256: cdiSha,
+            cdi_installed_by_model: cdiOwned,
             use_emulation: a.use_emulation,
             feature_gates: a.feature_gates,
           },
@@ -646,7 +717,7 @@ export const model = {
           dataHandles: [handle],
           result: {
             kubevirt_version: a.kubevirt_version,
-            cdi_version: a.install_cdi ? a.cdi_version : undefined,
+            cdi_version: cdiOwned ? cdiVersion : undefined,
             operator_sha256: a.operator_manifest_sha256,
             cr_sha256: state.cr_sha256,
           },
@@ -690,7 +761,8 @@ export const model = {
           "present",
           d.now(),
           {
-            cdi_version: probe.cdi?.status?.observedVersion,
+            cdi_version: prior?.cdi_version,
+            observed_cdi_version: probe.cdi?.status?.observedVersion,
             cdi_installed_by_model: prior?.cdi_installed_by_model,
             feature_gates: prior?.feature_gates ?? [],
             ...(prior?.cdi_operator_sha256
@@ -840,7 +912,8 @@ export const model = {
             const cdi = await readCdi(kubectl);
             const dev = cr.spec?.configuration?.developerConfiguration;
             return stateOf(a, fp, cr, nodes, "present", d.now(), {
-              cdi_version: cdi?.status?.observedVersion,
+              cdi_version: prior?.cdi_version,
+              observed_cdi_version: cdi?.status?.observedVersion,
               cdi_installed_by_model: prior?.cdi_installed_by_model,
               ...(prior?.cdi_operator_sha256
                 ? { cdi_operator_sha256: prior.cdi_operator_sha256 }
@@ -883,7 +956,11 @@ export const model = {
                 "not_found",
                 d.now(),
                 {
+                  cdi_version: prior?.cdi_version,
                   cdi_installed_by_model: prior?.cdi_installed_by_model,
+                  ...(prior?.cdi_operator_sha256
+                    ? { cdi_operator_sha256: prior.cdi_operator_sha256 }
+                    : {}),
                 },
               );
             }
@@ -891,7 +968,8 @@ export const model = {
             const cdi = await readCdi(kubectl);
             const dev = cr.spec?.configuration?.developerConfiguration;
             return stateOf(a, fp, cr, nodes, "present", d.now(), {
-              cdi_version: cdi?.status?.observedVersion,
+              cdi_version: prior?.cdi_version,
+              observed_cdi_version: cdi?.status?.observedVersion,
               cdi_installed_by_model: prior?.cdi_installed_by_model,
               ...(prior?.cdi_operator_sha256
                 ? { cdi_operator_sha256: prior.cdi_operator_sha256 }
@@ -912,7 +990,7 @@ export const model = {
     uninstall: {
       kind: "action" as const,
       description:
-        "DESTRUCTIVE. Delete the KubeVirt custom resource with --wait, then the operator manifest's objects, then CDI if this definition installed it. With the default BlockUninstallIfWorkloadsExist strategy a running workload blocks the delete (typed error); with RemoveWorkloads upstream deletes the running VMs. Requires confirm equal to the cluster fingerprint; an absent install is a clean no-op.",
+        "DESTRUCTIVE. Delete the KubeVirt custom resource with --wait, then the operator manifest's objects, then CDI when this definition installed it. The CDI version and digest must match the record. With the default BlockUninstallIfWorkloadsExist strategy a running workload blocks the delete (typed error); with RemoveWorkloads upstream deletes the running VMs. Requires confirm equal to the cluster fingerprint; an absent install is a clean no-op.",
       arguments: UninstallArgs,
       execute: async (args: z.input<typeof UninstallArgs>, context: Ctx) => {
         const a = UninstallArgs.parse(args);
@@ -927,19 +1005,28 @@ export const model = {
         const prior = await readPrior(context, a);
         const cdiInstalled = prior?.cdi_installed_by_model === true;
         // CDI is deleted only when this definition installed it, and only with
-        // the same version and digest. Fail before touching the cluster.
-        if (
-          cdiInstalled &&
-          (!a.cdi_version || !a.cdi_operator_manifest_sha256)
-        ) {
-          throw new KubevirtError(
-            "invalid_input",
-            "CDI was installed by this model; cdi_version and cdi_operator_manifest_sha256 are required to uninstall it",
-          );
+        // the exact version and digest it recorded. Fail before any kubectl.
+        if (cdiInstalled) {
+          if (!a.cdi_version || !a.cdi_operator_manifest_sha256) {
+            throw new KubevirtError(
+              "invalid_input",
+              "CDI was installed by this model; cdi_version and cdi_operator_manifest_sha256 are required to uninstall it",
+            );
+          }
+          if (
+            a.cdi_version !== prior?.cdi_version ||
+            a.cdi_operator_manifest_sha256 !== prior?.cdi_operator_sha256
+          ) {
+            throw new KubevirtError(
+              "invalid_input",
+              "cdi_version and cdi_operator_manifest_sha256 must match the CDI this model installed",
+            );
+          }
         }
-        // Fetch and verify every manifest needed before deleting anything, so
-        // a fetch or SHA failure never leaves the operator half-removed. The
-        // true no-op case is decided first, so it needs no manifest.
+        const cdiVersion = a.cdi_version;
+        const cdiSha = a.cdi_operator_manifest_sha256;
+        // KubeVirt cleanup. A missing CR with the namespace or CRD gone is a
+        // clean no-op; anything else is verified then deleted.
         const opUrl = manifestUrl(
           a.manifest_base_url,
           KUBEVIRT_REPO.org,
@@ -947,34 +1034,19 @@ export const model = {
           a.kubevirt_version,
           KUBEVIRT_OPERATOR_ASSET,
         );
-        const cdiVersion = a.cdi_version;
-        const cdiSha = a.cdi_operator_manifest_sha256;
-        const outcome = await withCluster(
+        const kvDeleted = await withCluster(
           d,
           a.kubeconfig,
           a.context,
           KUBEVIRT_NAMESPACE,
           async (kubectl) => {
             const cr = await readCr(kubectl);
-            if (!cr && !(await operatorObjectsRemain(kubectl))) {
-              return { status: "not_found" as const, cdiManifest: undefined };
-            }
+            if (!cr && !(await operatorObjectsRemain(kubectl))) return false;
             const opManifest = await fetchVerifiedManifest(
               d,
               opUrl,
               a.operator_manifest_sha256,
             );
-            let cdiManifest: string | undefined;
-            if (cdiInstalled && cdiVersion && cdiSha) {
-              const cdiUrl = manifestUrl(
-                a.manifest_base_url,
-                CDI_REPO.org,
-                CDI_REPO.repo,
-                cdiVersion,
-                CDI_OPERATOR_ASSET,
-              );
-              cdiManifest = await fetchVerifiedManifest(d, cdiUrl, cdiSha);
-            }
             if (cr) {
               const del = await kubectl([
                 "delete",
@@ -1001,42 +1073,63 @@ export const model = {
               ["delete", "-f", "-", "--ignore-not-found"],
               opManifest,
             );
-            return { status: "deleted" as const, cdiManifest };
+            return true;
           },
         );
-        const status = outcome.status;
-        if (outcome.cdiManifest) {
-          const cdiManifest = outcome.cdiManifest;
-          await withCluster(
+        // CDI cleanup is independent of KubeVirt, so a KubeVirt removed by hand
+        // or a failed retry never orphans the CDI this model installed.
+        let cdiDeleted = false;
+        if (cdiInstalled && cdiVersion && cdiSha) {
+          const version = cdiVersion;
+          const sha = cdiSha;
+          cdiDeleted = await withCluster(
             d,
             a.kubeconfig,
             a.context,
             CDI_NAMESPACE,
             async (kubectl) => {
+              if (!(await cdiObjectsRemain(kubectl))) return true;
+              const cdiUrl = manifestUrl(
+                a.manifest_base_url,
+                CDI_REPO.org,
+                CDI_REPO.repo,
+                version,
+                CDI_OPERATOR_ASSET,
+              );
+              const cdiManifest = await fetchVerifiedManifest(d, cdiUrl, sha);
               await kubectlText(kubectl, [
                 "delete",
                 "cdi",
                 CDI_CR_NAME,
                 "--ignore-not-found",
                 "--wait=true",
+                `--timeout=${a.timeout_s}s`,
               ]);
               await kubectlText(
                 kubectl,
                 ["delete", "-f", "-", "--ignore-not-found"],
                 cdiManifest,
               );
+              return true;
             },
           );
         }
+        const status = kvDeleted || cdiDeleted ? "deleted" : "not_found";
         context.logger.info("KubeVirt {status}", { status });
+        // The record is cleared: the flag only while a CDI delete has not
+        // succeeded, cdi_version/operator_sha256 kept as history.
         const state = stateOf(
           a,
           fp,
           null,
           { schedulable: [], kvm: [] },
-          status === "not_found" ? "not_found" : "present",
+          "not_found",
           d.now(),
-          { cdi_installed_by_model: false },
+          {
+            cdi_version: prior?.cdi_version,
+            cdi_operator_sha256: prior?.cdi_operator_sha256,
+            cdi_installed_by_model: cdiInstalled ? !cdiDeleted : false,
+          },
         );
         const handle = await persist(context, a, state);
         return { dataHandles: [handle], result: { status } };

@@ -45,11 +45,16 @@ import {
 type Ctx = any;
 
 /**
- * True for an http(s) URL with no userinfo. A credential embedded in the URL
- * would otherwise land in the VM spec, in the rendered YAML and in state.
+ * Strict grammar for a DataVolume http(s) URL: no query, fragment, userinfo,
+ * backslash, whitespace or control character anywhere. Combined with a `URL`
+ * parse that must show no username or password, so no credential (literal or
+ * percent-encoded) and no query token can reach the VM spec, rendered YAML or
+ * state.
  */
+const HTTP_URL_RE = /^https?:\/\/[A-Za-z0-9._~:\/%+,;=!$&'()*-]+$/;
+
 export function isHttpUrl(u: string): boolean {
-  if (!/^https?:\/\//.test(u)) return false;
+  if (!HTTP_URL_RE.test(u)) return false;
   try {
     const x = new URL(u);
     return (x.protocol === "http:" || x.protocol === "https:") &&

@@ -378,6 +378,71 @@ Deno.test("install_cdi fetches and applies the CDI manifest too", async () => {
   }
 });
 
+Deno.test("install adopts an existing CDI without claiming it", async () => {
+  const { context, getWrittenResources } = testCtx();
+  const h = harness((c) => {
+    if (verb(c) === "get" && sub(c) === "cdi") {
+      return {
+        stdout: JSON.stringify({ kind: "CDI", metadata: { name: "cdi" } }),
+      };
+    }
+    return getRoute(null)(c);
+  }, {
+    fetch: (url) =>
+      url.includes("kubevirt-operator")
+        ? { status: 200, body: MANIFEST }
+        : { status: 404, body: "" },
+  });
+  try {
+    await model.methods.install.execute({
+      ...INSTALL,
+      install_cdi: true,
+      cdi_version: "v1.2.3",
+      cdi_operator_manifest_sha256: "a".repeat(64),
+    }, context);
+    // Only the KubeVirt operator + CR were applied; CDI was not fetched.
+    assertEquals(h.fetched.length, 1);
+    assertEquals(h.calls.filter((c) => verb(c) === "apply").length, 2);
+    const state = getWrittenResources()[0].data as {
+      cdi_installed_by_model?: boolean;
+    };
+    assertEquals(state.cdi_installed_by_model, false);
+  } finally {
+    h.restore();
+  }
+});
+
+Deno.test("install without install_cdi preserves a prior CDI ownership record", async () => {
+  const key = await operatorStateKey(KC);
+  const { context, getWrittenResources } = testCtx({
+    storedResources: {
+      [key]: {
+        cluster_fp: await fingerprint(),
+        context: "current-context",
+        cdi_version: "v1.2.3",
+        cdi_installed_by_model: true,
+        cdi_operator_sha256: "a".repeat(64),
+        status: "present",
+        observed_at: "2026-10-17T00:00:00.000Z",
+      },
+    },
+  });
+  const h = harness(getRoute(null), {
+    fetch: () => ({ status: 200, body: MANIFEST }),
+  });
+  try {
+    await model.methods.install.execute(INSTALL, context);
+    const state = getWrittenResources()[0].data as {
+      cdi_installed_by_model?: boolean;
+      cdi_version?: string;
+    };
+    assertEquals(state.cdi_installed_by_model, true);
+    assertEquals(state.cdi_version, "v1.2.3");
+  } finally {
+    h.restore();
+  }
+});
+
 Deno.test("wait_ready reports ready with node facts", async () => {
   const h = harness(getRoute(crJson()));
   try {
@@ -683,7 +748,14 @@ Deno.test("uninstall deletes CDI only when this model installed it", async () =>
       },
     },
   });
-  const h = harness(getRoute(crJson()), {
+  const h = harness((c) => {
+    if (verb(c) === "get" && sub(c) === "cdi") {
+      return {
+        stdout: JSON.stringify({ kind: "CDI", metadata: { name: "cdi" } }),
+      };
+    }
+    return getRoute(crJson())(c);
+  }, {
     fetch: (url) =>
       url.includes("containerized-data-importer")
         ? { status: 200, body: cdi }
@@ -702,12 +774,97 @@ Deno.test("uninstall deletes CDI only when this model installed it", async () =>
       verb(c) === "delete" && sub(c) === "cdi"
     )!;
     assertEquals(nsOf(delCdi), "cdi");
+    assert(delCdi.args.includes("--timeout=10s"));
     const manifestDeletes = h.calls.filter((c) =>
       verb(c) === "delete" && sub(c) === "-f"
     );
     assertEquals(manifestDeletes.length, 2);
     assertEquals(nsOf(manifestDeletes[1]), "cdi");
     assertEquals(manifestDeletes[1].stdin, cdi);
+  } finally {
+    h.restore();
+  }
+});
+
+Deno.test("uninstall refuses a CDI version or digest that does not match the record", async () => {
+  const key = await operatorStateKey(KC);
+  const ctx = testCtx({
+    storedResources: {
+      [key]: {
+        cluster_fp: await fingerprint(),
+        context: "current-context",
+        cdi_version: "v1.60.0",
+        cdi_installed_by_model: true,
+        cdi_operator_sha256: "a".repeat(64),
+        status: "present",
+        observed_at: "2026-10-17T00:00:00.000Z",
+      },
+    },
+  });
+  const h = harness(getRoute(crJson()), {
+    fetch: () => ({ status: 200, body: MANIFEST }),
+  });
+  try {
+    const fp = await fingerprint();
+    const e = await assertRejects(
+      () =>
+        model.methods.uninstall.execute({
+          ...INSTALL,
+          confirm: fp,
+          cdi_version: "v1.59.0",
+          cdi_operator_manifest_sha256: "b".repeat(64),
+        }, ctx.context),
+      KubevirtError,
+    );
+    assertEquals((e as KubevirtError).code, "invalid_input");
+    assert((e as Error).message.includes("must match"));
+    assertEquals(h.calls.some((c) => verb(c) === "delete"), false);
+  } finally {
+    h.restore();
+  }
+});
+
+Deno.test("uninstall deletes an owned CDI even when KubeVirt is already gone", async () => {
+  const cdi = "apiVersion: v1\nkind: Namespace\nmetadata: {name: cdi}\n";
+  const cdiSha = await sha256(cdi);
+  const key = await operatorStateKey(KC);
+  const ctx = testCtx({
+    storedResources: {
+      [key]: {
+        cluster_fp: await fingerprint(),
+        context: "current-context",
+        cdi_version: "v1.2.3",
+        cdi_installed_by_model: true,
+        cdi_operator_sha256: cdiSha,
+        status: "present",
+        observed_at: "2026-10-17T00:00:00.000Z",
+      },
+    },
+  });
+  // KubeVirt is fully absent; only a CDI object remains.
+  const h = harness((c) => {
+    if (verb(c) === "get" && sub(c) === "cdi") {
+      return {
+        stdout: JSON.stringify({ kind: "CDI", metadata: { name: "cdi" } }),
+      };
+    }
+    return getRoute(null)(c);
+  }, {
+    fetch: () => ({ status: 200, body: cdi }),
+  });
+  try {
+    const fp = await fingerprint();
+    const out = await model.methods.uninstall.execute({
+      ...INSTALL,
+      confirm: fp,
+      cdi_version: "v1.2.3",
+      cdi_operator_manifest_sha256: cdiSha,
+    }, ctx.context) as { result: { status: string } };
+    assertEquals(out.result.status, "deleted");
+    // No KubeVirt manifest was fetched, but CDI was cleaned up.
+    assertEquals(h.fetched.length, 1);
+    assert(h.fetched[0].includes("containerized-data-importer"));
+    assert(h.calls.some((c) => verb(c) === "delete" && sub(c) === "cdi"));
   } finally {
     h.restore();
   }

@@ -26,7 +26,14 @@ One KubeVirt installation per cluster, addressed by method arguments
 bytes match, so nothing is applied from an unverified manifest. It adopts an
 installation already at the same version and refuses a different one with a
 pointer to `upgrade`. `upgrade` moves one minor at a time unless
-`allow_minor_skip` is set, and never downgrades.
+`allow_minor_skip` is set, and never downgrades. With `install_cdi`, the CDI
+operator manifest and a minimal `CDI` custom resource are applied in the `cdi`
+namespace; an existing CDI this model did not install is adopted without being
+claimed. `uninstall` uses `confirm`, deletes CDI only when this definition
+installed it, with the recorded version and digest, and cleans up CDI even when
+KubeVirt is already gone. With the default `BlockUninstallIfWorkloadsExist`
+strategy a running workload blocks the delete (typed error), while
+`RemoveWorkloads` lets upstream delete running VMs.
 
 ### `@randybias/kubevirt-vm`
 

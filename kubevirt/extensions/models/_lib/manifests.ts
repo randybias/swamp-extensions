@@ -67,7 +67,7 @@ export function renderCdiCr(): string {
   return stringify({
     apiVersion: CDI_API_VERSION,
     kind: "CDI",
-    metadata: { name: CDI_CR_NAME, namespace: CDI_NAMESPACE },
+    metadata: { name: CDI_CR_NAME },
     spec: {},
   }, { lineWidth: 0 });
 }

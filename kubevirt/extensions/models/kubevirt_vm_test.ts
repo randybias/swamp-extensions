@@ -214,8 +214,24 @@ Deno.test("schema: exactly one source, digest-pinned image, bounded memory", () 
   });
   assertEquals(userinfo.success, false);
   assertEquals(isHttpUrl("https://images.test/d.img"), true);
-  assertEquals(isHttpUrl("http://user:pass@images.test/d.img"), false);
-  assertEquals(isHttpUrl("ftp://images.test/d.img"), false);
+  const good = [
+    "http://images.test/disk.img",
+    "https://images.test:8443/a/b.img",
+    "https://user-host.example.com/d.img",
+  ];
+  const bad = [
+    "ftp://images.test/d.img",
+    "http://user:pass@images.test/d.img",
+    "https://user%40example.com@images.test/d.img",
+    "http://images.test/d.img?tok=1",
+    "http://images.test/d.img#frag",
+    "http://a\\:secret@host/x",
+    "http://h/a@b",
+    "https://images.test/d img",
+    "https://images.test/d\timg",
+  ];
+  for (const u of good) assertEquals(isHttpUrl(u), true, u);
+  for (const u of bad) assertEquals(isHttpUrl(u), false, u);
   const ok = model.methods.define.arguments.parse(CONTAINER) as {
     run_strategy: string;
     cpu_cores: number;

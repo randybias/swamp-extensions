@@ -1,0 +1,90 @@
+{
+  "extension": "@randybias/apt-cache",
+  "version": "2026.10.17.1",
+  "reviewedAt": "2026-10-17T17:30:00Z",
+  "dimensions": [
+    {
+      "id": "credentials-secrets",
+      "verdict": "pass",
+      "note": "ssh_key_ref and admin_auth_ref are sensitive-marked vault references resolved through the plain-object context.vaultService (get(vault,key)); the SSH key reaches ssh-agent over stdin and the AdminAuth line is uploaded over stdin into a 0600 security.conf, never argv. client_get stores only Acquire::http/https::Proxy, never other apt keys (live 5: 0 hits for a planted ftp proxy credential). Vendored _lib/ssh.ts is the canonical blob fe0139f0; managed-file digests are compared locally, so no content hash is on argv. Live argv scans: 0 admin-credential hits in 547, 642 and the cf83525 sampled lines and in all run logs. Residual: unit fixtures hold a synthetic placeholder credential (conformance Medium, kept)."
+    },
+    {
+      "id": "logging-quality",
+      "verdict": "pass",
+      "note": "Each method logs the host and outcome once; no credential, fragment text or host keys in log fields; proxy URLs with userinfo are refused at validation."
+    },
+    {
+      "id": "error-handling",
+      "verdict": "pass",
+      "note": "Typed AptCacheError codes (confirm, verify_failed, open_listener, log_missing, log_corrupt, policy mismatch); every remote write, rm, mv, stop and disable is requireOk'd and state is written last. install_server runs a bounded apt-get update first and surfaces its error; after install any wildcard listener on 3142 stops the daemon and fails with open_listener. apply verifies is-active, every exact listen address:port, a local fetch, and the admin probe: 401 when admin_auth_ref is set, exactly 200 after it is dropped (merge-prep 09f38dd; any other status fails). stats fails closed on an unrecognised log."
+    },
+    {
+      "id": "testing-completeness",
+      "verdict": "pass",
+      "note": "112 unit/contract tests: renderers with goldens (Remap shape checked against real apt-cacher-ng 3.7.4), proxy/backend URL grammar including the shell-metacharacter injection, apt-config dump parsing, the detect script under sh -eu, the log parser on a real log shape, ownership/backup/restore through a daemon fake that only reloads on restart, install ordering (update, then bootstrap fragment, then install), the wildcard-listener refusal, a 500 admin probe after a drop, and the plain-object vaultService path. Live: d256e1a 9/10 (install fixed in cf83525), 1a24f7b 7/7, cf83525 5/5 on <vps2>."
+    },
+    {
+      "id": "idempotency-resilience",
+      "verdict": "pass",
+      "note": "apply writes and restarts only when bytes change (live 6 and B3: MainPID, ActiveEnterTimestamp, mtimes and sha256 identical); install adopts an installed package and keeps the ownership map; remove_server and unconfigure_client re-runs are no-ops (live 9). A pre-existing file is backed up once and restored on remove; the model's own bytes are never backed up."
+    },
+    {
+      "id": "api-contracts",
+      "verdict": "pass",
+      "note": "Apt-Cacher NG 3.7.4 (Ubuntu 24.04): one zzzz- fragment that sorts after zz_debconf.conf, backends as files after ';' in Remap lines, explicit PassThroughPattern, debconf tunnelenable=false, the loopback BindAddress bootstrap fragment before install, admin probe on acng-report.html?doCount=Count+Data (401 with AdminAuth loaded, 200 without, measured live). Client: Acquire::http::Proxy, Acquire::https::Proxy DIRECT or via the proxy per policy, Proxy-Auto-Detect for fallback_direct, verified by apt-config dump. Verify reads the tools' own output (ss, apt-config, systemctl), not the render."
+    },
+    {
+      "id": "resource-management",
+      "verdict": "pass",
+      "note": "Managed paths come from one allowlist; a tampered record cannot steer rm/mv elsewhere. The cache directory is deleted only with purge_cache_ack and a matching recorded cache_dir; plain remove avoids the purge postrm that would delete the cache. unconfigure_client removes the script directory when empty (live C5). Local curls pass --noproxy '*'."
+    },
+    {
+      "id": "published-surface-hygiene",
+      "verdict": "pass",
+      "note": "Manifest @randybias/apt-cache 2026.10.17.1, Apache-2.0, additionalFiles README.md and LICENSE.txt; mutating methods are actions, read-only methods say READ-ONLY, remove_server says DESTRUCTIVE. Leak scan, gitleaks and the fixture guard pass; fixtures use RFC 5737 and example.test; LOGBOOK live receipts redact the host as <vps2>."
+    },
+    {
+      "id": "schema-strictness",
+      "verdict": "pass",
+      "note": "Strict objects throughout; https_policy is required with no default; host_key_policy is strict-only with required host_keys (no insecure_tofu); listen addresses are normalised and a wildcard needs listen_any_ack; backend URLs are scheme-checked per policy and refuse userinfo, query, fragment and explicit ports; debian-security is refused; remove_server requires confirm_host equal to the SSH host."
+    },
+    {
+      "id": "lifetime-gc",
+      "verdict": "pass",
+      "note": "server and client infinite/10; observation and render 7d/20."
+    },
+    {
+      "id": "crud-completeness",
+      "verdict": "pass",
+      "note": "install_server, render_server, apply_server, get, sync, stats, remove_server for the server; configure_client, client_get, unconfigure_client for clients."
+    },
+    {
+      "id": "preflight-checks",
+      "verdict": "pass",
+      "note": "Inputs are validated before any SSH; configure_client refuses a conflicting proxy file without override_existing_ack and a policy that disagrees with a recorded server for the proxy host; remove refuses a mismatched confirm_host and a purge of an unrecorded cache_dir. Host keys are pinned by the canonical transport."
+    },
+    {
+      "id": "instance-names",
+      "verdict": "pass",
+      "note": "Records are keyed by the canonical {user, host, port}; render records by input digest, so render_server never clobbers server state."
+    },
+    {
+      "id": "data-access",
+      "verdict": "pass",
+      "note": "Targets, keys and inputs arrive as method arguments; the model reads its own server records, and configure_client's policy check is scoped to @randybias/apt-cache server records."
+    },
+    {
+      "id": "version-upgrades",
+      "verdict": "pass",
+      "note": "First publish: no prior stored attributes, so no upgrade entries are needed."
+    }
+  ],
+  "panel": {
+    "codex-astra": "codex gpt-6-astra conformance seat, d5 rounds r1 1b18f4f to r4 d256e1a and b2's 1a24f7b: CLEAN at 1a24f7b after triage. Earlier Highs (Remap backend placement, purge deleting the cache, proxy-URL shell injection, missing detect dir, client_get over-collection, Count Data report rows, lost ownership records, missing restart after a dropped credential) were fixed in r1-r5. Open Medium at 1a24f7b (admin probe accepted any non-401) fixed at merge-prep 09f38dd; the synthetic test credential Medium is kept (LOGBOOK residual).",
+    "codex-terra": "codex gpt-5.6-terra adversarial seat, same rounds: CLEAN at 1a24f7b; its one Medium (require 200 and --noproxy on the admin probe) applied at merge-prep 09f38dd.",
+    "tightness-astra": "COULD-BE-TIGHTER at 1a24f7b, about 6 removable lines; all three suggestions applied at merge-prep 09f38dd (applyArgsOf reuse, mutable enforced flag removed, redundant ok alias removed).",
+    "merge-prep": "Self-review of the live-fix delta 1a24f7b..cf83525 against TRIAGE 4b-4h: no Critical/High. readResource/writeResource used in the runtime shape; the bootstrap fragment is a constant (no parser differential); the wildcard check reads ss output, not the render; the bounded apt-get update exits 124 on timeout and fails typed (no partial output needed); no insecure_tofu; no content hash and no secret on argv. Code commits at merge-prep: 09f38dd (quality pass) and 80ef0fc (gate 7: apt_cache_test.ts entry-point tests moved from server_methods_test.ts). Vendored _lib/ssh.ts is the canonical blob fe0139f0. 112 tests pass, gates 0 to 6 pass.",
+    "live-e2e": "One throwaway VPS (<vps2>, Ubuntu 24.04, apt-cacher-ng 3.7.4): d256e1a 9/10 (install on a stock image failed and the default listener was briefly open; fixed in cf83525), 1a24f7b 7/7, cf83525 5/5 from empty package lists with 554 ss samples during install showing only a loopback listener, never a wildcard.",
+    "ocr-llm": "advisory adversarial-glm seat timed out (rc=124) at 1a24f7b; not blocking"
+  }
+}

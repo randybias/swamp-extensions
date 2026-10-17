@@ -257,9 +257,14 @@ authoritative server over SSH. Adjacent only, each driving another product
 through its API: @jamesakeech/technitium and @thomas/technitium (Technitium DNS
 Server), @shrug/freeipa/dns (FreeIPA's integrated DNS), @magistr/pihole and
 @lint/adguard (filtering resolvers), @lint/dns-policy, @svendowideit/mdns, and
-the cloud DNS packages (@swamp/cloudflare/dns and secondary-dns, @swamp/gcp/dns,
-@swamp/aws/route53). None renders and validates a Knot zone or a Knot Resolver 6
-config, so there is nothing to file upstream.
+the provider DNS packages: @swamp/cloudflare/dns and
+@swamp/cloudflare/secondary-dns, @swamp/vercel/dns, @swamp/gcp/dns,
+@swamp/aws/route53 and @sntxrr/scaleway-dns (zone and record management over a
+provider API), and @webframp/aws/dns-observation (read-only Route53 zone and
+record observation with orphan detection). None renders and validates a Knot
+zone or a Knot Resolver 6 config; every one needs a provider API, account token
+or registrar credential, and none edits an on-host zone file over SSH, so there
+is nothing to file upstream.
 
 ## Decisions for Randy (merge summary)
 

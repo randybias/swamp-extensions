@@ -27,6 +27,7 @@ import {
   parseProbeLine,
   probeScript,
   runPackagePhase,
+  sanitizeProxyLine,
   splitSections,
 } from "./_lib/hostprep.ts";
 import {
@@ -37,21 +38,36 @@ import {
   toTarget,
 } from "./_lib/ssh.ts";
 import {
+  CEPH_ID_SCHEMA,
   CEPHADM_VERSION_SCHEMA,
+  CIDR_SCHEMA,
+  CONTAINER_IMAGE_SCHEMA,
+  FSID_SCHEMA,
   HOST_FIELD,
+  HOSTNAME_SCHEMA,
   HTTP_URL_SCHEMA,
+  IPV4_SCHEMA,
   PACKAGE_SCHEMA,
+  PLACEMENT_SCHEMA,
   SERIAL_SCHEMA,
   SSH_FIELDS,
+  SSH_PUBKEY_SCHEMA,
   UNIT_SCHEMA,
 } from "./_lib/schema.ts";
+import {
+  applyMon,
+  applyPlacement,
+  bootstrapCluster,
+  distributeKeyToHost,
+  type DistributeOutcome,
+  distributeRecordKey,
+  hostAdd,
+} from "./_lib/lifecycle.ts";
+import { TransportError } from "./_lib/errors.ts";
 import { wipeDiskToRaw, type WipeRecord } from "./_lib/wipe.ts";
 
 /** Model type version; must equal the manifest version. */
 export const VERSION = "2026.10.17.1";
-
-/** HTTP fetch, used only by the S3 methods; injectable. */
-export type FetchFn = (input: string, init?: RequestInit) => Promise<Response>;
 
 /** Replaceable dependencies of the model. */
 export interface CephadmDeps {
@@ -63,8 +79,6 @@ export interface CephadmDeps {
   sleep: (ms: number) => Promise<void>;
   /** Random value in [0, 1). */
   random: () => number;
-  /** HTTP fetch, used only by the S3 bucket methods. */
-  fetch: FetchFn;
 }
 
 const productionDeps: CephadmDeps = {
@@ -72,7 +86,6 @@ const productionDeps: CephadmDeps = {
   now: () => Date.now(),
   sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
   random: Math.random,
-  fetch: (input, init) => fetch(input, init),
 };
 
 /** Minimal logger shape the methods use. */
@@ -93,11 +106,6 @@ interface MethodContext {
     name: string,
     data: Record<string, unknown>,
   ) => Promise<{ name: string }>;
-  /** Reads a previously written resource by instance name. */
-  readResource?: (
-    name: string,
-    version?: number,
-  ) => Promise<Record<string, unknown> | null>;
 }
 
 const GlobalArgsSchema = z.strictObject({});
@@ -152,6 +160,7 @@ const WipeDiskResultSchema = z.strictObject({
   host: z.string(),
   dryRun: z.boolean(),
   capturedAt: z.string(),
+  alreadyRaw: z.boolean().optional(),
   plannedDevices: z.array(WipeDeviceSchema).optional(),
   excludedDevices: z.array(WipeDeviceSchema).optional(),
   wiped: z.array(WipeDeviceSchema).optional(),
@@ -162,13 +171,14 @@ const WipeDiskResultSchema = z.strictObject({
   mdConfigRewritten: z.boolean().optional(),
   initramfsRebuilt: z.boolean().optional(),
   preTeardownMdadmScan: z.string().optional(),
-  preTeardownFstab: z.string().optional(),
+  preTeardownFstabSha256: z.string().optional(),
+  preTeardownFstabEntries: z.number().optional(),
 });
 
 const HostPrepArgs = z.strictObject({
   host: HOST_FIELD.describe("Target host."),
   ...SSH_FIELDS,
-  packages: z.array(PACKAGE_SCHEMA).min(1).describe(
+  packages: z.array(PACKAGE_SCHEMA).min(1).max(64).describe(
     "Debian packages to ensure installed; the caller decides the list.",
   ),
   cephadmUrl: HTTP_URL_SCHEMA.describe("Where to download the cephadm binary."),
@@ -178,9 +188,10 @@ const HostPrepArgs = z.strictObject({
   timeSyncService: UNIT_SCHEMA.describe(
     "systemd unit that provides time sync.",
   ),
-  installRetryBudgetMs: z.number().int().min(0).nullish().describe(
-    "Total time the package phase may spend retrying; absent means no retry.",
-  ),
+  installRetryBudgetMs: z.number().int().min(0).max(86400000).nullish()
+    .describe(
+      "Total time the package phase may spend retrying; absent means no retry.",
+    ),
 });
 
 const PackageSourceArgs = z.strictObject({
@@ -207,20 +218,136 @@ const WipeArgsSchema = z.strictObject({
         "Informational kernel name; never used.",
       ),
     }),
-  ).min(1).describe("Disks to wipe, selected by serial."),
+  ).min(1).max(128).describe("Disks to wipe, selected by serial."),
   excludeDevices: z.array(
     z.strictObject({
       serial: SERIAL_SCHEMA.describe("Never-touch serial."),
       reason: z.string().max(256).optional().describe("Why it is excluded."),
     }),
-  ).describe("Never-touch list; required even when empty."),
+  ).max(256).describe("Never-touch list; required even when empty."),
   dryRun: z.boolean().nullish().describe(
     "Run every gate and report the plan; wipe nothing.",
   ),
 });
 
-/** The four S3 bucket methods that do not use SSH. */
-const S3_METHODS = new Set<string>([]);
+const BootstrapArgs = z.strictObject({
+  host: HOST_FIELD.describe("Host to bootstrap; also the SSH target."),
+  ...SSH_FIELDS,
+  monIp: IPV4_SCHEMA.describe("First monitor's IPv4 address."),
+  publicNet: CIDR_SCHEMA.describe("Ceph public network, containing monIp."),
+  clusterNet: CIDR_SCHEMA.describe("Ceph cluster network."),
+  cephImage: CONTAINER_IMAGE_SCHEMA.describe("Image to bootstrap with."),
+  timeoutMs: z.number().int().positive().max(3600000).nullish().describe(
+    "SSH budget for the bootstrap command; defaults to 900000.",
+  ),
+});
+
+const DistributeKeyArgs = z.strictObject({
+  ...SSH_FIELDS,
+  cephPubKey: SSH_PUBKEY_SCHEMA.describe("Cluster public key to install."),
+  hosts: z.array(
+    z.strictObject({
+      host: HOST_FIELD.describe("Target host."),
+      port: z.number().int().min(1).max(65535).describe(
+        "That target's SSH port.",
+      ),
+    }),
+  ).min(1).max(512).describe("Targets, each with its own port."),
+});
+
+const HostAddArgs = z.strictObject({
+  adminHost: HOST_FIELD.describe("Where ceph runs."),
+  ...SSH_FIELDS,
+  fsid: FSID_SCHEMA.describe("Expected cluster fsid."),
+  host: HOSTNAME_SCHEMA.describe("Name cephadm will register."),
+  addr: IPV4_SCHEMA.describe("Address cephadm will use for the host."),
+});
+
+const ApplyMonArgs = z.strictObject({
+  adminHost: HOST_FIELD.describe("Where ceph runs."),
+  ...SSH_FIELDS,
+  placement: PLACEMENT_SCHEMA.describe("Hosts that must run mons."),
+  allowQuorumRisk: z.boolean().nullish().describe(
+    "Proceed even if the quorum check fails or cannot run.",
+  ),
+});
+
+const ApplyMgrArgs = z.strictObject({
+  adminHost: HOST_FIELD.describe("Where ceph runs."),
+  ...SSH_FIELDS,
+  placement: PLACEMENT_SCHEMA.describe("Hosts that must run mgrs."),
+});
+
+const ApplyMdsArgs = z.strictObject({
+  adminHost: HOST_FIELD.describe("Where ceph runs."),
+  ...SSH_FIELDS,
+  fsName: CEPH_ID_SCHEMA.describe(
+    "Filesystem whose MDS placement to converge.",
+  ),
+  placement: PLACEMENT_SCHEMA.describe("Hosts that must run MDS daemons."),
+});
+
+const BootstrapResultSchema = z.strictObject({
+  host: z.string(),
+  fsid: z.string(),
+  cephPubKey: z.string(),
+  adminKeyringRef: z.strictObject({ host: z.string(), path: z.string() }),
+  bootstrapped: z.boolean(),
+  recoveredAfterTransportError: z.boolean(),
+  capturedAt: z.string(),
+});
+
+const DistributeKeyResultSchema = z.strictObject({
+  hosts: z.array(
+    z.strictObject({
+      host: z.string(),
+      port: z.number(),
+      alreadyPresent: z.boolean(),
+      backedUp: z.boolean(),
+      verified: z.boolean(),
+    }),
+  ),
+  capturedAt: z.string(),
+});
+
+const HostAddResultSchema = z.strictObject({
+  host: z.string(),
+  addr: z.string(),
+  added: z.boolean(),
+  capturedAt: z.string(),
+});
+
+const ApplyMonResultSchema = z.strictObject({
+  placement: z.array(z.string()),
+  applied: z.boolean(),
+  replacedCountSpec: z.boolean(),
+  previousCount: z.number().nullable(),
+  quorumCheck: z.strictObject({
+    evaluated: z.boolean(),
+    pass: z.boolean().nullable(),
+    overridden: z.boolean(),
+    kept: z.number(),
+    current: z.number(),
+  }),
+  capturedAt: z.string(),
+});
+
+const ApplyMgrResultSchema = z.strictObject({
+  placement: z.array(z.string()),
+  applied: z.boolean(),
+  replacedCountSpec: z.boolean(),
+  previousCount: z.number().nullable(),
+  capturedAt: z.string(),
+});
+
+const ApplyMdsResultSchema = z.strictObject({
+  fsName: z.string(),
+  placement: z.array(z.string()),
+  applied: z.boolean(),
+  replacedCountSpec: z.boolean(),
+  previousCount: z.number().nullable(),
+  capturedAt: z.string(),
+});
 
 /**
  * Builds the cephadm model. Overrides replace the production dependencies and
@@ -312,7 +439,9 @@ export function createCephadmModel(overrides: Partial<CephadmDeps> = {}) {
           privateKey: args.privateKey,
           strictHostKeyChecking: args.strictHostKeyChecking,
         });
-        const session = await openSession(deps, target, { multiplex: false });
+        const session = await openSession(deps, target, {
+          multiplex: args.multiplex ?? false,
+        });
         try {
           const result = await checkPackageSources(
             session,
@@ -398,13 +527,343 @@ export function createCephadmModel(overrides: Partial<CephadmDeps> = {}) {
         }
       },
     },
+
+    cephBootstrap: {
+      description:
+        "Bootstrap a new standalone cephadm cluster on one host, or do nothing when one already exists there. Idempotent; the result carries a path reference to the admin keyring, never its contents.",
+      arguments: BootstrapArgs,
+      execute: async (
+        args: z.infer<typeof BootstrapArgs>,
+        context: MethodContext,
+      ) => {
+        const target = toTarget({
+          host: args.host,
+          sshUser: args.sshUser,
+          port: args.port,
+          keyPath: args.keyPath,
+          privateKey: args.privateKey,
+          strictHostKeyChecking: args.strictHostKeyChecking,
+        });
+        const session = await openSession(deps, target, { multiplex: true });
+        context.logger.info("Bootstrapping {host}", { host: args.host });
+        try {
+          const result = await bootstrapCluster(
+            deps,
+            session,
+            {
+              host: args.host,
+              monIp: args.monIp,
+              publicNet: args.publicNet,
+              clusterNet: args.clusterNet,
+              cephImage: args.cephImage,
+              sshUser: args.sshUser,
+              timeoutMs: args.timeoutMs ?? 900_000,
+            },
+            context.logger,
+          );
+          const record = BootstrapResultSchema.parse({
+            host: args.host,
+            fsid: result.fsid,
+            cephPubKey: result.cephPubKey,
+            adminKeyringRef: {
+              host: args.host,
+              path: "/etc/ceph/ceph.client.admin.keyring",
+            },
+            bootstrapped: result.bootstrapped,
+            recoveredAfterTransportError: result.recoveredAfterTransportError,
+            capturedAt: new Date(deps.now()).toISOString(),
+          });
+          const handle = await context.writeResource(
+            "cephBootstrapResult",
+            `cephBootstrap-${args.host}`,
+            record,
+          );
+          return { dataHandles: [handle] };
+        } finally {
+          await session.close();
+        }
+      },
+    },
+
+    cephDistributeKey: {
+      description:
+        "Append the cluster public key to sshUser's authorized_keys on every listed host, deduplicated, with a backup taken on every run. Idempotent; processes every host and fails at the end if any host did not verify.",
+      arguments: DistributeKeyArgs,
+      execute: async (
+        args: z.infer<typeof DistributeKeyArgs>,
+        context: MethodContext,
+      ) => {
+        const outcomes: DistributeOutcome[] = [];
+        for (const entry of args.hosts) {
+          const target = toTarget({
+            host: entry.host,
+            sshUser: args.sshUser,
+            port: entry.port,
+            keyPath: args.keyPath,
+            privateKey: args.privateKey,
+            strictHostKeyChecking: args.strictHostKeyChecking,
+          });
+          const session = await openSession(deps, target, {
+            multiplex: args.multiplex ?? false,
+          });
+          try {
+            outcomes.push(
+              await distributeKeyToHost(
+                deps,
+                session,
+                args.cephPubKey,
+                entry.host,
+                entry.port,
+              ),
+            );
+          } catch (e) {
+            outcomes.push({
+              host: entry.host,
+              port: entry.port,
+              alreadyPresent: false,
+              backedUp: false,
+              verified: false,
+              reason: e instanceof TransportError
+                ? e.message
+                : (e as Error).message,
+            });
+          } finally {
+            await session.close();
+          }
+        }
+        const failed = outcomes.filter((o) => !o.verified);
+        if (failed.length > 0) {
+          throw new PhaseError(
+            "cephDistributeKey",
+            `the key is not present on ${failed.length} of ${outcomes.length} hosts`,
+            {
+              failures: failed.map((o) =>
+                `${o.host}:${o.port} (${o.reason ?? "unverified"})`
+              ),
+            },
+          );
+        }
+        const handle = await context.writeResource(
+          "cephDistributeKeyResult",
+          distributeRecordKey(args.hosts),
+          {
+            hosts: outcomes.map((o) => ({
+              host: o.host,
+              port: o.port,
+              alreadyPresent: o.alreadyPresent,
+              backedUp: o.backedUp,
+              verified: o.verified,
+            })),
+            capturedAt: new Date(deps.now()).toISOString(),
+          },
+        );
+        return { dataHandles: [handle] };
+      },
+    },
+
+    cephHostAdd: {
+      description:
+        "Enrol a host with the orchestrator after confirming the admin host is attached to the expected cluster, then read the host list back. Idempotent; a host already registered at the same address is a no-op.",
+      arguments: HostAddArgs,
+      execute: async (
+        args: z.infer<typeof HostAddArgs>,
+        context: MethodContext,
+      ) => {
+        const session = await openSession(
+          deps,
+          toTarget({
+            host: args.adminHost,
+            sshUser: args.sshUser,
+            port: args.port,
+            keyPath: args.keyPath,
+            privateKey: args.privateKey,
+            strictHostKeyChecking: args.strictHostKeyChecking,
+          }),
+          { multiplex: args.multiplex ?? false },
+        );
+        try {
+          const result = await hostAdd(
+            deps,
+            session,
+            { fsid: args.fsid, host: args.host, addr: args.addr },
+            context.logger,
+          );
+          const handle = await context.writeResource(
+            "cephHostAddResult",
+            `cephHostAdd-${args.host}`,
+            {
+              host: args.host,
+              addr: args.addr,
+              added: result.added,
+              capturedAt: new Date(deps.now()).toISOString(),
+            },
+          );
+          return { dataHandles: [handle] };
+        } finally {
+          await session.close();
+        }
+      },
+    },
+
+    cephApplyMon: {
+      description:
+        "Converge mon placement to an explicit host list, refusing a change that would leave fewer than a strict majority of the current in-quorum mons unless allowQuorumRisk is set. Idempotent; a count-based spec is replaced.",
+      arguments: ApplyMonArgs,
+      execute: async (
+        args: z.infer<typeof ApplyMonArgs>,
+        context: MethodContext,
+      ) => {
+        const session = await openSession(
+          deps,
+          toTarget({
+            host: args.adminHost,
+            sshUser: args.sshUser,
+            port: args.port,
+            keyPath: args.keyPath,
+            privateKey: args.privateKey,
+            strictHostKeyChecking: args.strictHostKeyChecking,
+          }),
+          { multiplex: args.multiplex ?? false },
+        );
+        try {
+          const result = await applyMon(
+            deps,
+            session,
+            {
+              placement: args.placement,
+              allowQuorumRisk: args.allowQuorumRisk ?? false,
+            },
+            context.logger,
+          );
+          const handle = await context.writeResource(
+            "cephApplyMonResult",
+            `cephApplyMon-${args.adminHost}`,
+            {
+              placement: args.placement,
+              applied: result.applied,
+              replacedCountSpec: result.replacedCountSpec,
+              previousCount: result.previousCount,
+              quorumCheck: result.quorumCheck,
+              capturedAt: new Date(deps.now()).toISOString(),
+            },
+          );
+          return { dataHandles: [handle] };
+        } finally {
+          await session.close();
+        }
+      },
+    },
+
+    cephApplyMgr: {
+      description:
+        "Converge mgr placement to an explicit host list, never a count. Idempotent; a count-based spec is replaced and recorded.",
+      arguments: ApplyMgrArgs,
+      execute: async (
+        args: z.infer<typeof ApplyMgrArgs>,
+        context: MethodContext,
+      ) => {
+        const session = await openSession(
+          deps,
+          toTarget({
+            host: args.adminHost,
+            sshUser: args.sshUser,
+            port: args.port,
+            keyPath: args.keyPath,
+            privateKey: args.privateKey,
+            strictHostKeyChecking: args.strictHostKeyChecking,
+          }),
+          { multiplex: args.multiplex ?? false },
+        );
+        try {
+          const result = await applyPlacement(
+            deps,
+            session,
+            {
+              serviceName: "mgr",
+              applyArgs: "mgr",
+              requested: args.placement,
+              phase: "cephApplyMgr",
+            },
+            context.logger,
+          );
+          const handle = await context.writeResource(
+            "cephApplyMgrResult",
+            `cephApplyMgr-${args.adminHost}`,
+            {
+              placement: args.placement,
+              applied: result.applied,
+              replacedCountSpec: result.replacedCountSpec,
+              previousCount: result.previousCount,
+              capturedAt: new Date(deps.now()).toISOString(),
+            },
+          );
+          return { dataHandles: [handle] };
+        } finally {
+          await session.close();
+        }
+      },
+    },
+
+    cephApplyMds: {
+      description:
+        "Converge one filesystem's MDS placement to an explicit host list. Idempotent; sets only where MDS daemons run, never max_mds or standby_count_wanted.",
+      arguments: ApplyMdsArgs,
+      execute: async (
+        args: z.infer<typeof ApplyMdsArgs>,
+        context: MethodContext,
+      ) => {
+        const session = await openSession(
+          deps,
+          toTarget({
+            host: args.adminHost,
+            sshUser: args.sshUser,
+            port: args.port,
+            keyPath: args.keyPath,
+            privateKey: args.privateKey,
+            strictHostKeyChecking: args.strictHostKeyChecking,
+          }),
+          { multiplex: args.multiplex ?? false },
+        );
+        try {
+          const result = await applyPlacement(
+            deps,
+            session,
+            {
+              serviceName: `mds.${args.fsName}`,
+              applyArgs: `mds ${args.fsName}`,
+              requested: args.placement,
+              phase: "cephApplyMds",
+            },
+            context.logger,
+          );
+          const handle = await context.writeResource(
+            "cephApplyMdsResult",
+            `cephApplyMds-${args.adminHost}-${args.fsName}`,
+            {
+              fsName: args.fsName,
+              placement: args.placement,
+              applied: result.applied,
+              replacedCountSpec: result.replacedCountSpec,
+              previousCount: result.previousCount,
+              capturedAt: new Date(deps.now()).toISOString(),
+            },
+          );
+          return { dataHandles: [handle] };
+        } finally {
+          await session.close();
+        }
+      },
+    },
   };
 
-  const sshMethods = Object.keys(methods).filter((m) => !S3_METHODS.has(m));
+  const sshMethods = Object.keys(methods);
 
   return {
     type: "@randybias/cephadm",
+    // The consistency gate requires this literal; VERSION mirrors it.
     version: "2026.10.17.1",
+    description:
+      "Install and operate a standalone Ceph cluster managed by cephadm on Debian-family hosts reached over SSH. One model type serves any number of hosts and clusters; every method takes its own target.",
     upgrades: [
       {
         toVersion: VERSION,
@@ -431,6 +890,43 @@ export function createCephadmModel(overrides: Partial<CephadmDeps> = {}) {
       wipeDiskResult: {
         description: "Disk wipe evidence and, on a dry run, its plan",
         schema: WipeDiskResultSchema,
+        lifetime: "infinite" as const,
+        garbageCollection: 10,
+      },
+      cephBootstrapResult: {
+        description:
+          "Bootstrap evidence: fsid, public key and admin keyring reference",
+        schema: BootstrapResultSchema,
+        lifetime: "infinite" as const,
+        garbageCollection: 10,
+      },
+      cephDistributeKeyResult: {
+        description: "Per-host admin-key distribution evidence",
+        schema: DistributeKeyResultSchema,
+        lifetime: "infinite" as const,
+        garbageCollection: 10,
+      },
+      cephHostAddResult: {
+        description: "Host enrolment evidence",
+        schema: HostAddResultSchema,
+        lifetime: "infinite" as const,
+        garbageCollection: 10,
+      },
+      cephApplyMonResult: {
+        description: "Mon placement convergence and quorum-safety evidence",
+        schema: ApplyMonResultSchema,
+        lifetime: "infinite" as const,
+        garbageCollection: 10,
+      },
+      cephApplyMgrResult: {
+        description: "Mgr placement convergence evidence",
+        schema: ApplyMgrResultSchema,
+        lifetime: "infinite" as const,
+        garbageCollection: 10,
+      },
+      cephApplyMdsResult: {
+        description: "MDS placement convergence evidence",
+        schema: ApplyMdsResultSchema,
         lifetime: "infinite" as const,
         garbageCollection: 10,
       },
@@ -511,7 +1007,7 @@ async function checkPackageSources(
   const noSourcesFound = aptEndpoints.length === 0;
   const proxyLines = sections.proxy.split("\n").map((l) => l.trim()).filter((
     l,
-  ) => l !== "");
+  ) => l !== "").map(sanitizeProxyLine);
   if (proxyLines.length > 0) {
     log.warn("apt is configured with a proxy, so the probed route may differ");
   }

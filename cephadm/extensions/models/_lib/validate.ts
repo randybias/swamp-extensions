@@ -118,12 +118,17 @@ export function isIpv4Cidr(value: string): boolean {
   return (asInt & mask) >>> 0 === asInt;
 }
 
-/** Characters that must never appear raw in an HTTP(S) URL we will fetch as root. */
-const URL_FORBIDDEN = /[;&|`$()<>\s\\]/;
+/**
+ * Allowlist for a raw HTTP(S) URL. Every character must be one this grammar
+ * names, so shell metacharacters, whitespace, backslashes and userinfo are
+ * refused by construction rather than by a denylist.
+ */
+const URL_ALLOWED =
+  /^https?:\/\/[A-Za-z0-9.-]+(?::\d{1,5})?(?:\/[A-Za-z0-9._~%!+,=:@/-]*)?(?:\?[A-Za-z0-9._~%!+,=:@/?-]*)?(?:#[A-Za-z0-9._~%!+,=:@/?-]*)?$/;
 
-/** True when `raw` parses as an absolute http/https URL with no smuggled content. */
+/** True when `raw` is an absolute http/https URL with an allowlisted shape and no userinfo. */
 export function isHttpUrl(raw: string): boolean {
-  if (raw === "" || URL_FORBIDDEN.test(raw)) return false;
+  if (raw === "" || !URL_ALLOWED.test(raw)) return false;
   let url: URL;
   try {
     url = new URL(raw);
@@ -131,7 +136,40 @@ export function isHttpUrl(raw: string): boolean {
     return false;
   }
   if (url.protocol !== "http:" && url.protocol !== "https:") return false;
-  return url.host !== "";
+  if (url.username !== "" || url.password !== "") return false;
+  if (url.hostname === "") return false;
+  return isHostTarget(url.hostname);
+}
+
+/** Removes any userinfo from a URL for safe display in an error or log. */
+export function redactUrl(raw: string): string {
+  return raw.replace(/^([A-Za-z][A-Za-z0-9+.-]*:\/\/)[^@/\s]*@/, "$1");
+}
+
+/** LVM volume-group name: letters, digits, plus, underscore, dot, hyphen; no leading hyphen. */
+export const VG_NAME_RE = /^[A-Za-z0-9+_.-]{1,128}$/;
+
+/** Runtime assertion: `value` is a safe LVM volume-group name. */
+export function assertVgName(field: string, value: string): string {
+  return assertGrammar(
+    field,
+    value,
+    VG_NAME_RE.test(value) && !value.startsWith("-"),
+    "an LVM volume-group name",
+  );
+}
+
+/** An md array path under `/dev/md`, no traversal. */
+export const MD_ARRAY_RE = /^\/dev\/md[0-9A-Za-z._/-]*$/;
+
+/** Runtime assertion: `value` is a safe md array path. */
+export function assertMdArrayPath(field: string, value: string): string {
+  return assertGrammar(
+    field,
+    value,
+    MD_ARRAY_RE.test(value) && !value.includes(".."),
+    "an md array path under /dev/md",
+  );
 }
 
 const SSH_KEY_TYPES = new Set([

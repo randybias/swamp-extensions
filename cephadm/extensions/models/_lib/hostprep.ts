@@ -14,7 +14,13 @@
 
 import { fail, SudoPolicyError, TransportError } from "./errors.ts";
 import type { SshSession } from "./ssh.ts";
-import { assertCephadmVersion, assertHttpUrl, quote } from "./validate.ts";
+import {
+  assertCephadmVersion,
+  assertHttpUrl,
+  HOSTNAME_RE,
+  quote,
+  redactUrl,
+} from "./validate.ts";
 
 /** Shared dependencies for waits and jitter. */
 export interface PrepDeps {
@@ -115,6 +121,16 @@ export function isAptLockContention(stderr: string): boolean {
 }
 
 type Logger = { warn: (m: string, p?: Record<string, unknown>) => void };
+
+/** The capped exponential wait between package-phase entries, clamped to what is left. */
+export function hostprepBackoff(
+  n: number,
+  remainingMs: number,
+  random: () => number,
+): number {
+  const raw = Math.min(30_000, 3000 * 2 ** n) + Math.floor(random() * 3000);
+  return Math.min(Math.max(1, remainingMs), raw);
+}
 
 /**
  * Runs the package phase. Returns evidence when every requested package is
@@ -275,10 +291,7 @@ export async function runPackagePhase(
     if (state.kind === "transport") {
       recordTransport(state.error);
       if (budget === 0) break;
-      const wait = Math.min(
-        Math.max(1, budget - (deps.now() - started)),
-        Math.min(30_000, 3000 * 2 ** n) + Math.floor(deps.random() * 3000),
-      );
+      const wait = hostprepBackoff(n, deadline - deps.now(), deps.random);
       if (deps.now() + wait > deadline) break;
       await deps.sleep(wait);
       n++;
@@ -288,10 +301,7 @@ export async function runPackagePhase(
       evidence.busyWaits++;
       lastCause = "busy";
       if (budget === 0) break;
-      const wait = Math.min(
-        Math.max(1, deadline - deps.now()),
-        Math.min(30_000, 3000 * 2 ** n) + Math.floor(deps.random() * 3000),
-      );
+      const wait = hostprepBackoff(n, deadline - deps.now(), deps.random);
       if (deps.now() + wait > deadline) break;
       await deps.sleep(wait);
       n++;
@@ -504,7 +514,7 @@ export async function ensureCephadm(
   });
   if (curl.code !== 0) {
     fail("hostprep.cephadm-install", "download failed", {
-      url: opts.url,
+      url: redactUrl(opts.url),
       cause: curl.stderr.slice(0, 300),
     });
   }
@@ -515,7 +525,7 @@ export async function ensureCephadm(
   });
   if (chmod.code !== 0) {
     fail("hostprep.cephadm-install", "chmod failed", {
-      url: opts.url,
+      url: redactUrl(opts.url),
       cause: chmod.stderr.slice(0, 300),
     });
   }
@@ -599,10 +609,22 @@ function addUrl(out: Endpoint[], raw: string): void {
   }
   if (url.protocol !== "http:" && url.protocol !== "https:") return;
   const name = url.hostname.toLowerCase();
-  if (name === "") return;
+  // A discovered name is host-file content and is treated as untrusted.
+  if (name === "" || !HOSTNAME_RE.test(name)) return;
   const scheme = url.protocol.slice(0, -1);
   if (out.some((e) => e.name === name && e.scheme === scheme)) return;
   out.push({ name, scheme, origin: "apt-source" });
+}
+
+/** Strips credentials from one apt proxy configuration line before storing it. */
+export function sanitizeProxyLine(line: string): string {
+  return line
+    .replace(/([A-Za-z][A-Za-z0-9+.-]*:\/\/)[^@\s"]*@/g, "$1")
+    .replace(
+      /(password|passwd|secret|token|user)[ \t]*=[ \t]*[^\s;"]+/gi,
+      "$1=<redacted>",
+    )
+    .replace(/([A-Za-z][A-Za-z0-9+.-]*:\/\/)[^\s"]*:(\S+)@/g, "$1<redacted>@");
 }
 
 /** Parses apt sources in both one-line and deb822 formats. */
@@ -693,6 +715,10 @@ export function hostOfUrl(
 export function probeScript(endpoints: Endpoint[]): string {
   const lines: string[] = [];
   for (const e of endpoints) {
+    // Defense in depth: never assemble a script from a name that is not a host.
+    if (
+      !HOSTNAME_RE.test(e.name) || (e.scheme !== "http" && e.scheme !== "https")
+    ) continue;
     lines.push(`name=${quote(e.name)}`);
     lines.push(`scheme=${quote(e.scheme)}`);
     lines.push(

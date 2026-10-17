@@ -13,15 +13,18 @@ import {
   assertHttpUrl,
   assertIpv4,
   assertIpv4Cidr,
+  assertMdArrayPath,
   assertSerial,
   assertSshPublicKey,
   assertUnit,
+  assertVgName,
   isContainerImage,
   isHostTarget,
   isHttpUrl,
   isIpv4Cidr,
   isKeyPath,
   quote,
+  redactUrl,
   SSH_USER_RE,
 } from "./validate.ts";
 
@@ -218,9 +221,9 @@ Deno.test("V6 host target disambiguates an all-numeric label as IPv4", () => {
 Deno.test("V8 HTTP URL rejects smuggled content and non-http schemes", () => {
   for (
     const ok of [
-      "https://download.example.com/ceph/cephadm",
+      "https://download.test/ceph/cephadm",
       "https://git.example.com/ceph/raw/v19.2.3/src/cephadm/cephadm",
-      "https://download.example.com:8443/cephadm?version=19.2.3",
+      "https://download.test:8443/cephadm?version=19.2.3",
     ]
   ) assertEquals(assertHttpUrl("url", ok), ok);
   for (
@@ -385,24 +388,57 @@ Deno.test("V14 Debian package names reject qualifiers and pins", () => {
 Deno.test("V15 container images require an explicit tag or digest", () => {
   for (
     const ok of [
-      "quay.io/ceph/ceph:v19.2.3",
+      "registry.example.com/ceph/ceph:v19.2.3",
       "registry.example.com:5000/ceph/ceph:v19.2.3",
-      `quay.io/ceph/ceph@sha256:${"a".repeat(64)}`,
+      `registry.example.com/ceph/ceph@sha256:${"a".repeat(64)}`,
     ]
   ) assertEquals(assertContainerImage("img", ok), ok);
   for (
     const bad of [
-      "quay.io/ceph/ceph",
-      "quay.io/Ceph/ceph:v19",
-      "quay.io/ceph/ceph:",
-      "quay.io/ceph/ceph:-v19",
-      "quay.io//ceph:v19",
-      "quay.io/ceph/ceph:v19 ; id",
-      "quay.io/ceph/ceph@sha256:short",
+      "registry.example.com/ceph/ceph",
+      "registry.example.com/Ceph/ceph:v19",
+      "registry.example.com/ceph/ceph:",
+      "registry.example.com/ceph/ceph:-v19",
+      "registry.example.com//ceph:v19",
+      "registry.example.com/ceph/ceph:v19 ; id",
+      "registry.example.com/ceph/ceph@sha256:short",
       "",
     ]
   ) assertThrows(() => assertContainerImage("img", bad), PhaseError);
   assertEquals(isContainerImage("nginx:1.27"), true);
+});
+
+Deno.test(
+  "HTTP URLs reject userinfo and non-allowlisted characters", // leak-allow(decision D24)
+  () => {
+    assertEquals(
+      isHttpUrl("https://user:pass@download.test/cephadm"),
+      false,
+    );
+    assertEquals(isHttpUrl("https://download.test/x?a=1&b=2"), false);
+    assertEquals(isHttpUrl("https://download.test/x;id"), false);
+    assertEquals(isHttpUrl("https://download.test/x`id`"), false);
+    assertEquals(isHttpUrl("https://download.test/x $(id)"), false);
+    assertEquals(isHttpUrl("https://download.test/x\nid"), false);
+    assertEquals(
+      isHttpUrl("https://download.test:8443/cephadm?version=19.2.3"),
+      true,
+    );
+    assertEquals(redactUrl("https://user:pass@host/x"), "https://host/x");
+  },
+);
+
+Deno.test("LVM volume-group and md array grammars are allowlisted", () => {
+  assertEquals(assertVgName("vg", "ceph-3f2a9c1e"), "ceph-3f2a9c1e");
+  assertEquals(assertVgName("vg", "vg_0.data+1"), "vg_0.data+1");
+  for (const bad of ["-vg", "vg name", "vg;id", "vg$(id)", ""]) {
+    assertThrows(() => assertVgName("vg", bad), PhaseError);
+  }
+  assertEquals(assertMdArrayPath("array", "/dev/md0"), "/dev/md0");
+  assertEquals(assertMdArrayPath("array", "/dev/md/data"), "/dev/md/data");
+  for (const bad of ["/dev/sda", "/dev/md0;id", "/dev/md/../x", "md0", ""]) {
+    assertThrows(() => assertMdArrayPath("array", bad), PhaseError);
+  }
 });
 
 Deno.test("other owned grammars accept their documented values", () => {

@@ -29,3 +29,40 @@ Not packaged. Notes for whoever maintains this extension.
   obligations (real cephadm binary, apt hosts, real disks, sshd throttling)
   remain for the twin and are recorded in the spec's test obligations. No spec
   file's SHA256 changed.
+- 2026-10-17: milestone-1 review ledger (codex astra + terra). All High and
+  Medium findings fixed before building further:
+  - HIGH-1 boot-RAID destruction: added an explicit protected-device set built
+    before any mutation from the mounted and configured root/boot filesystems
+    and the member devices of any array that backs them (active or inactive),
+    refusing a selected disk behind root/boot with `wipe.boot-protected`.
+  - HIGH-2 fstab credentials: the durable wipe record now stores only a
+    SHA-256 of /etc/fstab and its line count, never its contents.
+  - HIGH-3 proxy credentials: apt proxy lines are sanitized (userinfo and
+    password/token values removed) before they reach the record.
+  - HIGH-4 URL handling: V8 is now a character allowlist, userinfo-bearing
+    URLs are refused, and URLs are redacted in errors.
+  - HIGH-5 mdadm.conf rewrite: written to a same-directory temp file, read
+    back byte-for-byte, synced, atomically renamed, with the stable backup
+    restored on a later failure.
+  - HIGH-6 remote-derived names: LVM VG names and md array paths get runtime
+    grammars and `--` option terminators before appearing in destructive
+    commands.
+  - MEDIUM-7: device and backup paths are quoted everywhere.
+  - MEDIUM-8: discovered apt/cephadm endpoints are allowlist-validated before
+    script assembly.
+  - MEDIUM-9: arrays and strings are bounded (`packages`, `dataDevices`,
+    `excludeDevices`, `placement`, distribute hosts, `privateKey`, `keyPath`,
+    budgets, timeout).
+  - MEDIUM-10: an already-raw disk skips backup and all teardown writes; the
+    mdadm.conf backup has one stable idempotent path.
+  - MEDIUM-11: the model type has a description; `multiplex` is honored by
+    verify/wipe/host-add/apply (hostprep forces it on as the spec requires).
+  - LOW: quay.io removed from test fixtures; unused fetch/S3/resource-reader
+    scaffolding removed; retry-delay calculation consolidated.
+- 2026-10-17: cluster-lifecycle milestone added: cephBootstrap,
+  cephDistributeKey, cephHostAdd, cephApplyMon, cephApplyMgr, cephApplyMds,
+  with the cephadm-shell execution layer (`_lib/shell.ts`). cephApplyOsd and
+  the data-plane, verify, maintenance and RGW groups remain.
+- The SQLite `pvs`/`mdadm` discovery, the atomic mdadm.conf rewrite and the
+  boot-protection gate are unit-tested with scripted sessions; the live twin
+  checks in the spec's [twin] items still apply.

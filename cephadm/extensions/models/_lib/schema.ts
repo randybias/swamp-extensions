@@ -11,15 +11,18 @@
 
 import { z } from "npm:zod@4.3.6";
 import {
+  CEPH_ID_CREATE_RE,
   CEPHADM_VERSION_RE,
   DEB_PACKAGE_RE,
   FSID_RE,
   HOSTNAME_RE,
+  isContainerImage,
   isHostTarget,
   isHttpUrl,
   isIpv4,
   isIpv4Cidr,
   isKeyPath,
+  isSshPublicKey,
   SERIAL_RE,
   SSH_USER_RE,
   UNIT_RE,
@@ -84,14 +87,14 @@ export const SSH_FIELDS = {
   port: z.number().int().min(1).max(65535).nullish().describe(
     "SSH port; absent means 22. Workflows pass it explicitly.",
   ),
-  keyPath: z.string().refine(
+  keyPath: z.string().max(4096).refine(
     isKeyPath,
     "an absolute local path with no control characters",
   )
     .nullish().describe(
       "Path on the control host to a private key file; mutually exclusive with privateKey.",
     ),
-  privateKey: z.string().meta({ sensitive: true }).nullish().meta({
+  privateKey: z.string().max(16384).meta({ sensitive: true }).nullish().meta({
     sensitive: true,
   }).describe(
     "OpenSSH private key content, normally a vault reference; mutually exclusive with keyPath.",
@@ -128,3 +131,48 @@ export const HOSTNAME_SCHEMA = z.string().regex(
   HOSTNAME_RE,
   "an RFC 1122 hostname",
 );
+
+/** A cephadm-registered hostname for a placement list. */
+export const PLACEMENT_HOST_SCHEMA = HOSTNAME_SCHEMA;
+
+/** A non-empty placement host list with no duplicates. */
+export const PLACEMENT_SCHEMA = z.array(PLACEMENT_HOST_SCHEMA).min(1).max(64)
+  .refine(
+    (hosts) => new Set(hosts).size === hosts.length,
+    "placement hosts must be unique",
+  );
+
+/** Ceph identifier in the create direction. */
+export const CEPH_ID_SCHEMA = z.string().regex(
+  CEPH_ID_CREATE_RE,
+  "a Ceph identifier: letters, digits, dot, underscore or hyphen, starting with a letter or digit",
+);
+
+/** A single SSH public key line with no option prefix. */
+export const SSH_PUBKEY_SCHEMA = z.string().refine(
+  (v) => isSshPublicKey(v),
+  "a single <keytype> <blob> [comment] line with no options",
+);
+
+/** An OCI image reference with an explicit tag or digest. */
+export const CONTAINER_IMAGE_SCHEMA = z.string().refine(
+  (v) => isContainerImage(v),
+  "an OCI image reference with an explicit tag or digest",
+);
+
+/** A data device entry. */
+export const DATA_DEVICE_SCHEMA = z.strictObject({
+  serial: SERIAL_SCHEMA.describe("Disk serial."),
+  sizeBytes: z.number().int().positive().optional().describe(
+    "Informational size hint.",
+  ),
+  devHint: z.string().max(64).optional().describe(
+    "Informational kernel name; never used.",
+  ),
+});
+
+/** An excluded device entry. */
+export const EXCLUDE_DEVICE_SCHEMA = z.strictObject({
+  serial: SERIAL_SCHEMA.describe("Never-touch serial."),
+  reason: z.string().max(256).optional().describe("Why it is excluded."),
+});

@@ -301,6 +301,230 @@ Deno.test("the busy-probe script is the one the package phase sends", () => {
   assertEquals(busyProbeScript().includes("echo idle"), true);
 });
 
+const SSH_NULLS = {
+  port: null,
+  keyPath: null,
+  privateKey: null,
+  strictHostKeyChecking: null,
+  multiplex: null,
+  sshUser: "admin",
+};
+
+Deno.test("the bootstrap schema rejects hostile or malformed targets and images", () => {
+  const schema = model.methods.cephBootstrap.arguments;
+  const base = {
+    host: "192.0.2.10",
+    ...SSH_NULLS,
+    monIp: "192.0.2.10",
+    publicNet: "192.0.2.0/24",
+    clusterNet: "198.51.100.0/24",
+    cephImage: "registry.example.com/ceph/ceph:v19.2.3",
+    timeoutMs: null,
+  };
+  assertEquals(schema.safeParse(base).success, true);
+  assertEquals(
+    schema.safeParse({ ...base, monIp: "2001:db8::1" }).success,
+    false,
+  );
+  assertEquals(
+    schema.safeParse({ ...base, publicNet: "192.0.2.1/24" }).success,
+    false,
+  );
+  assertEquals(
+    schema.safeParse({ ...base, cephImage: "registry.example.com/ceph/ceph" })
+      .success,
+    false,
+  );
+  assertEquals(
+    schema.safeParse({
+      ...base,
+      cephImage: "registry.example.com/Ceph/ceph:v19",
+    }).success,
+    false,
+  );
+  assertEquals(schema.safeParse({ ...base, host: "n;id" }).success, false);
+});
+
+Deno.test("the distribute-key schema rejects option backdoors and needs a port per host", () => {
+  const schema = model.methods.cephDistributeKey.arguments;
+  const key =
+    "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIExampleExampleExampleExampleExample";
+  const base = {
+    ...SSH_NULLS,
+    cephPubKey: key,
+    hosts: [{ host: "192.0.2.10", port: 22 }],
+  };
+  assertEquals(schema.safeParse(base).success, true);
+  assertEquals(
+    schema.safeParse({ ...base, cephPubKey: `command="x" ${key}` }).success,
+    false,
+  );
+  assertEquals(
+    schema.safeParse({ ...base, cephPubKey: `${key}\n${key}` }).success,
+    false,
+  );
+  assertEquals(schema.safeParse({ ...base, hosts: [] }).success, false);
+  assertEquals(
+    schema.safeParse({ ...base, hosts: [{ host: "192.0.2.10" }] }).success,
+    false,
+  );
+  assertEquals(
+    schema.safeParse({ ...base, hosts: [{ host: "192.0.2.10", port: 0 }] })
+      .success,
+    false,
+  );
+});
+
+Deno.test("the host-add and apply schemas reject injection and duplicates", () => {
+  const addSchema = model.methods.cephHostAdd.arguments;
+  const addBase = {
+    adminHost: "192.0.2.10",
+    ...SSH_NULLS,
+    fsid: "3f2a9c1e-5b7d-4e8f-9a0b-1c2d3e4f5a6b",
+    host: "node1",
+    addr: "192.0.2.20",
+  };
+  assertEquals(addSchema.safeParse(addBase).success, true);
+  assertEquals(
+    addSchema.safeParse({ ...addBase, adminHost: "a;id" }).success,
+    false,
+  );
+  assertEquals(
+    addSchema.safeParse({ ...addBase, host: "a;id" }).success,
+    false,
+  );
+  assertEquals(
+    addSchema.safeParse({ ...addBase, addr: "not-an-ip" }).success,
+    false,
+  );
+  assertEquals(
+    addSchema.safeParse({ ...addBase, fsid: "nope" }).success,
+    false,
+  );
+
+  const monSchema = model.methods.cephApplyMon.arguments;
+  const monBase = {
+    adminHost: "192.0.2.10",
+    ...SSH_NULLS,
+    placement: ["node1"],
+    allowQuorumRisk: null,
+  };
+  assertEquals(monSchema.safeParse(monBase).success, true);
+  assertEquals(
+    monSchema.safeParse({ ...monBase, placement: [] }).success,
+    false,
+  );
+  assertEquals(
+    monSchema.safeParse({ ...monBase, placement: ["node1", "node1"] }).success,
+    false,
+  );
+  assertEquals(
+    monSchema.safeParse({ ...monBase, placement: ["node1;id"] }).success,
+    false,
+  );
+
+  const mdsSchema = model.methods.cephApplyMds.arguments;
+  const mdsBase = {
+    adminHost: "192.0.2.10",
+    ...SSH_NULLS,
+    fsName: "cephfs",
+    placement: ["node1"],
+  };
+  assertEquals(mdsSchema.safeParse(mdsBase).success, true);
+  assertEquals(
+    mdsSchema.safeParse({ ...mdsBase, fsName: "cephfs;id" }).success,
+    false,
+  );
+  assertEquals(
+    mdsSchema.safeParse({ ...mdsBase, fsName: "cephfs.x" }).success,
+    true,
+  );
+});
+
+Deno.test("bootstrap records the fsid and a keyring path, never keyring material", async () => {
+  const key =
+    "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIExampleExampleExampleExampleExample";
+  let probes = 0;
+  const spawn = routeSpawner((command) => {
+    if (command.endsWith("cephadm ls")) {
+      probes++;
+      return {
+        code: 0,
+        stdout: probes === 1 ? "[]" : '[{"fsid":"abc"}]',
+        stderr: "",
+      };
+    }
+    if (command.includes("sh -c ")) return { code: 0, stdout: "", stderr: "" };
+    if (command.endsWith("cat /etc/ceph/ceph.pub")) {
+      return { code: 0, stdout: `${key}\n`, stderr: "" };
+    }
+    return { code: 1, stdout: "", stderr: `unrouted: ${command}` };
+  });
+  const m = createCephadmModel({
+    spawn,
+    now: () => 0,
+    sleep: () => Promise.resolve(),
+    random: () => 0.25,
+  });
+  const { context, getWrittenResources } = createModelTestContext({
+    globalArgs: GLOBALS,
+  });
+  await m.methods.cephBootstrap.execute({
+    host: "192.0.2.10",
+    ...SSH_NULLS,
+    monIp: "192.0.2.10",
+    publicNet: "192.0.2.0/24",
+    clusterNet: "198.51.100.0/24",
+    cephImage: "registry.example.com/ceph/ceph:v19.2.3",
+    timeoutMs: null,
+  }, context);
+  const data = getWrittenResources()[0].data as {
+    fsid: string;
+    adminKeyringRef: { path: string };
+    bootstrapped: boolean;
+  };
+  assertEquals(data.fsid, "abc");
+  assertEquals(data.bootstrapped, true);
+  assertEquals(
+    data.adminKeyringRef.path,
+    "/etc/ceph/ceph.client.admin.keyring",
+  );
+  assertEquals(JSON.stringify(data).includes("PRIVATE KEY"), false);
+});
+
+Deno.test("distribute-key reports all hosts and fails at the end naming failures", async () => {
+  const key =
+    "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIExampleExampleExampleExampleExample";
+  const spawn = routeSpawner((command) => {
+    if (command.includes("mkdir -p")) {
+      return { code: 0, stdout: "", stderr: "" };
+    }
+    if (command.startsWith("grep -Fqx")) {
+      return { code: 0, stdout: "", stderr: "" };
+    }
+    if (command.startsWith("grep -Fq ")) {
+      return { code: 0, stdout: "", stderr: "" };
+    }
+    return { code: 1, stdout: "", stderr: "unrouted" };
+  });
+  const m = createCephadmModel({ spawn, now: () => 0 });
+  const { context, getWrittenResources } = createModelTestContext({
+    globalArgs: GLOBALS,
+  });
+  await m.methods.cephDistributeKey.execute({
+    ...SSH_NULLS,
+    cephPubKey: key,
+    hosts: [{ host: "192.0.2.10", port: 22 }, {
+      host: "198.51.100.9",
+      port: 2202,
+    }],
+  }, context);
+  assertEquals(
+    getWrittenResources()[0].name,
+    "cephDistributeKey-192.0.2.10:22,198.51.100.9:2202",
+  );
+});
+
 Deno.test("verifyPackageSource records first, then throws, when throwOnFail is unset", async () => {
   const spawn = routeSpawner((command, stdin) => {
     if (stdin.includes("###CEPHADM-SOURCES###")) {

@@ -15,6 +15,7 @@ import {
   parseProbeLine,
   probeScript,
   runPackagePhase,
+  sanitizeProxyLine,
   splitSections,
 } from "./hostprep.ts";
 import type { CommandResult, RunOptions, SshSession } from "./ssh.ts";
@@ -114,6 +115,21 @@ Deno.test("V8-style URL host extraction strips userinfo and port via apt parsing
   assertEquals(parseAptSources("# only comments\n"), []);
 });
 
+Deno.test("apt proxy lines are stored without credentials", () => {
+  assertEquals(
+    sanitizeProxyLine(
+      'Acquire::http::Proxy "http://user:pass@proxy.test:3128";',
+    ),
+    'Acquire::http::Proxy "http://proxy.test:3128";',
+  );
+  assertEquals(
+    sanitizeProxyLine(
+      'Acquire::https::Proxy "https://token@proxy.test";',
+    ),
+    'Acquire::https::Proxy "https://proxy.test";',
+  );
+});
+
 Deno.test("section splitting discards lines under unknown markers", () => {
   const sections = splitSections(
     [
@@ -123,7 +139,7 @@ Deno.test("section splitting discards lines under unknown markers", () => {
       "###UNKNOWN###",
       "deb http://ignored.example.com/debian stable main",
       "###CEPHADM-PROXY###",
-      'Acquire::http::Proxy "http://proxy.example.com:3128";',
+      'Acquire::http::Proxy "http://proxy.test:3128";',
       "###CEPHADM-PROBES###",
     ].join("\n"),
   );

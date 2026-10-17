@@ -702,7 +702,7 @@ export type ResendPolicy = "never" | "dropped" | "any";
 
 /** Runs one step, applying the re-send policy and logging retried blips. */
 export async function runStep(
-  deps: SshDeps,
+  deps: { sleep: (ms: number) => Promise<void> },
   session: SshSession,
   opts: RunOptions & {
     phase: string;

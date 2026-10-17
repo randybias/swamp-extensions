@@ -3,9 +3,13 @@
  * disks named by serial, leaving them raw for Ceph OSDs, while keeping the
  * host's boot RAID configuration intact.
  *
- * Every gate runs before anything destructive and re-reads the host. Safety is
- * verified positively: a device missing from a read is never reported raw, and
- * root-owned files are written only through `tee` on stdin.
+ * Before anything destructive, an explicit protected-device set is built from
+ * the mounted root and boot filesystems, the configured mounts, and the member
+ * devices of any array that backs them. A selected disk that is part of, or is
+ * the disk behind, a boot or root array is refused even when the array is
+ * unmounted, inactive or degraded. Every gate re-reads the host; a device
+ * missing from a read is never reported raw. Root-owned files are written only
+ * through `tee` on stdin, validated, then moved into place atomically.
  *
  * @module
  */
@@ -13,7 +17,7 @@
 import { fail, TransportError } from "./errors.ts";
 import type { CommandResult, SshSession } from "./ssh.ts";
 import { isSudoRefusal } from "./ssh.ts";
-import { quote } from "./validate.ts";
+import { assertMdArrayPath, assertVgName, quote } from "./validate.ts";
 import { type ResolvedDevice, resolveSerial } from "./resolve.ts";
 import type { PrepDeps } from "./hostprep.ts";
 
@@ -53,6 +57,8 @@ export interface WipeRecord {
   dryRun: boolean;
   /** Capture time. */
   capturedAt: string;
+  /** True when every selected disk was already raw, so nothing was changed. */
+  alreadyRaw?: boolean;
   /** Dry-run plan. */
   plannedDevices?: { serial: string; device: string }[];
   /** Dry-run exclusions. */
@@ -61,7 +67,7 @@ export interface WipeRecord {
   wiped?: { serial: string; device: string }[];
   /** Whether `/etc/mdadm/mdadm.conf` exists. */
   mdadmConfPresent?: boolean;
-  /** Backup path, or null when the file was absent. */
+  /** Stable backup path, or null when the file was absent. */
   backupPath?: string | null;
   /** Removed volume groups. */
   removedVolumeGroups?: string[];
@@ -73,8 +79,10 @@ export interface WipeRecord {
   initramfsRebuilt?: boolean;
   /** `mdadm --detail --scan` before teardown. */
   preTeardownMdadmScan?: string;
-  /** `/etc/fstab` before teardown. */
-  preTeardownFstab?: string;
+  /** SHA-256 of the captured `/etc/fstab`, never its contents. */
+  preTeardownFstabSha256?: string;
+  /** Number of non-blank `/etc/fstab` lines captured. */
+  preTeardownFstabEntries?: number;
 }
 
 interface LsblkNode {
@@ -87,6 +95,7 @@ interface LsblkNode {
 }
 
 const MDADM_CONF = "/etc/mdadm/mdadm.conf";
+const MDADM_BACKUP = "/etc/mdadm/mdadm.conf.cephadm.bak";
 
 /** Command used by every teardown step that must re-read the tree. */
 export function lsblkCommand(): string {
@@ -118,6 +127,25 @@ export function findNode(nodes: LsblkNode[], device: string): LsblkNode | null {
   return null;
 }
 
+/** Finds the top-level disk node that contains `device`. */
+export function findTopLevel(
+  nodes: LsblkNode[],
+  device: string,
+): LsblkNode | null {
+  for (const node of nodes) {
+    if (node.path === device || findNode([node], device)) return node;
+  }
+  return null;
+}
+
+/** The paths of a node and every descendant. */
+export function subtreePaths(node: LsblkNode): string[] {
+  const out: string[] = [];
+  if (node.path) out.push(node.path);
+  for (const child of node.children ?? []) out.push(...subtreePaths(child));
+  return out;
+}
+
 /** All mountpoints anywhere in a node's subtree. */
 export function subtreeMounts(node: LsblkNode): string[] {
   const out: string[] = [];
@@ -144,8 +172,17 @@ export function arrayBasename(arrayPath: string): string {
 
 /** The array path on an `ARRAY ...` line, or null. */
 export function parseArrayScanLine(line: string): string | null {
-  const m = line.match(/^ARRAY\s+(\S+)/);
+  const m = line.trim().match(/^ARRAY\s+(\S+)/);
   return m ? m[1] : null;
+}
+
+/** The first `ARRAY` path in `mdadm --examine --scan` output, or null. */
+export function firstArrayPath(stdout: string): string | null {
+  for (const line of stdout.split("\n")) {
+    const path = parseArrayScanLine(line);
+    if (path) return path;
+  }
+  return null;
 }
 
 /** Removes only the anchored line for exactly `arrayPath` from md config text. */
@@ -179,7 +216,7 @@ export function editMdConfig(
   let nextScan = scan;
   for (const array of stopped) nextScan = removeArrayLine(nextScan, array);
   for (const line of nextScan.split("\n")) {
-    const path = parseArrayScanLine(line.trim());
+    const path = parseArrayScanLine(line);
     if (path) next = ensureArrayLine(next, path, line);
   }
   const collapsed = next.split("\n").filter((l, i, all) =>
@@ -189,20 +226,78 @@ export function editMdConfig(
   return joined.endsWith("\n") ? joined : `${joined}\n`;
 }
 
-/** Holder shapes reported before giving up on a busy zero-superblock. */
-export interface Holders {
-  /** `lsblk -nro NAME,TYPE` output lines. */
-  lsblk: string;
-  /** `dmsetup ls` output. */
-  dmsetup: string;
+/** The languages of protection a disk can have. */
+export interface ProtectedSet {
+  /** Canonical device paths that must not be touched. */
+  devices: Set<string>;
+  /** md array paths that back the root or boot filesystem. */
+  arrays: Set<string>;
+}
+
+/** True for a mount target that is the root or part of the boot tree. */
+function isBootTarget(target: string): boolean {
+  return target === "/" || target === "/boot" || target === "/boot/efi" ||
+    target.startsWith("/boot/");
+}
+
+/**
+ * Builds the protected-device set from the mounted and configured root/boot
+ * filesystems and the member devices of any array that backs them. Runs before
+ * any mutation and is not recomputed from a later tree.
+ */
+export async function detectProtectedSet(
+  session: SshSession,
+  tree: LsblkNode[],
+): Promise<ProtectedSet> {
+  const devices = new Set<string>();
+  const arrays = new Set<string>();
+  const addSource = async (source: string): Promise<void> => {
+    if (!source.startsWith("/dev/")) return;
+    const resolved = await session.run({
+      command: `readlink -f ${quote(source)}`,
+      allowNonZero: true,
+    });
+    const device = resolved.stdout.trim() || source;
+    devices.add(device);
+    const node = findNode(tree, device);
+    if (node) {
+      for (const p of subtreePaths(node)) devices.add(p);
+      const top = findTopLevel(tree, device);
+      if (top) { for (const p of subtreePaths(top)) devices.add(p); }
+    }
+    if (device.startsWith("/dev/md")) {
+      arrays.add(device);
+      const detail = await session.run({
+        command: `mdadm --detail ${quote(device)}`,
+        sudo: true,
+        allowNonZero: true,
+      });
+      for (const line of detail.stdout.split("\n")) {
+        const fields = line.trim().split(/\s+/);
+        const last = fields.at(-1) ?? "";
+        if (last.startsWith("/dev/")) devices.add(last);
+      }
+    }
+  };
+
+  const readMounts = async (command: string): Promise<void> => {
+    const r = await session.run({ command, allowNonZero: true });
+    for (const line of r.stdout.split("\n")) {
+      const [source, target] = line.trim().split(/\s+/);
+      if (!source || !target) continue;
+      if (isBootTarget(target)) await addSource(source);
+    }
+  };
+  // Actual mounts, then the configured ones (which catch an inactive array).
+  await readMounts("findmnt -rno SOURCE,TARGET");
+  await readMounts("findmnt --fstab -rno SOURCE,TARGET --evaluate");
+  return { devices, arrays };
 }
 
 /** A full wipe run's dependencies. */
 export interface WipeDeps extends PrepDeps {
   /** The SSH session. */
   session: SshSession;
-  /** Clock, for the recovery-capture timestamp. */
-  now: () => number;
 }
 
 /** Runs one command as root, returning its result, and refusing a sudo refusal. */
@@ -229,6 +324,29 @@ async function root(
   return r;
 }
 
+/** The volume group a device is a physical volume of, or "". */
+async function pvsVg(session: SshSession, device: string): Promise<string> {
+  const r = await root(
+    session,
+    `pvs --noheadings -o vg_name -- ${quote(device)}`,
+    {
+      allowNonZero: true,
+    },
+  );
+  return r.stdout.trim();
+}
+
+/** The md array a device belongs to, or null. */
+async function examineArray(
+  session: SshSession,
+  device: string,
+): Promise<string | null> {
+  const r = await root(session, `mdadm --examine --scan -- ${quote(device)}`, {
+    allowNonZero: true,
+  });
+  return firstArrayPath(r.stdout);
+}
+
 /** A read-only poll of `/proc/mdstat` until an array's line disappears. */
 async function arrayStillPresent(
   deps: WipeDeps,
@@ -252,6 +370,33 @@ async function arrayStillPresent(
 async function readLsblk(session: SshSession): Promise<LsblkNode[]> {
   const r = await session.run({ command: lsblkCommand(), allowNonZero: true });
   return parseLsblk(r.stdout);
+}
+
+/** True when one device is already raw: no signature, no children, no array, no PV. */
+async function deviceIsRaw(
+  session: SshSession,
+  tree: LsblkNode[],
+  device: string,
+): Promise<boolean> {
+  const node = findNode(tree, device);
+  if (!node) return false;
+  if (node.fstype) return false;
+  if ((node.children ?? []).length > 0) return false;
+  if (subtreeMounts(node).length > 0) return false;
+  if ((await pvsVg(session, device)) !== "") return false;
+  if ((await examineArray(session, device)) !== null) return false;
+  return true;
+}
+
+/** SHA-256 hex of a string. */
+async function sha256Hex(text: string): Promise<string> {
+  const digest = await crypto.subtle.digest(
+    "SHA-256",
+    new TextEncoder().encode(text),
+  );
+  return Array.from(new Uint8Array(digest)).map((b) =>
+    b.toString(16).padStart(2, "0")
+  ).join("");
 }
 
 /**
@@ -331,6 +476,37 @@ export async function wipeDiskToRaw(
     }
   }
 
+  // Gate 3b: never eat the boot or root array, even when it is unmounted and
+  // inactive. Built once, before anything destructive.
+  const protectedSet = await detectProtectedSet(session, tree);
+  for (const d of args.dataDevices) {
+    const device = resolved.get(d.serial)!;
+    if (protectedSet.devices.has(device.device)) {
+      fail(
+        "wipe.boot-protected",
+        "the disk backs the root or boot filesystem",
+        {
+          host,
+          serial: d.serial,
+          device: device.device,
+        },
+      );
+    }
+    const array = await examineArray(session, device.device);
+    if (array !== null && protectedSet.arrays.has(array)) {
+      fail(
+        "wipe.boot-protected",
+        "the disk is a member of an array that backs root or boot",
+        {
+          host,
+          serial: d.serial,
+          device: device.device,
+          array,
+        },
+      );
+    }
+  }
+
   // Gate 4: a data device aliasing an excluded disk.
   for (const d of args.dataDevices) {
     const device = resolved.get(d.serial)!;
@@ -370,7 +546,36 @@ export async function wipeDiskToRaw(
 
   const devices = args.dataDevices.map((d) => resolved.get(d.serial)!);
 
-  // Step 0: recovery capture.
+  // Idempotency fast path: if every disk is already raw there is nothing to
+  // mutate, so no backup is taken and no teardown command runs.
+  let allRaw = true;
+  for (const device of devices) {
+    if (!(await deviceIsRaw(session, tree, device.device))) {
+      allRaw = false;
+      break;
+    }
+  }
+  if (allRaw) {
+    log?.info("wipe devices already raw", { host });
+    return {
+      host,
+      dryRun: false,
+      capturedAt,
+      alreadyRaw: true,
+      wiped: args.dataDevices.map((d) => ({
+        serial: d.serial,
+        device: resolved.get(d.serial)!.path,
+      })),
+      mdadmConfPresent: false,
+      backupPath: null,
+      removedVolumeGroups: [],
+      stoppedArrays: [],
+      mdConfigRewritten: false,
+      initramfsRebuilt: false,
+    };
+  }
+
+  // Step 0: recovery capture and one stable, idempotent backup.
   log?.info("wipe phase recovery-capture", { host });
   const conf = await session.run({
     command: `test -e ${MDADM_CONF}`,
@@ -379,44 +584,61 @@ export async function wipeDiskToRaw(
   const mdadmConfPresent = conf.code === 0;
   let backupPath: string | null = null;
   if (mdadmConfPresent) {
-    const stamp = capturedAt.replaceAll(":", "-").replaceAll(".", "-");
-    backupPath = `${MDADM_CONF}.bak.${stamp}`;
-    const backup = await root(session, `cp -a ${MDADM_CONF} ${backupPath}`);
-    if (backup.code !== 0) {
-      fail("wipe.backup", "could not back up the md config", {
-        path: MDADM_CONF,
-      });
+    backupPath = MDADM_BACKUP;
+    const existing = await session.run({
+      command: `test -e ${quote(MDADM_BACKUP)}`,
+      allowNonZero: true,
+    });
+    if (existing.code !== 0) {
+      const backup = await root(
+        session,
+        `cp -a -- ${quote(MDADM_CONF)} ${quote(MDADM_BACKUP)}`,
+        {
+          allowNonZero: true,
+        },
+      );
+      if (backup.code !== 0) {
+        fail("wipe.backup", "could not back up the md config", {
+          path: MDADM_CONF,
+        });
+      }
     }
   }
-  const scanBefore =
-    (await root(session, "mdadm --detail --scan", { allowNonZero: true }))
-      .stdout;
+  const scanBefore = (
+    await root(session, "mdadm --detail --scan", { allowNonZero: true })
+  ).stdout;
   const fstab =
     (await session.run({ command: "cat /etc/fstab", allowNonZero: true }))
       .stdout;
+  const fstabSha256 = await sha256Hex(fstab);
+  const fstabEntries = fstab.split("\n").filter((l) => l.trim() !== "").length;
 
   // Step 1: LVM teardown, deduplicated.
   log?.info("wipe phase lvm", { host });
   const removedVolumeGroups: string[] = [];
   const pvs: string[] = [];
   for (const device of devices) {
-    const pv = await root(
-      session,
-      `pvs --noheadings -o vg_name ${device.device}`,
-      { allowNonZero: true },
-    );
-    const vg = pv.stdout.trim();
+    const vg = await pvsVg(session, device.device);
     if (vg === "") continue;
+    assertVgName("volumeGroup", vg);
     pvs.push(device.device);
     if (!removedVolumeGroups.includes(vg)) {
-      await root(session, `vgchange -an ${quote(vg)}`, { allowNonZero: true });
-      await root(session, `lvremove -f ${quote(vg)}`, { allowNonZero: true });
-      await root(session, `vgremove -f ${quote(vg)}`, { allowNonZero: true });
+      await root(session, `vgchange -an -- ${quote(vg)}`, {
+        allowNonZero: true,
+      });
+      await root(session, `lvremove -f -- ${quote(vg)}`, {
+        allowNonZero: true,
+      });
+      await root(session, `vgremove -f -- ${quote(vg)}`, {
+        allowNonZero: true,
+      });
       removedVolumeGroups.push(vg);
     }
   }
   for (const device of pvs) {
-    await root(session, `pvremove -ff -y ${device}`, { allowNonZero: true });
+    await root(session, `pvremove -ff -y -- ${quote(device)}`, {
+      allowNonZero: true,
+    });
   }
 
   // Step 2: LVM gate, only when a PV was found.
@@ -424,12 +646,7 @@ export async function wipeDiskToRaw(
     const tree2 = await readLsblk(session);
     for (const device of devices) {
       const node = findNode(tree2, device.device);
-      const pv = await root(
-        session,
-        `pvs --noheadings -o vg_name ${device.device}`,
-        { allowNonZero: true },
-      );
-      const vg = pv.stdout.trim();
+      const vg = await pvsVg(session, device.device);
       const lvmChildren = node
         ? subtreeTypes(node).filter((t) => t === "lvm")
         : [];
@@ -463,16 +680,10 @@ export async function wipeDiskToRaw(
   log?.info("wipe phase md-stop", { host });
   const stoppedArrays: string[] = [];
   for (const device of devices) {
-    const examined = await root(
-      session,
-      `mdadm --examine --scan ${device.device}`,
-      { allowNonZero: true },
-    );
-    const arrayPath = examined.stdout.split("\n").map((l) =>
-      parseArrayScanLine(l.trim())
-    ).find((p) => p !== null);
+    const arrayPath = await examineArray(session, device.device);
     if (!arrayPath || stoppedArrays.includes(arrayPath)) continue;
-    await root(session, `mdadm --stop ${quote(arrayPath)}`, {
+    assertMdArrayPath("array", arrayPath);
+    await root(session, `mdadm --stop -- ${quote(arrayPath)}`, {
       allowNonZero: true,
     });
     if (await arrayStillPresent(deps, arrayBasename(arrayPath))) {
@@ -497,8 +708,10 @@ export async function wipeDiskToRaw(
       try {
         result = await root(
           session,
-          `mdadm --zero-superblock ${device.device}`,
-          { allowNonZero: true },
+          `mdadm --zero-superblock -- ${quote(device.device)}`,
+          {
+            allowNonZero: true,
+          },
         );
       } catch (e) {
         if (e instanceof TransportError) {
@@ -532,17 +745,10 @@ export async function wipeDiskToRaw(
           stderr: out.slice(0, 300),
         });
       }
-      // Busy: re-examine, re-stop anything udev rebuilt, settle, retry.
-      const again = await root(
-        session,
-        `mdadm --examine --scan ${device.device}`,
-        { allowNonZero: true },
-      );
-      const rebuilt = again.stdout.split("\n").map((l) =>
-        parseArrayScanLine(l.trim())
-      ).find((p) => p !== null);
+      const rebuilt = await examineArray(session, device.device);
       if (rebuilt) {
-        await root(session, `mdadm --stop ${quote(rebuilt)}`, {
+        assertMdArrayPath("array", rebuilt);
+        await root(session, `mdadm --stop -- ${quote(rebuilt)}`, {
           allowNonZero: true,
         });
       }
@@ -567,7 +773,7 @@ export async function wipeDiskToRaw(
   // Step 5: signatures.
   log?.info("wipe phase signatures", { host });
   for (const device of devices) {
-    const wiped = await root(session, `wipefs -a ${device.device}`, {
+    const wiped = await root(session, `wipefs -a -- ${quote(device.device)}`, {
       allowNonZero: true,
     });
     if (wiped.code !== 0) {
@@ -582,10 +788,10 @@ export async function wipeDiskToRaw(
   // Step 6: partition table.
   log?.info("wipe phase partitions", { host });
   for (const device of devices) {
-    await root(session, `sgdisk --zap-all ${device.device}`, {
+    await root(session, `sgdisk --zap-all -- ${quote(device.device)}`, {
       allowNonZero: true,
     });
-    const probed = await root(session, `partprobe ${device.device}`, {
+    const probed = await root(session, `partprobe -- ${quote(device.device)}`, {
       allowNonZero: true,
     });
     if (probed.code !== 0) {
@@ -597,32 +803,84 @@ export async function wipeDiskToRaw(
     }
   }
 
-  // Steps 7-9: md config edit, write, rebuild and boot-safety read-back.
+  // Steps 7-9: md config edit, atomic write, rebuild and boot-safety read-back.
   let mdConfigRewritten = false;
   let initramfsRebuilt = false;
   if (mdadmConfPresent) {
     log?.info("wipe phase md-config", { host });
-    const current =
-      (await session.run({ command: `cat ${MDADM_CONF}`, allowNonZero: true }))
-        .stdout;
+    const current = (
+      await session.run({ command: `cat ${MDADM_CONF}`, allowNonZero: true })
+    ).stdout;
     const next = editMdConfig(current, stoppedArrays, scanBefore);
     if (stoppedArrays.length > 0 || next !== current) {
-      const written = await root(session, `tee ${MDADM_CONF}`, {
-        stdin: next,
-        allowNonZero: false,
-      });
-      mdConfigRewritten = written.code === 0;
-      const rebuilt = await root(session, "update-initramfs -u");
-      initramfsRebuilt = rebuilt.code === 0;
+      const temp = `${MDADM_CONF}.new.${
+        (await sha256Hex(String(deps.now()))).slice(0, 12)
+      }`;
+      try {
+        const written = await root(session, `tee ${quote(temp)}`, {
+          stdin: next,
+          allowNonZero: true,
+        });
+        if (written.code !== 0) {
+          fail("wipe.md-config-write", "could not write the new md config", {
+            path: temp,
+          });
+        }
+        const rereadTemp = (
+          await session.run({
+            command: `cat ${quote(temp)}`,
+            allowNonZero: true,
+          })
+        ).stdout;
+        if (rereadTemp !== next) {
+          fail(
+            "wipe.md-config-write",
+            "the written md config did not read back byte-for-byte",
+            {
+              path: temp,
+            },
+          );
+        }
+        await root(session, "sync", { allowNonZero: true });
+        await root(session, `mv -f -- ${quote(temp)} ${quote(MDADM_CONF)}`, {
+          allowNonZero: false,
+        });
+        mdConfigRewritten = true;
+        const rebuilt = await root(session, "update-initramfs -u", {
+          allowNonZero: true,
+        });
+        if (rebuilt.code !== 0) {
+          fail(
+            "wipe.initramfs",
+            "update-initramfs failed after the md config was rewritten",
+            {
+              code: rebuilt.code,
+            },
+          );
+        }
+        initramfsRebuilt = true;
+      } catch (e) {
+        // Restore the backup so a later boot is not left on a partial config.
+        try {
+          await root(
+            session,
+            `cp -a -- ${quote(MDADM_BACKUP)} ${quote(MDADM_CONF)}`,
+            {
+              allowNonZero: true,
+            },
+          );
+        } catch { /* rollback is best effort */ }
+        throw e;
+      }
     }
-    const reread =
-      (await session.run({ command: `cat ${MDADM_CONF}`, allowNonZero: true }))
-        .stdout;
+    const reread = (
+      await session.run({ command: `cat ${MDADM_CONF}`, allowNonZero: true })
+    ).stdout;
     const scanNow = await root(session, "mdadm --detail --scan", {
       allowNonZero: true,
     });
     for (const line of scanNow.stdout.split("\n")) {
-      const path = parseArrayScanLine(line.trim());
+      const path = parseArrayScanLine(line);
       if (!path) continue;
       const re = new RegExp(
         `^ARRAY\\s+${path.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}(\\s|$)`,
@@ -672,6 +930,7 @@ export async function wipeDiskToRaw(
     host,
     dryRun: false,
     capturedAt,
+    alreadyRaw: false,
     wiped: args.dataDevices.map((d) => ({
       serial: d.serial,
       device: resolved.get(d.serial)!.path,
@@ -683,7 +942,8 @@ export async function wipeDiskToRaw(
     mdConfigRewritten,
     initramfsRebuilt,
     preTeardownMdadmScan: scanBefore,
-    preTeardownFstab: fstab,
+    preTeardownFstabSha256: fstabSha256,
+    preTeardownFstabEntries: fstabEntries,
   };
 }
 
@@ -691,9 +951,9 @@ export async function wipeDiskToRaw(
 async function measureHolders(
   session: SshSession,
   device: string,
-): Promise<Holders> {
+): Promise<{ lsblk: string; dmsetup: string }> {
   const lsblk = await session.run({
-    command: `lsblk -nro NAME,TYPE ${device}`,
+    command: `lsblk -nro NAME,TYPE -- ${quote(device)}`,
     allowNonZero: true,
   });
   const dmsetup = await root(session, "dmsetup ls", { allowNonZero: true });

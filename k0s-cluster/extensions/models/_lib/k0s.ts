@@ -240,7 +240,9 @@ export function installArgs(
   role: K0sRole,
   noTaints = false,
   force = false,
+  join = false,
 ): string[] {
+  const tokenFile = ["--token-file", K0S_WORKER_TOKEN_PATH];
   const base = role === "single"
     ? ["install", "controller", "--enable-worker", "--no-taints"]
     : role === "controller_worker"
@@ -249,10 +251,11 @@ export function installArgs(
       "controller",
       "--enable-worker",
       ...(noTaints ? ["--no-taints"] : []),
+      ...(join ? tokenFile : []),
     ]
     : role === "controller"
-    ? ["install", "controller"]
-    : ["install", "worker", "--token-file", K0S_WORKER_TOKEN_PATH];
+    ? ["install", "controller", ...(join ? tokenFile : [])]
+    : ["install", "worker", ...tokenFile];
   return force ? [...base, "--force"] : base;
 }
 

@@ -254,7 +254,7 @@ const InstallArgs = z.strictObject({
   ),
   join_token: z.string().max(16384).meta({ sensitive: true }).nullish()
     .describe(
-      "Join token for role worker, written to a root-only token file over stdin; never placed on a command line.",
+      "Join token for a worker, or for a controller/controller_worker joining an existing control plane, written to a root-only token file over stdin; never placed on a command line. Required for role worker.",
     ),
   force_reinstall: z.boolean().default(false).describe(
     "Reinstall over an existing service of the same role rather than adopting it.",
@@ -1344,7 +1344,7 @@ function buildK0sModel(deps: K0sDeps) {
               content: encoder.encode(yaml),
               mode: SECRET_MODE,
             });
-            if (args.role === "worker") {
+            if (args.join_token) {
               // Sent only once the install is certain to proceed, never to a
               // host that is about to be adopted or refused.
               await deps.ssh.upload(target, {
@@ -1360,7 +1360,12 @@ function buildK0sModel(deps: K0sDeps) {
 
             const installed = await deps.ssh.exec(target, [
               K0S_BINARY_PATH,
-              ...installArgs(args.role, args.no_taints, args.force_reinstall),
+              ...installArgs(
+                args.role,
+                args.no_taints,
+                args.force_reinstall,
+                args.join_token != null,
+              ),
             ]);
             if (!ok(installed)) {
               throw new Error(

@@ -2565,30 +2565,51 @@ Deno.test("kubeconfig builds the server URL from api_address and stores that kub
   assertEquals(v6.result.server, "https://[2001:db8::7]:6444");
 });
 
-Deno.test("the exact install argv for single, controller and worker", async () => {
-  const cases: [string, string[]][] = [
-    ["single", ["install", "controller", "--enable-worker", "--no-taints"]],
-    ["controller", ["install", "controller"]],
-    [
+Deno.test("the exact install argv for each role and join", async () => {
+  const cases: [Record<string, unknown>, string[]][] = [
+    [{ role: "single" }, [
+      "install",
+      "controller",
+      "--enable-worker",
+      "--no-taints",
+    ]],
+    [{ role: "controller" }, ["install", "controller"]],
+    [{ role: "worker", join_token: "PLACEHOLDER-JOIN-TOKEN" }, [
+      "install",
       "worker",
-      ["install", "worker", "--token-file", "/etc/k0s/worker-token"],
-    ],
+      "--token-file",
+      "/etc/k0s/worker-token",
+    ]],
+    [{ role: "controller", join_token: "PLACEHOLDER-JOIN-TOKEN" }, [
+      "install",
+      "controller",
+      "--token-file",
+      "/etc/k0s/worker-token",
+    ]],
+    [{ role: "controller_worker" }, [
+      "install",
+      "controller",
+      "--enable-worker",
+    ]],
+    [{ role: "controller_worker", no_taints: true }, [
+      "install",
+      "controller",
+      "--enable-worker",
+      "--no-taints",
+    ]],
   ];
-  for (const [role, expected] of cases) {
+  for (const [overrides, expected] of cases) {
     const fake = makeDeps({
       exec: installRouter,
       fetch: () => Promise.resolve(PAYLOAD),
     });
     const model = createModel(fake.deps);
     const { context } = createModelTestContext();
-    await model.methods.install.execute(
-      installArgs({ role, join_token: "PLACEHOLDER-JOIN-TOKEN" }),
-      context,
-    );
+    await model.methods.install.execute(installArgs(overrides), context);
     assertEquals(
       fake.execs.find((argv) => argv[1] === "install"),
       [K0S_BINARY_PATH, ...expected],
-      role,
+      JSON.stringify(overrides),
     );
   }
 });

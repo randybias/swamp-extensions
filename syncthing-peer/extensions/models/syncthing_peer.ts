@@ -1007,4 +1007,8 @@ export function createModel(
 }
 
 /** Production model: the factory with no overrides. */
-export const model: PeerModel = createModel();
+export const model = {
+  ...createModel(),
+  type: "@randybias/syncthing-peer",
+  version: "2026.10.17.1",
+} satisfies PeerModel;

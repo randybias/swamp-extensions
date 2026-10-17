@@ -241,3 +241,9 @@ Every one of those tests fails on the previous round's code.
   `fail`. The arm records and self-tests the path before changing anything. The
   clear's "no marker" is exit 10 (a broken checks.sh is exit 5), and a repeated
   clear is a no-op.
+- Live fixes: with `from` the kernel reports no prefsrc, so the recorded path
+  source is the connection's own local address (required on the route's device;
+  loopback refused) and the sim now behaves like ip. A VLAN MTU is refused,
+  before anything is armed, when it exceeds the declared ethernet MTU or, if the
+  link is undeclared or declared without one, its live MTU (no probe entry:
+  refused).

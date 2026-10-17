@@ -5,6 +5,7 @@ import {
   assertMtu,
   assertNoManagementOverlap,
   assertVlanId,
+  assertVlanMtusFit,
   cidrOverlaps,
   deviceGraph,
   HostNetConfigError,
@@ -189,4 +190,51 @@ Deno.test("the management interface is protected unless takeover is acknowledged
     mode: "takeover",
     managementChangeAck: true,
   });
+});
+
+Deno.test("a VLAN MTU is checked against the declared ethernet MTU, else the live link MTU, else refused", () => {
+  const vlan = {
+    id: 3011,
+    link: "enp7s0",
+    mtu: 9000,
+    addresses: [],
+    optional: false,
+  };
+  const cfg = (ethernets: { name: string; mtu?: number }[]) => ({
+    ...BASE,
+    managementInterface: "enp1s0",
+    ethernets,
+    vlans: [vlan],
+    bridge: undefined,
+  });
+  // Declared with an MTU: that is the bound, whatever the host says.
+  assertThrows(
+    () => assertVlanMtusFit(cfg([{ name: "enp7s0", mtu: 1500 }]), []),
+    HostNetConfigError,
+    "exceeds link enp7s0 MTU 1500",
+  );
+  assertVlanMtusFit(
+    cfg([{ name: "enp7s0", mtu: 9000 }]),
+    [{ name: "enp7s0", mtu: 1500 }],
+  );
+  // Declared without an MTU, or not declared: the live MTU is the bound.
+  for (const eths of [[{ name: "enp7s0" }], []]) {
+    assertThrows(
+      () => assertVlanMtusFit(cfg(eths), [{ name: "enp7s0", mtu: 1500 }]),
+      HostNetConfigError,
+      "exceeds link enp7s0 MTU 1500",
+    );
+    assertVlanMtusFit(cfg(eths), [{ name: "enp7s0", mtu: 9000 }]);
+  }
+  // No declared MTU and no probe entry: refused.
+  assertThrows(
+    () => assertVlanMtusFit(cfg([]), [{ name: "enp1s0", mtu: 9000 }]),
+    HostNetConfigError,
+    "cannot be checked",
+  );
+  // A VLAN without an MTU has nothing to compare.
+  assertVlanMtusFit(
+    { ...cfg([]), vlans: [{ ...vlan, mtu: undefined }] },
+    [],
+  );
 });

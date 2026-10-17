@@ -21,6 +21,7 @@ import {
 } from "./_lib/ssh.ts";
 import {
   assertNoManagementOverlap,
+  assertVlanMtusFit,
   type BridgeSpec,
   HostNetConfigError,
   type NetConfig,
@@ -752,6 +753,8 @@ export function createModel(overrides: Partial<HostNetDeps> = {}) {
             `management interface ${cfg.managementInterface} does not carry the SSH route`,
           );
         }
+        // Before anything is armed: a VLAN cannot be larger than its link.
+        assertVlanMtusFit(cfg, live.links);
         if (cfg.bridgeType === "ovs" && !live.hasOvs) {
           throw new HostNetConfigError("ovs-vsctl is not present on the host");
         }

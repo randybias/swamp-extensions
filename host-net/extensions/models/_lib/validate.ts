@@ -384,3 +384,32 @@ export function deviceGraph(cfg: NetConfig): DeviceNode[] {
   }
   return nodes;
 }
+
+/**
+ * Refuses a VLAN whose MTU exceeds the MTU its link will actually have: the
+ * declared ethernet's MTU when the link is declared with one, otherwise the
+ * link's live MTU. A link with neither a declared MTU nor a probe entry is
+ * refused, since the comparison cannot be made. Runs before anything is armed.
+ */
+export function assertVlanMtusFit(
+  cfg: NetConfig,
+  liveLinks: { name: string; mtu: number }[],
+): void {
+  const declared = new Map(cfg.ethernets.map((e) => [e.name, e.mtu]));
+  for (const vlan of cfg.vlans) {
+    if (vlan.mtu === undefined) continue;
+    const name = vlanName(vlan);
+    const effective = declared.get(vlan.link) ??
+      liveLinks.find((l) => l.name === vlan.link)?.mtu;
+    if (effective === undefined) {
+      throw new HostNetConfigError(
+        `VLAN ${name} MTU ${vlan.mtu} cannot be checked: link ${vlan.link} has no declared MTU and was not found on the host`,
+      );
+    }
+    if (vlan.mtu > effective) {
+      throw new HostNetConfigError(
+        `VLAN ${name} MTU ${vlan.mtu} exceeds link ${vlan.link} MTU ${effective}`,
+      );
+    }
+  }
+}

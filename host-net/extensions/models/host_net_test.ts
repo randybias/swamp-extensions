@@ -110,7 +110,15 @@ function fakeRun(
     if (command.includes("'-d' '-j' 'link'")) {
       return Promise.resolve({
         code: 0,
-        stdout: JSON.stringify(opts.links ?? []),
+        stdout: JSON.stringify(
+          opts.links ?? [{
+            ifname: "enp1s0",
+            mtu: 9000,
+            operstate: "UP",
+            address: "02:00:00:00:00:01",
+            linkinfo: { info_kind: "ether" },
+          }],
+        ),
         stderr: "",
       });
     }
@@ -284,6 +292,11 @@ Deno.test("apply refuses when a revert is already armed", async () => {
 Deno.test("remove arms before deleting and deletes only created devices", async () => {
   const fake = fakeRun({
     links: [{
+      ifname: "enp1s0",
+      mtu: 9000,
+      operstate: "UP",
+      linkinfo: { info_kind: "ether" },
+    }, {
       ifname: "enp1s0.100",
       mtu: 9000,
       operstate: "UP",
@@ -422,6 +435,11 @@ Deno.test("the vaultService object resolves the SSH key", async () => {
 Deno.test("apply after a committed apply does not treat an owned device as foreign", async () => {
   const fake = fakeRun({
     links: [{
+      ifname: "enp1s0",
+      mtu: 9000,
+      operstate: "UP",
+      linkinfo: { info_kind: "ether" },
+    }, {
       ifname: "enp1s0.100",
       mtu: 9000,
       operstate: "UP",

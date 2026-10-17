@@ -93,9 +93,9 @@ async function world(): Promise<World> {
       "state/units",
     ]
   ) await Deno.mkdir(`${root}/${d}`, { recursive: true });
-  const nic = (ifname: string, address: string) => ({
+  const nic = (ifname: string, address: string, mtu = 1500) => ({
     ifname,
-    mtu: 1500,
+    mtu,
     operstate: "UP",
     address,
     linkinfo: { info_kind: "ether" },
@@ -103,7 +103,8 @@ async function world(): Promise<World> {
   await Deno.writeTextFile(
     `${root}/state/links.json`,
     JSON.stringify([
-      nic("enp1s0", "02:00:00:00:00:01"),
+      // The management NIC is jumbo-capable, so a 9000 VLAN over it fits.
+      nic("enp1s0", "02:00:00:00:00:01", 9000),
       nic("enp2s0", "02:00:00:00:00:02"),
     ]),
   );
@@ -330,6 +331,15 @@ Deno.test("takeover: the precheck stage has the cloud-init directory, and remove
   if (!await simAvailable()) return;
   const w = await world();
   try {
+    // This host's NIC starts at the default 1500.
+    const links = JSON.parse(
+      await Deno.readTextFile(`${w.root}/state/links.json`),
+    );
+    links[0].mtu = 1500;
+    await Deno.writeTextFile(
+      `${w.root}/state/links.json`,
+      JSON.stringify(links),
+    );
     const cfg = net("netplan", [], {
       mode: "takeover",
       management_change_ack: true,
@@ -669,6 +679,49 @@ Deno.test("a local address that is not on the route's device is refused at the a
       () => w.call("apply", net("netplan", [A])),
       Error,
       "management path could not be recorded",
+    );
+  } finally {
+    await w.cleanup();
+  }
+});
+
+Deno.test("a VLAN MTU above its undeclared link's live MTU is refused before anything is armed", async () => {
+  if (!await simAvailable()) return;
+  const w = await world();
+  try {
+    // The management NIC is live at 1500 and is not declared as an ethernet
+    // (the live bm1 repro).
+    const links = JSON.parse(
+      await Deno.readTextFile(`${w.root}/state/links.json`),
+    );
+    links[0].mtu = 1500;
+    await Deno.writeTextFile(
+      `${w.root}/state/links.json`,
+      JSON.stringify(links),
+    );
+    const big = {
+      id: 3011,
+      link: "enp1s0",
+      mtu: 9000,
+      addresses: ["198.51.100.30/24"],
+    };
+    await assertRejects(
+      () =>
+        w.call("apply", {
+          ...net("netplan", [big]),
+          ethernets: [],
+        }),
+      Error,
+      "exceeds link enp1s0 MTU 1500",
+    );
+    assertEquals(await w.files(), []);
+    // Nothing was armed: the host state directory was never created.
+    assertEquals(
+      await Deno.stat(`${w.root}/var/lib/host-net`).then(
+        () => true,
+        () => false,
+      ),
+      false,
     );
   } finally {
     await w.cleanup();

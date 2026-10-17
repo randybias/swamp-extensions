@@ -91,7 +91,9 @@ const HEALTHY: Probes = {
   swaps: done("Filename\tType\tSize\tUsed\tPriority\n"),
   mdstat: done("", 1, "cat: /proc/mdstat: No such file or directory"),
   links: done(""),
-  blkid: done("", 127),
+  // A working blkid that knows one unrelated device and nothing about the
+  // raw candidate disk.
+  blkid: done('/dev/sdz9: UUID="1111" TYPE="ext4"\n'),
   zpool: done("", 127),
   pvs: done("", 127),
 };

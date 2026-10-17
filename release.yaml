@@ -135,5 +135,8 @@ zfs:
 
 server-stack:
   channel: beta
-  ci: false
-  published: {}
+  ci: true
+  published:
+    2026.10.17.3: e58bc1370170bb19f7fb1fe289c81c219bc24b1856211b8df7c880ba7a228940
+  notes:
+    2026.10.17.3: 'First release, beta. Two workflows that provision and tear down a hardened single-node k0s host on a WireGuard mesh, running NATS on the mesh address and published in Cloudflare DNS, by composing cherry-servers, ssh-host, wireguard-mesh, server-host, k0s-cluster and k8s-secret. Every destructive step depends directly, succeeded-only, on every safety gate that protects it; provision refuses an existing server or record unless adopt is set, and an adopt re-run orders nothing new, never reopens public SSH and leaves the firewall as is; teardown checks the ownership tag and record marker, forgets the server-host records and is re-runnable. Secrets are read from the server-stack vault by key name. Live end to end on throwaway Cherry VPS hosts with Cloudflare DNS: a fresh uninterrupted run, an adopt re-run (0 of 57 public SSH probes open) and teardown twice with provider counts restored, 8 of 8, after two earlier runs whose failures were fixed. Residuals are in the LOGBOOK: DNS checks read only the first A record, a bare known_hosts key line pins every address, teardown''s project_id is unused, and a wedged NATS Helm release needs a documented manual recovery.'

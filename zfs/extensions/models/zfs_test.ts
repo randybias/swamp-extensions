@@ -22,7 +22,8 @@ const SSH = {
   host: HOST,
   port: PORT,
   user: USER,
-  host_key_policy: "insecure_tofu" as const,
+  host_key_policy: "strict" as const,
+  host_keys: [`${HOST} ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFakeKeyForTests`],
   private_key: "PLACEHOLDER-PRIVATE-KEY-NOT-REAL",
 };
 
@@ -36,6 +37,7 @@ const LSBLK = JSON.stringify({
       fstype: null,
       uuid: null,
       partuuid: null,
+      parttype: null,
       label: null,
       mountpoints: [null],
       children: [{
@@ -46,6 +48,7 @@ const LSBLK = JSON.stringify({
         fstype: "ext4",
         uuid: "ROOT-UUID",
         partuuid: null,
+        parttype: "0x83",
         label: null,
         mountpoints: ["/"],
       }],
@@ -58,11 +61,13 @@ const LSBLK = JSON.stringify({
       fstype: null,
       uuid: null,
       partuuid: null,
+      parttype: null,
       label: null,
       mountpoints: [null],
     },
   ],
 });
+const ZERO_SECTOR = Array.from({ length: 512 }, () => "00").join(" ");
 const FINDMNT = JSON.stringify({
   filesystems: [{ target: "/", source: "/dev/sda1", fstype: "ext4" }],
 });
@@ -99,6 +104,10 @@ const P = {
   poolStatus: "'zpool' 'status' '-P'",
   poolStatusTank: "'zpool' 'status' '-P' 'tank'",
   poolCreate: "'zpool' 'create'",
+  poolDestroy: "'zpool' 'destroy'",
+  poolExport: "'zpool' 'export'",
+  poolDescendants:
+    "'zfs' 'list' '-H' '-r' '-o' 'name' '-t' 'filesystem,volume,snapshot'",
   dsProbe: "'zfs' 'list' '-H' '-o' 'name'",
   dsCreate: "'zfs' 'create'",
   dsGet: "'zfs' 'get'",
@@ -228,6 +237,11 @@ function guardProbeRoute(fixture: GuardFixture = {}): Route {
     if (has(remote, "pvs --noheadings")) {
       return { code: 0, stdout: fixture.pvs ?? "" };
     }
+    if (has(remote, "test -d /sys/firmware/efi")) {
+      return { code: 1, stdout: "" };
+    }
+    if (has(remote, "efibootmgr -v")) return { code: 127, stdout: "" };
+    if (has(remote, "dd if=")) return { code: 0, stdout: ZERO_SECTOR };
     return undefined;
   };
 }
@@ -304,6 +318,7 @@ interface DevSpec {
   type: string;
   fstype?: string;
   uuid?: string;
+  parttype?: string | null;
   label?: string;
   mounts?: string[];
   path?: string;
@@ -323,6 +338,7 @@ function devRow(d: DevSpec): Record<string, unknown> {
     fstype: d.fstype ?? null,
     uuid: d.uuid ?? null,
     partuuid: null,
+    parttype: d.parttype ?? (d.type === "part" ? "0x83" : null),
     label: d.label ?? null,
     mountpoints: d.mounts ?? [null],
     ...(d.children ? { children: d.children.map(devRow) } : {}),
@@ -974,18 +990,23 @@ Deno.test("the grammar rejects injection on every remote-bound input", () => {
   );
 });
 
-Deno.test("strict host-key policy requires a pinned key", () => {
+Deno.test("host-key policy is strict-only and host_keys is required", () => {
   const zfs = model(() => undefined);
-  assertThrows(
-    () =>
-      zfs.methods.create_pool.arguments.parse({
-        ssh: { ...SSH, host_key_policy: "strict" },
-        pool: "tank",
-        vdevs: ["/dev/sdb"],
-      }),
-    Error,
-    undefined,
-    "strict requires a non-empty host_keys",
+  // No pinned keys.
+  assertThrows(() =>
+    zfs.methods.create_pool.arguments.parse({
+      ssh: { ...SSH, host_keys: [] },
+      pool: "tank",
+      vdevs: ["/dev/sdb"],
+    })
+  );
+  // Trust-on-first-use is not offered.
+  assertThrows(() =>
+    zfs.methods.create_pool.arguments.parse({
+      ssh: { ...SSH, host_key_policy: "insecure_tofu" },
+      pool: "tank",
+      vdevs: ["/dev/sdb"],
+    })
   );
 });
 
@@ -1125,4 +1146,112 @@ Deno.test("sync compares recorded state with the host", async () => {
     out.result.diffs.some((diff) => diff.includes("pool health")),
     true,
   );
+});
+
+Deno.test("destroy_pool refuses children without an ack, then destroys with one", async () => {
+  const base = (remote: string): RouteResult | undefined => {
+    if (has(remote, P.poolProbe)) return { code: 0, stdout: "tank\n" };
+    if (has(remote, P.poolDescendants)) {
+      return { code: 0, stdout: "tank\ntank/data\ntank/data@a\n" };
+    }
+    return guardProbeRoute()(remote);
+  };
+  const refuses = model((remote) => {
+    if (has(remote, P.poolDestroy)) return { code: 0 };
+    return base(remote);
+  });
+  const error = await assertRejects(
+    () =>
+      refuses.methods.destroy_pool.execute(
+        refuses.methods.destroy_pool.arguments.parse({
+          ssh: SSH,
+          pool: "tank",
+          recursive: false,
+        }),
+        createModelTestContext().context,
+      ),
+    Error,
+    "set recursive",
+  );
+  assertEquals(error.message.includes("2 dataset"), true);
+
+  const commands: string[] = [];
+  const recursive = model((remote) => {
+    commands.push(remote);
+    if (has(remote, P.poolDestroy)) return { code: 0 };
+    return base(remote);
+  });
+  const out = await recursive.methods.destroy_pool.execute(
+    recursive.methods.destroy_pool.arguments.parse({
+      ssh: SSH,
+      pool: "tank",
+      recursive: true,
+    }),
+    createModelTestContext().context,
+  ) as { result: { destroyed: boolean } };
+  assertEquals(out.result.destroyed, true);
+  assertEquals(
+    commands.some((c) => has(c, "'zpool' 'destroy' '-f' 'tank'")),
+    true,
+  );
+});
+
+Deno.test("destroy_pool and export_pool are clean no-ops on an absent pool", async () => {
+  const m = model(guardProbeRoute());
+  const destroyed = await m.methods.destroy_pool.execute(
+    m.methods.destroy_pool.arguments.parse({ ssh: SSH, pool: "tank" }),
+    createModelTestContext().context,
+  ) as { result: { destroyed: boolean } };
+  assertEquals(destroyed.result.destroyed, false);
+  const exported = await m.methods.export_pool.execute(
+    m.methods.export_pool.arguments.parse({ ssh: SSH, pool: "tank" }),
+    createModelTestContext().context,
+  ) as { result: { exported: boolean } };
+  assertEquals(exported.result.exported, false);
+});
+
+Deno.test("export_pool forces a busy pool out", async () => {
+  const commands: string[] = [];
+  const m = model((remote) => {
+    commands.push(remote);
+    if (has(remote, P.poolProbe)) return { code: 0, stdout: "tank\n" };
+    if (has(remote, P.poolExport)) return { code: 0 };
+    return guardProbeRoute()(remote);
+  });
+  const out = await m.methods.export_pool.execute(
+    m.methods.export_pool.arguments.parse({ ssh: SSH, pool: "tank" }),
+    createModelTestContext().context,
+  ) as { result: { exported: boolean } };
+  assertEquals(out.result.exported, true);
+  assertEquals(
+    commands.some((c) => has(c, "'zpool' 'export' '-f' 'tank'")),
+    true,
+  );
+});
+
+Deno.test("a zpool failure surfaces the sanitized stderr reason", async () => {
+  const m = model((remote) => {
+    if (has(remote, P.poolCreate)) {
+      return {
+        code: 1,
+        stderr:
+          "cannot create 'tank': one or more devices is currently unavailable\n",
+      };
+    }
+    return fullCreateRoute()(remote);
+  });
+  const error = await assertRejects(
+    () =>
+      m.methods.create_pool.execute(
+        m.methods.create_pool.arguments.parse({
+          ssh: SSH,
+          pool: "tank",
+          vdevs: ["/dev/sdb"],
+        }),
+        createModelTestContext().context,
+      ),
+    Error,
+    "one or more devices is currently unavailable",
+  );
+  assertEquals(error.message.includes("failed (exit 1)"), true);
 });

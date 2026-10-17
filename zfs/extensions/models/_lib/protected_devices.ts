@@ -77,8 +77,14 @@ export interface ProbeInputs {
   zpool: CommandProbe;
   /** {@link PVS_COMMAND}; code 127 when LVM is not installed. */
   pvs: CommandProbe;
+  /** {@link EFI_COMMAND}: exit 0 on an EFI host, 1 on a BIOS host. */
+  efi: CommandProbe;
+  /** {@link EFIBOOTMGR_COMMAND}: extra evidence on an EFI host, never required. */
+  efibootmgr: CommandProbe;
   /** `mdadm --examine <path>` for every path in {@link examineTargets}. */
   mdExamine: Record<string, CommandProbe>;
+  /** {@link mbrReadCommand} for every path in {@link mbrTargets}. */
+  mbr: Record<string, CommandProbe>;
 }
 
 /** Why a device is protected. */
@@ -97,16 +103,32 @@ export interface ProtectedSet {
 }
 
 /** Why the module refused. */
-export type RefusalCode = "unverifiable" | "protected";
+export type RefusalCode = "unverifiable" | "protected" | "boot-partition";
 
 /** A typed refusal: the caller must not proceed. */
 export interface Refusal {
-  /** `unverifiable`: the host could not be read safely. `protected`: a candidate is protected. */
+  /**
+   * `unverifiable`: the host could not be read safely. `protected`: a
+   * candidate backs the running system. `boot-partition`: a candidate holds a
+   * boot-type partition (BIOS boot, EFI System, ...) and its disk was not
+   * acknowledged.
+   */
   code: RefusalCode;
   /** One-line explanation, free of any secret. */
   message: string;
   /** Structured detail for the caller's error. */
   detail: Record<string, unknown>;
+}
+
+/** Per-call options of {@link assess}. */
+export interface AssessOptions {
+  /**
+   * Canonical paths of disks whose boot-type partitions the caller has
+   * explicitly acknowledged it intends to wipe (identified by serial or WWN
+   * upstream, never by a path the caller typed). It lifts only the
+   * `boot-partition` refusal, never a protection.
+   */
+  bootAcknowledged?: string[];
 }
 
 /** The module's verdict. */
@@ -116,7 +138,7 @@ export type Assessment =
 
 /** Probe that lists block devices with the columns the module needs. */
 export const LSBLK_COMMAND =
-  "lsblk -J -b -o NAME,PATH,PKNAME,TYPE,FSTYPE,UUID,PARTUUID,LABEL,MOUNTPOINTS";
+  "lsblk -J -b -o NAME,PATH,PKNAME,TYPE,FSTYPE,UUID,PARTUUID,LABEL,MOUNTPOINTS,PARTTYPE";
 /** Probe for live mounts. */
 export const FINDMNT_COMMAND = "findmnt -J";
 /** Probe that resolves every device symlink: one `<link> <target>` per line. */
@@ -126,12 +148,82 @@ export const LINKS_COMMAND =
 export const BLKID_COMMAND = "blkid";
 /** Probe for ZFS pool membership with full device paths. */
 export const ZPOOL_COMMAND = "zpool status -P";
+/** Probe that tells an EFI host (exit 0) from a BIOS host (exit 1). */
+export const EFI_COMMAND = "test -d /sys/firmware/efi";
+/** Probe for the firmware's boot entries; extra evidence on an EFI host. */
+export const EFIBOOTMGR_COMMAND = "efibootmgr -v";
 /** Probe for LVM physical volumes and their volume groups. */
 export const PVS_COMMAND = "pvs --noheadings -o pv_name,vg_name";
+/**
+ * An absolute `/dev` path with no characters a shell or mdadm would treat
+ * specially. mdadm gets such a path as a bare argument, never after `--`: mdadm
+ * 4.3 treats `--` as "no devices given", so `--examine --`, `--stop --` and
+ * `--zero-superblock --` all silently do nothing.
+ */
+export const DEVICE_PATH_RE = /^\/dev\/[A-Za-z0-9][A-Za-z0-9._\/-]{0,254}$/;
+
+/** True for a device path that is safe to pass to mdadm without `--`. */
+export function isDevicePath(path: string): boolean {
+  return DEVICE_PATH_RE.test(path) && !path.includes("..");
+}
+
 /** Probe run for each path from {@link examineTargets}. */
 export function mdExamineCommand(path: string): string {
-  return `mdadm --examine -- '${path.replace(/'/g, "'\\''")}'`;
+  if (!isDevicePath(path)) {
+    throw new Error("not a plain /dev device path");
+  }
+  return `mdadm --examine '${path}'`;
 }
+
+/**
+ * Reads sector 0 of a whole disk as 512 hex bytes. The read is one sector and
+ * read-only; {@link parseMbrSector} insists on exactly 512 bytes, so a failed
+ * or short `dd` is never mistaken for an empty sector (no `pipefail` needed).
+ */
+export function mbrReadCommand(path: string): string {
+  if (!isDevicePath(path)) {
+    throw new Error("not a plain /dev device path");
+  }
+  return `dd if='${path}' bs=512 count=1 status=none | od -An -v -tx1`;
+}
+
+/**
+ * Sector 0 as 512 byte values, or null unless the probe produced exactly that.
+ */
+export function parseMbrSector(
+  probe: CommandProbe | undefined,
+): number[] | null {
+  if (!probe || probe.code !== 0) return null;
+  const tokens = probe.stdout.split(/\s+/).filter((t) => t !== "");
+  if (tokens.length !== 512) return null;
+  const bytes: number[] = [];
+  for (const t of tokens) {
+    if (!/^[0-9a-f]{2}$/.test(t)) return null;
+    bytes.push(parseInt(t, 16));
+  }
+  return bytes;
+}
+
+/** True for a sector 0 a BIOS would execute: 55 aa plus any boot code byte. */
+function hasMbrBootCode(sector: number[]): boolean {
+  if (sector[510] !== 0x55 || sector[511] !== 0xaa) return false;
+  return sector.slice(0, 440).some((b) => b !== 0);
+}
+
+/**
+ * GPT partition types that hold boot code or boot files and carry no
+ * filesystem or mount to give them away: BIOS boot (GRUB's core image), EFI
+ * System, Linux extended boot, and PReP boot. The MBR forms (`0xef` for EFI,
+ * `0x41` for PReP) are matched too.
+ */
+const BOOT_PART_TYPES = new Set([
+  "21686148-6449-6e6f-744e-656564454649",
+  "c12a7328-f81f-11d2-ba4b-00a0c93ec93b",
+  "bc13c2ff-59e6-4262-a352-b275fd6f7172",
+  "9e1a2d38-c612-4316-aa26-8b49521e5a8b",
+  "0xef",
+  "0x41",
+]);
 
 /** Filesystem types that are not backed by a local block device. */
 const NON_BLOCK_FS = new Set([
@@ -210,6 +302,8 @@ interface Node {
   uuid: string;
   partuuid: string;
   label: string;
+  /** Partition type: a GPT GUID (lowercased) or an MBR code such as `0x83`. */
+  parttype: string;
   mounts: string[];
   parents: Set<string>;
   children: Set<string>;
@@ -269,6 +363,7 @@ function parseLsblkGraph(
         uuid: str(raw.uuid),
         partuuid: str(raw.partuuid),
         label: str(raw.label),
+        parttype: str(raw.parttype).toLowerCase(),
         mounts: [],
         parents: new Set(),
         children: new Set(),
@@ -522,6 +617,38 @@ function parseFindmnt(probe: CommandProbe): Mount[] {
   };
   for (const r of roots) visit(r);
   return mounts;
+}
+
+/**
+ * The PARTUUIDs of the partitions the current and ordered EFI boot entries
+ * point at (BootCurrent, BootNext and BootOrder), from `efibootmgr -v`
+ * (`HD(n,GPT,<partuuid>,...)` or `HD(n,MBR,0x<signature>,...)`), lowercased.
+ */
+export function efiBootPartuuids(text: string): string[] {
+  const wanted = new Set<string>();
+  const current = /^BootCurrent:\s*([0-9A-Fa-f]{4})/m.exec(text)?.[1];
+  if (current) wanted.add(current.toUpperCase());
+  const next = /^BootNext:\s*([0-9A-Fa-f]{4})/m.exec(text)?.[1];
+  if (next) wanted.add(next.toUpperCase());
+  const order = /^BootOrder:\s*(\S+)/m.exec(text)?.[1] ?? "";
+  for (const id of order.split(",")) {
+    if (/^[0-9A-Fa-f]{4}$/.test(id)) wanted.add(id.toUpperCase());
+  }
+  const out = new Set<string>();
+  for (const line of text.split("\n")) {
+    const head = /^Boot([0-9A-Fa-f]{4})\*?\s/.exec(line);
+    if (!head || !wanted.has(head[1].toUpperCase())) continue;
+    const gpt = /HD\(\d+,GPT,([0-9A-Fa-f-]{36})[,)]/.exec(line);
+    if (gpt) out.add(gpt[1].toLowerCase());
+    // An msdos-labelled disk: libblkid's PARTUUID is <signature>-<number>, both
+    // hex, the signature padded to 8 digits (efivar may print it unpadded).
+    const dos = /HD\((\d+),MBR,0x([0-9A-Fa-f]{1,8})[,)]/.exec(line);
+    if (dos) {
+      const n = parseInt(dos[1], 10).toString(16).padStart(2, "0");
+      out.add(`${dos[2].padStart(8, "0").toLowerCase()}-${n}`);
+    }
+  }
+  return [...out];
 }
 
 /** Parses `blkid` lines into path to identifiers. */
@@ -871,6 +998,32 @@ function compute(input: ProbeInputs): ProtectedSet {
   for (let pass = 0, before = ""; before !== size(); pass++) {
     if (pass > 32) unverifiable("the protected topology did not settle");
     before = size();
+    // 3a. Boot partitions (BIOS boot, EFI system, ...) under every protected
+    // device: a disk, but also a multipath device whose partitions sit on it. They carry no filesystem and no mount, so nothing
+    // else claims them, and wiping one leaves the host unbootable. A partition
+    // whose type cannot be read cannot be ruled out, so it refuses.
+    for (const path of protectedNow()) {
+      const holder = graph.nodes.get(path);
+      if (!holder) continue;
+      for (const childPath of holder.children) {
+        const child = graph.nodes.get(childPath)!;
+        if (child.type !== "part") continue;
+        if (child.parttype === "") {
+          unverifiable(
+            "the type of a partition on a protected disk is unknown",
+            {
+              device: childPath,
+            },
+          );
+        }
+        if (BOOT_PART_TYPES.has(child.parttype)) {
+          collector.protect(
+            childPath,
+            "boot partition on a disk that holds a protected device",
+          );
+        }
+      }
+    }
     // 3b. A multi-device filesystem is reported under one device in the mount
     // table but lives on every device carrying its UUID.
     for (const path of Object.keys(collector.devices)) {
@@ -1062,6 +1215,24 @@ function compute(input: ProbeInputs): ProtectedSet {
     }
   }
 
+  // Extra evidence on an EFI host: the partitions the firmware's boot entries
+  // point at. A hard protection (the acknowledgement cannot lift it), but only
+  // ever in addition to the type-based rule, never instead of it.
+  if (input.efi.code !== 0 && input.efi.code !== 1) {
+    unverifiable("the firmware type could not be determined", {
+      exit: input.efi.code,
+    });
+  }
+  if (input.efi.code === 0 && input.efibootmgr.code === 0) {
+    for (const partuuid of efiBootPartuuids(input.efibootmgr.stdout)) {
+      for (const node of graph.nodes.values()) {
+        if (node.partuuid !== "" && node.partuuid.toLowerCase() === partuuid) {
+          collector.protect(node.path, "named by an EFI boot entry");
+        }
+      }
+    }
+  }
+
   // Missing evidence is never "not related". A mounted or configured
   // filesystem always has a type; and when blkid gave nothing either, a
   // protected device that carries data with no type at all cannot be told
@@ -1118,14 +1289,19 @@ export function examineTargets(
     return [];
   }
   const out = new Set<string>();
+  // A path mdadm could not be given safely is left out; the candidate check
+  // then reports it as never examined.
+  const add = (path: string): void => {
+    if (isDevicePath(path)) out.add(path);
+  };
   for (const node of graph.nodes.values()) {
-    if (node.fstype === "linux_raid_member") out.add(node.path);
+    if (node.fstype === "linux_raid_member") add(node.path);
   }
   if (probes.mdstat.state === "ok") {
     for (const array of parseMdstat(probes.mdstat.text)) {
       for (const member of array.members) {
         const p = resolver.resolve(`/dev/${member}`);
-        if (p) out.add(p);
+        if (p) add(p);
       }
     }
   }
@@ -1134,7 +1310,52 @@ export function examineTargets(
     if (!path) continue;
     for (const p of subtree(graph, path)) {
       const t = graph.nodes.get(p)?.type;
-      if (t === "disk" || t === "part") out.add(p);
+      if (t === "disk" || t === "part") add(p);
+    }
+  }
+  return [...out].sort();
+}
+
+/**
+ * The disks whose sector 0 decides whether a candidate may be wiped: every
+ * disk in its subtree and, unless the candidate is a partition (which does not
+ * touch the MBR), every disk above it. The latter covers a multipath device,
+ * whose own type is not "disk" but whose paths are.
+ */
+function bootDisks(graph: Graph, path: string): string[] {
+  const out = new Set<string>();
+  const nodes = [...subtree(graph, path)];
+  if (graph.nodes.get(path)?.type !== "part") {
+    nodes.push(...closure(graph, path, (n) => n.parents));
+  }
+  for (const p of nodes) {
+    if (graph.nodes.get(p)?.type === "disk") out.add(p);
+  }
+  return [...out].sort();
+}
+
+/**
+ * The whole disks whose sector 0 {@link assess} needs: every disk in or above
+ * a candidate. Returns an empty list when the host cannot be read.
+ */
+export function mbrTargets(
+  probes: Pick<ProbeInputs, "lsblk" | "links" | "blkid">,
+  candidates: string[],
+): string[] {
+  let graph: Graph;
+  let resolver: Resolver;
+  try {
+    graph = parseLsblkGraph(probes.lsblk, probes.blkid);
+    resolver = new Resolver(graph, probes.links);
+  } catch {
+    return [];
+  }
+  const out = new Set<string>();
+  for (const c of candidates) {
+    const path = resolver.resolve(c);
+    if (!path) continue;
+    for (const p of bootDisks(graph, path)) {
+      if (isDevicePath(p)) out.add(p);
     }
   }
   return [...out].sort();
@@ -1163,6 +1384,7 @@ function conflict(
   set: ProtectedSet,
   input: ProbeInputs,
   candidates: string[],
+  options: AssessOptions,
 ): Refusal | null {
   const graph = parseLsblkGraph(input.lsblk, input.blkid);
   const resolver = new Resolver(graph, input.links);
@@ -1188,6 +1410,7 @@ function conflict(
   const uuids = new Set(set.arrayUuids);
   const vgs = new Set(set.volumeGroups);
   const pools = new Set(set.pools);
+  const acknowledged = new Set(options.bootAcknowledged ?? []);
   for (const candidate of candidates) {
     const path = resolver.resolve(candidate);
     if (!path) {
@@ -1210,6 +1433,43 @@ function conflict(
       }
       const node = graph.nodes.get(p)!;
       const probe = input.mdExamine[p];
+      // Boot evidence anywhere is refused unless its disk was named: the
+      // firmware's boot device cannot be found from the root topology (GRUB on
+      // a SATA disk with / on NVMe, an unmounted fallback ESP, boot code in an
+      // msdos MBR gap). An unreadable partition type cannot rule a boot type
+      // out, so it counts too.
+      let bootEvidence: Record<string, unknown> | null = null;
+      if (
+        node.type === "part" &&
+        (node.parttype === "" || BOOT_PART_TYPES.has(node.parttype))
+      ) {
+        bootEvidence = { partition: p, partitionType: node.parttype };
+      } else if (node.type === "disk") {
+        const sector = parseMbrSector(input.mbr[p]);
+        if (sector === null) {
+          return {
+            code: "unverifiable",
+            message: "the first sector of a candidate disk could not be read",
+            detail: { device: path, disk: p },
+          };
+        }
+        if (hasMbrBootCode(sector)) {
+          bootEvidence = { disk: p, evidence: "mbr-boot-code" };
+        }
+      }
+      if (bootEvidence !== null) {
+        const roots = [...closure(graph, p, (n) => n.parents)].filter((q) =>
+          (graph.nodes.get(q)?.parents.size ?? 0) === 0
+        );
+        if (!roots.every((q) => acknowledged.has(q))) {
+          return {
+            code: "boot-partition",
+            message:
+              "the device holds boot code or a boot partition (BIOS boot, EFI System, MBR boot code or similar); acknowledge its serial to wipe it",
+            detail: { device: path, ...bootEvidence },
+          };
+        }
+      }
       // Without a working blkid an empty type proves nothing: a stale row, or
       // the second device of a multi-device root that spans a whole disk, looks
       // exactly like a raw disk. Only a candidate that mdadm identified, or that
@@ -1271,6 +1531,33 @@ function conflict(
         };
       }
     }
+    // A multipath (or any non-partition, non-disk) device is wiped through its
+    // paths, so the sector 0 of the disks behind it decides too.
+    if (graph.nodes.get(path)?.type !== "part") {
+      for (const d of bootDisks(graph, path)) {
+        if (subtree(graph, path).includes(d)) continue; // judged in the loop above
+        const sector = parseMbrSector(input.mbr[d]);
+        if (sector === null) {
+          return {
+            code: "unverifiable",
+            message: "the first sector of a candidate disk could not be read",
+            detail: { device: path, disk: d },
+          };
+        }
+        if (!hasMbrBootCode(sector)) continue;
+        const roots = [...closure(graph, d, (n) => n.parents)].filter((q) =>
+          (graph.nodes.get(q)?.parents.size ?? 0) === 0
+        );
+        if (!roots.every((q) => acknowledged.has(q))) {
+          return {
+            code: "boot-partition",
+            message:
+              "the device holds boot code or a boot partition (BIOS boot, EFI System, MBR boot code or similar); acknowledge its serial to wipe it",
+            detail: { device: path, disk: d, evidence: "mbr-boot-code" },
+          };
+        }
+      }
+    }
   }
   return null;
 }
@@ -1284,6 +1571,7 @@ export function assess(
   input: ProbeInputs,
   candidates: string[],
   previous?: ProtectedSet,
+  options: AssessOptions = {},
 ): Assessment {
   try {
     if (candidates.length === 0) {
@@ -1291,7 +1579,7 @@ export function assess(
     }
     let set = compute(input);
     if (previous) set = unionProtected(previous, set);
-    const hit = conflict(set, input, candidates);
+    const hit = conflict(set, input, candidates, options);
     if (hit) return { ok: false, refusal: hit };
     return { ok: true, set };
   } catch (e) {

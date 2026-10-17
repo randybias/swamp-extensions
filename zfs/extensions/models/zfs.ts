@@ -31,6 +31,7 @@ import {
   assertProperties,
   assertSnapshotTag,
   cloneArgv,
+  commandReason,
   DATASET_PROPERTIES,
   DATASET_RE,
   datasetCreateArgv,
@@ -47,6 +48,9 @@ import {
   parseSnapshots,
   POOL_RE,
   poolCreateArgv,
+  poolDescendantsArgv,
+  poolDestroyArgv,
+  poolExportArgv,
   type PoolState,
   PROPERTY_NAME_RE,
   propertyString,
@@ -93,11 +97,11 @@ const SSH = z.strictObject({
   ),
   port: z.number().int().min(1).max(65535).default(22).describe("SSH port."),
   user: z.string().regex(USER_RE).describe("Remote user name."),
-  host_key_policy: z.enum(["strict", "insecure_tofu"]).describe(
-    "Required. strict verifies against host_keys; insecure_tofu trusts the host's keys for this call only. The model persists no learned keys, so supply host_keys to pin.",
+  host_key_policy: z.literal("strict").describe(
+    "Required, always strict. This model persists no learned keys, so trust-on-first-use is not offered.",
   ),
-  host_keys: z.array(z.string().max(8192)).max(64).nullish().describe(
-    "ssh-keyscan-format lines. Required for strict.",
+  host_keys: z.array(z.string().max(8192)).min(1).max(64).describe(
+    "ssh-keyscan-format pinned host keys. Required and authoritative.",
   ),
   private_key: z.string().max(65536).meta({ sensitive: true }).nullish()
     .describe(
@@ -109,11 +113,7 @@ const SSH = z.strictObject({
   connect_timeout_s: z.number().int().min(1).max(120).default(15).describe(
     "Connection timeout in seconds.",
   ),
-}).refine(
-  (value) =>
-    value.host_key_policy !== "strict" || (value.host_keys?.length ?? 0) > 0,
-  "host_key_policy strict requires a non-empty host_keys",
-);
+});
 
 const PoolStateSchema = z.strictObject({
   name: z.string(),
@@ -155,6 +155,7 @@ const StateSchema = z.strictObject({
     "clone",
     "rollback",
     "destroy",
+    "export",
   ]),
   name: z.string(),
   pool: z.string().nullable(),
@@ -186,18 +187,18 @@ interface TargetArgs {
   host: string;
   port: number;
   user: string;
-  host_key_policy: "strict" | "insecure_tofu";
-  host_keys?: string[] | null;
+  host_key_policy: "strict";
+  host_keys: string[];
   private_key?: string | null;
   password?: string | null;
   connect_timeout_s: number;
 }
 
 function toTarget(args: TargetArgs): SshTarget {
-  if (
-    args.host_key_policy === "strict" && (args.host_keys?.length ?? 0) === 0
-  ) {
-    throw new Error("host_key_policy strict requires a non-empty host_keys");
+  if (args.host_key_policy !== "strict" || args.host_keys.length === 0) {
+    throw new Error(
+      "strict host_key_policy with a non-empty host_keys is required",
+    );
   }
   if (args.private_key && args.password) {
     throw new Error("pass private_key or password, not both");
@@ -227,11 +228,17 @@ function nonEmptyLines(stdout: string): string[] {
 }
 
 function requireOk(
-  result: { exit_code: number; stdout: string },
+  result: { exit_code: number; stdout: string; stderr?: string },
   what: string,
 ): { exit_code: number; stdout: string } {
   if (result.exit_code !== 0) {
-    throw new Error(`${what} failed (exit ${result.exit_code})`);
+    const reason = commandReason({
+      stdout: result.stdout,
+      stderr: result.stderr ?? "",
+    });
+    throw new Error(
+      `${what} failed (exit ${result.exit_code})${reason ? `: ${reason}` : ""}`,
+    );
   }
   return result;
 }
@@ -261,7 +268,8 @@ async function zfsExists(
   if (probe.exit_code === 0) return probe.stdout.trim() !== "";
   if (MISSING_RE.test(probe.stdout + probe.stderr)) return false;
   throw new Error(
-    `could not check whether ${name} exists (exit ${probe.exit_code})`,
+    `could not check whether ${name} exists (exit ${probe.exit_code})` +
+      (commandReason(probe) ? `: ${commandReason(probe)}` : ""),
   );
 }
 
@@ -286,9 +294,30 @@ async function resolveDevice(
   assertDevicePath(path);
   const link = await exec(deps.ssh, target, ["readlink", "-f", path]);
   if (link.exit_code !== 0 || link.stdout.trim() === "") {
-    throw new Error(`could not resolve ${path}; refusing to create a pool`);
+    throw new Error(
+      `could not resolve ${path}; refusing to create a pool` +
+        (commandReason(link) ? `: ${commandReason(link)}` : ""),
+    );
   }
   return link.stdout.trim();
+}
+
+async function listPoolDescendants(
+  deps: ZfsDeps,
+  target: SshTarget,
+  pool: string,
+): Promise<string[]> {
+  const result = await exec(deps.ssh, target, poolDescendantsArgv(pool));
+  if (result.exit_code === 0) {
+    return nonEmptyLines(result.stdout).filter((name) => name !== pool);
+  }
+  if (MISSING_RE.test(result.stdout + result.stderr)) return [];
+  const reason = commandReason(result);
+  throw new Error(
+    `could not list pool ${pool} (exit ${result.exit_code})${
+      reason ? `: ${reason}` : ""
+    }`,
+  );
 }
 
 async function listPools(deps: ZfsDeps, target: SshTarget): Promise<string[]> {
@@ -301,7 +330,10 @@ async function listPools(deps: ZfsDeps, target: SshTarget): Promise<string[]> {
   ]);
   if (result.exit_code === 0) return nonEmptyLines(result.stdout);
   if (/no pools available/i.test(result.stdout + result.stderr)) return [];
-  throw new Error(`could not list ZFS pools (exit ${result.exit_code})`);
+  throw new Error(
+    `could not list ZFS pools (exit ${result.exit_code})` +
+      (commandReason(result) ? `: ${commandReason(result)}` : ""),
+  );
 }
 
 /** Resolves the pool a read targets, validating an auto-discovered name. */
@@ -359,7 +391,10 @@ async function readDatasets(
   ]);
   if (result.exit_code === 0) return parseDatasets(result.stdout);
   if (MISSING_RE.test(result.stdout + result.stderr)) return [];
-  throw new Error(`zfs list failed (exit ${result.exit_code})`);
+  throw new Error(
+    `zfs list failed (exit ${result.exit_code})` +
+      (commandReason(result) ? `: ${commandReason(result)}` : ""),
+  );
 }
 
 async function readSnapshots(
@@ -383,7 +418,10 @@ async function readSnapshots(
   ]);
   if (result.exit_code === 0) return parseSnapshots(result.stdout);
   if (MISSING_RE.test(result.stdout + result.stderr)) return [];
-  throw new Error(`zfs list failed (exit ${result.exit_code})`);
+  throw new Error(
+    `zfs list failed (exit ${result.exit_code})` +
+      (commandReason(result) ? `: ${commandReason(result)}` : ""),
+  );
 }
 
 async function livePoolState(
@@ -481,6 +519,18 @@ const DestroyArgs = z.strictObject({
   ),
   recursive: z.boolean().default(false),
   force: z.boolean().default(false),
+});
+const DestroyPoolArgs = z.strictObject({
+  ssh: SSH,
+  pool: POOL,
+  recursive: z.boolean().default(false).describe(
+    "Acknowledge destroying the pool's datasets, zvols and snapshots; required when any exist.",
+  ),
+});
+const ExportPoolArgs = z.strictObject({
+  ssh: SSH,
+  pool: POOL,
+  force: z.boolean().default(true).describe("Force a busy pool out."),
 });
 const GetArgs = z.strictObject({
   ssh: SSH,
@@ -993,6 +1043,110 @@ function buildZfsModel(deps: ZfsDeps) {
           return {
             dataHandles: [handle],
             result: { target: args.target, destroyed },
+          };
+        },
+      },
+
+      destroy_pool: {
+        kind: "action" as const,
+        description:
+          "DESTRUCTIVE. Destroy a pool and everything in it, refusing while datasets, zvols or snapshots exist unless recursive is set. Destroying an absent pool is a clean no-op. Returns the pool and whether it was destroyed.",
+        arguments: DestroyPoolArgs,
+        execute: async (
+          args: z.infer<typeof DestroyPoolArgs>,
+          context: Ctx,
+        ) => {
+          const target = toTarget(args.ssh);
+          assertPoolName(args.pool);
+          const pools = await listPools(deps, target);
+          let destroyed = false;
+          if (!pools.includes(args.pool)) {
+            context.logger.info("{pool} is absent; destroy_pool is a no-op", {
+              pool: args.pool,
+            });
+          } else {
+            const descendants = await listPoolDescendants(
+              deps,
+              target,
+              args.pool,
+            );
+            if (descendants.length > 0 && !args.recursive) {
+              throw new Error(
+                `refusing to destroy pool ${args.pool}: ${descendants.length} dataset(s), zvol(s) or snapshot(s) exist; set recursive to acknowledge destroying them`,
+              );
+            }
+            requireOk(
+              await exec(deps.ssh, target, poolDestroyArgv(args.pool)),
+              `zpool destroy ${args.pool}`,
+            );
+            destroyed = true;
+          }
+          const handle = await context.writeResource(
+            "state",
+            instanceKey(identity(target), args.pool),
+            StateSchema.parse({
+              ...identity(target),
+              kind: "destroy",
+              name: args.pool,
+              pool: args.pool,
+              observed_at: iso(deps.now()),
+              pool_state: null,
+              datasets: [],
+              snapshots: [],
+            }),
+          );
+          return {
+            dataHandles: [handle],
+            result: { pool: args.pool, destroyed },
+          };
+        },
+      },
+
+      export_pool: {
+        kind: "action" as const,
+        description:
+          "Export a pool so it can be imported on another host. Idempotent: exporting an absent pool is a clean no-op. Returns the pool and whether it was exported.",
+        arguments: ExportPoolArgs,
+        execute: async (
+          args: z.infer<typeof ExportPoolArgs>,
+          context: Ctx,
+        ) => {
+          const target = toTarget(args.ssh);
+          assertPoolName(args.pool);
+          const pools = await listPools(deps, target);
+          let exported = false;
+          if (!pools.includes(args.pool)) {
+            context.logger.info("{pool} is absent; export_pool is a no-op", {
+              pool: args.pool,
+            });
+          } else {
+            requireOk(
+              await exec(
+                deps.ssh,
+                target,
+                poolExportArgv(args.pool, args.force),
+              ),
+              `zpool export ${args.pool}`,
+            );
+            exported = true;
+          }
+          const handle = await context.writeResource(
+            "state",
+            instanceKey(identity(target), args.pool),
+            StateSchema.parse({
+              ...identity(target),
+              kind: "export",
+              name: args.pool,
+              pool: args.pool,
+              observed_at: iso(deps.now()),
+              pool_state: null,
+              datasets: [],
+              snapshots: [],
+            }),
+          );
+          return {
+            dataHandles: [handle],
+            result: { pool: args.pool, exported },
           };
         },
       },

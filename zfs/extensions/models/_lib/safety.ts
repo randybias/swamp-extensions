@@ -12,13 +12,18 @@
 
 import {
   assess,
+  type AssessOptions,
   BLKID_COMMAND,
   type CommandProbe,
+  EFI_COMMAND,
+  EFIBOOTMGR_COMMAND,
   examineTargets,
   type FileProbe,
   FINDMNT_COMMAND,
   LINKS_COMMAND,
   LSBLK_COMMAND,
+  mbrReadCommand,
+  mbrTargets,
   mdExamineCommand,
   type ProbeInputs,
   type ProtectedSet,
@@ -40,13 +45,16 @@ export function isSudoRefusal(stderr: string): boolean {
 
 /** A boot-disk guard refusal, carrying the shared module's code and detail. */
 export class DeviceGuardError extends Error {
-  /** `boot-protected` when a device backs the system; `boot-unverifiable` otherwise. */
-  readonly code: "boot-protected" | "boot-unverifiable";
+  /**
+   * `boot-protected` when a device backs the system, `boot-partition` when it
+   * holds a boot-type partition, `boot-unverifiable` otherwise.
+   */
+  readonly code: "boot-protected" | "boot-partition" | "boot-unverifiable";
   /** Structured detail: host, device, reasons. */
   readonly detail: Record<string, unknown>;
   /** Creates a typed guard error. */
   constructor(
-    code: "boot-protected" | "boot-unverifiable",
+    code: "boot-protected" | "boot-partition" | "boot-unverifiable",
     message: string,
     detail: Record<string, unknown> = {},
   ) {
@@ -116,19 +124,19 @@ export async function collectProbes(
   const links = await runCommand(deps, target, LINKS_COMMAND, false);
   const blkid = await runCommand(deps, target, BLKID_COMMAND, true);
   const mdstat = await readFileProbe(deps, target, "/proc/mdstat");
+  const base = { lsblk, links, blkid, mdstat };
   const mdExamine: Record<string, CommandProbe> = {};
-  for (
-    const path of examineTargets(
-      { lsblk, links, blkid, mdstat },
-      candidates,
-    )
-  ) {
+  for (const path of examineTargets(base, candidates)) {
     mdExamine[path] = await runCommand(
       deps,
       target,
       mdExamineCommand(path),
       true,
     );
+  }
+  const mbr: Record<string, CommandProbe> = {};
+  for (const path of mbrTargets(base, candidates)) {
+    mbr[path] = await runCommand(deps, target, mbrReadCommand(path), true);
   }
   return {
     lsblk,
@@ -140,7 +148,10 @@ export async function collectProbes(
     blkid,
     zpool: await runCommand(deps, target, ZPOOL_COMMAND, true),
     pvs: await runCommand(deps, target, PVS_COMMAND, true),
+    efi: await runCommand(deps, target, EFI_COMMAND, false),
+    efibootmgr: await runCommand(deps, target, EFIBOOTMGR_COMMAND, false),
     mdExamine,
+    mbr,
   };
 }
 
@@ -152,11 +163,15 @@ function refusalError(target: SshTarget, refusal: Refusal): DeviceGuardError {
   const message = device
     ? `refusing ${device}: ${refusal.message}`
     : refusal.message;
-  return new DeviceGuardError(
-    refusal.code === "protected" ? "boot-protected" : "boot-unverifiable",
-    message,
-    { host: target.host, ...refusal.detail },
-  );
+  const code = refusal.code === "protected"
+    ? "boot-protected"
+    : refusal.code === "boot-partition"
+    ? "boot-partition"
+    : "boot-unverifiable";
+  return new DeviceGuardError(code, message, {
+    host: target.host,
+    ...refusal.detail,
+  });
 }
 
 /**
@@ -169,11 +184,13 @@ export async function assessProtected(
   target: SshTarget,
   candidates: string[],
   previous?: ProtectedSet,
+  options?: AssessOptions,
 ): Promise<ProtectedSet> {
   const result = assess(
     await collectProbes(deps, target, candidates),
     candidates,
     previous,
+    options,
   );
   if (result.ok) return result.set;
   throw refusalError(target, result.refusal);

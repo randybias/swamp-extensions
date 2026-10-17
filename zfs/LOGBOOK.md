@@ -175,3 +175,25 @@ and only the probe-running code kept. The guard was NOT rewritten here.
   disk carrying a root md member partition is refused, while a new free sibling
   partition is allowed both plain and by-id), plus a spare-disk allow. The
   shared module's own vendored test file also runs in the gate.
+
+## Pool lifecycle and review fixes (lane/d4-zfs)
+
+- Re-vendored the shared boot-disk guard `_lib/protected_devices.ts`
+  **byte-identical** from lane/b2-cephwipe `8729580` (git hash-object
+  `62743884da58660bac32df914fd6577f269280e5`), plus its `boot_fixtures.ts` and
+  `protected_devices_test.ts`. `_lib/safety.ts` now collects the guard's new
+  `efi`, `efibootmgr` and `mbr` probes and maps the new `boot-partition`
+  refusal.
+- Added `destroy_pool` (DESTRUCTIVE; refuses while datasets, zvols or snapshots
+  exist unless `recursive` is set; destroying an absent pool is a no-op) and
+  `export_pool` (idempotent; `-f` to force a busy pool out).
+- `zfs`/`zpool` failures now surface a sanitized reason: the last meaningful
+  stderr/stdout line, control characters blanked, truncated to 300 characters —
+  e.g.
+  `zpool create tank failed (exit 1): cannot create 'tank': one or more
+  devices is currently unavailable`.
+- The vdev grammar accepts `:` so a by-id `md-uuid-<a>:<b>:<c>:<d>` path (the
+  form Ubuntu writes in fstab) resolves; it is still passed only as one argv
+  word and every other metacharacter is still refused.
+- Host keys are strict-only with a required, non-empty `host_keys`; the model
+  persists no learned keys, so trust-on-first-use is no longer offered.

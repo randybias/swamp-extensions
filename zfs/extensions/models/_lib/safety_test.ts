@@ -74,6 +74,7 @@ const LSBLK = JSON.stringify({
       fstype: null,
       uuid: null,
       partuuid: null,
+      parttype: null,
       label: null,
       mountpoints: [null],
       children: [{
@@ -84,6 +85,7 @@ const LSBLK = JSON.stringify({
         fstype: "ext4",
         uuid: "ROOT-UUID",
         partuuid: null,
+        parttype: "0x83",
         label: null,
         mountpoints: ["/"],
       }],
@@ -96,11 +98,13 @@ const LSBLK = JSON.stringify({
       fstype: null,
       uuid: null,
       partuuid: null,
+      parttype: null,
       label: null,
       mountpoints: [null],
     },
   ],
 });
+const ZERO_SECTOR = Array.from({ length: 512 }, () => "00").join(" ");
 const FINDMNT = JSON.stringify({
   filesystems: [{ target: "/", source: "/dev/sda1", fstype: "ext4" }],
 });
@@ -137,6 +141,11 @@ function plainRoute(overrides: Route = () => undefined): Route {
       return { code: 0, stdout: "no pools available\n" };
     }
     if (has(remote, "pvs --noheadings")) return { code: 127, stdout: "" };
+    if (has(remote, "test -d /sys/firmware/efi")) {
+      return { code: 1, stdout: "" };
+    }
+    if (has(remote, "efibootmgr -v")) return { code: 127, stdout: "" };
+    if (has(remote, "dd if=")) return { code: 0, stdout: ZERO_SECTOR };
     return overrides(remote);
   };
 }

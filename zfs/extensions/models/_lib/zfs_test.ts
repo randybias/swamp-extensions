@@ -7,6 +7,7 @@ import {
   assertSnapshotTag,
   assertVolsize,
   cloneArgv,
+  commandReason,
   datasetCreateArgv,
   destroyArgv,
   DEVICE_RE,
@@ -20,6 +21,9 @@ import {
   parseSnapshots,
   parseTabbed,
   poolCreateArgv,
+  poolDescendantsArgv,
+  poolDestroyArgv,
+  poolExportArgv,
   propertyString,
   rollbackArgv,
   snapshotArgv,
@@ -45,6 +49,70 @@ Deno.test("name grammars accept valid ZFS names and reject injection", () => {
   assertThrows(() => assertDevicePath("/dev/sdb; rm -rf /"));
   assertThrows(() => assertDevicePath("/dev/../etc/passwd"));
   assertEquals(DEVICE_RE.test("/dev/nvme0n1"), true);
+});
+
+Deno.test("device grammar accepts by-id names with colons but no injection", () => {
+  // The md-uuid form Ubuntu writes in fstab, and a -partN suffix.
+  assertDevicePath(
+    "/dev/disk/by-id/md-uuid-777c3ba6:ac3b1753:f9208445:a01c3c16",
+  );
+  assertDevicePath(
+    "/dev/disk/by-id/ata-Samsung_SSD_860_EVO_250GB_S3YJNC0K915363M-part3",
+  );
+  assertEquals(
+    DEVICE_RE.test(
+      "/dev/disk/by-id/md-uuid-777c3ba6:ac3b1753:f9208445:a01c3c16-part1",
+    ),
+    true,
+  );
+  // The colon does not loosen the rest of the grammar.
+  for (
+    const bad of [
+      "/dev/sda; rm -rf /",
+      "/dev/sda && id",
+      "/dev/sda`id`",
+      "/dev/sda\nroot",
+      "/dev/disk/by-id/$(id)",
+    ]
+  ) {
+    assertThrows(() => assertDevicePath(bad), Error, undefined, bad);
+  }
+});
+
+Deno.test("pool destroy/export argv and the descendant list", () => {
+  assertEquals(poolDestroyArgv("tank"), ["zpool", "destroy", "-f", "tank"]);
+  assertEquals(poolDestroyArgv("tank", false), ["zpool", "destroy", "tank"]);
+  assertEquals(poolExportArgv("tank"), ["zpool", "export", "-f", "tank"]);
+  assertEquals(poolDescendantsArgv("tank"), [
+    "zfs",
+    "list",
+    "-H",
+    "-r",
+    "-o",
+    "name",
+    "-t",
+    "filesystem,volume,snapshot",
+    "tank",
+  ]);
+});
+
+Deno.test("commandReason keeps one sanitized line and drops control bytes", () => {
+  assertEquals(
+    commandReason({
+      stdout: "",
+      stderr:
+        "cannot destroy 'tank/x': dataset is busy\n\u0001\u0007second line\n",
+    }),
+    "second line",
+  );
+  assertEquals(commandReason({ stdout: "", stderr: "" }), "");
+  for (const bad of ["a\u0000b", "x\u001fy"]) {
+    const reason = commandReason({ stdout: "", stderr: `err\n${bad}` });
+    assertEquals(reason.includes("\u0000"), false);
+    assertEquals(reason.includes("\u001f"), false);
+  }
+  const long = commandReason({ stdout: "", stderr: "e".repeat(400) });
+  assertEquals(long.length, 303);
 });
 
 Deno.test("assertProperties enforces the allowlist and value grammar", () => {

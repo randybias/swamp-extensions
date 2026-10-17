@@ -13,17 +13,19 @@ One definition serves any host. Every method takes the SSH target and the ZFS
 operands as arguments, and state is keyed by the target's `{host, port, user}`
 plus the pool or dataset name.
 
-| Method           | Description                                                                |
-| ---------------- | -------------------------------------------------------------------------- |
-| `create_pool`    | DESTRUCTIVE. Create a pool from named vdevs, refusing any boot/root device |
-| `create_dataset` | Create a dataset, or set only the properties that differ                   |
-| `create_zvol`    | Create a sparse zvol of a given size                                       |
-| `snapshot`       | Create a `dataset@tag` snapshot                                            |
-| `clone`          | Clone a snapshot to a new dataset or zvol                                  |
-| `rollback`       | DESTRUCTIVE. Roll a dataset back to a snapshot                             |
-| `get`            | READ-ONLY. Report pool, dataset and snapshot state                         |
-| `sync`           | READ-ONLY. Compare recorded state with the host and report drift           |
-| `destroy`        | DESTRUCTIVE. Destroy a dataset, zvol or snapshot                           |
+| Method           | Description                                                                  |
+| ---------------- | ---------------------------------------------------------------------------- |
+| `create_pool`    | DESTRUCTIVE. Create a pool from named vdevs, refusing any boot/root device   |
+| `create_dataset` | Create a dataset, or set only the properties that differ                     |
+| `create_zvol`    | Create a sparse zvol of a given size                                         |
+| `snapshot`       | Create a `dataset@tag` snapshot                                              |
+| `clone`          | Clone a snapshot to a new dataset or zvol                                    |
+| `rollback`       | DESTRUCTIVE. Roll a dataset back to a snapshot                               |
+| `get`            | READ-ONLY. Report pool, dataset and snapshot state                           |
+| `sync`           | READ-ONLY. Compare recorded state with the host and report drift             |
+| `destroy`        | DESTRUCTIVE. Destroy a dataset, zvol or snapshot                             |
+| `destroy_pool`   | DESTRUCTIVE. Destroy a pool; refuses while children exist unless `recursive` |
+| `export_pool`    | Export a pool; absent is a no-op                                             |
 
 ## Dependencies
 
@@ -51,7 +53,9 @@ ssh:
   host: 192.0.2.10
   port: 22
   user: root
-  host_key_policy: insecure_tofu
+  host_key_policy: strict
+  host_keys:
+    - "192.0.2.10 ssh-ed25519 AAAA..."
   connect_timeout_s: 15
   private_key: ${{ vault.get("default", "ZFS_SSH_KEY") }}
 pool: tank

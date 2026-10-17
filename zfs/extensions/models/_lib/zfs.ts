@@ -27,8 +27,12 @@ export const DATASET_RE =
   /^[A-Za-z0-9][A-Za-z0-9._:-]{0,63}(?:\/[A-Za-z0-9][A-Za-z0-9._:-]{0,63})*$/;
 /** Snapshot tag after `@`. */
 export const SNAP_TAG_RE = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,63}$/;
-/** Device path under `/dev/`, no shell metacharacters. */
-export const DEVICE_RE = /^\/dev\/[A-Za-z0-9][A-Za-z0-9._/-]{0,255}$/;
+/**
+ * Device path under `/dev/`, no shell metacharacters. `:` is allowed so a
+ * by-id `md-uuid-<a>:<b>:<c>:<d>` (the form Ubuntu writes in fstab) resolves;
+ * it is still only ever passed as one argv word.
+ */
+export const DEVICE_RE = /^\/dev\/[A-Za-z0-9][A-Za-z0-9._:/-]{0,255}$/;
 /** ZFS size literal, e.g. `10G`, `512M`, `1.5T`, `1073741824`. */
 export const VOLSIZE_RE = /^\d+(?:\.\d+)?(?:[KMGTPEZ]i?B?)?$/i;
 /** ZFS property name. */
@@ -303,6 +307,60 @@ export function destroyArgv(
     ...(force ? ["-f"] : []),
     target,
   ];
+}
+
+/** Builds `zpool destroy`; `-f` forces a busy pool out. */
+export function poolDestroyArgv(pool: string, force = true): string[] {
+  assertPoolName(pool);
+  return ["zpool", "destroy", ...(force ? ["-f"] : []), pool];
+}
+
+/** Builds `zpool export`; `-f` forces a busy pool out. */
+export function poolExportArgv(pool: string, force = true): string[] {
+  assertPoolName(pool);
+  return ["zpool", "export", ...(force ? ["-f"] : []), pool];
+}
+
+/** Builds `zfs list` for every descendant (datasets, zvols, snapshots). */
+export function poolDescendantsArgv(pool: string): string[] {
+  assertPoolName(pool);
+  return [
+    "zfs",
+    "list",
+    "-H",
+    "-r",
+    "-o",
+    "name",
+    "-t",
+    "filesystem,volume,snapshot",
+    pool,
+  ];
+}
+
+/**
+ * A one-line, sanitized reason from a failed `zfs`/`zpool` result: control
+ * characters removed, the last meaningful line kept, truncated to 300 chars.
+ * No caller-supplied value is interpolated here beyond what the tool printed.
+ */
+export function commandReason(
+  result: { stdout: string; stderr: string },
+): string {
+  const clean = (() => {
+    let out = "";
+    for (const ch of `${result.stderr}\n${result.stdout}`) {
+      const code = ch.codePointAt(0) ?? 0;
+      // Keep line structure; blank other control characters.
+      const keep = code === 0x0a || code === 0x0d || code === 0x09;
+      out += (code < 0x20 && !keep) || code === 0x7f ? " " : ch;
+    }
+    return out;
+  })();
+  const text = clean
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter((line) => line !== "");
+  const reason = text.at(-1) ?? "";
+  return reason.length > 300 ? `${reason.slice(0, 300)}...` : reason;
 }
 
 /** Splits `dataset@tag`; returns null when there is no `@` or a part is bad. */

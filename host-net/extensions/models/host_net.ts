@@ -105,8 +105,11 @@ const TargetFields = {
   host: z.string().min(1).max(253),
   port: z.number().int().min(1).max(65535).default(22),
   user: z.string().min(1).max(32),
-  host_key_policy: z.enum(["strict", "insecure_tofu"]),
-  host_keys: z.array(z.string().max(8192)).max(64).nullish(),
+  // Strict only: this model does not persist a first-seen host key, so trusting
+  // one on first use would leave nothing to pin the next run to. The pinned keys
+  // are required.
+  host_key_policy: z.literal("strict"),
+  host_keys: z.array(z.string().max(8192)).min(1).max(64),
   ssh_key_ref: z.strictObject({
     vault: z.string().min(1).max(128),
     key: z.string().min(1).max(256),
@@ -281,8 +284,8 @@ function targetOf(a: {
   host: string;
   port: number;
   user: string;
-  host_key_policy: "strict" | "insecure_tofu";
-  host_keys?: string[] | null;
+  host_key_policy: "strict";
+  host_keys: string[];
   connect_timeout_s: number;
 }): SshTarget {
   return {
@@ -290,7 +293,7 @@ function targetOf(a: {
     port: a.port,
     user: a.user,
     host_key_policy: a.host_key_policy,
-    host_keys: a.host_keys ?? undefined,
+    host_keys: a.host_keys,
     connect_timeout_s: a.connect_timeout_s,
   };
 }
@@ -787,7 +790,12 @@ export function createModel(overrides: Partial<HostNetDeps> = {}) {
             [
               "sh",
               "-c",
-              `rm -rf '${stage}' && mkdir -p '${stage}/etc/netplan' '${stage}/etc/cloud/cloud.cfg.d'`,
+              // netplan merges every file in /etc/netplan, so the pre-check
+              // must see the same merge the apply will: a copy of the whole
+              // live directory (names, order and modes kept), then the
+              // rendered file on top. Staging only ours would reject a VLAN
+              // whose link NIC is defined in another file (cloud-init's).
+              `rm -rf '${stage}' && mkdir -p '${stage}/etc/netplan' '${stage}/etc/cloud/cloud.cfg.d' && cp -a /etc/netplan/. '${stage}/etc/netplan/'`,
             ],
             "the precheck setup",
           );

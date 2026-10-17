@@ -191,3 +191,26 @@ Every one of those tests fails on the previous round's code.
   so the cloud-init drop-in uploads (it failed safe).
 - `ssh.ts` resynced; the unit-test fake answers the upload helper's
   hash-and-mode read-back like a host that stored the bytes.
+
+## Round-5 (two live bugs on a real host; strict-only host keys)
+
+- **Keyless ethernet rendered as a null mapping.** `"enp7s0":` with no settings
+  is a null, which netplan 1.1 rejects ("expected mapping"). It now renders as
+  `"enp7s0": {}`, which netplan accepts and merges with the same NIC defined in
+  another file. Omitting the NIC was not an option: a VLAN's `link` must be
+  defined in the merged config. The management NIC may still be a VLAN link
+  without being declared.
+- **The pre-check staged only our file.** A VLAN on a NIC that cloud-init's file
+  defines failed `netplan generate` ("interface enp7s0 is not defined"). The
+  staged root is now a copy of the whole live `/etc/netplan` (names, order and
+  modes kept) with the rendered file on top, so the parser sees the merge the
+  apply will.
+- **Real-parser tests.** `_lib/netplan_real_test.ts` runs every netplan render
+  (keyless NIC, MTU-only/takeover, no-carrier NICs, MAC match, Linux bridges,
+  two VLANs) and a two-file case (cloud-init's file defining the NIC and the
+  provider VLAN, ours with only the VLAN) through `netplan generate --root-dir`.
+  Without netplan they are reported as ignored, not passed. A guard test checks
+  that the parser still rejects the old output.
+- **Host keys are strict-only.** The model does not persist a first-seen key, so
+  `insecure_tofu` is gone and `host_keys` is required (at least one) on every
+  method.

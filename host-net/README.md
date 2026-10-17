@@ -34,10 +34,11 @@ silently.
 
 ## Inputs
 
-- **SSH target** — `host`, `port`, `user`, `host_key_policy` (required),
-  `host_keys[]`, `ssh_key_ref` (a sensitive vault reference),
-  `connect_timeout_s`. `strict` trusts only the pinned keys; `insecure_tofu` is
-  an explicit opt-in.
+- **SSH target** — `host`, `port`, `user`, `host_key_policy` (required,
+  `strict`), `host_keys[]` (required, at least one pinned key), `ssh_key_ref` (a
+  sensitive vault reference), `connect_timeout_s`. Only the pinned keys are
+  trusted: the model does not persist a first-seen key, so trust-on-first-use is
+  not offered.
 - **`backend`** — `netplan` (default) or `networkd`. `networkd` supports Linux
   bridges only.
 - **`bridge_type`** — `linux` or `ovs`, required.

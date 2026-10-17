@@ -59,6 +59,11 @@ function renderEthernet(eth: EthernetSpec): string[] {
     );
   }
   if (eth.mtu !== undefined) lines.push(`      mtu: ${eth.mtu}`);
+  // An ethernet with no settings is declared only so VLANs and bridges can name
+  // it. A bare `"name":` is a null, which netplan rejects ("expected mapping");
+  // an empty mapping is accepted, and omitting it leaves the VLAN's `link`
+  // undefined, so the empty mapping it is.
+  if (lines.length === 1) lines[0] += " {}";
   return lines;
 }
 

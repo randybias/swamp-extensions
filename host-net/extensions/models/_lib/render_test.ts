@@ -30,7 +30,7 @@ Deno.test("golden netplan: linux bridge on a VLAN at MTU 9000", () => {
   version: 2
   renderer: networkd
   ethernets:
-    "enp1s0":
+    "enp1s0": {}
   vlans:
     "enp1s0.100":
       id: 100

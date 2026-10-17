@@ -679,3 +679,56 @@ Deno.test("a match_mac bridge member that resolves to management is refused", as
     "enslaves the management interface",
   );
 });
+
+Deno.test("host_key_policy is strict only and host_keys are required", () => {
+  const model = createModel(denoHostNetDeps);
+  const parse = (over: Record<string, unknown>) =>
+    model.methods.apply.arguments.safeParse({ ...NET, ...over }).success;
+  assertEquals(parse({}), true);
+  assertEquals(parse({ host_key_policy: "insecure_tofu" }), false);
+  assertEquals(parse({ host_key_policy: undefined }), false);
+  assertEquals(parse({ host_keys: [] }), false);
+  assertEquals(parse({ host_keys: undefined }), false);
+  assertEquals(parse({ host_keys: null }), false);
+  for (const name of ["commit", "get", "sync", "remove", "revert_now"]) {
+    // deno-lint-ignore no-explicit-any
+    const schema = (model.methods as any)[name].arguments;
+    const base = { ...SSH, backend: "netplan", bridge_type: "linux" };
+    const without = { ...base, host_keys: undefined, token: "0".repeat(16) };
+    assertEquals(
+      schema.safeParse({ ...NET, ...without }).success,
+      false,
+      `${name} requires host_keys`,
+    );
+    assertEquals(
+      schema.safeParse({
+        ...NET,
+        host_key_policy: "insecure_tofu",
+        token: "0".repeat(16),
+      }).success,
+      false,
+      `${name} refuses insecure_tofu`,
+    );
+  }
+});
+
+Deno.test("the netplan pre-check stages a copy of the live directory, not just the rendered file", async () => {
+  const fake = fakeRun();
+  const model = modelWith(fake);
+  await model.methods.apply.execute(
+    model.methods.apply.arguments.parse(NET),
+    createModelTestContext({ globalArgs: {} }).context,
+  );
+  const setup = fake.calls.find((c) =>
+    c.includes("host-net-precheck") && c.includes("mkdir")
+  );
+  assertEquals(setup !== undefined, true);
+  // The live directory is copied with names and modes kept, then ours goes on top.
+  assertEquals(setup!.includes("cp -a /etc/netplan/."), true);
+  const generate = fake.calls.findIndex((c) => c.includes("generate"));
+  const copy = fake.calls.findIndex((c) => c.includes("cp -a /etc/netplan/."));
+  const upload = fake.calls.findIndex((c) =>
+    c.includes(".ssh-host-upload") && c.includes("host-net-precheck")
+  );
+  assertEquals(copy >= 0 && copy < upload && upload < generate, true);
+});

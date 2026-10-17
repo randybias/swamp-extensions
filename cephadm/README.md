@@ -13,11 +13,58 @@ One cluster and its hosts. The model's global arguments are empty: every method
 takes its own target, so one definition serves any number of hosts and clusters,
 and stored state is keyed by host.
 
-| Method                    | Description                                                             |
-| ------------------------- | ----------------------------------------------------------------------- |
-| `cephHostPrep`            | Ensure packages, the pinned cephadm and a time-sync service on one host |
-| `cephVerifyPackageSource` | Check that each apt mirror and the cephadm URL resolve and answer       |
-| `wipeDiskToRaw`           | Tear down LVM, md-RAID, filesystem and partition state on named disks   |
+| Method                          | Description                                                                         |
+| ------------------------------- | ----------------------------------------------------------------------------------- |
+| `cephHostPrep`                  | Ensure packages, the pinned cephadm and a time-sync service on one host             |
+| `cephVerifyPackageSource`       | Check that each apt mirror and the cephadm URL resolve and answer (read-only)       |
+| `wipeDiskToRaw`                 | Tear down LVM, md-RAID, filesystem and partition state on named disks (destructive) |
+| `cephBootstrap`                 | Bootstrap a new standalone cluster on one host, or do nothing when one exists       |
+| `cephDistributeKey`             | Append the cluster public key to authorized_keys on every listed host               |
+| `cephHostAdd`                   | Enrol a host with the orchestrator and read the host list back                      |
+| `cephApplyMon`                  | Converge mon placement to an explicit host list, keeping a quorum majority          |
+| `cephApplyMgr`                  | Converge mgr placement to an explicit host list                                     |
+| `cephApplyMds`                  | Converge one filesystem's MDS placement to an explicit host list                    |
+| `cephApplyOsd`                  | Apply an OSD service, fleet-wide or one by-serial service per host                  |
+| `cephCreatePool`                | Ensure a replicated or erasure-coded pool exists with the requested shape           |
+| `cephCreateFs`                  | Ensure a CephFS volume exists with its MDS daemons on an explicit host list         |
+| `cephCreateCsiUser`             | Create a client entity or set its caps exactly, then read the caps back             |
+| `cephGetConnBundle`             | Produce the non-secret connection facts a client needs (read-only)                  |
+| `cephFetchCsiKey`               | Read one client entity's key into a sensitive, vaulted field                        |
+| `cephDeleteFs`                  | Delete a CephFS volume and its pools after double confirmation (destructive)        |
+| `cephRemoveOsds`                | Remove OSDs through the orchestrator and prove they are gone (destructive)          |
+| `cephVerifyMonQuorum`           | Assert the monmap size and that every mon is in quorum (read-only)                  |
+| `cephVerifyMgr`                 | Assert the mgr count and that one mgr is active (read-only)                         |
+| `cephVerifyOsd`                 | Assert OSD up and in counts and the CRUSH failure domain (read-only)                |
+| `cephVerifyCsiUsers`            | Assert every expected client entity exists and report its caps (read-only)          |
+| `cephVerifyHealth`              | Assert cluster health in a stated direction, naming the checks (read-only)          |
+| `cephVerifyHostNoout`           | Check the host-subtree noout flag against a stated expectation (read-only)          |
+| `cephVerifyHostPrep`            | Assert packages, pinned cephadm and time sync without changing anything (read-only) |
+| `cephVerifyDisksRaw`            | Assert each named device has no signature, children or mountpoint (read-only)       |
+| `cephVerifyKeyDistributed`      | Re-read each host's authorized_keys and report per-host key state (read-only)       |
+| `cephCapacityReport`            | Report cluster and per-pool capacity with the durability margin (read-only)         |
+| `cephVerifyMonPlacement`        | Judge a proposed mon host list against live quorum, applying nothing (read-only)    |
+| `cephVerifyMgrPlacement`        | Judge a proposed mgr host list, applying nothing (read-only)                        |
+| `cephVerifyPool`                | Assert a pool's size and that every PG is active+clean (read-only)                  |
+| `cephVerifyRbdSmoke`            | Create and remove one throwaway RBD image to prove the data path                    |
+| `cephVerifyOsdClaimable`        | Judge which disks cephadm would claim, applying nothing (read-only)                 |
+| `cephHostMaintenanceEnter`      | Put one host into maintenance and prove the effect                                  |
+| `cephHostMaintenanceExit`       | Take one host out of maintenance and prove its OSDs are restored                    |
+| `cephHostMaintenanceState`      | Report which hosts are out by maintenance status or noout flag (read-only)          |
+| `cephOsdOkToStop`               | Ask the orchestrator whether one host can be stopped safely (read-only)             |
+| `cephCephadmCheckHost`          | Run cephadm check-host for one host and classify the result (read-only)             |
+| `cephHostNooutClear`            | Clear an orphaned host-subtree noout flag for one host                              |
+| `cephOsdActivate`               | Re-create OSD daemons for existing OSD volumes on one host                          |
+| `cephHostClusterState`          | Report what Ceph state one host carries on its OS disk (read-only)                  |
+| `cephVerifyClusterFsid`         | Refuse unless every fsid on the host is the named one (read-only)                   |
+| `cephDisableOrchestration`      | Disable the cephadm mgr module so no daemons are deployed, and prove it             |
+| `cephRmCluster`                 | Purge a named cluster from one host and prove its state is gone (destructive)       |
+| `cephVerifyHostTornDown`        | Verify one host's OS disk carries no Ceph cluster state (read-only)                 |
+| `cephRgwBucketInventory`        | List every RGW bucket with owner, size and placement (read-only)                    |
+| `cephRgwUserEnsure`             | Ensure an RGW user exists; keys are generated and returned only vaulted             |
+| `cephRgwBucketInspect`          | Read one bucket's ACL, policy, versioning and Public Access Block (read-only)       |
+| `cephRgwBucketEnsure`           | Ensure a bucket exists, is private and fully Public-Access-Blocked (destructive)    |
+| `cephRgwBucketPolicyEnsure`     | Replace a bucket's policy with the caller's document (destructive)                  |
+| `cephRgwBucketVersioningEnsure` | Converge a bucket's versioning to Enabled or Suspended and re-read it               |
 
 ## Workflows
 

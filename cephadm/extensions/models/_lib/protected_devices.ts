@@ -419,9 +419,14 @@ function closure(
  */
 function stackOf(graph: Graph, path: string): string[] {
   const held = closure(graph, path, (n) => n.children);
+  // One walk up from every descendant at once.
   const out = new Set<string>();
-  for (const p of held) {
-    for (const q of closure(graph, p, (n) => n.parents)) out.add(q);
+  const stack = [...held];
+  while (stack.length > 0) {
+    const current = stack.pop()!;
+    if (out.has(current)) continue;
+    out.add(current);
+    for (const p of graph.nodes.get(current)?.parents ?? []) stack.push(p);
   }
   return [...out];
 }
@@ -1161,6 +1166,8 @@ function conflict(
       }
     }
   }
+  const blkidUsable = input.blkid.code === 0 &&
+    parseBlkid(input.blkid).size > 0;
   const uuids = new Set(set.arrayUuids);
   const vgs = new Set(set.volumeGroups);
   const pools = new Set(set.pools);
@@ -1186,6 +1193,24 @@ function conflict(
       }
       const node = graph.nodes.get(p)!;
       const probe = input.mdExamine[p];
+      // Without blkid, a candidate with no type that shares a disk with a
+      // protected device cannot be told from a stale row of something in use.
+      if (
+        !blkidUsable && node.fstype === "" &&
+        (node.type === "part" ||
+          (node.type === "disk" && node.children.size === 0)) &&
+        !(probe && probe.code === 0 && parseExamineUuid(probe.stdout)) &&
+        [...closure(graph, p, (n) => n.parents)].some((q) =>
+          q !== p && set.devices[q] !== undefined
+        )
+      ) {
+        return {
+          code: "unverifiable",
+          message:
+            "a candidate partition has no identifiable content and shares a disk with a protected device",
+          detail: { device: path, member: p },
+        };
+      }
       if (!probe && (node.type === "disk" || node.type === "part")) {
         return {
           code: "unverifiable",

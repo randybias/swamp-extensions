@@ -1519,7 +1519,7 @@ Deno.test("22 a mounted non-root filesystem outside fstab also needs a known typ
 
 // --- round 3: siblings of a protected partition are not protected ----------------
 
-/** The Cherry two-disk layout: root RAID1 on sdX1, free space in sdX2. */
+/** A two-disk layout: root RAID1 on sdX1, free space in sdX2. */
 function twinHost(opts: {
   sibling?: Partial<Dev>;
   extra?: Partial<ProbeInputs>;
@@ -1548,6 +1548,13 @@ function twinHost(opts: {
     links: ok(
       "/dev/disk/by-id/ata-EXAMPLE_A-part2 /dev/sda2\n" +
         "/dev/disk/by-id/ata-EXAMPLE_B-part2 /dev/sdb2\n",
+    ),
+    // A working blkid: it knows the members and md0 and nothing at all about
+    // the free partitions.
+    blkid: ok(
+      `/dev/sda1: UUID="${u}" TYPE="linux_raid_member"\n` +
+        `/dev/sdb1: UUID="${u}" TYPE="linux_raid_member"\n` +
+        `/dev/md0: UUID="11111111-2222-3333-4444-555555555555" TYPE="ext4"\n`,
     ),
     mdExamine: {
       "/dev/sda1": ok(examineOut(ARRAY_UUID)),
@@ -1648,9 +1655,14 @@ Deno.test("23d a sibling that is a PV of the root volume group is refused", () =
     fstab: file(""),
     links: ok("/dev/mapper/vg0-root /dev/dm-0\n"),
     pvs: ok("  /dev/sda1  vg0\n  /dev/sda2  vg0\n"),
+    blkid: ok(
+      `/dev/sda1: UUID="aaaa" TYPE="LVM2_member"\n/dev/sda2: UUID="bbbb" TYPE="LVM2_member"\n`,
+    ),
   });
   refused(input, ["/dev/sda2"], "protected");
   safe(input, ["/dev/sda3"]);
+  // Without a working blkid the free third partition cannot be vouched for.
+  refused({ ...input, blkid: missing }, ["/dev/sda3"], "unverifiable");
 });
 
 Deno.test("23e udev-less host with working blkid: an empty sibling is allowed", () => {
@@ -1705,4 +1717,85 @@ Deno.test("23e udev-less host with working blkid: an empty sibling is allowed", 
   for (const failing of [missing, NO_SB, { code: 2, stdout: "" }]) {
     refused({ ...input, blkid: failing }, ["/dev/sda2"], "unverifiable");
   }
+});
+
+// Unlike 23e, root's type is VISIBLE here (udev-ful lsblk), so only the free
+// sibling's empty type can be what refuses it.
+Deno.test("24a a free sibling is refused when blkid failed, however it failed", () => {
+  const input = twinHost();
+  safe(input, ["/dev/sda2"]);
+  for (const failing of [missing, NO_SB, { code: 2, stdout: "" }]) {
+    refused({ ...input, blkid: failing }, ["/dev/sda2"], "unverifiable");
+    refused({ ...input, blkid: failing }, ["/dev/sdb2"], "unverifiable");
+  }
+  // A raw disk with no protected neighbour stays allowed without blkid.
+  const alone = twinHost();
+  alone.lsblk = lsblk(
+    ...[
+      {
+        name: "sda",
+        type: "disk",
+        children: [{
+          name: "sda1",
+          type: "part",
+          fstype: "ext4",
+          mounts: ["/"],
+        }],
+      },
+      { name: "sdc", type: "disk" },
+    ] as Dev[],
+  );
+  alone.findmnt = findmnt({ target: "/", source: "/dev/sda1", fstype: "ext4" });
+  alone.fstab = file("");
+  alone.mdstat = { state: "absent" };
+  alone.links = ok("");
+  alone.blkid = missing;
+  alone.mdExamine = {};
+  safe(alone, ["/dev/sdc"]);
+});
+
+Deno.test("24b btrfs root on sda1 with an untyped sda2: refused without blkid, allowed with it", () => {
+  const rows = lsblk(
+    {
+      name: "sda",
+      type: "disk",
+      children: [
+        {
+          name: "sda1",
+          type: "part",
+          fstype: "btrfs",
+          uuid: BTRFS_UUID,
+          mounts: ["/"],
+        },
+        // A stale row: the type column is empty although the partition holds
+        // the second device of the root filesystem.
+        { name: "sda2", type: "part" },
+      ],
+    },
+    { name: "sdc", type: "disk" },
+  );
+  const base = plain({
+    lsblk: rows,
+    findmnt: findmnt({ target: "/", source: "/dev/sda1", fstype: "btrfs" }),
+    fstab: file(""),
+  });
+  for (const failing of [missing, NO_SB, { code: 2, stdout: "" }]) {
+    refused({ ...base, blkid: failing }, ["/dev/sda2"], "unverifiable");
+  }
+  // blkid works and says sda2 is the other btrfs device: protected.
+  refused(
+    {
+      ...base,
+      blkid: ok(
+        `/dev/sda1: UUID="${BTRFS_UUID}" TYPE="btrfs"\n/dev/sda2: UUID="${BTRFS_UUID}" TYPE="btrfs"\n`,
+      ),
+    },
+    ["/dev/sda2"],
+    "protected",
+  );
+  // blkid works and knows nothing about sda2: empty, unrelated.
+  safe(
+    { ...base, blkid: ok(`/dev/sda1: UUID="${BTRFS_UUID}" TYPE="btrfs"\n`) },
+    ["/dev/sda2"],
+  );
 });

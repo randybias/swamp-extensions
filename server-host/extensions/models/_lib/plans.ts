@@ -115,7 +115,29 @@ if ! id -u "$1" >/dev/null 2>&1; then
   useradd -m -s /bin/bash "$1"
   printf 'created %s\\n' "$1"
 fi
-usermod -aG sudo "$1" 2>/dev/null || true
+if ! id -nG "$1" | tr ' ' '\\n' | grep -qx sudo; then
+  if usermod -aG sudo "$1" 2>/dev/null; then
+    install -d -m 0755 "${STATE_DIR}"
+    : > "${STATE_DIR}/sudo-granted-$1"
+  fi
+fi
+`;
+
+/**
+ * Takes back what an earlier run granted a previous managed account: the
+ * managed authorized_keys file, and the sudo membership only if this tool added
+ * it (a marker on the host records that). The account itself stays.
+ */
+const REVOKE_SCRIPT = `set -e
+user=$1
+home=$(getent passwd "$user" | cut -d: -f6 || true)
+if [ -n "$home" ]; then rm -f "$home/.ssh/authorized_keys"; fi
+m="${STATE_DIR}/sudo-granted-$user"
+if [ -e "$m" ]; then
+  gpasswd -d "$user" sudo >/dev/null 2>&1 || true
+  rm -f "$m"
+fi
+printf 'revoked %s\\n' "$user"
 `;
 
 const KEYS_SCRIPT = `set -e
@@ -150,6 +172,8 @@ export interface BaseInput {
   sysctl: Record<string, string>;
   /** Time zone to set. */
   timezone: string;
+  /** Previous managed account whose grants are revoked first, if any. */
+  previousAdmin?: string;
 }
 
 /** Renders the managed sysctl drop-in with sorted keys. */
@@ -212,6 +236,20 @@ export function planApplyBase(
 ): Step[] {
   const steps: Step[] = [];
   const want = (name: string) => changed.includes(name);
+  if (want("revoke_previous") && input.previousAdmin) {
+    steps.push({
+      kind: "base",
+      label: "revoke previous admin account grants",
+      argv: withSudo(input.sudo, [
+        "sh",
+        "-c",
+        REVOKE_SCRIPT,
+        "sh",
+        input.previousAdmin,
+      ]),
+      check: true,
+    });
+  }
   if (want("packages") && input.packages.length > 0) {
     steps.push({
       kind: "base",

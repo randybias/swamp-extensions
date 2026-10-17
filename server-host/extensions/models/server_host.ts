@@ -235,6 +235,24 @@ const RevertSchema = z.strictObject({
   cancelled_at: z.string().optional(),
 });
 
+const ObservationSchema = z.strictObject({
+  host: z.string(),
+  observed_by: z.enum(["get", "sync"]),
+  observed_at: z.string(),
+  base_applied: z.boolean(),
+  admin_user: z.string().nullable(),
+  firewall_mode: z.enum(["firewall", "lockdown"]).nullable(),
+  ssh_exposure: z.enum(["management-only", "anywhere", "unknown"]),
+  managed_table: z.boolean(),
+  ruleset_sha256: z.string(),
+  managed_sha256: z.string(),
+  revert_armed: z.boolean(),
+  // swamp-quality-ignore credentials-sensitive-field
+  revert_token: z.string().nullable(),
+  revert_expires_at: z.string().nullable(),
+  drift: z.array(z.string()),
+});
+
 const RenderStateSchema = z.strictObject({
   host: z.string(),
   ruleset: z.string(),
@@ -276,6 +294,10 @@ function stateName(host: string): string {
 
 function revertName(host: string): string {
   return `revert-${hostInstance(host)}`;
+}
+
+function observationName(host: string): string {
+  return `observation-${hostInstance(host)}`;
 }
 
 function renderName(host: string): string {
@@ -561,6 +583,72 @@ export function createModel(overrides: Partial<HostDeps> = {}) {
     }
   }
 
+  /**
+   * Probes the host and persists what it saw. swamp does not show a method's
+   * returned result, so the observation is written as a resource that
+   * `swamp data get` can read; it holds hashes, times and an opaque token, no
+   * secret.
+   */
+  async function observe(
+    context: Ctx,
+    args: z.infer<typeof ProbeArgs>,
+    by: "get" | "sync",
+  ) {
+    const t = await openTarget(context, args);
+    const stored = await context.readResource(stateName(args.host)) as
+      | HostState
+      | null;
+    const revert = await context.readResource(revertName(args.host)) as
+      | Revert
+      | null;
+    const active = isOpen(revert) ? revert : null;
+    const probe = await probeState(deps, t, {
+      sudo: args.sudo,
+      token: active?.token,
+    });
+    const drift: string[] = [];
+    if (stored?.firewall) {
+      if (
+        stored.firewall.managed_sha256 !== undefined &&
+        stored.firewall.managed_sha256 !== probe.managed_sha256
+      ) {
+        drift.push("ruleset");
+      }
+    } else if (probe.managed_table) {
+      drift.push("firewall_unrecorded");
+    }
+    if (active && !probe.armed) drift.push("revert_fired");
+    if (!active && probe.armed) drift.push("revert_unrecorded");
+    const observation = {
+      host: args.host,
+      observed_by: by,
+      observed_at: probe.observed_at,
+      base_applied: Boolean(stored?.base),
+      admin_user: stored?.base?.admin_user ?? null,
+      firewall_mode: stored?.firewall?.mode ?? null,
+      ssh_exposure: stored?.firewall?.ssh_exposure ?? "unknown",
+      managed_table: probe.managed_table,
+      ruleset_sha256: probe.ruleset_sha256,
+      managed_sha256: probe.managed_sha256,
+      revert_armed: probe.armed,
+      revert_token: active?.token ?? probe.current_token ?? null,
+      revert_expires_at: active?.expires_at ?? probe.current_expires_at ??
+        null,
+      drift,
+    };
+    const state = await context.writeResource(
+      "host_state",
+      stateName(args.host),
+      mergeState(stored, { host: args.host, observed_at: probe.observed_at }),
+    );
+    const seen = await context.writeResource(
+      "observation",
+      observationName(args.host),
+      observation,
+    );
+    return { dataHandles: [state, seen], result: observation };
+  }
+
   /** Turns the host's "earlier revert still active" refusal into a clear error. */
   function busyAsConfigError(error: unknown, host: string): unknown {
     if (
@@ -592,6 +680,13 @@ export function createModel(overrides: Partial<HostDeps> = {}) {
           "An armed host-side revert timer and the snapshot it restores",
         schema: RevertSchema,
         lifetime: "1d" as const,
+        garbageCollection: 5,
+      },
+      observation: {
+        description:
+          "What get or sync last saw on the host: revert timer and expiry, managed ruleset hash, drift and SSH exposure",
+        schema: ObservationSchema,
+        lifetime: "infinite" as const,
         garbageCollection: 5,
       },
       firewall_render: {
@@ -647,6 +742,17 @@ export function createModel(overrides: Partial<HostDeps> = {}) {
             changed.push("timezone");
           }
           if (!prev) changed.push("journald", "time_sync");
+          // Take back what the previous managed account was granted, before the
+          // new one is granted. Never root, and never the account this run logs
+          // in with: that would cut the management path.
+          const previousAdmin = prev && prev.admin_user !== args.admin_user &&
+              prev.admin_user !== "root" && prev.admin_user !== args.user
+            ? prev.admin_user
+            : undefined;
+          if (previousAdmin) {
+            assertUser(previousAdmin);
+            changed.push("revoke_previous");
+          }
           // A changed account must receive the managed keys even when the key
           // material is unchanged, and an empty list too: the managed file is
           // rewritten empty rather than leaving the new account with old keys.
@@ -663,6 +769,7 @@ export function createModel(overrides: Partial<HostDeps> = {}) {
             authorizedKeys: keys,
             sysctl: args.sysctl,
             timezone: args.timezone,
+            previousAdmin,
           }, changed);
           const emitted = await executePlan(deps, t, steps);
           context.logger.info("apply_base on {host}: {count} steps", {
@@ -893,107 +1000,17 @@ export function createModel(overrides: Partial<HostDeps> = {}) {
       },
       get: {
         description:
-          "READ-ONLY. Report the recorded phase state and probe the host for the active ruleset SHA-256 and whether a recorded revert timer is still armed. A failed probe is an error, not an observation.",
+          "READ-ONLY. Probe the host and record what it sees as the observation resource: revert timer and expiry, managed ruleset hash, drift and SSH exposure. A failed probe is an error, not an observation.",
         arguments: ProbeArgs,
-        execute: async (
-          args: z.infer<typeof ProbeArgs>,
-          context: Ctx,
-        ) => {
-          const t = await openTarget(context, args);
-          const stored = await context.readResource(stateName(args.host)) as
-            | HostState
-            | null;
-          const revert = await context.readResource(revertName(args.host)) as
-            | Revert
-            | null;
-          const active = isOpen(revert) ? revert : null;
-          const probe = await probeState(deps, t, {
-            sudo: args.sudo,
-            token: active?.token,
-          });
-          const handle = await context.writeResource(
-            "host_state",
-            stateName(args.host),
-            mergeState(stored, {
-              host: args.host,
-              observed_at: probe.observed_at,
-            }),
-          );
-          return {
-            dataHandles: [handle],
-            result: {
-              host: args.host,
-              base_applied: Boolean(stored?.base),
-              admin_user: stored?.base?.admin_user ?? null,
-              firewall_mode: stored?.firewall?.mode ?? null,
-              ruleset_sha256: probe.ruleset_sha256,
-              managed_sha256: probe.managed_sha256,
-              managed_table: probe.managed_table,
-              revert_armed: probe.armed,
-              armed_revert: active
-                ? {
-                  token: active.token,
-                  phase: active.phase,
-                  expires_at: active.expires_at,
-                }
-                : null,
-              ssh_exposure: stored?.firewall?.ssh_exposure ?? "unknown",
-            },
-          };
-        },
+        execute: (args: z.infer<typeof ProbeArgs>, context: Ctx) =>
+          observe(context, args, "get"),
       },
       sync: {
         description:
-          "READ-ONLY. Probe the host and report drift between the recorded state and the live ruleset and revert timer. A failed probe is an error, not an observation.",
+          "READ-ONLY. Probe the host and record the observation resource, including drift between the recorded state and the live ruleset and revert timer. A failed probe is an error, not an observation.",
         arguments: ProbeArgs,
-        execute: async (
-          args: z.infer<typeof ProbeArgs>,
-          context: Ctx,
-        ) => {
-          const t = await openTarget(context, args);
-          const stored = await context.readResource(stateName(args.host)) as
-            | HostState
-            | null;
-          const revert = await context.readResource(revertName(args.host)) as
-            | Revert
-            | null;
-          const active = isOpen(revert) ? revert : null;
-          const probe = await probeState(deps, t, {
-            sudo: args.sudo,
-            token: active?.token,
-          });
-          const drift: string[] = [];
-          if (stored?.firewall) {
-            if (
-              stored.firewall.managed_sha256 !== undefined &&
-              stored.firewall.managed_sha256 !== probe.managed_sha256
-            ) {
-              drift.push("ruleset");
-            }
-          } else if (probe.managed_table) {
-            drift.push("firewall_unrecorded");
-          }
-          if (active && !probe.armed) drift.push("revert_fired");
-          const handle = await context.writeResource(
-            "host_state",
-            stateName(args.host),
-            mergeState(stored, {
-              host: args.host,
-              observed_at: probe.observed_at,
-            }),
-          );
-          return {
-            dataHandles: [handle],
-            result: {
-              host: args.host,
-              ruleset_sha256: probe.ruleset_sha256,
-              managed_sha256: probe.managed_sha256,
-              managed_table: probe.managed_table,
-              revert_armed: probe.armed,
-              drift,
-            },
-          };
-        },
+        execute: (args: z.infer<typeof ProbeArgs>, context: Ctx) =>
+          observe(context, args, "sync"),
       },
     },
   };

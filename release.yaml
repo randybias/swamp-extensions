@@ -28,6 +28,14 @@ ssh-host:
   notes:
     2026.10.17.1: 'First release. Run one argv vector, push bytes atomically (bytes and mode converge; symlink and directory destinations are refused; Linux mv -T), and wait for SSH host keys on any host, under a required strict or trust-on-first-use host-key policy. Every ssh exit 255 is a typed transport error; supplied host keys that do not apply to the target are refused; under trust-on-first-use a recorded key is pinned for later runs and a supplied pin must match it. exec returns exit code and output hashes by default; raw output is stored only in a sensitive resource when asked, with a bounded capture size. Security: pass the private key as a vault reference only; the swamp CLI prints literal sensitive arguments under --json (swamp-club lab 3555). Every method was run live end to end on a VPS (23 cells, including failure and injection paths). Published to stable by a manual push; later versions go to beta first.'
 
+cephadm:
+  channel: beta
+  ci: true
+  published:
+    2026.10.17.1: cb3f5404e00b2797a65dfae6694cc9a03f2d474c734ae3f2640bf5e09f50254e
+  notes:
+    2026.10.17.1: 'First release, beta. Install and operate a standalone Ceph cluster managed by cephadm on Linux hosts over SSH: host preparation, disk wiping behind a fail-closed boot and root device guard, bootstrap, daemon placement, pools, CephFS, client entities, RGW users and buckets (S3 plane signed with SigV4), maintenance, teardown and read-only verification, with 22 workflows. Live testing needs three or more hosts with free whole disks and was not possible in this release; every live cell is recorded as blocked, so it stays on beta.'
+
 cherry-servers:
   channel: beta
   ci: true
@@ -37,3 +45,11 @@ cherry-servers:
     2026.10.16.3: 2d64e0af158363ffb1f5adb23061fc25483add8c9de2644f2a3a33b96ce6b5b7
   notes:
     2026.10.16.3: 'Fixes: the wait-ready and delete workflows did not work in 2026.10.16.1 or 2026.10.16.2 (they read definition inputs that were never set); upgrade to this version before using them. Every delete (server, SSH key, project) is now an action, so deleting one record no longer marks every record of a shared definition as deleted. On bare metal, wait_ready now waits until the API reports the server deployed and active, because the public IP and host keys can change during deploy; read the address from state after wait_ready, never from create. New: project delete (refuses a project that still holds servers); the create workflow takes os_partition_size, spot_market, tags, and vault key names for user data and the marker-check key. Security: pass ssh_private_key and user_data as vault references only; the swamp CLI currently prints literal sensitive arguments, including from --stdin (swamp-club lab 3555). Every method and both workflows were run live end to end on VPS and bare metal; the annually billing cycle was not.'
+
+wireguard-mesh:
+  channel: beta
+  ci: true
+  published:
+    2026.10.17.4: f74daacaa223888d33da7a3018ca6d2beb22520f2d04f1e44a50913882eb7957
+  notes:
+    2026.10.17.4: 'First release, beta. Render one node''s WireGuard config from mesh inputs (peers allowlist, relay exclusion) and push it over SSH under a strict or persisted trust-on-first-use host-key policy. Every apply arms a host-side rollback before any live change, confirms over a fresh management connection, and disarms only its own generation under a host lock; Address or routed AllowedIPs changes recreate the interface. Live end to end on two throwaway VPS: 19 of 21 cells pass, 0 fail; a delete that severs its own management path and that delete''s rollback firing were not exercised, so it stays on beta.'

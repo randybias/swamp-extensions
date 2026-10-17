@@ -274,3 +274,19 @@ Round 10 (delta review of 749819d):
   `add table` then `delete table` in the same batch, which works on older
   kernels too (applied for real on nftables 1.0.9 here; not run on a 6.1
   kernel).
+
+Round 11 (live findings):
+
+- `get` and `sync` returned their findings only in the method result, which
+  swamp does not show. They now also write an `observation` resource per host
+  (`observed_by`, revert armed, token and expiry, managed hash, drift, SSH
+  exposure); no secret is in it.
+- An `admin_user` change left the previous account's `authorized_keys` and sudo
+  membership in place. Now the first step is a revoke of what this tool granted
+  that account: remove the managed `authorized_keys`, and remove the sudo
+  membership only if a marker (`/var/lib/server-host/sudo-granted-<user>`,
+  written when the tool added the membership) says it did. The account stays.
+  Skipped for root and for the account the run logs in with, so the management
+  path cannot be cut. Tested under `sh` with stubs, and disabling it fails the
+  tests. Accounts created before this version have no marker, so their sudo
+  membership is not revoked (only the keys file).

@@ -12,15 +12,15 @@ nothing here spawns `ssh` directly.
 
 One host, described per call by its SSH target and the phase inputs.
 
-| Method            | Description                                                                                         |
-| ----------------- | --------------------------------------------------------------------------------------------------- |
-| `apply_base`      | Install packages, create the admin user and keys, write sysctl and journald settings, set time sync |
-| `render_firewall` | Render the deterministic nftables ruleset and its SHA-256 without touching a host                   |
-| `apply_firewall`  | Pre-check with `nft -c`, arm a revert, then apply the ruleset with `nft -f`                         |
-| `lockdown`        | Restrict the SSH port to management CIDRs, armed before the change and reverted unless committed    |
-| `commit`          | Cancel the armed revert for good after confirming the host is still reachable                       |
-| `get`             | Report recorded phase state, the live ruleset SHA-256 and whether a revert is still armed           |
-| `sync`            | Probe the host and report drift between recorded state and the live ruleset and timer               |
+| Method            | Description                                                                                           |
+| ----------------- | ----------------------------------------------------------------------------------------------------- |
+| `apply_base`      | Install packages, create the admin user and keys, write sysctl and journald settings, set time sync   |
+| `render_firewall` | Render the deterministic nftables ruleset and its SHA-256 without touching a host                     |
+| `apply_firewall`  | Pre-check with `nft -c`, arm a revert, then apply the ruleset with `nft -f`                           |
+| `lockdown`        | Restrict the SSH port to management CIDRs, armed before the change and reverted unless committed      |
+| `commit`          | Cancel the armed revert for good after confirming the host is still reachable                         |
+| `get`             | Probe the host and record the observation: revert timer and expiry, ruleset hash, drift, SSH exposure |
+| `sync`            | Same probe, recorded as the observation, with drift against the recorded state                        |
 
 ### Armed revert
 
@@ -49,6 +49,16 @@ cancels its own timer.
 Under `insecure_tofu` the host key is read once at the start of a method and
 pinned for every step of it, so a host cannot present a different key to a later
 step.
+
+`get` and `sync` write what they saw as the `observation` resource, because
+swamp does not show a method's returned result: read it with
+`swamp data get <model> observation-<host>`. It holds hashes, times and the
+opaque revert token, never a key.
+
+When `admin_user` changes, `apply_base` first takes back what it granted the
+previous managed account: its managed `authorized_keys` file, and its `sudo`
+membership if this tool added it. The account is not deleted, and root and the
+account the run logs in with are never touched.
 
 ## Install
 

@@ -1373,3 +1373,200 @@ Deno.test("real nft output: apply verifies, then commit and an identical re-appl
     assertEquals(again.result.changed, false, name);
   }
 });
+
+const BASE_ARGS = {
+  ...SSH,
+  packages: [],
+  authorized_keys: [KEY],
+  sysctl: {},
+  timezone: "UTC",
+};
+
+async function baseStored(adminUser: string) {
+  return {
+    [`state-${hostInstance(SSH.host)}`]: {
+      host: SSH.host,
+      base: {
+        packages: [],
+        admin_user: adminUser,
+        authorized_keys_sha256: await rulesetSha256([KEY].join("\n")),
+        sysctl_sha256: await rulesetSha256(renderSysctlConf({})),
+        timezone: "UTC",
+        applied_at: "2026-01-01T00:00:00.000Z",
+      },
+      observed_at: "2026-01-01T00:00:00.000Z",
+    },
+  };
+}
+
+Deno.test("apply_base: an account change revokes the previous account's grants FIRST", async () => {
+  const f = fakeTransport();
+  const m = modelWith(f);
+  const { context } = createModelTestContext({
+    globalArgs: {},
+    storedResources: await baseStored("oldops"),
+  });
+  const out = await m.methods.apply_base.execute(
+    m.methods.apply_base.arguments.parse({
+      ...BASE_ARGS,
+      admin_user: "newops",
+    }),
+    context,
+  );
+  assertEquals(out.result.changed.includes("revoke_previous"), true);
+  const revoke = f.commands.findIndex((c) =>
+    c.includes("sudo-granted-$user") && c.includes("'oldops'")
+  );
+  const create = f.commands.findIndex((c) => c.includes("useradd"));
+  const keys = f.commands.findIndex((c) =>
+    c.includes("authorized_keys.XXXXXX")
+  );
+  assertEquals(revoke >= 0 && revoke < create && create < keys, true);
+  // The account is not deleted.
+  assertEquals(f.commands.some((c) => c.includes("userdel")), false);
+});
+
+Deno.test("apply_base: no revoke for the first apply, the same account, root, or the login account", async () => {
+  const cases: [string, string, string?][] = [
+    ["first apply", ""],
+    ["same account", "ops"],
+    ["previous was root", "root"],
+    ["previous is the login user", "loginops"],
+  ];
+  for (const [name, prev, login] of cases) {
+    const f = fakeTransport();
+    const m = modelWith(f);
+    const { context } = createModelTestContext({
+      globalArgs: {},
+      storedResources: prev ? await baseStored(prev) : {},
+    });
+    const out = await m.methods.apply_base.execute(
+      m.methods.apply_base.arguments.parse({
+        ...BASE_ARGS,
+        user: login ?? "root",
+        ...(prev === "loginops" ? { user: "loginops" } : {}),
+        admin_user: "ops",
+      }),
+      context,
+    );
+    assertEquals(out.result.changed.includes("revoke_previous"), false, name);
+    assertEquals(
+      f.commands.some((c) => c.includes("sudo-granted-$user")),
+      false,
+      name,
+    );
+  }
+});
+
+Deno.test("get and sync persist their observation as a resource readable with swamp data", async () => {
+  const live = JSON.stringify({
+    nftables: [
+      ...(JSON.parse(expectedListing(FIREWALL)).nftables as unknown[]),
+    ],
+  });
+  const f = fakeTransport((c) => {
+    if (c.includes("'nft' '-j' 'list' 'ruleset'")) {
+      return { code: 0, stdout: live };
+    }
+    if (c.includes("'systemctl' 'is-active'")) {
+      return { code: 0, stdout: "active\n" };
+    }
+    return { code: 0 };
+  });
+  const m = modelWith(f);
+  const expires = new Date(NOW + 60_000).toISOString();
+  const { context, getWrittenResources } = createModelTestContext({
+    globalArgs: {},
+    storedResources: {
+      [`state-${hostInstance(SSH.host)}`]: {
+        host: SSH.host,
+        firewall: {
+          ruleset_sha256: "x",
+          managed_sha256: await expectedManagedSha256(FIREWALL),
+          mode: "lockdown",
+          ssh_exposure: "management-only",
+          applied_at: "2026-01-01T00:00:00.000Z",
+        },
+        observed_at: "2026-01-01T00:00:00.000Z",
+      },
+      [`revert-${hostInstance(SSH.host)}`]: {
+        host: SSH.host,
+        token: TOKEN,
+        phase: "lockdown",
+        unit: `server-host-revert-${TOKEN}`,
+        expires_at: expires,
+        armed_at: "2026-01-01T00:00:00.000Z",
+        ruleset_sha256: "x",
+        managed_sha256: await expectedManagedSha256(FIREWALL),
+      },
+    },
+  });
+  for (const method of ["get", "sync"] as const) {
+    await m.methods[method].execute(
+      m.methods[method].arguments.parse({ ...SSH }),
+      context,
+    );
+    const w = getWrittenResources().filter((r) =>
+      r.name.startsWith("observation-")
+    ).at(-1)!;
+    const o = w.data as Record<string, unknown>;
+    assertEquals(o.observed_by, method);
+    assertEquals(o.managed_table, true);
+    assertEquals(o.revert_armed, true);
+    assertEquals(o.revert_token, TOKEN);
+    assertEquals(o.revert_expires_at, expires);
+    assertEquals(o.ssh_exposure, "management-only");
+    assertEquals(o.firewall_mode, "lockdown");
+    assertEquals(o.drift, []);
+    assertEquals(
+      o.managed_sha256,
+      await expectedManagedSha256(FIREWALL),
+    );
+    assertEquals(JSON.stringify(o).includes("PRIVATE KEY"), false);
+  }
+});
+
+Deno.test("sync records drift: a revert that fired, and a changed ruleset", async () => {
+  const f = fakeTransport((c) =>
+    c.includes("'systemctl' 'is-active'")
+      ? { code: 3, stdout: "inactive\n" }
+      : { code: 0 }
+  );
+  const m = modelWith(f);
+  const { context, getWrittenResources } = createModelTestContext({
+    globalArgs: {},
+    storedResources: {
+      [`state-${hostInstance(SSH.host)}`]: {
+        host: SSH.host,
+        firewall: {
+          ruleset_sha256: "x",
+          managed_sha256: await expectedManagedSha256(FIREWALL),
+          mode: "firewall",
+          ssh_exposure: "anywhere",
+          applied_at: "2026-01-01T00:00:00.000Z",
+        },
+        observed_at: "2026-01-01T00:00:00.000Z",
+      },
+      [`revert-${hostInstance(SSH.host)}`]: {
+        host: SSH.host,
+        token: TOKEN,
+        phase: "firewall",
+        unit: `server-host-revert-${TOKEN}`,
+        expires_at: new Date(NOW - 1000).toISOString(),
+        armed_at: "2026-01-01T00:00:00.000Z",
+        ruleset_sha256: "x",
+      },
+    },
+  });
+  await m.methods.sync.execute(
+    m.methods.sync.arguments.parse({ ...SSH }),
+    context,
+  );
+  const o = getWrittenResources().find((r) =>
+    r.name.startsWith("observation-")
+  )!
+    .data as { drift: string[]; managed_table: boolean };
+  assertEquals(o.managed_table, false);
+  assertEquals(o.drift.includes("ruleset"), true);
+  assertEquals(o.drift.includes("revert_fired"), true);
+});

@@ -407,3 +407,9 @@ a secret. Fixtures are synthetic only (RFC 5737 addresses, `.test` names).
   non-partition candidate (a multipath device is wiped through its paths); a
   missing or short read of any of them is unverifiable. The boundary is pinned
   (bytes 0-439 are boot code, 440-445 are not).
+- 2026-10-17 wipe alreadyRaw (live finding): a partitionless disk with MBR boot
+  code was judged already raw. `deviceIsRaw` now also needs a readable sector 0
+  with zero bytes 0-439, no 55 AA, and no wipefs signature; otherwise the wipe
+  runs (wipefs -a, sgdisk --zap-all, then a zeroed sector 0) and the raw check
+  re-probes sector 0 and signatures, failing `wipe.raw-signatures` if they
+  survive. protected_devices.ts is untouched.

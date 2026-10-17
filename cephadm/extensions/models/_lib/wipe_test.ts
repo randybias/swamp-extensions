@@ -131,10 +131,15 @@ function probeAnswer(
     const answer = over[hit[1]] ?? HEALTHY[hit[1]];
     return typeof answer === "function" ? answer(command) : answer;
   }
+  if (/^wipefs --noheadings --output TYPE -- /.test(command)) {
+    const answer = over[`sigs:${command.split(" -- ")[1].replace(/'/g, "")}`] ??
+      done("");
+    return typeof answer === "function" ? answer(command) : answer;
+  }
   const mbr = /^dd if='(.+)' bs=512 count=1 status=none \| od -An -v -tx1$/
     .exec(command);
   if (mbr) {
-    const answer = over[`mbr:${mbr[1]}`] ?? done(sector0());
+    const answer = over[`mbr:${mbr[1]}`] ?? done(sector0({ sig: false }));
     return typeof answer === "function" ? answer(command) : answer;
   }
   const examine = /^mdadm --examine '(.+)'$/.exec(command);
@@ -292,7 +297,7 @@ function routedSession(
 }
 
 const NO_DESTRUCTIVE =
-  /wipefs|vgremove|vgchange|lvremove|pvremove|mdadm --stop|zero-superblock|sgdisk/;
+  /wipefs -a|vgremove|vgchange|lvremove|pvremove|mdadm --stop|zero-superblock|sgdisk|dd if=\/dev\/zero/;
 
 /** Routes listing, readlink and one lsblk read for a single disk. */
 function diskRouter(opts: RunOptions, lsblk: string): CommandResult {
@@ -345,7 +350,7 @@ Deno.test(
     );
     assertEquals(
       calls.some((c) =>
-        /wipefs|vgremove|mdadm --stop|zero-superblock/.test(c.command)
+        /wipefs -a|vgremove|mdadm --stop|zero-superblock/.test(c.command)
       ),
       false,
     );
@@ -365,7 +370,7 @@ Deno.test("a dry run plans and runs nothing destructive", async () => {
     device: "/dev/disk/by-id/nvme-SN0001",
   }]);
   assertEquals(
-    calls.some((c) => /wipefs|vgremove|zero-superblock/.test(c.command)),
+    calls.some((c) => /wipefs -a|vgremove|zero-superblock/.test(c.command)),
     false,
   );
 });
@@ -433,6 +438,9 @@ Deno.test("an already-raw disk completes the teardown idempotently", async () =>
       return { code: 0, stdout: "", stderr: "" };
     }
     if (opts.command.startsWith("sgdisk")) {
+      return { code: 0, stdout: "", stderr: "" };
+    }
+    if (opts.command.startsWith("dd if=/dev/zero")) {
       return { code: 0, stdout: "", stderr: "" };
     }
     if (opts.command.startsWith("partprobe")) {
@@ -718,7 +726,8 @@ Deno.test("a healthy host passes both reads and the wipe proceeds", async () => 
       return done("/dev/sda1 / ext4 defaults 0 1\n");
     }
     if (
-      /^(mdadm --zero-superblock|wipefs -a|sgdisk|partprobe)/.test(opts.command)
+      /^(mdadm --zero-superblock|wipefs -a|sgdisk|dd if=\/dev\/zero|partprobe)/
+        .test(opts.command)
     ) {
       return done("");
     }
@@ -800,9 +809,10 @@ Deno.test("no mdadm command is ever given `--` (mdadm 4.3 reads it as 'no device
     if (opts.command.startsWith("mdadm --detail --scan")) return done("");
     if (opts.command === "cat /etc/fstab") return done("");
     if (
-      /^(mdadm --zero-superblock|wipefs -a|sgdisk|partprobe)/.test(
-        opts.command,
-      )
+      /^(mdadm --zero-superblock|wipefs -a|sgdisk|dd if=\/dev\/zero|partprobe)/
+        .test(
+          opts.command,
+        )
     ) {
       return done("");
     }
@@ -852,9 +862,10 @@ Deno.test("an array stopped by the wipe is named bare, after the grammar check",
       if (opts.command.startsWith("mdadm --detail --scan")) return done("");
       if (opts.command === "cat /etc/fstab") return done("");
       if (
-        /^(mdadm --zero-superblock|wipefs -a|sgdisk|partprobe)/.test(
-          opts.command,
-        )
+        /^(mdadm --zero-superblock|wipefs -a|sgdisk|dd if=\/dev\/zero|partprobe)/
+          .test(
+            opts.command,
+          )
       ) {
         return done("");
       }
@@ -998,4 +1009,119 @@ Deno.test("MBR boot code on a candidate disk is refused unless its serial is ack
     dryRun: true,
   });
   assertEquals(record.dryRun, true);
+});
+
+/**
+ * One partitionless NVMe disk (no children, no filesystem) whose sector 0 and
+ * wipefs signatures are scripted. Writes take effect: `dd if=/dev/zero` empties
+ * the sector and `wipefs -a` the signatures, unless `stuck` says they survive.
+ */
+function sectorCase(
+  sector: string,
+  sigs: string,
+  opts: { stuck?: boolean; ack?: boolean } = {},
+) {
+  let zeroed = false;
+  let wiped = false;
+  const { session, calls } = routedSession(
+    (o) => {
+      if (o.command === listByIdCommand()) return done("nvme-SN0001\n");
+      if (o.command.startsWith("readlink")) return done("/dev/nvme0n1\n");
+      if (o.command === lsblkCommand()) return done(RAW_TREE);
+      if (o.command === "test -e /etc/mdadm/mdadm.conf") return done("", 1);
+      if (o.command.startsWith("mdadm --detail --scan")) return done("");
+      if (o.command === "cat /etc/fstab") {
+        return done("/dev/sda1 / ext4 defaults 0 1\n");
+      }
+      if (o.command.startsWith("pvs ")) return done("");
+      if (o.command.startsWith("mdadm --examine")) {
+        return done("", 1, "mdadm: No md superblock detected\n");
+      }
+      if (o.command.startsWith("dd if=/dev/zero")) {
+        zeroed = !opts.stuck;
+        return done("");
+      }
+      if (o.command.startsWith("wipefs -a")) {
+        wiped = !opts.stuck;
+        return done("");
+      }
+      if (/^(mdadm --zero-superblock|sgdisk|partprobe)/.test(o.command)) {
+        return done("");
+      }
+      return undefined;
+    },
+    "192.0.2.10",
+    {
+      "mbr:/dev/nvme0n1": () => done(zeroed ? sector0({ sig: false }) : sector),
+      "sigs:/dev/nvme0n1": () => done(wiped ? "" : sigs),
+    },
+  );
+  const run = () =>
+    wipeDiskToRaw({ ...deps, session }, {
+      dataDevices: [{
+        serial: "SN0001",
+        acknowledgeBootPartitions: opts.ack ?? false,
+      }],
+      excludeDevices: [],
+    });
+  return { run, calls };
+}
+
+const MUTATING = /^(wipefs -a|sgdisk|dd if=\/dev\/zero)/;
+
+Deno.test("a truly raw disk (zeroed sector 0, no signature) is already raw and nothing is written", async () => {
+  const { run, calls } = sectorCase(sector0({ sig: false }), "");
+  const record = await run();
+  assertEquals(record.alreadyRaw, true);
+  assertEquals(calls.some((c) => MUTATING.test(c.command)), false);
+});
+
+Deno.test("a partitionless disk with MBR boot code is not already raw: acknowledged, it is wiped and re-probed", async () => {
+  const { run, calls } = sectorCase(sector0({ code: true }), "dos\n", {
+    ack: true,
+  });
+  const record = await run();
+  assertEquals(record.alreadyRaw, false);
+  const cmds = calls.map((c) => c.command);
+  assertEquals(cmds.some((c) => c.startsWith("wipefs -a")), true);
+  assertEquals(cmds.some((c) => c.startsWith("sgdisk --zap-all")), true);
+  assertEquals(cmds.some((c) => c.startsWith("dd if=/dev/zero")), true);
+  // The sector was read again after the wipe.
+  const lastZero = cmds.findLastIndex((c) => c.startsWith("dd if=/dev/zero"));
+  assertEquals(
+    cmds.slice(lastZero).some((c) => c.includes("bs=512 count=1 status=none")),
+    true,
+  );
+});
+
+Deno.test("without the acknowledgement a disk with boot code is refused before any write", async () => {
+  const { run, calls } = sectorCase(sector0({ code: true }), "dos\n");
+  await assertRejects(run, PhaseError, "wipe.boot-partition");
+  assertEquals(calls.some((c) => MUTATING.test(c.command)), false);
+});
+
+Deno.test("a dos signature alone (55 AA, no boot code) or a wipefs signature alone is not raw", async () => {
+  for (
+    const [sector, sigs] of [
+      [sector0(), ""], // 55 AA, zero boot code
+      [sector0({ sig: false }), "xfs\n"], // zero sector, a signature
+      [sector0({ sig: false, bytes: { 100: 7 } }), ""], // code without 55 AA
+    ] as const
+  ) {
+    const { run, calls } = sectorCase(sector, sigs);
+    const record = await run();
+    assertEquals(record.alreadyRaw, false, sigs);
+    assertEquals(calls.some((c) => MUTATING.test(c.command)), true);
+  }
+});
+
+Deno.test("an unreadable sector 0 is not raw, and a wipe that leaves boot code behind fails", async () => {
+  const { run } = sectorCase("not hex", "");
+  // Unreadable: the guard refuses it as unverifiable before anything is written.
+  await assertRejects(run, PhaseError, "wipe.boot-unverifiable");
+  const stuck = sectorCase(sector0({ code: true }), "dos\n", {
+    ack: true,
+    stuck: true,
+  });
+  await assertRejects(stuck.run, PhaseError, "wipe.raw-signatures");
 });

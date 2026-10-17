@@ -83,7 +83,22 @@ function fakeRun(
       return Promise.resolve({ code: 0, stdout: "MISSING\n", stderr: "" });
     }
     if (command.includes(".ssh-host-upload")) {
-      return Promise.resolve({ code: 0, stdout: "", stderr: "" });
+      // The upload helper compares the destination's hash and mode, which the
+      // remote prints back: answer as a host that stored the bytes it was sent.
+      const bytes = typeof _options.stdin === "string"
+        ? new TextEncoder().encode(_options.stdin)
+        : (_options.stdin ?? new Uint8Array());
+      const mode = /chmod '(\d+)'/.exec(command)?.[1] ?? "600";
+      return crypto.subtle.digest("SHA-256", new Uint8Array(bytes)).then((
+        d,
+      ) => ({
+        code: 0,
+        stdout: `${
+          [...new Uint8Array(d)].map((b) => b.toString(16).padStart(2, "0"))
+            .join("")
+        } ${mode}\n`,
+        stderr: "",
+      }));
     }
     if (command.includes("'-d' '-j' 'link'")) {
       return Promise.resolve({

@@ -20,9 +20,9 @@ Item 11 (P1b) of run sp-20261017. Lane d4, branch `lane/d4-hostnet`, based on
   `@mccormick/migrate` rewrites a _guest_ netplan as a migration fallback, and
   `@svendowideit/host-facts` is read-only facts. Net-new build confirmed.
 - Transport: `extensions/models/_lib/ssh.ts` vendored **byte-identical** from
-  `@randybias/ssh-host` on `origin/main`, git blob
-  `cb61c4adfbedee0a6c9914deae52d3864d5a1afb` (ssh-host version 2026.10.17.1).
-  Not edited; all remote exec and upload go through it.
+  `@randybias/ssh-host` (version 2026.10.17.2, lane/d1-ssh2 e3c0057), git blob
+  `fe0139f08c42e3fdae0061b9688fb5c534174957`; its upload no longer puts the
+  content digest on argv. Not edited; all remote exec and upload go through it.
 
 ## Layout
 
@@ -164,3 +164,30 @@ refuses enslaving the management NIC into a bridge; the restore restores files
 before MTUs and aborts on a `cp` failure; `revert_now` records a failed restore
 before throwing. Tests cover apply A, A+B, B-only, MTU-only apply→remove, and a
 match_mac bridge member. 88 unit tests; gates 0-6 pass offline.
+
+## Round-4 review (escalated to a second author)
+
+Proven first in a fake-host simulation (a real `sh` with stub `ip`, `netplan`,
+`networkctl`, `systemctl`, `systemd-run`), now permanent in
+`host_net_sim_test.ts` (needs `sh` and `python3`; it skips itself without them).
+Every one of those tests fails on the previous round's code.
+
+- **HIGH file provenance flipped.** Each commit took `preExisted` from that
+  apply's own snapshot, so files host-net wrote in apply A looked pre-existing
+  by A+B and `remove` left them behind (netplan re-created the devices).
+  Provenance is now FIRST-SEEN: a path already in the committed record keeps its
+  flag.
+- **HIGH parent MTU baseline lost.** A second commit saw the NIC already raised
+  and recorded 9000 as the baseline, so `remove` left it at 9000. The baseline
+  is now the ORIGINAL pre-change value; a parent stays recorded while it is
+  managed.
+- **HIGH dropped VLAN left unowned.** Dropping a declared device relinquished
+  ownership without deleting it, so re-adding it was refused as foreign. A
+  device that was owned and is no longer declared is now deleted at apply, under
+  the armed revert and the apply guard, and the files host-net created for it
+  are removed; both are in the arm snapshot so a fired revert restores them, and
+  `commit` refuses unless they are really gone.
+- **MEDIUM takeover precheck.** The staged root now has `etc/cloud/cloud.cfg.d`,
+  so the cloud-init drop-in uploads (it failed safe).
+- `ssh.ts` resynced; the unit-test fake answers the upload helper's
+  hash-and-mode read-back like a host that stored the bytes.

@@ -1,0 +1,3 @@
+#!/bin/sh
+for a in "$@"; do case "$a" in --unit=*) u="${a#--unit=}";; esac; done
+touch "$SIMROOT/state/units/$u.timer"; exit 0

@@ -374,6 +374,10 @@ interface ArmInput {
   createdBridges: string[];
   /** The files this change owns. */
   ownedFiles: string[];
+  /** Previously owned devices no longer declared: deleted by this change. */
+  staleDevices: string[];
+  /** Previously owned files no longer rendered: removed by this change. */
+  staleFiles: string[];
   /** Parent MTUs this change raises, with the pre-change value. */
   parentMtus: { name: string; mtu: number }[];
   /** The rendered config identity. */
@@ -391,7 +395,9 @@ function revertContext(token: string, input: ArmInput): RevertContext {
     bridgeType: input.bridgeType,
     created: input.created,
     createdBridges: input.createdBridges,
-    ownedFiles: input.ownedFiles,
+    // The snapshot also covers the files this change deletes, so a revert
+    // puts them back.
+    ownedFiles: [...new Set([...input.ownedFiles, ...input.staleFiles])],
     parentMtus: input.parentMtus,
   };
 }
@@ -445,6 +451,8 @@ async function armRevert(
     created: input.created,
     createdBridges: input.createdBridges,
     ownedFiles: input.ownedFiles,
+    staleDevices: input.staleDevices,
+    staleFiles: input.staleFiles,
     parentMtus: input.parentMtus,
     backend: input.backend,
     bridgeType: input.bridgeType,
@@ -507,6 +515,8 @@ interface GuardOpts {
   mtuCommands?: string[][];
   /** Files removed after the guard checks pass (never pre-existing ones). */
   removeFiles?: string[];
+  /** Devices deleted after the backend ran, once the guard has passed. */
+  deleteDevices?: string[];
 }
 
 /**
@@ -532,6 +542,14 @@ function guardedApplyScript(ctx: RevertContext, opts: GuardOpts = {}): string {
   const removes = (opts.removeFiles ?? []).map((p) => `rm -f ${shq(p)}`).join(
     "\n",
   );
+  // The backend does not reliably delete a virtual device that left the
+  // config, so a device that was owned and is no longer declared goes here,
+  // under the same guard as the rest.
+  const deletes = (opts.deleteDevices ?? []).map((n) =>
+    `if ip link show dev ${shq(n)} >/dev/null 2>&1; then ip link delete dev ${
+      shq(n)
+    }; fi`
+  ).join("\n");
   return [
     "set -eu",
     `exec 9>${LOCK_PATH}`,
@@ -552,7 +570,23 @@ function guardedApplyScript(ctx: RevertContext, opts: GuardOpts = {}): string {
     moves,
     removes,
     apply,
+    deletes,
   ].filter((l) => l !== "").join("\n");
+}
+
+/**
+ * Merges parent-MTU baselines: an entry already recorded keeps its ORIGINAL
+ * value, a new parent takes the value this change saw, and a parent the
+ * previous commit managed stays recorded so `remove` can still restore it.
+ */
+function mergeBaselines(
+  previous: { name: string; mtu: number }[],
+  current: { name: string; mtu: number }[],
+): { name: string; mtu: number }[] {
+  const merged = new Map<string, number>();
+  for (const p of previous) merged.set(p.name, p.mtu);
+  for (const c of current) if (!merged.has(c.name)) merged.set(c.name, c.mtu);
+  return [...merged].map(([name, mtu]) => ({ name, mtu }));
 }
 
 /** True while a recorded revert is pending and has not expired. */
@@ -753,7 +787,7 @@ export function createModel(overrides: Partial<HostNetDeps> = {}) {
             [
               "sh",
               "-c",
-              `rm -rf '${stage}' && mkdir -p '${stage}/etc/netplan'`,
+              `rm -rf '${stage}' && mkdir -p '${stage}/etc/netplan' '${stage}/etc/cloud/cloud.cfg.d'`,
             ],
             "the precheck setup",
           );
@@ -843,6 +877,20 @@ export function createModel(overrides: Partial<HostNetDeps> = {}) {
             ...created,
           ]),
         ];
+        // What the previous commit owned and this desired config no longer
+        // declares is deleted (never left behind unowned, which would block
+        // re-adding it): the devices, and the files host-net itself created.
+        const rendered = new Set(render.files.map((f) => f.path));
+        const staleDevices = [...owned].filter((name) =>
+          !render.created.includes(name)
+        );
+        const previousFiles =
+          config !== null && Array.isArray(config.ownedFiles)
+            ? config.ownedFiles as { path: string; preExisted: boolean }[]
+            : [];
+        const staleFiles = previousFiles
+          .filter((f) => !rendered.has(f.path) && f.preExisted !== true)
+          .map((f) => f.path);
         const createdBridges = cfg.bridgeType === "ovs" &&
             cfg.bridge !== undefined && created.includes(cfg.bridge.name)
           ? [cfg.bridge.name]
@@ -870,6 +918,8 @@ export function createModel(overrides: Partial<HostNetDeps> = {}) {
           created,
           createdBridges,
           ownedFiles: render.files.map((f) => f.path),
+          staleDevices,
+          staleFiles,
           parentMtus,
           armedSha256: render.sha256,
           contentSha256: desiredContentSha,
@@ -899,6 +949,8 @@ export function createModel(overrides: Partial<HostNetDeps> = {}) {
             guardedApplyScript(revertContext(token, armInput), {
               stagedFiles: render.files,
               mtuCommands: mtuArgvs,
+              removeFiles: staleFiles,
+              deleteDevices: staleDevices,
             }),
           ],
           "the guarded apply",
@@ -965,6 +1017,25 @@ export function createModel(overrides: Partial<HostNetDeps> = {}) {
           );
         }
         const isRemove = recorded.operation === "remove";
+        const previousConfig = await context.readResource(
+          `config-${targetKey(args)}`,
+        );
+        const previousProvenance = new Map<string, boolean>();
+        for (
+          const f of (previousConfig !== null &&
+              Array.isArray(previousConfig.ownedFiles)
+            ? previousConfig.ownedFiles as {
+              path: string;
+              preExisted: boolean;
+            }[]
+            : [])
+        ) {
+          previousProvenance.set(f.path, f.preExisted === true);
+        }
+        const previousBaselines = previousConfig !== null &&
+            Array.isArray(previousConfig.parentMtus)
+          ? previousConfig.parentMtus as { name: string; mtu: number }[]
+          : [];
         const ownedFiles = Array.isArray(recorded.ownedFiles)
           ? recorded.ownedFiles as string[]
           : [];
@@ -1010,6 +1081,39 @@ export function createModel(overrides: Partial<HostNetDeps> = {}) {
             }
           }
         } else if (typeof recorded.contentSha256 === "string") {
+          // What this change deleted must really be gone before it is owned
+          // no more.
+          const liveNames = new Set(live.links.map((l) => l.name));
+          for (
+            const name of (recorded.staleDevices as string[] | undefined) ?? []
+          ) {
+            if (liveNames.has(name)) {
+              throw new HostNetConfigError(
+                `device ${name} is still present; refusing to commit`,
+              );
+            }
+          }
+          for (
+            const path of (recorded.staleFiles as string[] | undefined) ?? []
+          ) {
+            const gone = await run(
+              deps,
+              target,
+              [
+                "sh",
+                "-c",
+                'if [ -e "$1" ]; then echo present; else echo absent; fi',
+                "sh",
+                path,
+              ],
+              `the removal check for ${path}`,
+            );
+            if (gone.stdout.trim() !== "absent") {
+              throw new HostNetConfigError(
+                `the dropped file ${path} is still present; refusing to commit`,
+              );
+            }
+          }
           const liveSha = await liveContentShaPaths(deps, target, ownedFiles);
           if (liveSha !== recorded.contentSha256) {
             throw new HostNetConfigError(
@@ -1056,13 +1160,24 @@ export function createModel(overrides: Partial<HostNetDeps> = {}) {
             managementInterface: cfg.managementInterface,
             bridge: cfg.bridge?.name ?? "",
             devices: (recorded.owned as string[] | undefined) ?? [],
+            // Provenance is FIRST-SEEN: a path already in the record keeps its
+            // recorded flag. This apply's snapshot calls a file host-net wrote
+            // earlier "pre-existing", and trusting it would make remove leave
+            // host-net's own files behind.
             ownedFiles: ownedFiles.map((path) => ({
               path,
-              preExisted: preExisted.get(path) === true,
+              preExisted: previousProvenance.has(path)
+                ? previousProvenance.get(path) === true
+                : preExisted.get(path) === true,
             })),
-            parentMtus: (recorded.parentMtus as
-              | { name: string; mtu: number }[]
-              | undefined) ?? [],
+            // The baseline is the ORIGINAL pre-change MTU: a later apply sees
+            // the already-raised value, which is not what remove must restore.
+            parentMtus: mergeBaselines(
+              previousBaselines,
+              (recorded.parentMtus as
+                | { name: string; mtu: number }[]
+                | undefined) ?? [],
+            ),
             configSha256: recorded.armedSha256 ?? "",
             contentSha256: recorded.contentSha256 ?? "",
             committedAt,
@@ -1234,6 +1349,8 @@ export function createModel(overrides: Partial<HostNetDeps> = {}) {
           created: [],
           createdBridges: [],
           ownedFiles: recordFiles.map((o) => o.path),
+          staleDevices: [],
+          staleFiles: [],
           parentMtus: recordMtus,
           armedSha256: String(config?.configSha256 ?? ""),
           contentSha256: String(config?.contentSha256 ?? ""),

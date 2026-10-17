@@ -860,8 +860,11 @@ function normalizeMode(mode: string): string {
  * bytes and mode: identical bytes and mode mean no write, no rename and no new
  * resource version, while a mode-only difference is replaced through the same
  * temp-file path (never chmod-in-place, which would follow a symlink). A
- * destination that is a directory or a symlink is refused. Returns the
- * destination, byte count, SHA-256 and whether anything changed.
+ * destination that is a directory or a symlink is refused. The expected hash
+ * is never sent to the host: the remote prints the destination's own SHA-256
+ * and mode after the rename and this side compares them, so no content-derived
+ * digest appears on a command line. Returns the destination, byte count,
+ * SHA-256 and whether anything changed.
  */
 export async function upload(
   deps: SshDeps,
@@ -933,9 +936,12 @@ export async function upload(
       posixQuote(UNSUPPORTED_PLATFORM)
     }; exit 1;; esac`,
     `[ -f "$f" ] && [ ! -d "$f" ] && [ ! -L "$f" ] || exit 1`,
-    // Verify the destination really holds these bytes before reporting success.
+    // Print the destination's hash and mode. The caller compares them locally,
+    // so the expected hash never reaches the remote command line and cannot be
+    // read back out of a process listing.
     `h=$( { sha256sum "$f" 2>/dev/null || shasum -a 256 "$f" 2>/dev/null; } | awk '{print $1}' )`,
-    `[ "$h" = ${posixQuote(sha256)} ] || exit 1`,
+    `m=$( { stat -c %a "$f" 2>/dev/null || stat -f %Lp "$f" 2>/dev/null; } )`,
+    `printf '%s %s\n' "\${h:-none}" "\${m:-none}"`,
   ].join("\n");
   const res = await runRemote(deps, target, script, bytes);
   if (res.exit_code !== 0) {
@@ -946,6 +952,17 @@ export async function upload(
     }
     throw new SshError(
       `upload to ${target.user}@${target.host}:${options.path} failed (exit ${res.exit_code})`,
+    );
+  }
+  // Verify the destination really holds these bytes and mode before reporting
+  // success; both values came back from the remote, not the other way around.
+  const tokens = res.stdout.trim().split(/\s+/);
+  if (
+    tokens[0] !== sha256 ||
+    normalizeMode(tokens[1] ?? "") !== normalizeMode(mode)
+  ) {
+    throw new SshError(
+      `upload to ${target.user}@${target.host}:${options.path} did not converge`,
     );
   }
   return { path: options.path, bytes: bytes.length, sha256, changed: true };

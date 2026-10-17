@@ -37,44 +37,40 @@ import {
 
 const GlobalArgsSchema = z.strictObject({});
 
-/** The legacy `{type, key}` host-key shape accepted for backwards compat. */
-const LegacyHostKeySchema = z.strictObject({
-  type: z.string().regex(/^[a-z0-9@.-]{1,40}$/),
-  key: z.string().regex(/^[A-Za-z0-9+/=]{1,2048}$/),
-});
-
 const SshSchema = z.strictObject({
   host: z.string().min(1).max(253),
   user: z.string().regex(/^[a-z_][a-z0-9_-]{0,31}$/),
   port: z.number().int().min(1).max(65535).default(22),
-  host_key_policy: z.enum([
-    "strict",
-    "insecure_tofu",
-    "accept-new",
-    "insecure",
-  ]).transform((v, ctx) => {
-    if (v === "accept-new") return "insecure_tofu" as const;
-    if (v === "insecure") {
-      ctx.addIssue({
-        code: "custom",
-        message:
-          "host_key_policy insecure was removed; use insecure_tofu (learns and pins the first key) or strict",
-      });
-      return z.NEVER;
-    }
-    return v;
-  }).describe(
-    "How the node's SSH host key is checked; there is no default. insecure_tofu learns the first keys seen and pins them for later steps.",
+  // A preprocess (not a transform) keeps the enum and description visible to
+  // `swamp model type describe`; `accept-new` maps to insecure_tofu and
+  // `insecure` is refused with a clear message.
+  host_key_policy: z.preprocess(
+    (v) => (v === "accept-new" ? "insecure_tofu" : v),
+    z.enum(["strict", "insecure_tofu"], {
+      error: (issue: { input?: unknown }) =>
+        issue.input === "insecure"
+          ? "host_key_policy insecure was removed; use insecure_tofu (learns and pins the first key) or strict"
+          : undefined,
+    }).describe(
+      "How the node's SSH host key is checked; there is no default. insecure_tofu learns the first keys seen and pins them for later steps.",
+    ),
   ),
-  host_keys: z.array(
-    z.union([
-      z.string().max(8192).refine(isHostKeyLine, "an ssh-keyscan line"),
-      LegacyHostKeySchema,
-    ]),
-  ).max(64).default([]).transform((items) =>
-    items.map((item) =>
-      typeof item === "string" ? item : `${item.type} ${item.key}`
-    )
+  // A preprocess turns the legacy `{type, key}` objects into ssh-keyscan lines
+  // so the item shape still renders; the grammar is enforced on the line.
+  host_keys: z.preprocess(
+    (v) =>
+      Array.isArray(v)
+        ? v.map((item) =>
+          item !== null && typeof item === "object" && "type" in item &&
+            "key" in item
+            ? `${(item as { type: unknown }).type} ${
+              (item as { key: unknown }).key
+            }`
+            : item
+        )
+        : v,
+    z.array(z.string().max(8192).refine(isHostKeyLine, "an ssh-keyscan line"))
+      .max(64).default([]),
   ).describe(
     "Pinned ssh-keyscan-format lines; required for strict.",
   ),
@@ -298,7 +294,9 @@ export function createModel(deps: Partial<Deps> = {}) {
         const type = (key as { type?: unknown }).type;
         const blob = (key as { key?: unknown }).key;
         if (typeof type === "string" && typeof blob === "string") {
-          out.push(`${field} ${type} ${blob}`);
+          const line = `${field} ${type} ${blob}`;
+          // A stored value with whitespace or a newline is not a valid pin.
+          if (isHostKeyLine(line)) out.push(line);
         }
       }
     }
@@ -336,29 +334,37 @@ export function createModel(deps: Partial<Deps> = {}) {
         stored.host,
         stored.port,
       );
-      if (lines.length > 0) {
-        // A published 17.4 record stored objects; rewrite it in the new shape.
-        if (
-          (stored.host_keys as unknown[]).some((k) => typeof k !== "string")
-        ) {
-          await context.writeResource("hostkeys", `${name}-hostkeys`, {
-            node: name,
-            host: stored.host,
-            port: stored.port,
-            host_keys: lines,
-            observed_at: d.now().toISOString(),
-          });
-        }
-        return {
-          target: { ...ssh, host_key_policy: "strict", host_keys: lines },
-          remember: () =>
-            Promise.resolve({
-              ...ssh,
-              host_key_policy: "strict" as const,
-              host_keys: lines,
-            }),
-        };
+      if (lines.length === 0) {
+        // A record exists for this host/port but nothing in it is a usable pin.
+        // Fail closed rather than re-learning (and overwriting) on a later run.
+        throw new TransportError(
+          "host-key",
+          `stored host-key record for ${name} is unreadable; delete it to re-learn`,
+        );
       }
+      return {
+        target: { ...ssh, host_key_policy: "strict", host_keys: lines },
+        // A published 17.4 record stored objects; rewrite it only after the
+        // operation has succeeded.
+        remember: async () => {
+          if (
+            (stored.host_keys as unknown[]).some((k) => typeof k !== "string")
+          ) {
+            await context.writeResource("hostkeys", `${name}-hostkeys`, {
+              node: name,
+              host: stored.host,
+              port: stored.port,
+              host_keys: lines,
+              observed_at: d.now().toISOString(),
+            });
+          }
+          return {
+            ...ssh,
+            host_key_policy: "strict" as const,
+            host_keys: lines,
+          };
+        },
+      };
     }
     return {
       target: ssh,

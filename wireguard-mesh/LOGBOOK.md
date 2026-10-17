@@ -333,3 +333,30 @@ guards) are unchanged; only delivery changed:
 - **Host-key line grammar (MEDIUM).** Each `ssh.host_keys` line must be an
   optional host field plus a key type plus a base64 payload; extra or malformed
   tokens are rejected.
+
+## Transport-convergence round 2 fixes
+
+- **Cleanup exit codes (HIGH).** The remote cleanup is now
+  `rm -f -- tmp && { rmdir -- dir 2>/dev/null || [ ! -e dir/stdin ]; }`, so only
+  a failed `rm` of the key file is non-zero, and the transport surfaces "may
+  still hold the key". The script body checks each prep step
+  (`exec 3<tmp || exit 70; rm -f -- tmp || exit 70; [ ! -e tmp ] || exit 70`)
+  before running the script, so a failed unlink stops the run instead of letting
+  the script execute.
+- **Fail closed on an unreadable stored pin (HIGH).** When a `<node>-hostkeys`
+  record matches host/port but none of its entries normalizes (an over-long
+  blob, corrupt or tampered), `establish` throws
+  `TransportError("host-key", "stored host-key record for <node> is unreadable;
+  delete it to re-learn")`
+  instead of falling through to a fresh insecure_tofu and overwriting the pin.
+- **Stored object grammar (MEDIUM).** `normalizeStoredKeys` now validates each
+  built line with `isHostKeyLine` before using it.
+- **JSON Schema (MEDIUM).** `host_key_policy` and `host_keys` use `z.preprocess`
+  instead of `z.transform`, so `swamp model type describe` renders the enum,
+  description and array-of-string item shape; `accept-new` maps to
+  `insecure_tofu` and `insecure` fails with the clear replacement message.
+- **Rewrite after success (MEDIUM).** A legacy `<node>-hostkeys` record is
+  rewritten inside `remember()`, i.e. after the operation succeeds, not at read
+  time.
+- **Docs (LOW).** The README no longer claims the key is "never at rest"; it now
+  says the file stays on disk only for the upload-to-unlink window.

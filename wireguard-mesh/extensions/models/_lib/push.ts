@@ -199,9 +199,12 @@ export function sshTransport(t: SshTarget, deps: SshDeps): Transport {
       }
       const body = tmp === undefined || dir === undefined ? script : [
         "umask 077",
-        // Open the file, then unlink it before the script runs, so the key is
-        // never at rest even if the script cuts the SSH path.
-        `exec 3<'${tmp}' && rm -f -- '${tmp}'`,
+        // Open the file, then unlink it before the script body runs. Each step
+        // is checked, so a failed open or unlink stops before the script can
+        // touch the host.
+        `exec 3<'${tmp}' || exit 70`,
+        `rm -f -- '${tmp}' || exit 70`,
+        `[ ! -e '${tmp}' ] || exit 70`,
         `trap 'rm -f -- "${tmp}"; rmdir -- "${dir}" 2>/dev/null || true' EXIT HUP INT TERM`,
         "{",
         script,
@@ -229,7 +232,9 @@ export function sshTransport(t: SshTarget, deps: SshDeps): Transport {
         cleaned = await exec(deps, target, [
           "sh",
           "-c",
-          `rm -f -- '${tmp}'; rmdir -- '${dir}' 2>/dev/null || true`,
+          // Only a failed rm of the key file is an error; an absent directory
+          // (or one still holding the file) is handled by the trailing test.
+          `rm -f -- '${tmp}' && { rmdir -- '${dir}' 2>/dev/null || [ ! -e '${dir}/stdin' ]; }`,
         ]);
       } catch {
         cleaned = undefined;

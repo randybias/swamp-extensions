@@ -5,6 +5,7 @@ import {
   assertStringIncludes,
 } from "jsr:@std/assert@1.0.19";
 import { createModelTestContext } from "jsr:@swamp-club/swamp-testing@0.20261014.55";
+import { z } from "npm:zod@4.3.6";
 import { fullMesh, hubSelf, hubSpoke, key } from "./_lib/fixtures.ts";
 import {
   sha256Hex,
@@ -872,4 +873,108 @@ Deno.test("a legacy {type,key} hostkeys record is migrated to a port-aware line"
   );
   assertExists(rewritten);
   assertEquals((rewritten.data as { host_keys: string[] }).host_keys, [line]);
+});
+
+Deno.test("a failed cleanup surfaces that the temp file may still hold the key", async () => {
+  const run: CommandRunner = (cmd, args, _o = {}) => {
+    if (cmd === "ssh-agent") {
+      return Promise.resolve(
+        args[0] === "-s"
+          ? {
+            code: 0,
+            stdout:
+              "SSH_AUTH_SOCK=/tmp/a.sock;\nexport SSH_AUTH_SOCK;\nSSH_AGENT_PID=1;\nexport SSH_AGENT_PID;\n",
+            stderr: "",
+          }
+          : { code: 0, stdout: "", stderr: "" },
+      );
+    }
+    if (cmd === "ssh-add") {
+      return Promise.resolve({ code: 0, stdout: "", stderr: "" });
+    }
+    if (cmd !== "ssh") {
+      return Promise.resolve({ code: 0, stdout: "", stderr: "" });
+    }
+    const remote = args[args.length - 1] ?? "";
+    if (remote.includes("'mktemp'")) {
+      return Promise.resolve({
+        code: 0,
+        stdout: "/tmp/wgmesh.AbC123XY\n",
+        stderr: "",
+      });
+    }
+    if (remote.includes("echo MISSING")) {
+      return Promise.resolve({ code: 0, stdout: "MISSING\n", stderr: "" });
+    }
+    if (remote.includes(".ssh-host-upload")) {
+      // The cleanup command is the one with rmdir and without umask 077.
+      return sha256Hex("SECRET\n").then((h) => ({
+        code: 0,
+        stdout: `${h} 0600\n`,
+        stderr: "",
+      }));
+    }
+    if (remote.includes("rmdir") && !remote.includes("umask 077")) {
+      return Promise.resolve({ code: 1, stdout: "", stderr: "rm failed" });
+    }
+    return Promise.resolve({ code: 0, stdout: "", stderr: "" });
+  };
+  const deps: SshDeps = { run, now: () => 0, sleep: () => Promise.resolve() };
+  await assertRejects(
+    () => sshTransport(STRICT_TARGET, deps)("echo hi", "SECRET\n"),
+    TransportError,
+    "may still hold the key",
+  );
+});
+
+Deno.test("a stored hostkey record that cannot be normalized fails closed", async () => {
+  const m = createModel({
+    now: () => NOW,
+    transport: (): Transport => () =>
+      Promise.resolve({ code: 0, stdout: "changed=0\n", stderr: "" }),
+  });
+  const ctx = createModelTestContext({
+    globalArgs: {},
+    storedResources: {
+      "spoke-1-hostkeys": {
+        node: "spoke-1",
+        host: "198.51.100.20",
+        port: 22,
+        host_keys: [{ type: "ssh-rsa", key: "A".repeat(3000) }],
+        observed_at: NOW.toISOString(),
+      },
+    },
+  });
+  await assertRejects(
+    () =>
+      m.methods.apply.execute({
+        ...applyArgs(),
+        ssh: { ...SSH, host_key_policy: "insecure_tofu", host_keys: [] },
+      }, ctx.context),
+    TransportError,
+    "delete it to re-learn",
+  );
+});
+
+Deno.test("model type describe: the ssh schema still renders its enum and item shape", () => {
+  const schema = z.toJSONSchema(
+    model.methods.apply.arguments,
+  ) as unknown as {
+    properties: {
+      ssh: {
+        properties: {
+          host_key_policy: { enum?: string[]; description?: string };
+          host_keys: {
+            items?: { type?: string };
+            anyOf?: { items?: { type?: string } }[];
+          };
+        };
+      };
+    };
+  };
+  const ssh = schema.properties.ssh.properties;
+  assertEquals(ssh.host_key_policy.enum, ["strict", "insecure_tofu"]);
+  assertEquals(typeof ssh.host_key_policy.description, "string");
+  const items = ssh.host_keys.items ?? ssh.host_keys.anyOf?.[0]?.items;
+  assertEquals(items?.type, "string");
 });

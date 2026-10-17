@@ -3,6 +3,8 @@ import {
   assertEquals,
   assertStringIncludes,
 } from "jsr:@std/assert@1.0.19";
+import { parse } from "jsr:@std/yaml@1.0.9";
+import { Environment } from "npm:@marcbachmann/cel-js@7.6.1";
 
 const read = (name: string) =>
   Deno.readTextFile(new URL(`./${name}/workflow.yaml`, import.meta.url));
@@ -279,4 +281,62 @@ Deno.test("with auth on, check-nats requires an authenticated session and a refu
   ) {
     assertStringIncludes(check, need);
   }
+});
+
+Deno.test("the NATS chart namespace is DNS-1123 and, with auth on, must be one of cluster_namespaces", async () => {
+  const doc = parse(await read("server-stack-provision-host")) as {
+    inputs: { properties: Record<string, Record<string, unknown>> };
+    jobs: { steps: { name: string; task: { expr?: string } }[] }[];
+  };
+  const props = doc.inputs.properties;
+  const ns =
+    (props.nats_chart.properties as Record<string, { pattern: string }>)
+      .namespace.pattern;
+  assertEquals(
+    ns,
+    (props.cluster_namespaces.items as { pattern: string }).pattern,
+  );
+  const dns1123 = new RegExp(ns);
+  assert(dns1123.test("nats"));
+  for (const bad of ["NATS", "nats/x", "-nats", "x".repeat(64), ""]) {
+    assertEquals(dns1123.test(bad), false, JSON.stringify(bad));
+  }
+
+  const expr = doc.jobs[0].steps.find((s) => s.name === "check-inputs")?.task
+    .expr;
+  assert(expr);
+  // CEL integers are BigInts in cel-js.
+  const cel = new Environment({ unlistedVariablesAreDyn: true });
+  const valid = {
+    verify_timeout_s: 60n,
+    revert_after_s: 300n,
+    allow_udp: [51820n],
+    mesh_node: { listen_port: 51820n },
+    management_cidrs: ["192.0.2.0/24"],
+    host_key_policy: "strict",
+    known_hosts: ["ssh-ed25519 AAAA"],
+    ownership_tag: "owner=e2e",
+    tags: { owner: "e2e" },
+    cluster_secrets: [],
+    cluster_namespaces: ["nats"],
+    nats_chart: { namespace: "nats" },
+    nats_auth_token_key: null,
+    publish_dns: false,
+    cloudflare_zone_id: "",
+    dns_record_name: "",
+    cloudflare_token_key: "",
+  };
+  const ok = (over: Record<string, unknown>) =>
+    cel.evaluate(expr, { inputs: { ...valid, ...over } });
+  assertEquals(ok({}), true);
+  assertEquals(
+    ok({ cluster_namespaces: [] }),
+    true,
+    "auth off: no listing needed",
+  );
+  assertEquals(ok({ nats_auth_token_key: "nats-token" }), true);
+  assertEquals(
+    ok({ nats_auth_token_key: "nats-token", cluster_namespaces: ["other"] }),
+    false,
+  );
 });

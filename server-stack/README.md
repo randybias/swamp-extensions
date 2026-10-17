@@ -25,6 +25,12 @@ Build a hardened k0s host running NATS on the mesh, then publish its DNS.
 
 Remove a provisioned host's DNS record, k0s cluster and server.
 
+> **Teardown needs `@randybias/k0s-cluster` 2026.10.17.3 or later.** Its
+> `reset-k0s` step fails on the published k0s-cluster 2026.10.17.2, whose reset
+> rebuilds the vault key from the masked host in its stored record. Until
+> 2026.10.17.3 is published, teardown stops at `reset-k0s` and the server is not
+> deleted.
+
 | Job      | Steps                                                                                                                                                              |
 | -------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
 | teardown | check-inputs, sync-server, check-ownership, find-record, check-record, delete-record, reset-k0s, delete-server, verify-cherry, check-cherry, verify-dns, check-dns |
@@ -185,6 +191,10 @@ handshake after the node joins the mesh; `0` skips the wait.
   address and are overwritten by the next run.
 - The API server binds the mesh address (`api_address`), and the kubeconfig the
   workflow stores points at it; the step's log line shows it.
+- `cluster_secrets` is disabled: `check-inputs` requires it to be empty. Its
+  steps write Secrets with `@randybias/k8s-secret` from the control host, which
+  cannot reach the Kubernetes API (the firewall opens no 6443 to it). The NATS
+  auth Secret is applied on the host instead.
 
 ## License
 

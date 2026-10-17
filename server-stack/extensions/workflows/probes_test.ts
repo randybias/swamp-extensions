@@ -167,8 +167,6 @@ async function readmeValues(): Promise<unknown> {
     .values;
 }
 
-const REPO = "https://nats-io.github.io/k8s/helm/charts/";
-
 Deno.test({
   name:
     "the documented token reference renders unquoted and NATS expands it from the environment",
@@ -187,7 +185,7 @@ Deno.test({
           "nats",
           "nats",
           "--repo",
-          REPO,
+          "https://nats-io.github.io/k8s/helm/charts/",
           "--version",
           "2.15.1",
           "-f",

@@ -377,7 +377,7 @@ inputs:
           maxLength: 64
         namespace:
           type: string
-          maxLength: 63
+          pattern: "^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$"
         values:
           type: object
     nats_auth_token_key:
@@ -447,6 +447,8 @@ jobs:
             (inputs.host_key_policy != "strict" || size(inputs.known_hosts) > 0) &&
             inputs.tags[inputs.ownership_tag.split("=")[0]] == inputs.ownership_tag.split("=")[1] &&
             size(inputs.cluster_secrets) == 0 &&
+            (inputs.nats_auth_token_key == null ||
+            inputs.cluster_namespaces.exists(n, n == inputs.nats_chart.namespace)) &&
             (!inputs.publish_dns || (inputs.cloudflare_zone_id != "" &&
             inputs.dns_record_name != "" && inputs.cloudflare_token_key != ""))
           message: Cross-input invariants failed

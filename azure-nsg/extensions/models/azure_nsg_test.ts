@@ -49,6 +49,19 @@ const RULE = {
   destinationPortRanges: ["22"],
 };
 
+/** An ARM read-back body: desired properties plus a Succeeded state. */
+type RuleInput = Parameters<typeof buildRuleBody>[0];
+function settled(rule: RuleInput): Record<string, unknown> {
+  const body = buildRuleBody(rule) as {
+    name: string;
+    properties: Record<string, unknown>;
+  };
+  return {
+    name: body.name,
+    properties: { ...body.properties, provisioningState: "Succeeded" },
+  };
+}
+
 interface Reply {
   status: number;
   body: unknown;
@@ -245,11 +258,17 @@ Deno.test("ensure_rule is a no-op when the rule already matches", async () => {
 });
 
 Deno.test("ensure_rule PUTs when the rule differs", async () => {
-  const { fetch, calls } = armFetch((method) =>
-    method === "GET"
-      ? { status: 200, body: buildRuleBody({ ...RULE, priority: 101 }) }
-      : { status: 200, body: buildRuleBody(RULE) }
-  );
+  let put = false;
+  const { fetch, calls } = armFetch((method) => {
+    if (method === "PUT") {
+      put = true;
+      return { status: 200, body: {} };
+    }
+    return {
+      status: 200,
+      body: put ? settled(RULE) : buildRuleBody({ ...RULE, priority: 101 }),
+    };
+  });
   const m = createModel(deps(fetch));
   const { context, written } = testContext();
   const result = await m.methods.ensure_rule.execute(RULE, context);
@@ -308,10 +327,10 @@ Deno.test("apply_rule_set plans first and only writes when apply is true", async
       return { status: 200, body: { value: existing } };
     }
     if (method === "GET") {
-      return {
-        status: 200,
-        body: { name: "rule", properties: { provisioningState: "Succeeded" } },
-      };
+      const rule: RuleInput = url.includes("/securityRules/allow-http")
+        ? builds[1]
+        : { ...RULE, priority: 101 };
+      return { status: 200, body: settled(rule) };
     }
     if (method === "PUT") return { status: 200, body: {} };
     return { status: 404, body: {} };
@@ -589,4 +608,151 @@ Deno.test("apply_rule_set refuses a priority held by an undeclared or swapped ru
     GrammarError,
   );
   assertEquals(swap.calls.filter((c) => c.method === "PUT").length, 0);
+});
+
+const LIVE_SINGULAR = {
+  name: "allow-ssh",
+  properties: {
+    priority: 100,
+    direction: "Inbound",
+    access: "Allow",
+    protocol: "Tcp",
+    sourceAddressPrefix: "192.0.2.0/24",
+    sourceAddressPrefixes: [],
+    destinationAddressPrefix: "*",
+    destinationAddressPrefixes: [],
+    sourcePortRange: "*",
+    sourcePortRanges: [],
+    destinationPortRange: "22",
+    destinationPortRanges: [],
+    provisioningState: "Succeeded",
+  },
+};
+
+Deno.test("ruleMatches and state handle the real ARM read-back shape", async () => {
+  const desired = { ...RULE, sourceAddressPrefixes: ["192.0.2.0/24"] };
+  assert(
+    ruleMatches(LIVE_SINGULAR, desired),
+    "singular plus empty plural matches",
+  );
+  assert(
+    ruleMatches(
+      {
+        name: "allow-ssh",
+        properties: {
+          ...LIVE_SINGULAR.properties,
+          sourceAddressPrefix: undefined,
+          sourceAddressPrefixes: ["192.0.2.0/24"],
+        },
+      },
+      desired,
+    ),
+    "non-empty plural matches",
+  );
+
+  const { fetch, calls } = armFetch(() => ({
+    status: 200,
+    body: LIVE_SINGULAR,
+  }));
+  const m = createModel(deps(fetch));
+  const { context, written } = testContext();
+  const result = await m.methods.ensure_rule.execute(desired, context);
+  assertEquals(
+    calls.some((c) => c.method === "PUT"),
+    false,
+    "no PUT when the live rule matches",
+  );
+  assertEquals((result.result as { changed: boolean }).changed, false);
+  assertEquals(written[0].data.sourceAddressPrefixes, ["192.0.2.0/24"]);
+  assertEquals(written[0].data.destinationPortRanges, ["22"]);
+});
+
+Deno.test("apply_rule_set lists a real ARM-shaped rule as unchanged", async () => {
+  const { fetch } = armFetch((method, url) =>
+    method === "GET" && url.includes("/securityRules?")
+      ? { status: 200, body: { value: [LIVE_SINGULAR] } }
+      : { status: 200, body: {} }
+  );
+  const m = createModel(deps(fetch));
+  const ctx = testContext();
+  const result = await m.methods.apply_rule_set.execute({
+    ...BASE,
+    rules: [{ ...RULE, sourceAddressPrefixes: ["192.0.2.0/24"] }],
+    apply: false,
+  }, ctx.context);
+  assertEquals((result.result as { update: string[] }).update, []);
+  assertEquals((result.result as { unchanged: string[] }).unchanged, [
+    "allow-ssh",
+  ]);
+});
+
+Deno.test("apply_rule_set refuses an invalid rule before any PUT", async () => {
+  const { fetch, calls } = armFetch((method, url) =>
+    method === "GET" && url.includes("/securityRules?")
+      ? { status: 200, body: { value: [] } }
+      : { status: 200, body: {} }
+  );
+  const m = createModel(deps(fetch));
+  const ctx = testContext();
+  await assertRejects(
+    () =>
+      m.methods.apply_rule_set.execute({
+        ...BASE,
+        rules: [
+          RULE,
+          {
+            ...RULE,
+            ruleName: "bad",
+            sourceAddressPrefixes: ["192.0.2.0/24", "Internet"],
+          },
+        ],
+        apply: true,
+      }, ctx.context),
+    GrammarError,
+  );
+  assertEquals(
+    calls.filter((c) => c.method === "PUT").length,
+    0,
+    "no PUT when a later rule is invalid",
+  );
+  assert(
+    (ctx.written[0].data as { collisions: string[] }).collisions.some((c) =>
+      c.includes("invalid rule bad")
+    ),
+    "the invalid rule must be recorded",
+  );
+});
+
+Deno.test("buildRuleBody rejects '*' in a multi-element port list", () => {
+  assertThrows(
+    () => buildRuleBody({ ...RULE, sourcePortRanges: ["*", "80"] }),
+    GrammarError,
+  );
+});
+
+Deno.test("ensure_rule fails when the rule reaches Failed", async () => {
+  let put = false;
+  const { fetch } = armFetch((method) => {
+    if (method === "PUT") {
+      put = true;
+      return { status: 200, body: {} };
+    }
+    return {
+      status: 200,
+      body: {
+        name: "allow-ssh",
+        properties: {
+          ...(buildRuleBody({ ...RULE, priority: 101 }).properties as object),
+          provisioningState: put ? "Failed" : "Succeeded",
+        },
+      },
+    };
+  });
+  const m = createModel(deps(fetch));
+  const { context } = testContext();
+  await assertRejects(
+    () => m.methods.ensure_rule.execute(RULE, context),
+    GrammarError,
+    "Failed",
+  );
 });

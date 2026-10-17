@@ -34,3 +34,14 @@ Not packaged. Notes for whoever maintains this extension.
   model and manifest descriptions no longer claim a `create` method, which does
   not exist. Shared `_lib/arm.ts` error parsing fixed as in
   `@randybias/azure-vm`.
+- 2026-10-17 review round 2: `apply_rule_set` now builds every desired body
+  before any PUT, so a grammar or plural-list violation is recorded in the plan
+  (as `invalid rule <name>: ...` in `collisions`) and refuses the whole set with
+  zero PUTs. `fieldList` prefers a non-empty plural array, else the singular
+  string, because a real ARM read returns both forms (a set singular beside an
+  empty plural array); `toRuleState` stores the normalized list via `fieldList`,
+  so a single-value rule is recorded as the value, not `[]`. `awaitRule` now
+  waits for `Succeeded` **and** a live match (and fails on `Failed`/`Canceled`),
+  and `portField` rejects `*` in a multi-element port list. Tests add the real
+  ARM read-back shape, the invalid-later-rule zero-PUT case, the `*`-in-plural
+  case, and a Failed settle.

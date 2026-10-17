@@ -396,17 +396,31 @@ function portField(
   singular: string,
 ): Record<string, unknown> {
   if (values.length === 1) return { [singular]: values[0] };
+  for (const value of values) {
+    if (value === "*") {
+      throw new GrammarError(
+        `${plural} may not contain '*' when more than one value is given`,
+      );
+    }
+  }
   return { [plural]: values };
 }
 
-/** Normalizes a singular or plural rule list to a string array. */
+/**
+ * Normalizes a singular or plural rule list to a string array. Azure returns
+ * both forms on a read: a set singular value beside an empty plural array, or
+ * the plural array beside a null singular. A non-empty plural wins, then the
+ * singular string.
+ */
 function fieldList(
   props: Record<string, unknown>,
   plural: string,
   singular: string,
 ): string[] | undefined {
   const pluralValue = props[plural];
-  if (Array.isArray(pluralValue)) return pluralValue.map(String);
+  if (Array.isArray(pluralValue) && pluralValue.length > 0) {
+    return pluralValue.map(String);
+  }
   const singularValue = props[singular];
   if (typeof singularValue === "string") return [singularValue];
   return undefined;
@@ -543,15 +557,15 @@ export function toRuleState(
   for (const field of ["direction", "access", "protocol", "description"]) {
     if (typeof props[field] === "string") state[field] = props[field];
   }
-  for (
-    const field of [
-      "sourceAddressPrefixes",
-      "destinationAddressPrefixes",
-      "sourcePortRanges",
-      "destinationPortRanges",
-    ]
-  ) {
-    if (Array.isArray(props[field])) state[field] = props[field];
+  const lists: [string, string][] = [
+    ["sourceAddressPrefixes", "sourceAddressPrefix"],
+    ["destinationAddressPrefixes", "destinationAddressPrefix"],
+    ["sourcePortRanges", "sourcePortRange"],
+    ["destinationPortRanges", "destinationPortRange"],
+  ];
+  for (const [plural, singular] of lists) {
+    const list = fieldList(props, plural, singular);
+    if (list !== undefined) state[plural] = list;
   }
   if (typeof props.provisioningState === "string") {
     state.provisioningState = props.provisioningState;
@@ -648,12 +662,16 @@ function nameOf(body: unknown): string {
   return "";
 }
 
-/** Waits until a rule write reaches Succeeded and returns the settled rule. */
+/**
+ * Waits until a rule write reaches Succeeded and the live rule matches the
+ * desired one. A GET right after an async PUT can still return the old rule,
+ * and a Failed or Canceled state ends the wait immediately.
+ */
 async function awaitRule(
   deps: ArmDeps,
   client: ArmClient,
   args: TargetArgs & { timeoutMs?: number; pollIntervalMs?: number },
-  ruleName: string,
+  desired: RuleArgs,
   label: string,
 ): Promise<ArmResult> {
   return await pollUntil(deps, {
@@ -661,10 +679,15 @@ async function awaitRule(
     intervalMs: args.pollIntervalMs ?? 5000,
     label,
   }, async () => {
-    const current = await readRule(client, args, ruleName);
+    const current = await readRule(client, args, desired.ruleName);
     if (current === null) return null;
     const state = properties(current.body).provisioningState;
-    return state === undefined || state === "Succeeded" ? current : null;
+    if (state === "Failed" || state === "Canceled") {
+      throw new GrammarError(`rule ${desired.ruleName} reached ${state}`);
+    }
+    return state === "Succeeded" && ruleMatches(current.body, desired)
+      ? current
+      : null;
   });
 }
 
@@ -855,7 +878,7 @@ export function createModel(deps: ArmDeps = denoArmDeps): NsgModel {
             deps,
             client,
             args,
-            args.ruleName,
+            args,
             `Rule ${args.ruleName} update`,
           );
           const handle = await writeRule(
@@ -964,18 +987,33 @@ export function createModel(deps: ArmDeps = denoArmDeps): NsgModel {
             } else plan.update.push(rule.ruleName);
           }
           plan.collisions = ruleSetCollisions(args.rules, existing);
+          // Build every desired body before any PUT, so a grammar or plural-list
+          // violation is recorded and refuses the whole set with zero writes.
+          const bodies = new Map<string, Record<string, unknown>>();
+          for (const rule of args.rules) {
+            try {
+              bodies.set(rule.ruleName, buildRuleBody(rule));
+            } catch (error) {
+              plan.collisions.push(
+                `invalid rule ${rule.ruleName}: ${
+                  error instanceof Error ? error.message : String(error)
+                }`,
+              );
+            }
+          }
+          plan.collisions = [...new Set(plan.collisions)].sort();
           if (args.apply && plan.collisions.length === 0) {
             for (const rule of args.rules) {
               if (plan.unchanged.includes(rule.ruleName)) continue;
               await client.put(
                 ruleUrl(args, rule.ruleName),
-                buildRuleBody(rule),
+                bodies.get(rule.ruleName) as Record<string, unknown>,
               );
               await awaitRule(
                 deps,
                 client,
                 args,
-                rule.ruleName,
+                rule,
                 `Rule ${rule.ruleName} update`,
               );
               plan.applied.push(rule.ruleName);

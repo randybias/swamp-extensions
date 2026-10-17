@@ -1,0 +1,88 @@
+{
+  "extension": "@randybias/zfs",
+  "version": "2026.10.17.1",
+  "reviewedAt": "2026-10-17T15:47:49Z",
+  "dimensions": [
+    {
+      "id": "credentials-secrets",
+      "verdict": "pass",
+      "note": "private_key and password are sensitive-marked arguments, passed as vault references, and reach the vendored canonical transport (_lib/ssh.ts blob fe0139f08c42e3fdae0061b9688fb5c534174957), which loads the key into a short-lived ssh-agent over stdin, never argv. No secret or content-derived hash appears on any argv or remote command text. Known external issue swamp-club lab 3555: the CLI prints literal sensitive arguments, so examples use vault references only."
+    },
+    {
+      "id": "logging-quality",
+      "verdict": "pass",
+      "note": "Methods log once per outcome with structured placeholders (host, pool or dataset name, change counts); refusal reasons are sanitized; no key or remote stderr dump in log fields."
+    },
+    {
+      "id": "error-handling",
+      "verdict": "pass",
+      "note": "Every OpenSSH exit 255 is a typed SshError from the canonical transport. zfs/zpool failures are typed with a sanitized cause; documented benign outcomes (already exists, absent on destroy) are no-ops. The system-pool guard fails closed on every probe failure (zfs list, readlink, findmnt, lsblk, /proc/swaps), and on an unknown swap type. Live bug on bc7ec1d (a stock Ubuntu swap file made lsblk fail and refused every destroy_pool/export_pool) fixed in dfc3124: a swap file is judged through findmnt -T on its backing filesystem; verified live with swap on."
+    },
+    {
+      "id": "testing-completeness",
+      "verdict": "pass",
+      "note": "157 tests with injected ssh fakes using real tool output shapes (/dev/zd0, /dev/zd0p1, findmnt JSON with bind suffixes, /proc/swaps file and partition rows, lsblk -s ancestry). The shared boot-disk guard (_lib/protected_devices.ts blob 62743884da58660bac32df914fd6577f269280e5) carries its own suite. Live end to end on bare metal (Ubuntu 24.04, OpenZFS 2.2.2, md-root): 11/11 on dfc3124 with the stock swap file on, including the system-pool refusals (dataset at /boot/efi, bootfs set) for destroy_pool and export_pool; 17 pass on bc7ec1d (guard refusals for whole disk, BIOS-boot, root md member, md0 and mixed sets; injection; create and lifecycle), with the swap-file failure and 4 invalid setup cells redone on dfc3124; the first run passed 59 of 61 cells across datasets, zvols, snapshots, clones, rollback, get/sync, destroy, injection and transport refusals, and its two failures (shared-guard mdadm argv, no pool destroy/export) were fixed."
+    },
+    {
+      "id": "idempotency-resilience",
+      "verdict": "pass",
+      "note": "create_pool with the same vdevs (by-id or kernel names) is a no-op and a differing set is refused; create_dataset applies only property changes; create_zvol compares volsize in bytes; snapshot and clone re-runs are no-ops; destroy, destroy_pool and export of an absent object are clean no-ops (all live)."
+    },
+    {
+      "id": "api-contracts",
+      "verdict": "pass",
+      "note": "Built on zpool/zfs over SSH as the connecting user. The system-pool guard resolves each pool zvol to its canonical /dev/zdN (strict readlink), reads findmnt JSON (bind [..] suffix stripped), walks lsblk -s ancestry for dm/LVM/dm-crypt stacked on a zvol, and judges swap partitions and swap files separately, so mount(8) and kernel shapes match what the tools really report (live-verified)."
+    },
+    {
+      "id": "resource-management",
+      "verdict": "pass",
+      "note": "One state resource per pool or dataset; remote output is capped by the transport. Residual: the system-pool guard costs one ssh round trip per pool zvol (readlink)."
+    },
+    {
+      "id": "published-surface-hygiene",
+      "verdict": "pass",
+      "note": "Manifest: @randybias/zfs 2026.10.17.1 (model type and version literals repeated on a plain-object export, checked with satisfies), Apache-2.0, additionalFiles README.md and LICENSE.txt. Every mutating method is kind action; destroy, destroy_pool, export_pool and rollback descriptions lead with DESTRUCTIVE. Fixtures use RFC 5737 addresses and obviously synthetic by-id names; the LOGBOOK redacts the live target. Leak scan, gitleaks and fixture guard pass."
+    },
+    {
+      "id": "schema-strictness",
+      "verdict": "pass",
+      "note": "All arguments and resources are strictObject. Pool, dataset, snapshot and vdev arguments have anchored grammars (no leading '-', no shell metacharacters; by-id colons allowed); property names are allowlisted and values match an anchored grammar (injection refused live on every remote-bound input). host_key_policy accepts only strict with a non-empty host_keys list (insecure_tofu not offered, as no key is persisted). Residual MEDIUM (astra): zvol names read back from zfs list are passed as an argv element to readlink without re-validation; the transport quotes argv and a non-/dev/zdN result refuses."
+    },
+    {
+      "id": "lifetime-gc",
+      "verdict": "pass",
+      "note": "state: lifetime infinite, garbageCollection 10."
+    },
+    {
+      "id": "crud-completeness",
+      "verdict": "pass",
+      "note": "create_pool, destroy_pool, export_pool, create_dataset, create_zvol, snapshot, clone, rollback, destroy, get and sync. Residual: no pool import method and no mountpoint property on create_dataset (live used plain zpool import / zfs set for those setups)."
+    },
+    {
+      "id": "preflight-checks",
+      "verdict": "pass",
+      "note": "create_pool runs the shared boot-disk guard on every candidate (whole disk, partitions, md members, BIOS-boot and EFI, unknown devices) before zpool create (live). destroy_pool and export_pool refuse, before any change and regardless of recursive or force, a pool with bootfs set, a system mount (/, /boot, /boot/efi, /usr, /var, /var/lib, /var/log) sourced from its dataset, zvol or a device stacked on one, or swap backed by it (live for the mount and bootfs cells). destroy_pool without recursive refuses a pool with children. Residuals: only exact system mount paths are protected (/var/lib/docker and similar are documented); a pool zvol with no /dev/zvol link (volmode=none) makes the guard refuse."
+    },
+    {
+      "id": "instance-names",
+      "verdict": "pass",
+      "note": "<host>-<port>-<user>-<pool or dataset> with unsafe characters encoded, plus a short hash of the raw key; one record per target and object."
+    },
+    {
+      "id": "data-access",
+      "verdict": "pass",
+      "note": "Methods read only live host state and this model's own record for the target; every host and operand arrives as method arguments, so one definition manages any host."
+    },
+    {
+      "id": "version-upgrades",
+      "verdict": "pass",
+      "note": "First release; no earlier data to upgrade."
+    }
+  ],
+  "panel": {
+    "codex-astra": "codex gpt-6-astra conformance seat, rounds r1-r3 on lane/d4-zfs (716864b, 3ea4866 routed; dbc1244 CLEAN). r3: 0 Critical/High; Mediums: unvalidated zvol name into readlink (carried), lax readlink acceptance (fixed in bc7ec1d: exactly /dev/zdN), and a Low duplicate scan.",
+    "codex-terra": "codex gpt-5.6-terra adversarial seat, same rounds. r3 raised dm/LVM/dm-crypt layered on a zvol (dispositioned Medium under RULINGS, fixed in bc7ec1d with an lsblk -s ancestry walk) and the exact-path system-mount limit (Medium, carried and documented). No credential exposure or injection found.",
+    "merge-prep": "Merged as e66cfc6 from lane/d4-zfs dfc3124; release.yaml conflict resolved by keeping main and adding the zfs beta stanza. Triage on dbc1244 CLEAN; bc7ec1d polish (Mediums) and the dfc3124 swap-file fix self-reviewed against triage 4b-4h: no vault/context use change, no parser differential (findmnt output only read), no workflows, no killable remote command, strict host keys only, no content hash on argv; unknown swap types and failed probes fail closed; no Critical/High. Gate 7 flagged uncatalogued-model; fixed at merge prep with a plain-object model export (9543542, no behaviour change).",
+    "ocr-llm": "OCR sonnet5 and glm seats were not run"
+  }
+}

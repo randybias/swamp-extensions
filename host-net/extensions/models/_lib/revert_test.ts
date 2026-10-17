@@ -146,7 +146,10 @@ Deno.test("the arm script records the path actually used and refuses if it does 
     contentSha256: "b".repeat(64),
     operation: "apply",
   });
-  assertEquals(script.includes('ip -j route get "$peer"'), true);
+  assertEquals(
+    script.includes('ip -j route get "$peer" from "$local_ip"'),
+    true,
+  );
   assertEquals(script.includes("exit 77"), true);
   assertEquals(script.includes("linkdown"), true);
   assertEquals(script.includes("prefixlen"), true);

@@ -104,8 +104,10 @@ function ownedList(ctx: RevertContext): string {
 function recordPathScript(): string {
   return String.raw`ssh_conn="$(printenv SSH_CONNECTION || true)"
 peer="$(printf '%s' "$ssh_conn" | cut -d' ' -f1)"
-case "$peer" in ""|*[!0-9A-Fa-f:.]*) echo 'host-net: cannot determine the management peer' >&2; exit 77 ;; esac
-rg="$(ip -j route get "$peer" 2>/dev/null | tr -d ' ' || true)"
+local_ip="$(printf '%s' "$ssh_conn" | cut -d' ' -f3)"
+case "$peer$local_ip" in ""|*[!0-9A-Fa-f:.]*) echo 'host-net: cannot determine the management peer' >&2; exit 77 ;; esac
+[ -n "$peer" ] && [ -n "$local_ip" ] || { echo 'host-net: cannot determine the management peer' >&2; exit 77; }
+rg="$(ip -j route get "$peer" from "$local_ip" 2>/dev/null | tr -d ' ' || true)"
 pick() { printf '%s' "$rg" | sed -n "s/.*\"$1\":\"\([^\"]*\)\".*/\1/p" | head -n 1; }
 pdev="$(pick dev)"; pgw="$(pick gateway)"; psrc="$(pick prefsrc)"
 ppl="$(ip -j addr show dev "$pdev" 2>/dev/null | tr -d ' ' | sed -n "s/.*\"local\":\"$psrc\",\"prefixlen\":\([0-9]*\).*/\1/p" | head -n 1)"
@@ -114,7 +116,7 @@ case "$pgw$psrc" in *[!0-9A-Fa-f:.]*) pdev= ;; esac
 case "$ppl" in ""|*[!0-9]*) pdev= ;; esac
 [ -n "$pdev" ] && [ -n "$psrc" ] || { echo 'host-net: cannot record the management path' >&2; rm -rf "$DIR"; exit 77; }
 {
-  printf "PEER='%s'\nDEV='%s'\nGW='%s'\nSRC='%s'\nPL='%s'\n" "$peer" "$pdev" "$pgw" "$psrc" "$ppl"
+  printf "PEER='%s'\nLOCAL='%s'\nDEV='%s'\nGW='%s'\nSRC='%s'\nPL='%s'\n" "$peer" "$local_ip" "$pdev" "$pgw" "$psrc" "$ppl"
   cat <<'HOST_NET_CHECKS'
 ` + POST_CHECKS_BODY + String.raw`
 HOST_NET_CHECKS
@@ -130,7 +132,7 @@ HOST_NET_CHECKS
  * the route is not marked dead or linkdown.
  */
 const POST_CHECKS_BODY = String.raw`CHECK=fail
-now="$(ip -j route get "$PEER" 2>/dev/null | tr -d ' ' || true)"
+now="$(ip -j route get "$PEER" from "$LOCAL" 2>/dev/null | tr -d ' ' || true)"
 pick() { printf '%s' "$now" | sed -n "s/.*\"$1\":\"\([^\"]*\)\".*/\1/p" | head -n 1; }
 case "$now" in ""|*'"linkdown"'*|*'"dead"'*) ;; *)
   if [ "$(pick dev)" = "$DEV" ] && [ "$(pick gateway)" = "$GW" ] && [ "$(pick prefsrc)" = "$SRC" ]; then

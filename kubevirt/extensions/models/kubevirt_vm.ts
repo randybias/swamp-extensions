@@ -44,7 +44,20 @@ import {
 // deno-lint-ignore no-explicit-any
 type Ctx = any;
 
-const HTTP_URL_RE = /^https?:\/\/[^\s?#]+$/;
+/**
+ * True for an http(s) URL with no userinfo. A credential embedded in the URL
+ * would otherwise land in the VM spec, in the rendered YAML and in state.
+ */
+export function isHttpUrl(u: string): boolean {
+  if (!/^https?:\/\//.test(u)) return false;
+  try {
+    const x = new URL(u);
+    return (x.protocol === "http:" || x.protocol === "https:") &&
+      x.username === "" && x.password === "";
+  } catch {
+    return false;
+  }
+}
 
 const ContainerDisk = z.strictObject({
   image: z.string().max(1024).refine(
@@ -56,7 +69,10 @@ const ContainerDisk = z.strictObject({
 const DataVolumeSource = z.union([
   z.strictObject({
     http: z.strictObject({
-      url: z.string().max(2048).regex(HTTP_URL_RE, "not an http(s) URL"),
+      url: z.string().max(2048).refine(
+        isHttpUrl,
+        "must be an http(s) URL with no userinfo",
+      ),
     }),
   }),
   z.strictObject({
@@ -168,6 +184,13 @@ const StopArgs = z.strictObject({
   grace_s: timeoutField(120),
 });
 
+const RestartArgs = z.strictObject({
+  ...TargetShape,
+  namespace: VmFields.namespace,
+  name: VmFields.name,
+  timeout_s: timeoutField(120),
+});
+
 const WaitReadyArgs = z.strictObject({
   ...TargetShape,
   namespace: VmFields.namespace,
@@ -261,46 +284,21 @@ interface DvJson {
   status?: { phase?: string; progress?: string; conditions?: Condition[] };
 }
 
-async function readVm(
-  kubectl: Kubectl,
-  namespace: string,
-  name: string,
-): Promise<VmJson | null> {
-  return await kubectlJson<VmJson>(kubectl, [
-    "get",
-    "vm",
-    name,
-    "-n",
-    namespace,
-  ]);
+// The namespace is set on the withCluster target, which appends
+// `--namespace <ns>` to every argv; per-call `-n` would be overridden.
+async function readVm(kubectl: Kubectl, name: string): Promise<VmJson | null> {
+  return await kubectlJson<VmJson>(kubectl, ["get", "vm", name]);
 }
 
 async function readVmi(
   kubectl: Kubectl,
-  namespace: string,
   name: string,
 ): Promise<VmiJson | null> {
-  return await kubectlJson<VmiJson>(kubectl, [
-    "get",
-    "vmi",
-    name,
-    "-n",
-    namespace,
-  ]);
+  return await kubectlJson<VmiJson>(kubectl, ["get", "vmi", name]);
 }
 
-async function readDv(
-  kubectl: Kubectl,
-  namespace: string,
-  name: string,
-): Promise<DvJson | null> {
-  return await kubectlJson<DvJson>(kubectl, [
-    "get",
-    "datavolume",
-    name,
-    "-n",
-    namespace,
-  ]);
+async function readDv(kubectl: Kubectl, name: string): Promise<DvJson | null> {
+  return await kubectlJson<DvJson>(kubectl, ["get", "datavolume", name]);
 }
 
 /** The DataVolume name owned by a VM, or undefined when the VM has none. */
@@ -310,7 +308,6 @@ function dvName(vm: VmJson | null): string | undefined {
 
 function patchRunStrategy(
   kubectl: Kubectl,
-  namespace: string,
   name: string,
   value: string,
 ) {
@@ -320,8 +317,6 @@ function patchRunStrategy(
       "patch",
       "vm",
       name,
-      "-n",
-      namespace,
       "--type=merge",
       "-p",
       JSON.stringify({ spec: { runStrategy: value } }),
@@ -485,7 +480,7 @@ export const model = {
     define: {
       kind: "action" as const,
       description:
-        "Idempotent. Create or update the VirtualMachine by server-side apply, always writing spec.runStrategy and never spec.running. Refuses an existing VM that uses the deprecated spec.running. Returns the uid, generation and spec digest.",
+        "Idempotent. Create or update the VirtualMachine by server-side apply, always writing spec.runStrategy and never spec.running. Refuses an existing VM that uses the deprecated spec.running, and a DataVolume source when CDI is not installed. Returns the uid, generation and spec digest.",
       arguments: DefineArgs,
       execute: async (args: z.input<typeof DefineArgs>, context: Ctx) => {
         const a = DefineArgs.parse(args);
@@ -499,13 +494,27 @@ export const model = {
           d,
           a.kubeconfig,
           a.context,
+          a.namespace,
           async (kubectl) => {
-            const before = await readVm(kubectl, a.namespace, a.name);
+            const before = await readVm(kubectl, a.name);
             if (before?.spec?.running !== undefined) {
               throw new KubevirtError(
                 "running_field",
                 "the existing VirtualMachine uses the deprecated spec.running; migrate it to spec.runStrategy first",
               );
+            }
+            if (a.data_volume) {
+              const crd = await kubectlJson<unknown>(kubectl, [
+                "get",
+                "crd",
+                "datavolumes.cdi.kubevirt.io",
+              ]);
+              if (!crd) {
+                throw new KubevirtError(
+                  "crd_missing",
+                  "CDI is not installed: the datavolumes.cdi.kubevirt.io resource type is absent",
+                );
+              }
             }
             await kubectlText(
               kubectl,
@@ -519,11 +528,9 @@ export const model = {
               ],
               yaml,
             );
-            const vm = await readVm(kubectl, a.namespace, a.name);
-            const vmi = await readVmi(kubectl, a.namespace, a.name);
-            const dv = dvName(vm)
-              ? await readDv(kubectl, a.namespace, dvName(vm)!)
-              : null;
+            const vm = await readVm(kubectl, a.name);
+            const vmi = await readVmi(kubectl, a.name);
+            const dv = dvName(vm) ? await readDv(kubectl, dvName(vm)!) : null;
             context.logger.info("VirtualMachine {name} defined", {
               name: a.name,
             });
@@ -560,8 +567,9 @@ export const model = {
           d,
           a.kubeconfig,
           a.context,
+          a.namespace,
           async (kubectl) => {
-            const vm = await readVm(kubectl, a.namespace, a.name);
+            const vm = await readVm(kubectl, a.name);
             if (!vm) {
               throw new KubevirtError(
                 "not_found",
@@ -569,21 +577,21 @@ export const model = {
               );
             }
             if (vm.spec?.runStrategy !== "Always") {
-              await patchRunStrategy(kubectl, a.namespace, a.name, "Always");
+              await patchRunStrategy(kubectl, a.name, "Always");
             }
             if (a.wait) {
               await pollUntil(
                 d,
                 a.timeout_s * 1000,
                 POLL_INTERVAL_MS,
-                async () => await readVm(kubectl, a.namespace, a.name),
+                async () => await readVm(kubectl, a.name),
                 (v) => v?.status?.printableStatus === "Running",
               );
             }
-            const after = await readVm(kubectl, a.namespace, a.name);
-            const vmi = await readVmi(kubectl, a.namespace, a.name);
+            const after = await readVm(kubectl, a.name);
+            const vmi = await readVmi(kubectl, a.name);
             const dv = dvName(after)
-              ? await readDv(kubectl, a.namespace, dvName(after)!)
+              ? await readDv(kubectl, dvName(after)!)
               : null;
             return vmStateOf(a, fp, after, vmi, dv, "present", d.now());
           },
@@ -609,26 +617,27 @@ export const model = {
           d,
           a.kubeconfig,
           a.context,
+          a.namespace,
           async (kubectl) => {
-            const vm = await readVm(kubectl, a.namespace, a.name);
+            const vm = await readVm(kubectl, a.name);
             if (!vm) {
               throw new KubevirtError(
                 "not_found",
                 `VirtualMachine ${a.namespace}/${a.name} not found`,
               );
             }
-            await patchRunStrategy(kubectl, a.namespace, a.name, "Halted");
+            await patchRunStrategy(kubectl, a.name, "Halted");
             await pollUntil(
               d,
               a.grace_s * 1000,
               POLL_INTERVAL_MS,
-              async () => await readVmi(kubectl, a.namespace, a.name),
+              async () => await readVmi(kubectl, a.name),
               (v) => v === null,
             );
-            const after = await readVm(kubectl, a.namespace, a.name);
-            const vmi = await readVmi(kubectl, a.namespace, a.name);
+            const after = await readVm(kubectl, a.name);
+            const vmi = await readVmi(kubectl, a.name);
             const dv = dvName(after)
-              ? await readDv(kubectl, a.namespace, dvName(after)!)
+              ? await readDv(kubectl, dvName(after)!)
               : null;
             return vmStateOf(a, fp, after, vmi, dv, "present", d.now());
           },
@@ -644,17 +653,18 @@ export const model = {
     restart: {
       kind: "action" as const,
       description:
-        "Call the public restart subresource with an empty body. Refuses a Halted VM. Returns the VMI uid before and after.",
-      arguments: TargetedArgs,
-      execute: async (args: z.infer<typeof TargetedArgs>, context: Ctx) => {
-        const a = TargetedArgs.parse(args);
+        "Call the public restart subresource with an empty body, then wait until the VMI has a new uid and is Running. Refuses a Halted VM. Returns the VMI uid before and after.",
+      arguments: RestartArgs,
+      execute: async (args: z.input<typeof RestartArgs>, context: Ctx) => {
+        const a = RestartArgs.parse(args);
         const d = currentDeps();
         const outcome = await withCluster(
           d,
           a.kubeconfig,
           a.context,
+          a.namespace,
           async (kubectl) => {
-            const vm = await readVm(kubectl, a.namespace, a.name);
+            const vm = await readVm(kubectl, a.name);
             if (!vm) {
               throw new KubevirtError(
                 "not_found",
@@ -667,7 +677,7 @@ export const model = {
                 "cannot restart a Halted VirtualMachine; start it first",
               );
             }
-            const before = await readVmi(kubectl, a.namespace, a.name);
+            const before = await readVmi(kubectl, a.name);
             await kubectlText(
               kubectl,
               [
@@ -679,7 +689,15 @@ export const model = {
               ],
               "",
             );
-            const after = await readVmi(kubectl, a.namespace, a.name);
+            const after = await pollUntil<VmiJson | null>(
+              d,
+              a.timeout_s * 1000,
+              POLL_INTERVAL_MS,
+              async () => await readVmi(kubectl, a.name),
+              (v) =>
+                v !== null && v.metadata?.uid !== before?.metadata?.uid &&
+                v.status?.phase === "Running",
+            );
             return {
               vmi_uid_before: before?.metadata?.uid,
               vmi_uid_after: after?.metadata?.uid,
@@ -706,18 +724,17 @@ export const model = {
           d,
           a.kubeconfig,
           a.context,
+          a.namespace,
           async (kubectl) => {
             return await pollUntil(
               d,
               a.timeout_s * 1000,
               POLL_INTERVAL_MS,
               async () => {
-                const vm = await readVm(kubectl, a.namespace, a.name);
-                const vmi = await readVmi(kubectl, a.namespace, a.name);
+                const vm = await readVm(kubectl, a.name);
+                const vmi = await readVmi(kubectl, a.name);
                 const name = dvName(vm);
-                const dv = name
-                  ? await readDv(kubectl, a.namespace, name)
-                  : null;
+                const dv = name ? await readDv(kubectl, name) : null;
                 const ready = vm?.status?.printableStatus === "Running" &&
                   vmiBoolean(vmi, "Ready") &&
                   (!a.require_agent || vmiBoolean(vmi, "AgentConnected")) &&
@@ -768,17 +785,18 @@ export const model = {
           d,
           a.kubeconfig,
           a.context,
+          a.namespace,
           async (kubectl) => {
-            const vm = await readVm(kubectl, a.namespace, a.name);
+            const vm = await readVm(kubectl, a.name);
             if (!vm) {
               throw new KubevirtError(
                 "not_found",
                 `VirtualMachine ${a.namespace}/${a.name} not found`,
               );
             }
-            const vmi = await readVmi(kubectl, a.namespace, a.name);
+            const vmi = await readVmi(kubectl, a.name);
             const name = dvName(vm);
-            const dv = name ? await readDv(kubectl, a.namespace, name) : null;
+            const dv = name ? await readDv(kubectl, name) : null;
             return vmStateOf(a, fp, vm, vmi, dv, "present", d.now());
           },
         );
@@ -799,22 +817,15 @@ export const model = {
           d,
           a.kubeconfig,
           a.context,
+          a.namespace,
           async (kubectl) => {
-            const vm = await readVm(kubectl, a.namespace, a.name);
+            const vm = await readVm(kubectl, a.name);
             if (!vm) {
-              return vmStateOf(
-                a,
-                fp,
-                null,
-                null,
-                null,
-                "not_found",
-                d.now(),
-              );
+              return vmStateOf(a, fp, null, null, null, "not_found", d.now());
             }
-            const vmi = await readVmi(kubectl, a.namespace, a.name);
+            const vmi = await readVmi(kubectl, a.name);
             const name = dvName(vm);
-            const dv = name ? await readDv(kubectl, a.namespace, name) : null;
+            const dv = name ? await readDv(kubectl, name) : null;
             return vmStateOf(a, fp, vm, vmi, dv, "present", d.now());
           },
         );
@@ -840,8 +851,9 @@ export const model = {
           d,
           a.kubeconfig,
           a.context,
+          a.namespace,
           async (kubectl) => {
-            const vm = await readVm(kubectl, a.namespace, a.name);
+            const vm = await readVm(kubectl, a.name);
             if (!vm) return "not_found" as const;
             if (dvName(vm) && a.confirm !== a.name) {
               throw new KubevirtError(
@@ -853,8 +865,6 @@ export const model = {
               "delete",
               "vm",
               a.name,
-              "-n",
-              a.namespace,
               "--ignore-not-found",
               "--wait=true",
             ]);

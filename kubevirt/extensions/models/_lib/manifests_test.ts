@@ -3,6 +3,7 @@ import { parse } from "npm:yaml@2.9.1";
 import {
   CDI_CR_NAME,
   KUBEVIRT_CR_NAME,
+  renderCdiCr,
   renderKubeVirtCr,
   renderVm,
   stableJson,
@@ -180,6 +181,13 @@ Deno.test("stableJson sorts keys at every depth and vmSpecSha256 is order indepe
   assert(a !== changed);
 });
 
-Deno.test("the CDI custom resource name constant is the upstream default", () => {
-  assertEquals(CDI_CR_NAME, "cdi");
+Deno.test("the CDI custom resource is a minimal deterministic document", () => {
+  const cr = renderCdiCr();
+  assertEquals(cr, renderCdiCr());
+  const doc = parse(cr) as Record<string, unknown>;
+  assertEquals(doc.apiVersion, "cdi.kubevirt.io/v1beta1");
+  assertEquals(doc.kind, "CDI");
+  assertEquals((doc.metadata as { name: string }).name, CDI_CR_NAME);
+  assertEquals((doc.metadata as { namespace: string }).namespace, "cdi");
+  assertEquals(doc.spec, {});
 });

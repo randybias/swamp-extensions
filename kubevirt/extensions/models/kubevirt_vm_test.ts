@@ -1,6 +1,6 @@
 import { assert, assertEquals, assertRejects } from "jsr:@std/assert@1.0.19";
 import { createModelTestContext } from "jsr:@swamp-club/swamp-testing@0.20261014.55";
-import { model } from "./kubevirt_vm.ts";
+import { isHttpUrl, model } from "./kubevirt_vm.ts";
 import { type KubectlResult, KubevirtError, setDeps } from "./_lib/k8s.ts";
 
 const KC = `apiVersion: v1
@@ -144,6 +144,16 @@ function harness(route: (c: Call) => Partial<KubectlResult>) {
 
 const verb = (c: Call) => c.args[0];
 const sub = (c: Call) => c.args[1] ?? "";
+const nsOf = (c: Call): string | undefined => {
+  const i = c.args.indexOf("--namespace");
+  return i >= 0 ? c.args[i + 1] : undefined;
+};
+
+/** A present CDI DataVolume CRD, so a DataVolume define can proceed. */
+const CRD = JSON.stringify({
+  kind: "CustomResourceDefinition",
+  metadata: { name: "datavolumes.cdi.kubevirt.io" },
+});
 const argv = (h: { calls: Call[] }) =>
   h.calls.map((c) => c.args.join(" ")).join("\n");
 
@@ -164,6 +174,7 @@ const readRoute =
     if (verb(c) === "get" && sub(c) === "datavolume") {
       return { stdout: dv ?? "" };
     }
+    if (verb(c) === "get" && sub(c) === "crd") return { stdout: CRD };
     return {};
   };
 
@@ -192,6 +203,19 @@ Deno.test("schema: exactly one source, digest-pinned image, bounded memory", () 
     memory: "2G",
   });
   assertEquals(mem.success, false);
+  // A URL credential would land in the VM spec and in state.
+  const userinfo = model.methods.define.arguments.safeParse({
+    ...CONTAINER,
+    container_disk: undefined,
+    data_volume: {
+      source: { http: { url: "https://user:pass@images.test/d.img" } },
+      size: "1Gi",
+    },
+  });
+  assertEquals(userinfo.success, false);
+  assertEquals(isHttpUrl("https://images.test/d.img"), true);
+  assertEquals(isHttpUrl("http://user:pass@images.test/d.img"), false);
+  assertEquals(isHttpUrl("ftp://images.test/d.img"), false);
   const ok = model.methods.define.arguments.parse(CONTAINER) as {
     run_strategy: string;
     cpu_cores: number;
@@ -283,6 +307,35 @@ Deno.test("define with a DataVolume records the DataVolume name", async () => {
     }, ctx.context) as { result: { uid: string } };
     assertEquals(out.result.uid, "u-1");
     assert(h.calls.some((c) => verb(c) === "get" && sub(c) === "datavolume"));
+    // Every call is scoped to the VM's namespace.
+    assertEquals(nsOf(h.calls[0]), "app");
+  } finally {
+    h.restore();
+  }
+});
+
+Deno.test("define refuses a DataVolume source when CDI is not installed", async () => {
+  const h = harness((c) => {
+    if (verb(c) === "get" && sub(c) === "crd") return { stdout: "" };
+    if (verb(c) === "get" && sub(c) === "vm") return { stdout: "" };
+    return {};
+  });
+  try {
+    const ctx = testCtx();
+    const e = await assertRejects(
+      () =>
+        model.methods.define.execute({
+          ...CONTAINER,
+          container_disk: undefined,
+          data_volume: {
+            source: { http: { url: "https://images.example.com/d.img" } },
+            size: "20Gi",
+          },
+        }, ctx.context),
+      KubevirtError,
+    );
+    assertEquals((e as KubevirtError).code, "crd_missing");
+    assertEquals(h.calls.some((c) => verb(c) === "apply"), false);
   } finally {
     h.restore();
   }

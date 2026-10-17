@@ -46,6 +46,7 @@ import {
   KUBEVIRT_NAMESPACE,
   KUBEVIRT_OPERATOR_ASSET,
   KUBEVIRT_REPO,
+  renderCdiCr,
   renderKubeVirtCr,
   UNINSTALL_STRATEGIES,
   WORKLOAD_UPDATE_METHODS,
@@ -213,6 +214,9 @@ const OperatorStateSchema = z.strictObject({
   schedulable_nodes: z.array(z.string()).default([]),
   kvm_nodes: z.array(z.string()).default([]),
   outdated_vmis: z.number().int().default(0),
+  installed_by_model: z.boolean().optional(),
+  cdi_installed_by_model: z.boolean().optional(),
+  cdi_operator_sha256: z.string().optional(),
   status: z.enum(["present", "not_found"]),
   observed_at: z.string(),
 });
@@ -250,6 +254,7 @@ interface CdiCr {
 
 interface Node {
   metadata?: { name?: string; labels?: Record<string, string> };
+  status?: { allocatable?: Record<string, string> };
 }
 
 interface NodeFacts {
@@ -267,19 +272,18 @@ async function readCr(kubectl: Kubectl): Promise<KubeVirtCr | null> {
     "get",
     "kubevirt",
     KUBEVIRT_CR_NAME,
-    "-n",
-    KUBEVIRT_NAMESPACE,
   ]);
 }
 
 async function readCdi(kubectl: Kubectl): Promise<CdiCr | null> {
-  return await kubectlJson<CdiCr>(kubectl, [
-    "get",
-    "cdi",
-    CDI_CR_NAME,
-    "-n",
-    CDI_NAMESPACE,
-  ]);
+  return await kubectlJson<CdiCr>(kubectl, ["get", "cdi", CDI_CR_NAME]);
+}
+
+/** True for a node whose allocatable KVM device count is greater than zero. */
+function nodeHasKvm(n: Node): boolean {
+  const raw = n.status?.allocatable?.["devices.kubevirt.io/kvm"] ?? "0";
+  const count = Number.parseInt(raw, 10);
+  return Number.isFinite(count) && count > 0;
 }
 
 async function readNodes(kubectl: Kubectl): Promise<NodeFacts> {
@@ -296,8 +300,30 @@ async function readNodes(kubectl: Kubectl): Promise<NodeFacts> {
     schedulable: names((n) =>
       n.metadata?.labels?.["kubevirt.io/schedulable"] === "true"
     ),
-    kvm: names((n) => n.metadata?.labels?.["kubevirt.io/kvm"] === "true"),
+    // KubeVirt advertises KVM as the node resource devices.kubevirt.io/kvm,
+    // not as a label.
+    kvm: names(nodeHasKvm),
   };
+}
+
+/**
+ * True when any object from the operator manifest still exists: the `kubevirt`
+ * namespace or the `kubevirts.kubevirt.io` CRD. Used so an uninstall whose
+ * custom resource is already gone still deletes the rest.
+ */
+async function operatorObjectsRemain(kubectl: Kubectl): Promise<boolean> {
+  const ns = await kubectlJson<unknown>(kubectl, [
+    "get",
+    "namespace",
+    KUBEVIRT_NAMESPACE,
+  ]);
+  if (ns) return true;
+  const crd = await kubectlJson<unknown>(kubectl, [
+    "get",
+    "crd",
+    "kubevirts.kubevirt.io",
+  ]);
+  return crd !== null;
 }
 
 function cdiReady(cdi: CdiCr | null): boolean {
@@ -367,6 +393,8 @@ interface StateExtra {
   operator_sha256?: string;
   cr_sha256?: string;
   cdi_version?: string;
+  cdi_operator_sha256?: string;
+  cdi_installed_by_model?: boolean;
   use_emulation?: boolean;
   feature_gates?: string[];
 }
@@ -390,6 +418,9 @@ function stateOf(
     ...(cdiVersion ? { cdi_version: cdiVersion } : {}),
     ...(operatorSha ? { operator_sha256: operatorSha } : {}),
     ...(extra.cr_sha256 ? { cr_sha256: extra.cr_sha256 } : {}),
+    ...(extra.cdi_operator_sha256
+      ? { cdi_operator_sha256: extra.cdi_operator_sha256 }
+      : {}),
     ...(cr?.status?.phase ? { phase: cr.status.phase } : {}),
     conditions: cr?.status?.conditions ?? [],
     ...(extra.use_emulation !== undefined
@@ -399,6 +430,9 @@ function stateOf(
     schedulable_nodes: nodes.schedulable,
     kvm_nodes: nodes.kvm,
     outdated_vmis: cr?.status?.outdatedVirtualMachineInstanceWorkloads ?? 0,
+    ...(extra.cdi_installed_by_model !== undefined
+      ? { cdi_installed_by_model: extra.cdi_installed_by_model }
+      : {}),
     status,
     observed_at: now.toISOString(),
   });
@@ -416,6 +450,7 @@ function summary(s: OperatorState) {
     schedulable_nodes: s.schedulable_nodes,
     kvm_nodes: s.kvm_nodes,
     outdated_vmis: s.outdated_vmis,
+    cdi_installed_by_model: s.cdi_installed_by_model,
   };
 }
 
@@ -430,6 +465,16 @@ async function persist(
     await operatorStateKey(a.kubeconfig, a.context),
     state,
   );
+}
+
+/** Reads the stored installation record, or null when there is none. */
+async function readPrior(
+  context: Ctx,
+  a: { kubeconfig: string; context?: string },
+): Promise<OperatorState | null> {
+  return await context.readResource(
+    await operatorStateKey(a.kubeconfig, a.context),
+  ) as OperatorState | null;
 }
 
 /** Model definition for the KubeVirt operator install. */
@@ -473,17 +518,18 @@ export const model = {
     install: {
       kind: "action" as const,
       description:
-        "Idempotent. Verify the pinned operator manifest, server-side apply it and the KubeVirt custom resource, and optionally CDI. Adopts an install at the same version and refuses a different one with a pointer to upgrade. Returns the versions and manifest digests.",
+        "Idempotent. Verify the pinned operator manifest, server-side apply it and the KubeVirt custom resource, and optionally CDI (operator manifest and custom resource). Adopts an install at the same version and refuses a different one with a pointer to upgrade. Returns the versions and manifest digests.",
       arguments: InstallArgs,
       execute: async (args: z.input<typeof InstallArgs>, context: Ctx) => {
         const a = InstallArgs.parse(args);
         const d = currentDeps();
         const fm = await fieldManager(context.definition.name);
         const fp = await clusterFingerprint16(a.kubeconfig, a.context);
-        const state = await withCluster(
+        const facts = await withCluster(
           d,
           a.kubeconfig,
           a.context,
+          KUBEVIRT_NAMESPACE,
           async (kubectl) => {
             const before = await readCr(kubectl);
             const installed = before?.status?.observedKubeVirtVersion;
@@ -505,23 +551,6 @@ export const model = {
               opUrl,
               a.operator_manifest_sha256,
             );
-            let cdiManifest: string | undefined;
-            if (
-              a.install_cdi && a.cdi_version && a.cdi_operator_manifest_sha256
-            ) {
-              const cdiUrl = manifestUrl(
-                a.manifest_base_url,
-                CDI_REPO.org,
-                CDI_REPO.repo,
-                a.cdi_version,
-                CDI_OPERATOR_ASSET,
-              );
-              cdiManifest = await fetchVerifiedManifest(
-                d,
-                cdiUrl,
-                a.cdi_operator_manifest_sha256,
-              );
-            }
             const apply = (body: string) =>
               kubectlText(
                 kubectl,
@@ -543,18 +572,73 @@ export const model = {
               uninstall_strategy: a.uninstall_strategy,
             });
             await apply(crYaml);
-            if (cdiManifest) await apply(cdiManifest);
             const cr = await readCr(kubectl);
             const nodes = await readNodes(kubectl);
             context.logger.info("KubeVirt {version} installed", {
               version: a.kubevirt_version,
             });
-            return stateOf(a, fp, cr, nodes, "present", d.now(), {
-              operator_sha256: a.operator_manifest_sha256,
-              cr_sha256: await sha256Hex(crYaml),
-              use_emulation: a.use_emulation,
-              feature_gates: a.feature_gates,
-            });
+            return { cr, nodes, crSha: await sha256Hex(crYaml) };
+          },
+        );
+        // CDI lives in its own namespace; the operator manifest ships the
+        // operator and CRDs but not the custom resource, so apply both.
+        if (a.install_cdi && a.cdi_version && a.cdi_operator_manifest_sha256) {
+          const cdiVersion = a.cdi_version;
+          const cdiSha = a.cdi_operator_manifest_sha256;
+          await withCluster(
+            d,
+            a.kubeconfig,
+            a.context,
+            CDI_NAMESPACE,
+            async (kubectl) => {
+              const cdiUrl = manifestUrl(
+                a.manifest_base_url,
+                CDI_REPO.org,
+                CDI_REPO.repo,
+                cdiVersion,
+                CDI_OPERATOR_ASSET,
+              );
+              const cdiManifest = await fetchVerifiedManifest(
+                d,
+                cdiUrl,
+                cdiSha,
+              );
+              const apply = (body: string) =>
+                kubectlText(
+                  kubectl,
+                  [
+                    "apply",
+                    "--server-side",
+                    "--force-conflicts",
+                    `--field-manager=${fm}`,
+                    "-f",
+                    "-",
+                  ],
+                  body,
+                );
+              await apply(cdiManifest);
+              await apply(renderCdiCr());
+            },
+          );
+        }
+        const state = stateOf(
+          a,
+          fp,
+          facts.cr,
+          facts.nodes,
+          "present",
+          d.now(),
+          {
+            operator_sha256: a.operator_manifest_sha256,
+            cr_sha256: facts.crSha,
+            ...(a.install_cdi
+              ? {
+                cdi_installed_by_model: true,
+                cdi_operator_sha256: a.cdi_operator_manifest_sha256,
+              }
+              : {}),
+            use_emulation: a.use_emulation,
+            feature_gates: a.feature_gates,
           },
         );
         const handle = await persist(context, a, state);
@@ -579,10 +663,12 @@ export const model = {
         const a = WaitReadyArgs.parse(args);
         const d = currentDeps();
         const fp = await clusterFingerprint16(a.kubeconfig, a.context);
+        const prior = await readPrior(context, a);
         const probe = await withCluster(
           d,
           a.kubeconfig,
           a.context,
+          KUBEVIRT_NAMESPACE,
           (kubectl) =>
             waitOperatorReady(
               d,
@@ -605,7 +691,11 @@ export const model = {
           d.now(),
           {
             cdi_version: probe.cdi?.status?.observedVersion,
-            feature_gates: [],
+            cdi_installed_by_model: prior?.cdi_installed_by_model,
+            feature_gates: prior?.feature_gates ?? [],
+            ...(prior?.cdi_operator_sha256
+              ? { cdi_operator_sha256: prior.cdi_operator_sha256 }
+              : {}),
           },
         );
         const readyState: OperatorState = {
@@ -637,10 +727,12 @@ export const model = {
         const d = currentDeps();
         const fm = await fieldManager(context.definition.name);
         const fp = await clusterFingerprint16(a.kubeconfig, a.context);
+        const prior = await readPrior(context, a);
         const outcome = await withCluster(
           d,
           a.kubeconfig,
           a.context,
+          KUBEVIRT_NAMESPACE,
           async (kubectl) => {
             const cr = await readCr(kubectl);
             const from = cr?.status?.observedKubeVirtVersion;
@@ -701,6 +793,13 @@ export const model = {
             return {
               state: stateOf(a, fp, after, probe.nodes, "present", d.now(), {
                 operator_sha256: a.operator_manifest_sha256,
+                cdi_installed_by_model: prior?.cdi_installed_by_model,
+                ...(prior?.cdi_operator_sha256
+                  ? { cdi_operator_sha256: prior.cdi_operator_sha256 }
+                  : {}),
+                ...(prior?.cdi_version
+                  ? { cdi_version: prior.cdi_version }
+                  : {}),
               }),
               from,
             };
@@ -726,10 +825,12 @@ export const model = {
         const a = ReadArgs.parse(args);
         const d = currentDeps();
         const fp = await clusterFingerprint16(a.kubeconfig, a.context);
+        const prior = await readPrior(context, a);
         const state = await withCluster(
           d,
           a.kubeconfig,
           a.context,
+          KUBEVIRT_NAMESPACE,
           async (kubectl) => {
             const cr = await readCr(kubectl);
             if (!cr) {
@@ -740,6 +841,10 @@ export const model = {
             const dev = cr.spec?.configuration?.developerConfiguration;
             return stateOf(a, fp, cr, nodes, "present", d.now(), {
               cdi_version: cdi?.status?.observedVersion,
+              cdi_installed_by_model: prior?.cdi_installed_by_model,
+              ...(prior?.cdi_operator_sha256
+                ? { cdi_operator_sha256: prior.cdi_operator_sha256 }
+                : {}),
               use_emulation: dev?.useEmulation,
               feature_gates: dev?.featureGates ?? [],
             });
@@ -758,10 +863,12 @@ export const model = {
         const a = ReadArgs.parse(args);
         const d = currentDeps();
         const fp = await clusterFingerprint16(a.kubeconfig, a.context);
+        const prior = await readPrior(context, a);
         const state = await withCluster(
           d,
           a.kubeconfig,
           a.context,
+          KUBEVIRT_NAMESPACE,
           async (kubectl) => {
             const cr = await readCr(kubectl);
             if (!cr) {
@@ -769,9 +876,15 @@ export const model = {
                 a,
                 fp,
                 null,
-                { schedulable: [], kvm: [] },
+                {
+                  schedulable: [],
+                  kvm: [],
+                },
                 "not_found",
                 d.now(),
+                {
+                  cdi_installed_by_model: prior?.cdi_installed_by_model,
+                },
               );
             }
             const nodes = await readNodes(kubectl);
@@ -779,6 +892,10 @@ export const model = {
             const dev = cr.spec?.configuration?.developerConfiguration;
             return stateOf(a, fp, cr, nodes, "present", d.now(), {
               cdi_version: cdi?.status?.observedVersion,
+              cdi_installed_by_model: prior?.cdi_installed_by_model,
+              ...(prior?.cdi_operator_sha256
+                ? { cdi_operator_sha256: prior.cdi_operator_sha256 }
+                : {}),
               use_emulation: dev?.useEmulation,
               feature_gates: dev?.featureGates ?? [],
             });
@@ -795,7 +912,7 @@ export const model = {
     uninstall: {
       kind: "action" as const,
       description:
-        "DESTRUCTIVE. Delete the KubeVirt custom resource with --wait, then the operator manifest's objects, then CDI if this definition installed it. Refuses when workloads are running. Requires confirm equal to the cluster fingerprint; an absent install is a clean no-op.",
+        "DESTRUCTIVE. Delete the KubeVirt custom resource with --wait, then the operator manifest's objects, then CDI if this definition installed it. With the default BlockUninstallIfWorkloadsExist strategy a running workload blocks the delete (typed error); with RemoveWorkloads upstream deletes the running VMs. Requires confirm equal to the cluster fingerprint; an absent install is a clean no-op.",
       arguments: UninstallArgs,
       execute: async (args: z.input<typeof UninstallArgs>, context: Ctx) => {
         const a = UninstallArgs.parse(args);
@@ -807,80 +924,110 @@ export const model = {
             "confirm must equal the cluster fingerprint",
           );
         }
-        const prior = await context.readResource(
-          await operatorStateKey(a.kubeconfig, a.context),
-        ) as OperatorState | null;
-        const cdiInstalled =
-          (prior?.cdi_version ?? a.cdi_version) !== undefined;
-        const status = await withCluster(
+        const prior = await readPrior(context, a);
+        const cdiInstalled = prior?.cdi_installed_by_model === true;
+        // CDI is deleted only when this definition installed it, and only with
+        // the same version and digest. Fail before touching the cluster.
+        if (
+          cdiInstalled &&
+          (!a.cdi_version || !a.cdi_operator_manifest_sha256)
+        ) {
+          throw new KubevirtError(
+            "invalid_input",
+            "CDI was installed by this model; cdi_version and cdi_operator_manifest_sha256 are required to uninstall it",
+          );
+        }
+        // Fetch and verify every manifest needed before deleting anything, so
+        // a fetch or SHA failure never leaves the operator half-removed. The
+        // true no-op case is decided first, so it needs no manifest.
+        const opUrl = manifestUrl(
+          a.manifest_base_url,
+          KUBEVIRT_REPO.org,
+          KUBEVIRT_REPO.repo,
+          a.kubevirt_version,
+          KUBEVIRT_OPERATOR_ASSET,
+        );
+        const cdiVersion = a.cdi_version;
+        const cdiSha = a.cdi_operator_manifest_sha256;
+        const outcome = await withCluster(
           d,
           a.kubeconfig,
           a.context,
+          KUBEVIRT_NAMESPACE,
           async (kubectl) => {
             const cr = await readCr(kubectl);
-            if (!cr) return "not_found" as const;
-            const del = await kubectl([
-              "delete",
-              "kubevirt",
-              KUBEVIRT_CR_NAME,
-              "-n",
-              KUBEVIRT_NAMESPACE,
-              "--wait=true",
-              `--timeout=${a.timeout_s}s`,
-            ]);
-            if (del.code !== 0) {
-              if (
-                /workloads|BlockUninstall|denied the request|admission webhook/i
-                  .test(del.stderr)
-              ) {
-                throw new KubevirtError(
-                  "uninstall_blocked",
-                  "the cluster still runs KubeVirt workloads; stop them before uninstalling",
-                );
-              }
-              throw classifyKubectl(del.stderr);
+            if (!cr && !(await operatorObjectsRemain(kubectl))) {
+              return { status: "not_found" as const, cdiManifest: undefined };
             }
-            const opUrl = manifestUrl(
-              a.manifest_base_url,
-              KUBEVIRT_REPO.org,
-              KUBEVIRT_REPO.repo,
-              a.kubevirt_version,
-              KUBEVIRT_OPERATOR_ASSET,
-            );
             const opManifest = await fetchVerifiedManifest(
               d,
               opUrl,
               a.operator_manifest_sha256,
             );
+            let cdiManifest: string | undefined;
+            if (cdiInstalled && cdiVersion && cdiSha) {
+              const cdiUrl = manifestUrl(
+                a.manifest_base_url,
+                CDI_REPO.org,
+                CDI_REPO.repo,
+                cdiVersion,
+                CDI_OPERATOR_ASSET,
+              );
+              cdiManifest = await fetchVerifiedManifest(d, cdiUrl, cdiSha);
+            }
+            if (cr) {
+              const del = await kubectl([
+                "delete",
+                "kubevirt",
+                KUBEVIRT_CR_NAME,
+                "--wait=true",
+                `--timeout=${a.timeout_s}s`,
+              ]);
+              if (del.code !== 0) {
+                if (
+                  /workloads|BlockUninstall|denied the request|admission webhook/i
+                    .test(del.stderr)
+                ) {
+                  throw new KubevirtError(
+                    "uninstall_blocked",
+                    "the cluster still runs KubeVirt workloads; stop them before uninstalling",
+                  );
+                }
+                throw classifyKubectl(del.stderr);
+              }
+            }
             await kubectlText(
               kubectl,
               ["delete", "-f", "-", "--ignore-not-found"],
               opManifest,
             );
-            if (
-              cdiInstalled && a.cdi_version && a.cdi_operator_manifest_sha256
-            ) {
-              const cdiUrl = manifestUrl(
-                a.manifest_base_url,
-                CDI_REPO.org,
-                CDI_REPO.repo,
-                a.cdi_version,
-                CDI_OPERATOR_ASSET,
-              );
-              const cdiManifest = await fetchVerifiedManifest(
-                d,
-                cdiUrl,
-                a.cdi_operator_manifest_sha256,
-              );
+            return { status: "deleted" as const, cdiManifest };
+          },
+        );
+        const status = outcome.status;
+        if (outcome.cdiManifest) {
+          const cdiManifest = outcome.cdiManifest;
+          await withCluster(
+            d,
+            a.kubeconfig,
+            a.context,
+            CDI_NAMESPACE,
+            async (kubectl) => {
+              await kubectlText(kubectl, [
+                "delete",
+                "cdi",
+                CDI_CR_NAME,
+                "--ignore-not-found",
+                "--wait=true",
+              ]);
               await kubectlText(
                 kubectl,
                 ["delete", "-f", "-", "--ignore-not-found"],
                 cdiManifest,
               );
-            }
-            return "deleted" as const;
-          },
-        );
+            },
+          );
+        }
         context.logger.info("KubeVirt {status}", { status });
         const state = stateOf(
           a,
@@ -889,6 +1036,7 @@ export const model = {
           { schedulable: [], kvm: [] },
           status === "not_found" ? "not_found" : "present",
           d.now(),
+          { cdi_installed_by_model: false },
         );
         const handle = await persist(context, a, state);
         return { dataHandles: [handle], result: { status } };

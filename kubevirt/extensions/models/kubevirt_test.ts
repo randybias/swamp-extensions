@@ -76,22 +76,29 @@ const nodeList = JSON.stringify({
     {
       metadata: {
         name: "node-1",
-        labels: {
-          "kubevirt.io/schedulable": "true",
-          "kubevirt.io/kvm": "true",
-        },
+        labels: { "kubevirt.io/schedulable": "true" },
       },
+      status: { allocatable: { "devices.kubevirt.io/kvm": "1" } },
     },
-    { metadata: { name: "node-2", labels: {} } },
+    {
+      metadata: {
+        name: "node-2",
+        labels: { "kubevirt.io/schedulable": "true" },
+      },
+      status: { allocatable: {} },
+    },
   ],
 });
 
 type Call = { args: string[]; stdin?: string };
 
-function testCtx() {
+function testCtx(
+  options: { storedResources?: Record<string, Record<string, unknown>> } = {},
+) {
   return createModelTestContext({
     globalArgs: {},
     definition: { name: "test-kubevirt" },
+    ...options,
   });
 }
 
@@ -155,6 +162,10 @@ function harness(
 
 const verb = (c: Call) => c.args[0];
 const sub = (c: Call) => c.args[1] ?? "";
+const nsOf = (c: Call): string | undefined => {
+  const i = c.args.indexOf("--namespace");
+  return i >= 0 ? c.args[i + 1] : undefined;
+};
 const argv = (h: { calls: Call[] }) =>
   h.calls.map((c) => c.args.join(" ")).join("\n");
 
@@ -247,6 +258,9 @@ Deno.test("install verifies the manifest and applies it and the CR on stdin", as
     assert(!all.includes("kind: Namespace"));
     assertEquals(out.result.kubevirt_version, "v1.2.3");
     assertEquals(out.result.operator_sha256, MANIFEST_SHA);
+    // Every call is scoped to the KubeVirt namespace; withKubectl appends
+    // --namespace itself, so a per-call -n would have been overridden.
+    assertEquals(stateful.calls.every((c) => nsOf(c) === "kubevirt"), true);
     assertEquals(stateful.removed, stateful.written);
   } finally {
     stateful.restore();
@@ -334,16 +348,31 @@ Deno.test("install_cdi fetches and applies the CDI manifest too", async () => {
         : { status: 200, body: cdi },
   });
   try {
-    const ctx = testCtx();
+    const { context, getWrittenResources } = testCtx();
     await model.methods.install.execute({
       ...INSTALL,
       install_cdi: true,
       cdi_version: "v1.2.3",
       cdi_operator_manifest_sha256: cdiSha,
-    }, ctx.context);
+    }, context);
     assertEquals(h.fetched.length, 2);
     assert(h.fetched.some((u) => u.includes("containerized-data-importer")));
-    assertEquals(h.calls.filter((c) => verb(c) === "apply").length, 3);
+    // operator + CR in the KubeVirt namespace, then CDI operator + CDI CR in
+    // the CDI namespace.
+    const applies = h.calls.filter((c) => verb(c) === "apply");
+    assertEquals(applies.length, 4);
+    assertEquals(nsOf(applies[0]), "kubevirt");
+    assertEquals(nsOf(applies[1]), "kubevirt");
+    assertEquals(nsOf(applies[2]), "cdi");
+    assertEquals(nsOf(applies[3]), "cdi");
+    assert(applies[3].stdin!.includes("kind: CDI"));
+    // The install records that this model owns CDI.
+    const state = getWrittenResources()[0].data as {
+      cdi_installed_by_model?: boolean;
+      cdi_operator_sha256?: string;
+    };
+    assertEquals(state.cdi_installed_by_model, true);
+    assertEquals(state.cdi_operator_sha256, cdiSha);
   } finally {
     h.restore();
   }
@@ -365,7 +394,7 @@ Deno.test("wait_ready reports ready with node facts", async () => {
       };
     };
     assertEquals(out.result.ready, true);
-    assertEquals(out.result.schedulable_nodes, ["node-1"]);
+    assertEquals(out.result.schedulable_nodes, ["node-1", "node-2"]);
     assertEquals(out.result.kvm_nodes, ["node-1"]);
   } finally {
     h.restore();
@@ -556,6 +585,8 @@ Deno.test("uninstall surfaces a blocked delete as a typed error", async () => {
       };
     }
     return getRoute(crJson())(c);
+  }, {
+    fetch: () => ({ status: 200, body: MANIFEST }),
   });
   try {
     const fp = await fingerprint();
@@ -570,6 +601,149 @@ Deno.test("uninstall surfaces a blocked delete as a typed error", async () => {
     );
     assertEquals((e as KubevirtError).code, "uninstall_blocked");
     assert((e as Error).message.includes("workloads"));
+  } finally {
+    h.restore();
+  }
+});
+
+Deno.test("get preserves the CDI install-owned flag set by install", async () => {
+  const key = await operatorStateKey(KC);
+  const ctx = testCtx({
+    storedResources: {
+      [key]: {
+        cluster_fp: await fingerprint(),
+        context: "current-context",
+        cdi_version: "v1.2.3",
+        cdi_installed_by_model: true,
+        cdi_operator_sha256: "a".repeat(64),
+        status: "present",
+        observed_at: "2026-10-17T00:00:00.000Z",
+      },
+    },
+  });
+  const h = harness(getRoute(crJson()));
+  try {
+    const out = await model.methods.get.execute(
+      { kubeconfig: KC },
+      ctx.context,
+    ) as {
+      result: { cdi_installed_by_model?: boolean };
+    };
+    assertEquals(out.result.cdi_installed_by_model, true);
+  } finally {
+    h.restore();
+  }
+});
+
+Deno.test("uninstall with the CDI flag requires matching CDI inputs", async () => {
+  const key = await operatorStateKey(KC);
+  const ctx = testCtx({
+    storedResources: {
+      [key]: {
+        cluster_fp: await fingerprint(),
+        context: "current-context",
+        cdi_installed_by_model: true,
+        status: "present",
+        observed_at: "2026-10-17T00:00:00.000Z",
+      },
+    },
+  });
+  const h = harness(getRoute(crJson()));
+  try {
+    const fp = await fingerprint();
+    const e = await assertRejects(
+      () =>
+        model.methods.uninstall.execute(
+          { ...INSTALL, confirm: fp },
+          ctx.context,
+        ),
+      KubevirtError,
+    );
+    assertEquals((e as KubevirtError).code, "invalid_input");
+    assertEquals(h.calls.length, 0);
+  } finally {
+    h.restore();
+  }
+});
+
+Deno.test("uninstall deletes CDI only when this model installed it", async () => {
+  const cdi = "apiVersion: v1\nkind: Namespace\nmetadata: {name: cdi}\n";
+  const cdiSha = await sha256(cdi);
+  const key = await operatorStateKey(KC);
+  const ctx = testCtx({
+    storedResources: {
+      [key]: {
+        cluster_fp: await fingerprint(),
+        context: "current-context",
+        cdi_version: "v1.2.3",
+        cdi_installed_by_model: true,
+        cdi_operator_sha256: cdiSha,
+        status: "present",
+        observed_at: "2026-10-17T00:00:00.000Z",
+      },
+    },
+  });
+  const h = harness(getRoute(crJson()), {
+    fetch: (url) =>
+      url.includes("containerized-data-importer")
+        ? { status: 200, body: cdi }
+        : { status: 200, body: MANIFEST },
+  });
+  try {
+    const fp = await fingerprint();
+    const out = await model.methods.uninstall.execute({
+      ...INSTALL,
+      confirm: fp,
+      cdi_version: "v1.2.3",
+      cdi_operator_manifest_sha256: cdiSha,
+    }, ctx.context) as { result: { status: string } };
+    assertEquals(out.result.status, "deleted");
+    const delCdi = h.calls.find((c) =>
+      verb(c) === "delete" && sub(c) === "cdi"
+    )!;
+    assertEquals(nsOf(delCdi), "cdi");
+    const manifestDeletes = h.calls.filter((c) =>
+      verb(c) === "delete" && sub(c) === "-f"
+    );
+    assertEquals(manifestDeletes.length, 2);
+    assertEquals(nsOf(manifestDeletes[1]), "cdi");
+    assertEquals(manifestDeletes[1].stdin, cdi);
+  } finally {
+    h.restore();
+  }
+});
+
+Deno.test("uninstall finishing when the CR is gone but the operator remains", async () => {
+  // The custom resource is absent but the kubevirt namespace lingers.
+  const h = harness((c) => {
+    if (verb(c) === "get" && sub(c) === "namespace") {
+      return {
+        stdout: JSON.stringify({
+          kind: "Namespace",
+          metadata: { name: "kubevirt" },
+        }),
+      };
+    }
+    return getRoute(null)(c);
+  }, {
+    fetch: () => ({ status: 200, body: MANIFEST }),
+  });
+  try {
+    const fp = await fingerprint();
+    const ctx = testCtx();
+    const out = await model.methods.uninstall.execute({
+      ...INSTALL,
+      confirm: fp,
+    }, ctx.context) as { result: { status: string } };
+    assertEquals(out.result.status, "deleted");
+    assertEquals(
+      h.calls.some((c) => verb(c) === "delete" && sub(c) === "kubevirt"),
+      false,
+    );
+    const delManifest = h.calls.find((c) =>
+      verb(c) === "delete" && sub(c) === "-f"
+    )!;
+    assertEquals(delManifest.stdin, MANIFEST);
   } finally {
     h.restore();
   }

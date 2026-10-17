@@ -30,6 +30,8 @@ export const CDI_REPO = {
   org: "kubevirt",
   repo: "containerized-data-importer",
 } as const;
+/** API version of the CDI custom resource at the pinned CDI releases. */
+export const CDI_API_VERSION = "cdi.kubevirt.io/v1beta1";
 /** The uninstall strategies the `KubeVirt` CR accepts. */
 export const UNINSTALL_STRATEGIES = [
   "BlockUninstallIfWorkloadsExist",
@@ -55,6 +57,19 @@ export interface CrInput {
   workload_update_methods: string[];
   /** Uninstall strategy for the CR. */
   uninstall_strategy: typeof UNINSTALL_STRATEGIES[number];
+}
+
+/**
+ * Renders the minimal `CDI` custom resource. The CDI operator manifest ships
+ * the operator and CRDs but not the CR, so install applies this after it.
+ */
+export function renderCdiCr(): string {
+  return stringify({
+    apiVersion: CDI_API_VERSION,
+    kind: "CDI",
+    metadata: { name: CDI_CR_NAME, namespace: CDI_NAMESPACE },
+    spec: {},
+  }, { lineWidth: 0 });
 }
 
 /** Inputs of a `VirtualMachine` and its optional DataVolume template. */

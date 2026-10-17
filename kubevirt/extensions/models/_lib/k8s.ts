@@ -191,11 +191,19 @@ export function mapSecretError(e: unknown): never {
   throw new KubevirtError("kubectl_failed", "kubectl failed");
 }
 
-/** Runs `fn` with a kubectl bound to a validated temporary kubeconfig. */
+/**
+ * Runs `fn` with a kubectl bound to a validated temporary kubeconfig.
+ *
+ * `namespace` is set on the vendored `withKubectl` target, which appends
+ * `--namespace <namespace>` to every argv itself; a per-call `-n` would only
+ * be overridden by that trailing flag. Open one `withCluster` per target
+ * namespace (the KubeVirt namespace, the CDI namespace, or a VM's namespace).
+ */
 export async function withCluster<T>(
   d: Deps,
   kubeconfig: string,
   context: string | undefined,
+  namespace: string,
   fn: (
     kubectl: (args: string[], stdin?: string) => Promise<KubectlResult>,
   ) => Promise<T>,
@@ -203,7 +211,7 @@ export async function withCluster<T>(
   try {
     return await withKubectl(
       { run: d.run, files: d.files, now: d.now },
-      { kubeconfig, context, namespace: "default", name: "unused" },
+      { kubeconfig, context, namespace, name: "unused" },
       fn,
     );
   } catch (e) {
@@ -425,12 +433,13 @@ export function parseVersion(
   return { major: Number(m[1]), minor: Number(m[2]), patch: Number(m[3]) };
 }
 
-/** True when `to` is a downgrade from `from`, across any component. */
+/** True when `to` is a downgrade from `from`, across major, minor or patch. */
 export function isDowngrade(from: string, to: string): boolean {
   const a = parseVersion(from);
   const b = parseVersion(to);
-  if (b.major !== a.major) return b.major < a.major;
-  return b.minor < a.minor;
+  if (a.major !== b.major) return b.major < a.major;
+  if (a.minor !== b.minor) return b.minor < a.minor;
+  return b.patch < a.patch;
 }
 
 /** True when `to` skips more than one minor ahead of `from` in one major. */

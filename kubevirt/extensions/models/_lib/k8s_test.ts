@@ -140,6 +140,10 @@ Deno.test("version guards refuse a downgrade and a multi-minor jump", () => {
   assertEquals(isDowngrade("v1.2.0", "v1.1.0"), true);
   assertEquals(isDowngrade("v1.2.0", "v1.3.0"), false);
   assertEquals(isDowngrade("v2.0.0", "v1.9.0"), true);
+  // A patch-level move backwards is still a downgrade.
+  assertEquals(isDowngrade("v1.3.2", "v1.3.1"), true);
+  assertEquals(isDowngrade("v1.3.1", "v1.3.2"), false);
+  assertEquals(isDowngrade("v1.3.1", "v1.3.1"), false);
   assertEquals(isMinorSkip("v1.2.0", "v1.3.0"), false);
   assertEquals(isMinorSkip("v1.2.0", "v1.4.0"), true);
   assertEquals(isMinorSkip("v1.2.0", "v2.0.0"), false);

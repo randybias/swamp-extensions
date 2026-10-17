@@ -20,7 +20,7 @@ One KubeVirt installation per cluster, addressed by method arguments
 | `upgrade`    | Apply a newer pinned manifest and wait; refuses a downgrade or a minor skip      |
 | `get`        | Installed versions, CR conditions, node facts and outdated workloads (read-only) |
 | `sync`       | Refresh stored state; an absent CR is recorded as `not_found` (read-only)        |
-| `uninstall`  | Delete the CR and the manifest's objects; blocked while workloads run            |
+| `uninstall`  | Delete the CR, the manifest's objects and any CDI this model installed           |
 
 `install` requires `operator_manifest_sha256`; the fetch is refused unless the
 bytes match, so nothing is applied from an unverified manifest. It adopts an
@@ -57,7 +57,8 @@ content enters the manifest.
 
 `kubectl` on the PATH and a reachable API server. KubeVirt and (for DataVolume
 VMs) CDI are installed by this extension from their public release assets, each
-verified against a required SHA-256.
+verified against a required SHA-256; the CDI operator manifest ships no custom
+resource, so a minimal `CDI` object is applied after it.
 
 ## Install
 
@@ -109,12 +110,13 @@ remote output.
 
 `wait_ready` returns `ready: false` with the last conditions after its timeout
 rather than throwing; a host without `/dev/kvm` and `use_emulation: false`
-reports no KVM-labelled nodes and a VM stays `ErrorUnschedulable`. Every
-mutating verb is an action; `uninstall` always requires a `confirm` value equal
-to the cluster fingerprint, and VM `delete` requires `confirm` equal to the VM
-name when the VM owns a DataVolume. Both are clean no-ops when the object is
-already absent. This version is published to `beta`: it has not yet been run
-against a live cluster.
+reports no KVM-capable nodes (nodes are counted through the
+`devices.kubevirt.io/kvm` allocatable resource) and a VM stays
+`ErrorUnschedulable`. Every mutating verb is an action; `uninstall` always
+requires a `confirm` value equal to the cluster fingerprint, and VM `delete`
+requires `confirm` equal to the VM name when the VM owns a DataVolume. Both are
+clean no-ops when the object is already absent. This version is published to
+`beta`: it has not yet been run against a live cluster.
 
 ## License
 

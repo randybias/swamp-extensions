@@ -72,6 +72,12 @@ Not packaged. Notes for whoever maintains this extension.
   discarded; the shell runner gained a redacted-stdout mode so an error from a
   key-bearing command never quotes stdout. No D-number references in packaged
   source.
+- 2026-10-17: verify group started: shared `cephVerifyResult` contract
+  (persist-then-throw, settle polling, key forms, unconditional faults) and the
+  checks cephVerifyMonQuorum, cephVerifyMgr, cephVerifyOsd and
+  cephVerifyCsiUsers. The package-source record now shares the same resource.
+  Remaining verify checks, maintenance/teardown, RGW and the workflow catalog
+  are next.
 - The SQLite `pvs`/`mdadm` discovery, the atomic mdadm.conf rewrite and the
   boot-protection gate are unit-tested with scripted sessions; the live twin
   checks in the spec's [twin] items still apply.

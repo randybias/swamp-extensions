@@ -77,6 +77,13 @@ import {
   getConnBundle,
   removeOsds,
 } from "./_lib/dataplane.ts";
+import {
+  persistVerdict,
+  verifyCsiUsers,
+  verifyMgr,
+  verifyMonQuorum,
+  verifyOsd,
+} from "./_lib/verify.ts";
 import { TransportError } from "./_lib/errors.ts";
 import { wipeDiskToRaw, type WipeRecord } from "./_lib/wipe.ts";
 
@@ -125,11 +132,13 @@ interface MethodContext {
 const GlobalArgsSchema = z.strictObject({});
 
 const VerifyResultSchema = z.strictObject({
+  method: z.string(),
+  host: z.string(),
+  subject: z.string().optional(),
   pass: z.boolean(),
   expected: z.unknown(),
   actual: z.unknown(),
   detail: z.unknown(),
-  subject: z.string().optional(),
   capturedAt: z.string(),
 });
 
@@ -423,6 +432,57 @@ const RemoveOsdsArgs = z.strictObject({
   ),
 });
 
+const VerifyCommon = {
+  host: HOST_FIELD.describe("Admin host."),
+  ...SSH_FIELDS,
+  throwOnFail: z.boolean().nullish().describe(
+    "Throw after recording a failing verdict; defaults to true.",
+  ),
+};
+
+const VerifyMonQuorumArgs = z.strictObject({
+  ...VerifyCommon,
+  expectedMonCount: z.number().int().min(1).describe(
+    "Expected number of mons in the monmap.",
+  ),
+  quorumSettleMs: z.number().int().min(0).nullish().describe(
+    "Settle budget in ms; 0 means one read.",
+  ),
+  quorumPollIntervalMs: z.number().int().min(1).nullish().describe(
+    "Backoff ceiling in ms.",
+  ),
+});
+
+const VerifyMgrArgs = z.strictObject({
+  ...VerifyCommon,
+  expectedCount: z.number().int().min(1).describe("Expected total mgr count."),
+});
+
+const VerifyOsdArgs = z.strictObject({
+  ...VerifyCommon,
+  expectedUp: z.number().int().min(0).describe("Expected OSD up count."),
+  expectedIn: z.number().int().min(0).describe("Expected OSD in count."),
+  expectedFailureDomain: CEPH_ID_SCHEMA.describe(
+    "Expected CRUSH failure domain.",
+  ),
+  crushRuleName: CEPH_ID_SCHEMA.nullish().describe(
+    "Rule name; default is the rule with rule_id 0.",
+  ),
+  osdSettleMs: z.number().int().min(0).nullish().describe(
+    "Settle budget in ms; 0 means one read.",
+  ),
+  osdPollIntervalMs: z.number().int().min(1).nullish().describe(
+    "Backoff ceiling in ms.",
+  ),
+});
+
+const VerifyCsiUsersArgs = z.strictObject({
+  ...VerifyCommon,
+  expectedUserNames: z.array(CEPH_ID_SCHEMA).min(1).max(256).describe(
+    "Bare entity names, without the client. prefix.",
+  ),
+});
+
 const PoolResultSchema = z.strictObject({
   name: z.string(),
   scheme: z.string(),
@@ -645,9 +705,11 @@ export function createCephadmModel(overrides: Partial<CephadmDeps> = {}) {
             context.logger,
           );
           const handle = await context.writeResource(
-            "verifyResult",
+            "cephVerifyResult",
             `cephVerifyPackageSource-${args.host}`,
             {
+              method: "cephVerifyPackageSource",
+              host: args.host,
               pass: result.pass,
               expected: result.expected,
               actual: result.actual,
@@ -1385,6 +1447,172 @@ export function createCephadmModel(overrides: Partial<CephadmDeps> = {}) {
         }
       },
     },
+
+    cephVerifyMonQuorum: {
+      description:
+        "READ-ONLY. Assert the monmap has exactly the expected number of mons and that every defined mon is in quorum. Writes the verdict before throwing, then throws when it fails unless throwOnFail is false.",
+      arguments: VerifyMonQuorumArgs,
+      execute: async (
+        args: z.infer<typeof VerifyMonQuorumArgs>,
+        context: MethodContext,
+      ) => {
+        const session = await openSession(
+          deps,
+          toTarget({
+            host: args.host,
+            sshUser: args.sshUser,
+            port: args.port,
+            keyPath: args.keyPath,
+            privateKey: args.privateKey,
+            strictHostKeyChecking: args.strictHostKeyChecking,
+          }),
+          { multiplex: args.multiplex ?? false },
+        );
+        try {
+          const outcome = await verifyMonQuorum(deps, session, {
+            expectedMonCount: args.expectedMonCount,
+            quorumSettleMs: args.quorumSettleMs,
+            quorumPollIntervalMs: args.quorumPollIntervalMs,
+          }, context.logger);
+          const handle = await persistVerdict(context, deps, {
+            method: "cephVerifyMonQuorum",
+            host: args.host,
+            phase: "mon-quorum",
+            key: `cephVerifyMonQuorum-${args.host}`,
+            outcome,
+            throwOnFail: args.throwOnFail ?? true,
+          });
+          return { dataHandles: [handle] };
+        } finally {
+          await session.close();
+        }
+      },
+    },
+
+    cephVerifyMgr: {
+      description:
+        "READ-ONLY. Assert the mgr daemon count and that one mgr is genuinely active. Writes the verdict before throwing, then throws when it fails unless throwOnFail is false.",
+      arguments: VerifyMgrArgs,
+      execute: async (
+        args: z.infer<typeof VerifyMgrArgs>,
+        context: MethodContext,
+      ) => {
+        const session = await openSession(
+          deps,
+          toTarget({
+            host: args.host,
+            sshUser: args.sshUser,
+            port: args.port,
+            keyPath: args.keyPath,
+            privateKey: args.privateKey,
+            strictHostKeyChecking: args.strictHostKeyChecking,
+          }),
+          { multiplex: args.multiplex ?? false },
+        );
+        try {
+          const outcome = await verifyMgr(deps, session, {
+            expectedCount: args.expectedCount,
+          }, context.logger);
+          const handle = await persistVerdict(context, deps, {
+            method: "cephVerifyMgr",
+            host: args.host,
+            phase: "mgr",
+            key: `cephVerifyMgr-${args.host}`,
+            outcome,
+            throwOnFail: args.throwOnFail ?? true,
+          });
+          return { dataHandles: [handle] };
+        } finally {
+          await session.close();
+        }
+      },
+    },
+
+    cephVerifyOsd: {
+      description:
+        "READ-ONLY. Assert the OSD up count and in count independently, and that a CRUSH rule's failure domain matches. Writes the verdict before throwing, then throws when it fails unless throwOnFail is false.",
+      arguments: VerifyOsdArgs,
+      execute: async (
+        args: z.infer<typeof VerifyOsdArgs>,
+        context: MethodContext,
+      ) => {
+        const session = await openSession(
+          deps,
+          toTarget({
+            host: args.host,
+            sshUser: args.sshUser,
+            port: args.port,
+            keyPath: args.keyPath,
+            privateKey: args.privateKey,
+            strictHostKeyChecking: args.strictHostKeyChecking,
+          }),
+          { multiplex: args.multiplex ?? false },
+        );
+        try {
+          const outcome = await verifyOsd(deps, session, {
+            expectedUp: args.expectedUp,
+            expectedIn: args.expectedIn,
+            expectedFailureDomain: args.expectedFailureDomain,
+            crushRuleName: args.crushRuleName,
+            osdSettleMs: args.osdSettleMs,
+            osdPollIntervalMs: args.osdPollIntervalMs,
+          }, context.logger);
+          const handle = await persistVerdict(context, deps, {
+            method: "cephVerifyOsd",
+            host: args.host,
+            phase: "osd",
+            key: `cephVerifyOsd-${args.host}`,
+            outcome,
+            throwOnFail: args.throwOnFail ?? true,
+          });
+          return { dataHandles: [handle] };
+        } finally {
+          await session.close();
+        }
+      },
+    },
+
+    cephVerifyCsiUsers: {
+      description:
+        "READ-ONLY. Assert that every expected client entity exists and report its caps; keys are discarded. Writes the verdict before throwing, then throws when it fails unless throwOnFail is false.",
+      arguments: VerifyCsiUsersArgs,
+      execute: async (
+        args: z.infer<typeof VerifyCsiUsersArgs>,
+        context: MethodContext,
+      ) => {
+        const session = await openSession(
+          deps,
+          toTarget({
+            host: args.host,
+            sshUser: args.sshUser,
+            port: args.port,
+            keyPath: args.keyPath,
+            privateKey: args.privateKey,
+            strictHostKeyChecking: args.strictHostKeyChecking,
+          }),
+          { multiplex: args.multiplex ?? false },
+        );
+        try {
+          const outcome = await verifyCsiUsers(
+            deps,
+            session,
+            args.expectedUserNames,
+            context.logger,
+          );
+          const handle = await persistVerdict(context, deps, {
+            method: "cephVerifyCsiUsers",
+            host: args.host,
+            phase: "csi-users",
+            key: `cephVerifyCsiUsers-${args.host}`,
+            outcome,
+            throwOnFail: args.throwOnFail ?? true,
+          });
+          return { dataHandles: [handle] };
+        } finally {
+          await session.close();
+        }
+      },
+    },
   };
 
   const sshMethods = Object.keys(methods);
@@ -1404,9 +1632,9 @@ export function createCephadmModel(overrides: Partial<CephadmDeps> = {}) {
     ],
     globalArguments: GlobalArgsSchema,
     resources: {
-      verifyResult: {
+      cephVerifyResult: {
         description:
-          "A verify-result record: pass, expected, actual, detail and subject",
+          "A shared verify-result record: method, host, pass, expected, actual, detail and optional subject",
         schema: VerifyResultSchema,
         lifetime: "infinite" as const,
         garbageCollection: 10,

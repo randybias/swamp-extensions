@@ -1,6 +1,6 @@
 manifestVersion: 1
 name: "@randybias/server-stack"
-version: "2026.10.17.1"
+version: "2026.10.17.2"
 description: "Provision and tear down a hardened single-node k0s host on a WireGuard mesh, running NATS and published in Cloudflare DNS, by composing the server, SSH, mesh, hardening, cluster and secret model types. Workflows only: the package ships no models of its own, and every instance value arrives as a workflow input."
 license: Apache-2.0
 repository: https://github.com/randybias/swamp-extensions

@@ -80,3 +80,50 @@ references another extension's model type: `@randybias/cherry-servers/servers`
 - `@webframp/cloudflare` stands in for the first-party dns-records model because
   its `lookup` throws identically on absence and on errors; `list` returns
   empty.
+
+## 2026.10.17.2 (first live run, fixes)
+
+Found by the first end-to-end run on a throwaway host (the receipts are in the
+maintainer's e2e repo):
+
+- The firewall's drop policies cut off a k0s node's pods; both firewall steps
+  now pass `trusted_interfaces` (server-host 2026.10.17.2).
+- `probe-nats` passed `NATS_PORT` as a number (the command model wants a string)
+  and its timeout in seconds (the model takes milliseconds); both fixed.
+- The stored kubeconfig pointed at the node's public address. `api_address` is
+  now the mesh address for `install`, `apply_helm` and `kubeconfig`, and
+  `check-kubeconfig` asserts the URL is `https://<mesh>:6443`.
+- `apply-nats` was skipped in every run: a step that depends on a `forEach` step
+  with nothing to iterate gets no state from it, so even
+  `or[succeeded, skipped]` never matched. `apply-nats` now has no dependency on
+  `apply-secrets` and runs when there are no secrets; `apply-nats-after-secrets`
+  waits for `apply-secrets` to have succeeded and runs when there are. No safety
+  gate uses `skipped`.
+- A fresh host cannot use `host_key_policy: strict` for the Cherry readiness
+  wait: `wait_ready` matches the known_hosts host field against the public IP,
+  which is unknown before the order. Use `accept-new` for that step only; every
+  later step is strict against host keys pre-generated into the cloud-init user
+  data.
+
+### Known issue: a wedged NATS Helm release
+
+If the chart's first install never becomes Ready (here: NATS bound only to the
+mesh address while the kubelet probed the node address) and its values are then
+changed, the k0s Helm controller stays at
+`can't install loadedChart nats: cannot re-use a name that is still in use`, and
+`apply_helm` times out with the release `uninstalling`. Changing the values
+again does not help. Recovery on the node, as root, using only what the chart
+created:
+
+```
+k0s kubectl -n nats delete statefulset/nats --wait=false
+k0s kubectl -n nats delete secret/sh.helm.release.v1.nats.v1
+k0s kubectl -n kube-system patch chart.helm.k0sproject.io k0s-addon-chart-nats \
+  --type=merge -p '{"metadata":{"finalizers":null}}'
+systemctl restart k0scontroller
+```
+
+The Chart object is recreated from `k0s.yaml` within a minute and installs with
+the current values. Avoid it by getting the values right before the first
+install: `config.merge: {host: <mesh address>, http: "0.0.0.0:8222"}` with
+`hostNetwork`, because the firewall still blocks 8222 from outside.

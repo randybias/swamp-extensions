@@ -262,6 +262,15 @@ inputs:
       items:
         type: string
         maxLength: 64
+    trusted_interfaces:
+      type: array
+      description: Interface names or prefix* patterns whose traffic the firewall accepts; the k0s CNI bridge
+      default: [kube-bridge]
+      maxItems: 16
+      items:
+        type: string
+        maxLength: 15
+        pattern: "^[A-Za-z0-9_.-]{1,14}[*]$|^[A-Za-z0-9_.-]{1,15}$"
     allow_tcp:
       type: array
       description: Public TCP ports
@@ -671,6 +680,7 @@ jobs:
             allow_udp: ${{ inputs.allow_udp }}
             ssh_port: ${{ inputs.ssh_port }}
             allow_ssh_from_anywhere: true
+            trusted_interfaces: ${{ inputs.trusted_interfaces }}
             revert_after_s: ${{ inputs.revert_after_s }}
       - name: verify-firewall
         description: Verify SSH answers over the mesh after the firewall
@@ -746,6 +756,7 @@ jobs:
             management_cidrs: ${{ inputs.management_cidrs }}
             allow_tcp: ${{ inputs.allow_tcp }}
             allow_udp: ${{ inputs.allow_udp }}
+            trusted_interfaces: ${{ inputs.trusted_interfaces }}
             ssh_port: ${{ inputs.ssh_port }}
             revert_after_s: ${{ inputs.revert_after_s }}
       - name: verify-lockdown
@@ -852,6 +863,7 @@ jobs:
             role: single
             cluster_name: ${{ inputs.hostname }}
             api_sans: ${{ inputs.k0s_api_sans }}
+            api_address: ${{ inputs.mesh_node.address.split("/")[0] }}
             pod_cidr: ${{ inputs.k0s_pod_cidr }}
             service_cidr: ${{ inputs.k0s_service_cidr }}
             helm:
@@ -902,6 +914,7 @@ jobs:
           modelName: k0s-cluster
           methodName: kubeconfig
           inputs:
+            api_address: ${{ inputs.mesh_node.address.split("/")[0] }}
             ssh:
               host: ${{ inputs.mesh_node.address.split("/")[0] }}
               port: ${{ inputs.ssh_port }}
@@ -922,10 +935,8 @@ jobs:
           type: assert
           expr: >-
             data.latest("k0s-cluster", inputs.ssh_user + "~" + inputs.mesh_node.address.split("/")[0] + "~" + string(inputs.ssh_port) + "~kubeconfig")
-              .attributes.server != null &&
-            data.latest("k0s-cluster", inputs.ssh_user + "~" + inputs.mesh_node.address.split("/")[0] + "~" + string(inputs.ssh_port) + "~kubeconfig")
-              .attributes.server != "unknown"
-          message: The kubeconfig server URL is missing or unknown
+              .attributes.server == "https://" + inputs.mesh_node.address.split("/")[0] + ":6443"
+          message: The kubeconfig server URL is not the node's mesh address
           severity: high
       - name: apply-namespaces
         description: Create the cluster namespaces via the k0s manifest deployer
@@ -984,13 +995,8 @@ jobs:
             data: ${{ self.secret.data }}
       - name: apply-nats
         description: Reconcile the NATS chart via the k0s Helm extension
+        guard: ${{ size(inputs.cluster_secrets) > 0 }}
         dependsOn:
-          - step: apply-secrets
-            condition:
-              type: or
-              conditions:
-                - type: succeeded
-                - type: skipped
           - step: apply-namespaces
             condition:
               type: or
@@ -1015,6 +1021,43 @@ jobs:
               private_key: ${{ vault.get("server-stack", inputs.ssh_private_key_key) }}
             cluster_name: ${{ inputs.hostname }}
             api_sans: ${{ inputs.k0s_api_sans }}
+            api_address: ${{ inputs.mesh_node.address.split("/")[0] }}
+            pod_cidr: ${{ inputs.k0s_pod_cidr }}
+            service_cidr: ${{ inputs.k0s_service_cidr }}
+            helm:
+              - ${{ inputs.nats_chart }}
+      - name: apply-nats-after-secrets
+        description: Reconcile the NATS chart via the k0s Helm extension
+        guard: ${{ size(inputs.cluster_secrets) == 0 }}
+        dependsOn:
+          - step: apply-secrets
+            condition:
+              type: succeeded
+          - step: apply-namespaces
+            condition:
+              type: or
+              conditions:
+                - type: succeeded
+                - type: skipped
+          - step: check-kubeconfig
+            condition:
+              type: succeeded
+        task:
+          type: model_method
+          modelType: "@randybias/k0s-cluster"
+          modelName: k0s-cluster
+          methodName: apply_helm
+          inputs:
+            ssh:
+              host: ${{ inputs.mesh_node.address.split("/")[0] }}
+              port: ${{ inputs.ssh_port }}
+              user: ${{ inputs.ssh_user }}
+              host_key_policy: strict
+              host_keys: ${{ inputs.known_hosts }}
+              private_key: ${{ vault.get("server-stack", inputs.ssh_private_key_key) }}
+            cluster_name: ${{ inputs.hostname }}
+            api_sans: ${{ inputs.k0s_api_sans }}
+            api_address: ${{ inputs.mesh_node.address.split("/")[0] }}
             pod_cidr: ${{ inputs.k0s_pod_cidr }}
             service_cidr: ${{ inputs.k0s_service_cidr }}
             helm:
@@ -1045,8 +1088,8 @@ jobs:
               '
             env:
               NATS_HOST: ${{ inputs.mesh_node.address.split("/")[0] }}
-              NATS_PORT: ${{ inputs.nats_probe_port }}
-            timeout: ${{ inputs.verify_timeout_s }}
+              NATS_PORT: ${{ string(inputs.nats_probe_port) }}
+            timeout: ${{ inputs.verify_timeout_s * 1000 }}
             ignoreExitCode: false
       - name: check-nats
         description: Check the banner is NATS INFO with the expected server name

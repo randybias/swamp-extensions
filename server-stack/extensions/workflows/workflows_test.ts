@@ -45,3 +45,62 @@ Deno.test("teardown removes DNS and resets k0s before deleting the server", asyn
   assert(s.indexOf("name: verify-cherry") < s.indexOf("name: verify-dns"));
   assertEquals(/BEGIN [A-Z ]*PRIVATE KEY/.test(s), false);
 });
+
+/** The text of one step, from its `- name:` line to the next step. */
+function stepText(s: string, name: string): string {
+  const a = s.indexOf(`      - name: ${name}\n`);
+  assert(a >= 0, name);
+  const b = s.indexOf("\n      - name: ", a + 1);
+  return s.slice(a, b < 0 ? undefined : b);
+}
+
+Deno.test("both firewall steps pass the trusted interfaces, so a k0s node's pods are not cut off", async () => {
+  const s = await read("server-stack-provision-host");
+  assertStringIncludes(s, "    trusted_interfaces:\n      type: array");
+  assertStringIncludes(s, "default: [kube-bridge]");
+  for (const step of ["apply-firewall", "lockdown"]) {
+    assertStringIncludes(
+      stepText(s, step),
+      "trusted_interfaces: ${{ inputs.trusted_interfaces }}",
+    );
+  }
+});
+
+Deno.test("the API address is the mesh address for install, kubeconfig and the chart, and the kubeconfig is checked against it", async () => {
+  const s = await read("server-stack-provision-host");
+  const api = 'api_address: ${{ inputs.mesh_node.address.split("/")[0] }}';
+  for (const step of ["install-k0s", "kubeconfig", "apply-nats"]) {
+    assertStringIncludes(stepText(s, step), api);
+  }
+  assertStringIncludes(
+    stepText(s, "check-kubeconfig"),
+    '"https://" + inputs.mesh_node.address.split("/")[0] + ":6443"',
+  );
+});
+
+Deno.test("the NATS probe passes its port as a string and its timeout in milliseconds", async () => {
+  const s = await read("server-stack-provision-host");
+  const probe = stepText(s, "probe-nats");
+  assertStringIncludes(
+    probe,
+    "NATS_PORT: ${{ string(inputs.nats_probe_port) }}",
+  );
+  assertStringIncludes(probe, "timeout: ${{ inputs.verify_timeout_s * 1000 }}");
+});
+
+Deno.test("apply-nats never waits on the forEach secrets step when there are no secrets", async () => {
+  const s = await read("server-stack-provision-host");
+  const plain = stepText(s, "apply-nats");
+  assertEquals(plain.includes("step: apply-secrets"), false);
+  assertStringIncludes(plain, "guard: ${{ size(inputs.cluster_secrets) > 0 }}");
+  // With secrets the chart waits for them to have succeeded, and for nothing weaker.
+  const after = stepText(s, "apply-nats-after-secrets");
+  assertStringIncludes(
+    after,
+    "guard: ${{ size(inputs.cluster_secrets) == 0 }}",
+  );
+  assertStringIncludes(
+    after,
+    "- step: apply-secrets\n            condition:\n              type: succeeded\n",
+  );
+});

@@ -71,6 +71,7 @@ known_hosts: ["192.0.2.10 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIEXAMPLE"]
 admin_user: ops
 management_cidrs: ["192.0.2.0/24"]
 allow_udp: [51820]
+trusted_interfaces: [kube-bridge]
 verify_timeout_s: 120
 mesh_node: { name: host-1, address: 192.0.2.10/32, listen_port: 51820 }
 mesh_peers: []
@@ -123,9 +124,14 @@ swamp workflow run @randybias/server-stack-teardown-host \
   to skip every Cloudflare DNS step in both workflows, for example to prove NATS
   answers before a zone is chosen; the server teardown still proceeds because a
   step succeeds when DNS is disabled.
-- The firewall is expected to own its own nftables table and never flush the
-  whole ruleset, so a later re-apply does not wipe the cluster's CNI and
-  kube-proxy rules.
+- The firewall owns its own nftables table and never flushes the whole ruleset,
+  so a later re-apply does not wipe the cluster's CNI and kube-proxy rules. Its
+  input and forward policies drop, so the CNI interface must be trusted:
+  `trusted_interfaces` (default `[kube-bridge]`, k0s's kube-router bridge; use
+  `cali*` and the like for another CNI) is passed to both firewall steps. This
+  needs `@randybias/server-host` 2026.10.17.2 or later.
+- The API server binds the mesh address (`api_address`), and the kubeconfig the
+  workflow stores points at it; `check-kubeconfig` asserts that.
 
 ## License
 

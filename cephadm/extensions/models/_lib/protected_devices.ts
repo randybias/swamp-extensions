@@ -116,7 +116,7 @@ export type Assessment =
 
 /** Probe that lists block devices with the columns the module needs. */
 export const LSBLK_COMMAND =
-  "lsblk -J -b -o NAME,PATH,PKNAME,TYPE,FSTYPE,UUID,PARTUUID,LABEL,MOUNTPOINTS";
+  "lsblk -J -b -o NAME,PATH,PKNAME,TYPE,FSTYPE,UUID,PARTUUID,LABEL,MOUNTPOINTS,PARTTYPE,PARTTYPENAME";
 /** Probe for live mounts. */
 export const FINDMNT_COMMAND = "findmnt -J";
 /** Probe that resolves every device symlink: one `<link> <target>` per line. */
@@ -128,10 +128,41 @@ export const BLKID_COMMAND = "blkid";
 export const ZPOOL_COMMAND = "zpool status -P";
 /** Probe for LVM physical volumes and their volume groups. */
 export const PVS_COMMAND = "pvs --noheadings -o pv_name,vg_name";
+/**
+ * An absolute `/dev` path with no characters a shell or mdadm would treat
+ * specially. mdadm gets such a path as a bare argument, never after `--`: mdadm
+ * 4.3 treats `--` as "no devices given", so `--examine --`, `--stop --` and
+ * `--zero-superblock --` all silently do nothing.
+ */
+export const DEVICE_PATH_RE = /^\/dev\/[A-Za-z0-9][A-Za-z0-9._\/-]{0,254}$/;
+
+/** True for a device path that is safe to pass to mdadm without `--`. */
+export function isDevicePath(path: string): boolean {
+  return DEVICE_PATH_RE.test(path) && !path.includes("..");
+}
+
 /** Probe run for each path from {@link examineTargets}. */
 export function mdExamineCommand(path: string): string {
-  return `mdadm --examine -- '${path.replace(/'/g, "'\\''")}'`;
+  if (!isDevicePath(path)) {
+    throw new Error("not a plain /dev device path");
+  }
+  return `mdadm --examine '${path}'`;
 }
+
+/**
+ * GPT partition types that hold boot code or boot files and carry no
+ * filesystem or mount to give them away: BIOS boot (GRUB's core image), EFI
+ * System, Linux extended boot, and PReP boot. The MBR forms (`0xef` for EFI,
+ * `0x41` for PReP) are matched too.
+ */
+const BOOT_PART_TYPES = new Set([
+  "21686148-6449-6e6f-744e-656564454649",
+  "c12a7328-f81f-11d2-ba4b-00a0c93ec93b",
+  "bc13c2ff-59e6-4262-a352-b275fd6f7172",
+  "9e1a2d38-c612-4316-aa26-8b49521e5a8b",
+  "0xef",
+  "0x41",
+]);
 
 /** Filesystem types that are not backed by a local block device. */
 const NON_BLOCK_FS = new Set([
@@ -210,6 +241,8 @@ interface Node {
   uuid: string;
   partuuid: string;
   label: string;
+  /** Partition type: a GPT GUID (lowercased) or an MBR code such as `0x83`. */
+  parttype: string;
   mounts: string[];
   parents: Set<string>;
   children: Set<string>;
@@ -269,6 +302,7 @@ function parseLsblkGraph(
         uuid: str(raw.uuid),
         partuuid: str(raw.partuuid),
         label: str(raw.label),
+        parttype: str(raw.parttype).toLowerCase(),
         mounts: [],
         parents: new Set(),
         children: new Set(),
@@ -871,6 +905,32 @@ function compute(input: ProbeInputs): ProtectedSet {
   for (let pass = 0, before = ""; before !== size(); pass++) {
     if (pass > 32) unverifiable("the protected topology did not settle");
     before = size();
+    // 3a. Boot partitions (BIOS boot, EFI system, ...) of every disk that holds
+    // a protected device. They carry no filesystem and no mount, so nothing
+    // else claims them, and wiping one leaves the host unbootable. A partition
+    // whose type cannot be read cannot be ruled out, so it refuses.
+    for (const path of protectedNow()) {
+      const disk = graph.nodes.get(path);
+      if (disk?.type !== "disk") continue;
+      for (const childPath of disk.children) {
+        const child = graph.nodes.get(childPath)!;
+        if (child.type !== "part") continue;
+        if (child.parttype === "") {
+          unverifiable(
+            "the type of a partition on a protected disk is unknown",
+            {
+              device: childPath,
+            },
+          );
+        }
+        if (BOOT_PART_TYPES.has(child.parttype)) {
+          collector.protect(
+            childPath,
+            "boot partition on a disk that holds a protected device",
+          );
+        }
+      }
+    }
     // 3b. A multi-device filesystem is reported under one device in the mount
     // table but lives on every device carrying its UUID.
     for (const path of Object.keys(collector.devices)) {
@@ -1118,14 +1178,19 @@ export function examineTargets(
     return [];
   }
   const out = new Set<string>();
+  // A path mdadm could not be given safely is left out; the candidate check
+  // then reports it as never examined.
+  const add = (path: string): void => {
+    if (isDevicePath(path)) out.add(path);
+  };
   for (const node of graph.nodes.values()) {
-    if (node.fstype === "linux_raid_member") out.add(node.path);
+    if (node.fstype === "linux_raid_member") add(node.path);
   }
   if (probes.mdstat.state === "ok") {
     for (const array of parseMdstat(probes.mdstat.text)) {
       for (const member of array.members) {
         const p = resolver.resolve(`/dev/${member}`);
-        if (p) out.add(p);
+        if (p) add(p);
       }
     }
   }
@@ -1134,7 +1199,7 @@ export function examineTargets(
     if (!path) continue;
     for (const p of subtree(graph, path)) {
       const t = graph.nodes.get(p)?.type;
-      if (t === "disk" || t === "part") out.add(p);
+      if (t === "disk" || t === "part") add(p);
     }
   }
   return [...out].sort();

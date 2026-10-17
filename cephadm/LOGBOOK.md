@@ -131,3 +131,15 @@ Not packaged. Notes for whoever maintains this extension.
   protected volume group needs a pvs row. Accepted limits: external fs
   journal/log devices and `resume=` (the kernel's exclusive open refuses a write
   to a mounted, swapped or claimed device).
+- 2026-10-17 live fix of the wipe guard, from a run on a real two-disk host
+  (mdadm 4.3, util-linux 2.39): (A) mdadm 4.3 reads `--` as "no devices given",
+  so `--examine --`, `--stop --` and `--zero-superblock --` all did nothing and
+  the guard refused every candidate; mdadm is now given bare, grammar-checked
+  `/dev` paths (`--examine --scan --` happened to work and was changed too for
+  uniformity; LVM tools and wipefs accept `--` and were left alone). The wipe's
+  own array stop and superblock zero were affected the same way. (B) a BIOS-boot
+  (EF02) or EFI System partition has no filesystem or mount, so nothing
+  protected it; the lsblk probe now reads PARTTYPE/PARTTYPENAME and every
+  boot-type partition of a disk that holds a protected device is protected, and
+  an unreadable partition type on such a disk refuses. Tests use the real
+  captured shapes (`protected_devices_real_test.ts`).

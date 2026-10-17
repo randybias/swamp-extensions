@@ -27,6 +27,7 @@ import {
   examineTargets,
   type FileProbe,
   FINDMNT_COMMAND,
+  isDevicePath,
   LINKS_COMMAND,
   LSBLK_COMMAND,
   mdExamineCommand,
@@ -375,14 +376,36 @@ async function pvsVg(session: SshSession, device: string): Promise<string> {
   return r.stdout.trim();
 }
 
+/**
+ * A device path for an mdadm argument. mdadm 4.3 reads `--` as "no devices
+ * given" (so `--stop --` and `--zero-superblock --` silently did nothing), so
+ * its paths are passed bare; the grammar check is what keeps that safe.
+ */
+function devicePath(path: string): string {
+  if (!isDevicePath(path)) {
+    fail("wipe.step", "a device path failed the mdadm argument grammar", {});
+  }
+  return `'${path}'`;
+}
+
+/** An md array path for an mdadm argument; see {@link devicePath}. */
+function arrayPathArg(path: string): string {
+  assertMdArrayPath("array", path);
+  return devicePath(path);
+}
+
 /** The md array a device belongs to, or null. */
 async function examineArray(
   session: SshSession,
   device: string,
 ): Promise<string | null> {
-  const r = await root(session, `mdadm --examine --scan -- ${quote(device)}`, {
-    allowNonZero: true,
-  });
+  const r = await root(
+    session,
+    `mdadm --examine --scan ${devicePath(device)}`,
+    {
+      allowNonZero: true,
+    },
+  );
   return firstArrayPath(r.stdout);
 }
 
@@ -763,7 +786,7 @@ export async function wipeDiskToRaw(
       arrayPath,
       "an array about to be stopped backs the root or boot filesystem",
     );
-    await root(session, `mdadm --stop -- ${quote(arrayPath)}`, {
+    await root(session, `mdadm --stop ${arrayPathArg(arrayPath)}`, {
       allowNonZero: true,
     });
     if (await arrayStillPresent(deps, arrayBasename(arrayPath))) {
@@ -788,7 +811,7 @@ export async function wipeDiskToRaw(
       try {
         result = await root(
           session,
-          `mdadm --zero-superblock -- ${quote(device.device)}`,
+          `mdadm --zero-superblock ${devicePath(device.device)}`,
           {
             allowNonZero: true,
           },
@@ -835,7 +858,7 @@ export async function wipeDiskToRaw(
           rebuilt,
           "an array about to be re-stopped backs the root or boot filesystem",
         );
-        await root(session, `mdadm --stop -- ${quote(rebuilt)}`, {
+        await root(session, `mdadm --stop ${arrayPathArg(rebuilt)}`, {
           allowNonZero: true,
         });
       }

@@ -65,6 +65,8 @@ function guardRow(
     uuid: null,
     partuuid: null,
     label: null,
+    parttype: type === "part" ? "0fc63daf-8483-4772-8e79-3d69d8477de4" : null,
+    parttypename: null,
     mountpoints: [null],
     ...extra,
     ...(children ? { children } : {}),
@@ -121,7 +123,7 @@ function probeAnswer(
     const answer = over[hit[1]] ?? HEALTHY[hit[1]];
     return typeof answer === "function" ? answer(command) : answer;
   }
-  const examine = /^mdadm --examine -- '(.+)'$/.exec(command);
+  const examine = /^mdadm --examine '(.+)'$/.exec(command);
   if (examine) {
     const answer = over[`examine:${examine[1]}`] ?? NO_SUPERBLOCK;
     return typeof answer === "function" ? answer(command) : answer;
@@ -774,4 +776,86 @@ Deno.test("a failed mdadm --examine before --stop refuses and nothing is stopped
   );
   assertEquals(examines, 3);
   assertEquals(calls.some((c) => c.command.startsWith("mdadm --stop")), false);
+});
+
+Deno.test("no mdadm command is ever given `--` (mdadm 4.3 reads it as 'no devices')", async () => {
+  const { session, calls } = routedSession((opts) => {
+    const base = discover(opts, DIRTY_TREE);
+    if (base) return base;
+    if (opts.command === "test -e /etc/mdadm/mdadm.conf") return done("", 1);
+    if (opts.command.startsWith("mdadm --detail --scan")) return done("");
+    if (opts.command === "cat /etc/fstab") return done("");
+    if (
+      /^(mdadm --zero-superblock|wipefs -a|sgdisk|partprobe)/.test(
+        opts.command,
+      )
+    ) {
+      return done("");
+    }
+    return undefined;
+  });
+  await wipeDiskToRaw({ ...deps, session }, {
+    dataDevices: [{ serial: "SN0001" }],
+    excludeDevices: [],
+  });
+  const mdadm = calls.map((c) => c.command).filter((c) =>
+    c.startsWith("mdadm ")
+  );
+  assertEquals(mdadm.length > 0, true);
+  for (const c of mdadm) assertEquals(/ -- /.test(c), false, c);
+  assertEquals(
+    mdadm.includes("mdadm --zero-superblock '/dev/nvme0n1'"),
+    true,
+  );
+  assertEquals(
+    mdadm.some((c) => c === "mdadm --examine --scan '/dev/nvme0n1'"),
+    true,
+  );
+});
+
+Deno.test("an array stopped by the wipe is named bare, after the grammar check", async () => {
+  let stopped = false;
+  let examines = 0;
+  const probes: Probes = {
+    // The two guard reads see no superblock; the belt check before --stop
+    // then sees the array's own (unprotected) UUID.
+    "examine:/dev/nvme0n1": () =>
+      ++examines <= 2 ? NO_SUPERBLOCK : examineOut(),
+  };
+  const { session, calls } = routedSession(
+    (opts) => {
+      if (opts.command.startsWith("mdadm --examine --scan")) {
+        return done("ARRAY /dev/md9 metadata=1.2 name=host:9 UUID=abc\n");
+      }
+      if (opts.command.startsWith("mdadm --stop")) {
+        stopped = true;
+        return done("");
+      }
+      if (opts.command === "cat /proc/mdstat") {
+        return done(stopped ? "" : "md9 : active raid1 nvme0n1[0]\n");
+      }
+      if (opts.command === "test -e /etc/mdadm/mdadm.conf") return done("", 1);
+      if (opts.command.startsWith("mdadm --detail --scan")) return done("");
+      if (opts.command === "cat /etc/fstab") return done("");
+      if (
+        /^(mdadm --zero-superblock|wipefs -a|sgdisk|partprobe)/.test(
+          opts.command,
+        )
+      ) {
+        return done("");
+      }
+      return discover(opts, DIRTY_TREE);
+    },
+    "192.0.2.10",
+    probes,
+  );
+  await wipeDiskToRaw({ ...deps, session }, {
+    dataDevices: [{ serial: "SN0001" }],
+    excludeDevices: [],
+  }).catch(() => undefined);
+  const stops = calls.map((c) => c.command).filter((c) =>
+    c.startsWith("mdadm --stop")
+  );
+  assertEquals(stops.length > 0, true);
+  for (const c of stops) assertEquals(c, "mdadm --stop '/dev/md9'");
 });

@@ -23,6 +23,8 @@ interface Dev {
   uuid?: string;
   partuuid?: string;
   label?: string;
+  /** GPT partition type GUID; a plain Linux filesystem partition by default. */
+  parttype?: string;
   mounts?: string[];
   path?: string;
   children?: Dev[];
@@ -42,10 +44,16 @@ function row(d: Dev): Record<string, unknown> {
     uuid: d.uuid ?? null,
     partuuid: d.partuuid ?? null,
     label: d.label ?? null,
+    parttype: d.type === "part"
+      ? (d.parttype ?? LINUX_FS_PARTTYPE)
+      : (d.parttype ?? null),
+    parttypename: null,
     mountpoints: d.mounts ?? [null],
     ...(d.children ? { children: d.children.map(row) } : {}),
   };
 }
+
+const LINUX_FS_PARTTYPE = "0fc63daf-8483-4772-8e79-3d69d8477de4";
 
 const ok = (stdout: string): CommandProbe => ({ code: 0, stdout });
 const missing: CommandProbe = { code: 127, stdout: "" };
@@ -1133,6 +1141,7 @@ function bare(...devs: Dev[]): CommandProbe {
   const strip = (d: Dev): Dev => ({
     name: d.name,
     type: d.type,
+    parttype: d.parttype,
     mounts: d.mounts,
     children: d.children?.map(strip),
   });

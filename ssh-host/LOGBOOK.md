@@ -293,3 +293,45 @@ the two heads, sha256 23074b45…): 23/23.
   way. `mv -T`, symlink and directory refusal, and mode convergence are
   unchanged. A test asserts no 64-hex content-derived string appears in any
   spawned argv or script text. Every vendor resyncs to this blob.
+
+## 2026-10-17: 2026.10.17.2 live e2e status and delta review
+
+Delta: only the upload's post-rename verification in `_lib/ssh.ts` changed (blob
+fe0139f0…; the remote prints the destination's SHA-256 and mode and the
+comparison runs locally). exec, execPipeline, wait_connection, the transport
+(`runRemote`), host-key handling and the upload probe are byte-identical to
+2026.10.17.1, which is on stable with 23/23 live cells.
+
+| Cell                                                                      | 2026.10.17.2 status                                   |
+| ------------------------------------------------------------------------- | ----------------------------------------------------- |
+| 3 upload                                                                  | pending re-run on 2026.10.17.2                        |
+| 3b upload read-back                                                       | pending re-run on 2026.10.17.2                        |
+| 10 idempotent re-run (upload)                                             | pending re-run on 2026.10.17.2                        |
+| X2 upload onto symlink                                                    | pending re-run on 2026.10.17.2                        |
+| X3 upload onto directory                                                  | pending re-run on 2026.10.17.2                        |
+| X4 upload unwritable path                                                 | pending re-run on 2026.10.17.2                        |
+| 1, 2, 4, 5, 6, 7, 8, 9, 9b, X1, X5, X5b, X6, X7a, X7b, X7c, X8 (17 cells) | carried from 2026.10.17.1 (PASS); code path unchanged |
+
+The six upload cells must pass on 2026.10.17.2 before it is promoted to stable;
+beta allows the pending state.
+
+Delta review (codex astra + terra over e3c0057 against merge-base 63987af; a
+first run against origin/main produced a two-dot diff that showed main's newer
+commits as deletions and was discarded):
+
+- No unrefuted Critical/High. Triage 4h confirmed: no content-derived 64-hex
+  string on any spawned argv or in script text for upload (probe and write),
+  exec or execPipeline; `mv -T`, symlink/directory refusal and mode convergence
+  unchanged; manifest and model version literals both 2026.10.17.2.
+- terra HIGH (upload returns the content SHA-256 in its result and resource):
+  refuted as a regression. Behaviour is unchanged from 2026.10.17.1, where it
+  was dispositioned as the MEDIUM residual "SHA-256 of low-entropy output or
+  content can be guessed"; hashes in place of raw content is the design the run
+  rulings require. Carried as that MEDIUM.
+- New MEDIUM residual (terra): the post-rename check takes the first stdout
+  token, so a target whose forced-command wrapper prints to stdout fails upload
+  with "did not converge" after the rename. It fails closed (never a false
+  success) and the probe already parsed stdout the same way. Fix: a delimited
+  verification record.
+- LOW (astra): the exact-hash assertion in the new no-hash-on-argv test is
+  subsumed by the 64-hex assertion.

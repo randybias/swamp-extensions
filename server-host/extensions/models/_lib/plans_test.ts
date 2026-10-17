@@ -3,7 +3,9 @@ import {
   assertRejects,
   assertThrows,
 } from "jsr:@std/assert@1.0.19";
-import { type CommandRunner, type SshDeps, type Target } from "./ssh.ts";
+import { SshError, type SshTarget } from "./ssh.ts";
+import { dataOf, fakeHost } from "./test_support.ts";
+import { renderScript } from "./remote.ts";
 import {
   assertArmedBeforeApply,
   executePlan,
@@ -19,17 +21,17 @@ import {
 import { type FirewallRules, renderRuleset } from "./nftables.ts";
 import { HostConfigError } from "./validate.ts";
 
-const TARGET: Target = {
+const TARGET: SshTarget = {
   host: "192.0.2.10",
   port: 22,
   user: "root",
-  hostKeyPolicy: "strict",
-  hostKeys: [
+  host_key_policy: "strict",
+  host_keys: [
     "192.0.2.10 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFakeKeyMaterialForTests",
   ],
-  privateKey:
+  private_key:
     "-----BEGIN OPENSSH PRIVATE KEY-----\nZmFrZS1rZXktbWF0ZXJpYWw=\n-----END OPENSSH PRIVATE KEY-----",
-  connectTimeoutS: 15,
+  connect_timeout_s: 15,
 };
 
 const RULES: FirewallRules = {
@@ -45,45 +47,19 @@ const KEY = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFakeKeyMaterialForTests";
 const TOKEN = "0".repeat(16);
 const SHA = "c".repeat(64);
 
-interface Fake {
-  deps: SshDeps;
-  commands: string[];
-}
-
-/** A transport whose only real work is recording the ssh command strings. */
+/** A fake host answering each remote script through `respond`. */
 function fakeTransport(
-  respond: (command: string) => { code: number; stdout?: string } = () => ({
+  respond: (script: string) => { code: number; stdout?: string } = () => ({
     code: 0,
   }),
-): Fake {
-  const commands: string[] = [];
-  const run: CommandRunner = async (cmd, args, _options = {}) => {
-    await Promise.resolve();
-    if (cmd === "ssh-agent") {
-      return args[0] === "-s"
-        ? {
-          code: 0,
-          stdout: "SSH_AUTH_SOCK=/tmp/a.sock;\nSSH_AGENT_PID=1;\n",
-          stderr: "",
-        }
-        : { code: 0, stdout: "", stderr: "" };
-    }
-    if (cmd === "ssh-add") return { code: 0, stdout: "", stderr: "" };
-    if (cmd !== "ssh") return { code: 0, stdout: "", stderr: "" };
-    const command = args[args.length - 1];
-    commands.push(command);
-    const r = respond(command);
-    return { code: r.code, stdout: r.stdout ?? "", stderr: "" };
+) {
+  const host = fakeHost((body) => respond(body));
+  return {
+    deps: host.deps,
+    get commands() {
+      return host.scripts();
+    },
   };
-  const deps: SshDeps = {
-    run,
-    makeTempDir: () => Promise.resolve("/tmp/t"),
-    writeFile: () => Promise.resolve(),
-    removeDir: () => Promise.resolve(),
-    now: () => 1_700_000_000_000,
-    sleep: () => Promise.resolve(),
-  };
-  return { deps, commands };
 }
 
 Deno.test("armed-revert: the arm step precedes the apply step in the plan", () => {
@@ -119,11 +95,9 @@ Deno.test("armed-revert: the emitted command stream arms before it applies", asy
     "precheck,stage,arm,apply,verify",
   );
   const armAt = f.commands.findIndex((c) => c.includes("systemd-run"));
-  const checkAt = f.commands.findIndex((c) =>
-    c.includes("'nft' '-c' '-f' '-'")
-  );
+  const checkAt = f.commands.findIndex((c) => c.includes("nft -c -f -"));
   const applyAt = f.commands.findIndex((c) =>
-    c.includes("nft -f -") && c.includes("exit 70")
+    c.includes("| nft -f -") && c.includes("exit 70")
   );
   assertEquals(armAt >= 0, true, "arm emitted");
   assertEquals(checkAt >= 0 && checkAt < armAt, true, "pre-check before arm");
@@ -132,7 +106,7 @@ Deno.test("armed-revert: the emitted command stream arms before it applies", asy
 
 Deno.test("pre-check failure stops the plan before apply", async () => {
   const f = fakeTransport((c) =>
-    c.includes("'nft' '-c' '-f' '-'") ? { code: 1 } : { code: 0 }
+    c.includes("nft -c -f -") ? { code: 1 } : { code: 0 }
   );
   const steps = planFirewallChange({
     managedSha256: SHA,
@@ -146,13 +120,11 @@ Deno.test("pre-check failure stops the plan before apply", async () => {
     HostOpsError,
     "nft syntax check",
   );
-  assertEquals(
-    f.commands.some((c) => c.includes("'nft' '-f' '-'") && !c.includes("'-c'")),
-    false,
-  );
+  assertEquals(f.commands.some((c) => c.includes("| nft -f -")), false);
+  assertEquals(f.commands.some((c) => c.includes("systemd-run")), false);
 });
 
-Deno.test("base plan: caller values are separate argv words, keys on stdin", () => {
+Deno.test("base plan: caller values are positional parameters, keys are data", () => {
   const steps = planApplyBase({
     sudo: true,
     packages: ["curl", "openssh-server"],
@@ -172,18 +144,23 @@ Deno.test("base plan: caller values are separate argv words, keys on stdin", () 
   const pkg = steps.find((s) => s.label === "install packages");
   assertEquals(pkg !== undefined, true);
   if (pkg !== undefined) {
-    assertEquals(pkg.argv.slice(-2), ["curl", "openssh-server"]);
-    assertEquals(pkg.argv[4].includes("curl"), false);
+    assertEquals(pkg.call.args, ["curl", "openssh-server"]);
+    assertEquals(pkg.call.script.includes("curl"), false);
+    // A long install gets a long, but finite, remote deadline.
+    assertEquals(pkg.call.deadlineS, 900);
   }
   const keys = steps.find((s) => s.label === "authorize admin keys");
   assertEquals(keys !== undefined, true);
   if (keys !== undefined) {
-    assertEquals(JSON.stringify(keys.argv).includes(KEY), false);
-    assertEquals(new TextDecoder().decode(keys.stdin).includes(KEY), true);
+    assertEquals(keys.call.script.includes(KEY), false);
+    assertEquals(
+      dataOf(renderScript(keys.call)),
+      `${KEY}\n`,
+    );
   }
 });
 
-Deno.test("base plan: an injected package stays one literal argv word", () => {
+Deno.test("base plan: an injected package stays one literal parameter", () => {
   const evil = "curl; rm -rf /";
   const steps = planApplyBase({
     sudo: false,
@@ -195,8 +172,12 @@ Deno.test("base plan: an injected package stays one literal argv word", () => {
   }, ["packages"]);
   const pkg = steps.find((s) => s.label === "install packages");
   if (pkg === undefined) throw new Error("no package step");
-  assertEquals(pkg.argv.includes(evil), true);
-  assertEquals(pkg.argv[2].includes(evil), false);
+  assertEquals(pkg.call.args, [evil]);
+  assertEquals(pkg.call.script.includes(evil), false);
+  assertEquals(
+    renderScript(pkg.call).includes("set -- 'curl; rm -rf /'"),
+    true,
+  );
 });
 
 Deno.test("base plan: an unchanged re-run emits no steps", () => {
@@ -222,24 +203,26 @@ Deno.test("base plan: a cleared managed file is still written", () => {
   }, ["authorized_keys", "sysctl"]);
   const keys = cleared.find((s) => s.label === "authorize admin keys");
   assertEquals(keys !== undefined, true);
-  assertEquals(keys?.stdin?.length, 0);
+  assertEquals(keys?.call.data?.length, 0);
   const sysctl = cleared.find((s) => s.label === "write sysctl drop-in");
   assertEquals(sysctl !== undefined, true);
   assertEquals(
-    new TextDecoder().decode(sysctl?.stdin).includes("net.ipv4"),
+    new TextDecoder().decode(sysctl?.call.data).includes("net.ipv4"),
     false,
   );
 });
 
 Deno.test("writeFileStep: same-directory temp, parent dir, atomic mv", () => {
   const step = planStepWrite();
-  const script = step.argv[4];
+  const script = step.call.script;
   assertEquals(script.includes('dir=$(dirname "'), true);
   assertEquals(script.includes('install -d -m 0755 "$dir"'), true);
   assertEquals(script.includes('tmp=$(mktemp "'), true);
   assertEquals(script.includes(".XXXXXX"), true);
   assertEquals(script.includes('mv -f "$tmp"'), true);
   assertEquals(script.includes("cmp -s"), true);
+  // The temp file is removed on any exit.
+  assertEquals(step.call.cleanup, 'rm -f "${tmp:-}"');
 });
 
 function planStepWrite() {
@@ -271,10 +254,10 @@ const EMPTY_TABLE = JSON.stringify({
 
 Deno.test("probe: reads the ruleset sha and timer state without mutating", async () => {
   const f = fakeTransport((c) => {
-    if (c.includes("'nft' '-j' 'list' 'ruleset'")) {
+    if (c.includes("nft -j list ruleset")) {
       return { code: 0, stdout: EMPTY_TABLE };
     }
-    if (c.includes("'systemctl' 'is-active'")) {
+    if (c.includes("systemctl is-active")) {
       return { code: 0, stdout: "active\n" };
     }
     return { code: 0 };
@@ -288,36 +271,38 @@ Deno.test("probe: reads the ruleset sha and timer state without mutating", async
   assertEquals(probe.ruleset_sha256.length, 64);
   assertEquals(probe.managed_sha256.length, 64);
   assertEquals(f.commands.every((c) => !c.includes("nft -f")), true);
+  assertEquals(f.commands.every((c) => !c.includes("systemd-run")), true);
 });
 
 Deno.test("probe: a failed or truncated ruleset read is an error, not an observation", async () => {
   const failed = fakeTransport((c) =>
-    c.includes("'nft' '-j' 'list' 'ruleset'") ? { code: 1 } : { code: 0 }
+    c.includes("nft -j list ruleset") ? { code: 1 } : { code: 0 }
   );
   await assertRejects(
     () => probeState(failed.deps, TARGET, { sudo: true }),
     HostOpsError,
     "nft -j list ruleset",
   );
-  const truncated = fakeTransport((c) => {
-    if (c.includes("'nft' '-j' 'list' 'ruleset'")) {
-      return { code: 0, stdout: "x".repeat(2_000_000) };
-    }
-    return { code: 0 };
-  });
+  // Output past the transport's capture cap is the transport's error, never a
+  // short listing that would be hashed as if it were whole.
+  const flood = fakeTransport((c) =>
+    c.includes("nft -j list ruleset")
+      ? { code: 0, stdout: "x".repeat(10 * 1024 * 1024 + 1) }
+      : { code: 0 }
+  );
   await assertRejects(
-    () => probeState(truncated.deps, TARGET, { sudo: true }),
-    HostOpsError,
-    "truncated",
+    () => probeState(flood.deps, TARGET, { sudo: true }),
+    SshError,
+    "capture limit",
   );
 });
 
 Deno.test("probe: an unexpected timer-probe exit is an error", async () => {
   const f = fakeTransport((c) => {
-    if (c.includes("'nft' '-j' 'list' 'ruleset'")) {
+    if (c.includes("nft -j list ruleset")) {
       return { code: 0, stdout: EMPTY_TABLE };
     }
-    if (c.includes("'systemctl' 'is-active'")) return { code: 1 };
+    if (c.includes("systemctl is-active")) return { code: 1 };
     return { code: 0 };
   });
   await assertRejects(
@@ -330,10 +315,10 @@ Deno.test("probe: an unexpected timer-probe exit is an error", async () => {
 Deno.test("probe: inactive and unknown timers are simply not armed", async () => {
   for (const code of [3, 4]) {
     const f = fakeTransport((c) => {
-      if (c.includes("'nft' '-j' 'list' 'ruleset'")) {
+      if (c.includes("nft -j list ruleset")) {
         return { code: 0, stdout: EMPTY_TABLE };
       }
-      if (c.includes("'systemctl' 'is-active'")) {
+      if (c.includes("systemctl is-active")) {
         return { code, stdout: "inactive\n" };
       }
       return { code: 0 };
@@ -351,4 +336,46 @@ Deno.test("commit plan: a single cleanup step", () => {
   assertEquals(steps.length, 1);
   assertEquals(steps[0].kind, "cleanup");
   assertThrows(() => planCommit("bad token", true), HostConfigError);
+});
+
+Deno.test("executePlan: a step that outlives its remote deadline is an unknown outcome, checked or not", async () => {
+  for (const code of [124, 137]) {
+    const f = fakeTransport((c) =>
+      c.includes("| nft -f -") ? { code } : { code: 0 }
+    );
+    const steps = planFirewallChange({
+      managedSha256: SHA,
+      token: TOKEN,
+      revertAfterS: 300,
+      sudo: true,
+      rulesText: renderRuleset(RULES),
+    });
+    const err = await assertRejects(
+      () => executePlan(f.deps, TARGET, steps),
+      HostOpsError,
+      "deadline",
+    );
+    assertEquals(err.deadline, true);
+    assertEquals(err.stepKind, "apply");
+    assertEquals(err.exitCode, code);
+  }
+});
+
+Deno.test("executePlan: every step is a stdin script under a remote timeout, nothing on the remote command line", async () => {
+  const f = fakeHost();
+  const steps = planFirewallChange({
+    managedSha256: SHA,
+    token: TOKEN,
+    revertAfterS: 300,
+    sudo: true,
+    rulesText: renderRuleset(RULES),
+  });
+  await executePlan(f.deps, TARGET, steps);
+  const calls = f.sshCalls();
+  assertEquals(calls.length, steps.length);
+  for (const c of calls) {
+    assertEquals(c.argv[c.argv.length - 1], "'sudo' '-n' 'sh' '-s'");
+    assertEquals(c.stdin?.startsWith("timeout -k 5 "), true);
+    assertEquals(typeof c.timeoutMs, "number");
+  }
 });

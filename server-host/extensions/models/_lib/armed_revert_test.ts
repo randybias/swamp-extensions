@@ -1,21 +1,21 @@
 import { assertEquals, assertThrows } from "jsr:@std/assert@1.0.19";
 import {
+  armCall,
+  commitCall,
   CURRENT_PATH,
+  disarmCall,
+  guardedApplyCall,
   isTimerActive,
+  markerCall,
   parseMarker,
-  renderArmArgv,
-  renderCommitArgv,
-  renderDisarmArgv,
-  renderGuardedApplyArgv,
-  renderMarkerArgv,
-  renderProbeArgv,
+  probeCall,
   renderRevertScript,
   scriptPath,
   snapshotPath,
   TOKEN_RE,
   unitName,
-  withSudo,
 } from "./armed_revert.ts";
+import { renderRemote, renderScript, withSudo } from "./remote.ts";
 import { HostConfigError } from "./validate.ts";
 
 const TOKEN = "0".repeat(16);
@@ -63,7 +63,7 @@ Deno.test("revert script: locked, atomic, and abort-safe", () => {
     script.includes('exec 9>"/var/lib/server-host/revert.lock"'),
     true,
   );
-  assertEquals(script.includes("flock 9"), true);
+  assertEquals(script.includes("flock -w 120 9"), true);
   assertEquals(
     script.includes('[ ! -f "$snap" ]'),
     true,
@@ -90,20 +90,21 @@ Deno.test("revert script: restores only while it is still the current revert", (
   const guard = script.indexOf(`"$ctok" != '${TOKEN}'`);
   assertEquals(guard > 0 && guard < script.indexOf("nft -f -"), true);
   // It holds the lock before reading the marker.
-  assertEquals(script.indexOf("flock 9") < guard, true);
+  assertEquals(script.indexOf("flock -w") < guard, true);
 });
 
 Deno.test("arm: under the host lock, snapshots, records the marker, then starts the timer", () => {
-  const argv = renderArmArgv(TOKEN, 300, true, SHA);
-  assertEquals(argv.slice(0, 4), ["sudo", "-n", "sh", "-c"]);
-  const s = argv[4];
-  assertEquals(s.indexOf("flock 9") > 0, true);
+  const call = armCall(TOKEN, 300, true, SHA);
+  const { argv, stdin } = renderRemote(call);
+  assertEquals(argv, ["sudo", "-n", "sh", "-s"]);
+  const s = renderScript(call);
+  assertEquals(s.indexOf("flock -w") > 0, true);
   const snap = s.indexOf(
     `nft list table inet server_host > "$snap"`,
   );
   const mark = s.indexOf(`'${TOKEN}'`, s.indexOf("printf"));
   const run = s.indexOf("systemd-run");
-  assertEquals(s.indexOf("flock 9") < snap, true);
+  assertEquals(s.indexOf("flock -w") < snap, true);
   assertEquals(snap < mark && mark < run, true);
   assertEquals(s.includes("--on-active=300s"), true);
   assertEquals(s.includes(`--unit=server-host-revert-${TOKEN}`), true);
@@ -114,22 +115,24 @@ Deno.test("arm: under the host lock, snapshots, records the marker, then starts 
     s.includes(`rm -f "$cur" "/var/lib/server-host/revert-${TOKEN}.nft"`),
     true,
   );
+  // The script travels on stdin, bounded by a remote deadline.
+  assertEquals(stdin.startsWith("timeout -k 5 60 sh -c "), true);
+  assertEquals(stdin.endsWith("; exit $?"), true);
   for (const bad of [59, 1801, 0, -1, 1.5]) {
-    assertThrows(() => renderArmArgv(TOKEN, bad, false, SHA), HostConfigError);
+    assertThrows(() => armCall(TOKEN, bad, false, SHA), HostConfigError);
   }
 });
 
 Deno.test("commit: locked, fails unless the timer is active, then cleanup", () => {
-  const argv = renderCommitArgv(TOKEN, false);
-  assertEquals(argv[0], "sh");
-  assertEquals(argv[1], "-c");
-  const script = argv[2];
-  assertEquals(script.startsWith("set -e"), true);
+  const call = commitCall(TOKEN, false);
+  assertEquals(renderRemote(call).argv, ["sh", "-s"]);
+  const script = renderScript(call);
+  assertEquals(script.startsWith("set -eu"), true);
   assertEquals(
-    script.includes('exec 9>"/var/lib/server-host/revert.lock"'),
+    script.includes("exec 9>'/var/lib/server-host/revert.lock'"),
     true,
   );
-  assertEquals(script.includes("flock 9"), true);
+  assertEquals(script.includes("flock -w 20 9"), true);
   assertEquals(script.includes('if [ "$state" != "active" ]; then'), true);
   assertEquals(script.includes("exit 1"), true);
   assertEquals(
@@ -150,20 +153,19 @@ Deno.test("commit: locked, fails unless the timer is active, then cleanup", () =
 });
 
 Deno.test("probe: reads the timer state without changing it", () => {
-  assertEquals(renderProbeArgv(TOKEN, true), [
-    "sudo",
-    "-n",
-    "systemctl",
-    "is-active",
-    `server-host-revert-${TOKEN}.timer`,
-  ]);
+  const call = probeCall(TOKEN, true);
+  assertEquals(renderRemote(call).argv, ["sudo", "-n", "sh", "-s"]);
+  assertEquals(
+    call.script,
+    `systemctl is-active 'server-host-revert-${TOKEN}.timer'\n`,
+  );
   assertEquals(isTimerActive("active\n"), true);
   assertEquals(isTimerActive("inactive\n"), false);
   assertEquals(isTimerActive(""), false);
 });
 
 Deno.test("arm: the table listing's exit status is checked on its own, not through a pipe", () => {
-  const s = renderArmArgv(TOKEN, 300, false, SHA)[2];
+  const s = armCall(TOKEN, 300, false, SHA).script;
   assertEquals(s.includes("tables=$(nft list tables)"), true);
   assertEquals(s.includes("nft list tables |"), false);
   assertEquals(
@@ -173,7 +175,7 @@ Deno.test("arm: the table listing's exit status is checked on its own, not throu
 });
 
 Deno.test("arm: refuses (75) while an earlier revert's timer OR service is busy, or its files remain", () => {
-  const s = renderArmArgv(TOKEN, 300, false, SHA)[2];
+  const s = armCall(TOKEN, 300, false, SHA).script;
   assertEquals(s.includes('busy "$ou.timer" || busy "$ou.service"'), true);
   assertEquals(s.includes("exit 75"), true);
   // "Inactive" alone is not enough: artifacts within the grace window still block.
@@ -193,36 +195,43 @@ Deno.test("arm: refuses (75) while an earlier revert's timer OR service is busy,
 });
 
 Deno.test("guarded apply: locked, and refused unless this revert still guards the change", () => {
-  const argv = renderGuardedApplyArgv(TOKEN, true);
-  const s = argv[4];
-  assertEquals(argv.slice(0, 4), ["sudo", "-n", "sh", "-c"]);
+  const rules = new TextEncoder().encode("table inet server_host\n");
+  const call = guardedApplyCall(TOKEN, true, rules);
+  assertEquals(renderRemote(call).argv, ["sudo", "-n", "sh", "-s"]);
+  const s = renderScript(call);
   const checks = [
-    "flock 9",
+    "flock -w 10 9",
     `[ "$ctok" = '${TOKEN}' ] || exit 70`,
     `revert-${TOKEN}.nft" ] || exit 71`,
     `"$cexp" ] || exit 72`,
     `.timer' || true)" = active ] || exit 73`,
-    "nft -f -",
+    "bw_data | nft -f -",
   ].map((c) => s.indexOf(c));
   assertEquals(checks.every((i) => i >= 0), true, JSON.stringify(checks));
   assertEquals([...checks].sort((a, b) => a - b), checks);
+  // The ruleset is data, not shell text, and the apply is bounded under the
+  // shortest revert.
+  assertEquals(s.includes("add table"), false);
+  assertEquals(call.deadlineS < 60, true);
 });
 
 Deno.test("disarm: tolerant and idempotent; commit stays strict", () => {
-  const d = renderDisarmArgv(TOKEN, false)[2];
-  const c = renderCommitArgv(TOKEN, false)[2];
+  const d = disarmCall(TOKEN, false).script;
+  const c = commitCall(TOKEN, false).script;
   assertEquals(d.includes('"$unit.timer" 2>/dev/null || true'), true);
   assertEquals(d.includes("exit 1"), false);
   assertEquals(c.includes("exit 1"), true);
   for (const x of [d, c]) {
     assertEquals(x.includes(`rm -f "${CURRENT_PATH}"`), true);
     assertEquals(x.includes(`'${TOKEN}'`), true);
-    assertEquals(x.indexOf("flock 9") >= 0, true);
+  }
+  for (const call of [disarmCall(TOKEN, false), commitCall(TOKEN, false)]) {
+    assertEquals(renderScript(call).includes("flock -w 20 9"), true);
   }
 });
 
-Deno.test("marker: read-only argv and strict parsing", () => {
-  assertEquals(renderMarkerArgv(false)[0], "sh");
+Deno.test("marker: read-only call and strict parsing", () => {
+  assertEquals(renderRemote(markerCall(false)).argv, ["sh", "-s"]);
   assertEquals(parseMarker(`${TOKEN} 1700000300\n`), {
     token: TOKEN,
     expires_at_s: 1700000300,

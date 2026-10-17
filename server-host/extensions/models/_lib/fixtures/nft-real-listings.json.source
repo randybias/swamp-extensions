@@ -1,0 +1,5 @@
+command: nft -f - (the rendered ruleset); nft list table inet server_host; nft -j list table inet server_host
+tool: nftables v1.0.9 (Ubuntu 24.04)
+image: nft-check:local (ubuntu:24.04 with the nftables and netbase packages installed, built locally), run with --cap-add NET_ADMIN --network none
+captured: 2026-10-17T14:44:00Z
+by: lane

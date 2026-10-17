@@ -177,3 +177,94 @@ Deno.test({
     }
   },
 });
+
+Deno.test({
+  name:
+    "netns: drift is repaired under an armed rollback, and a confirm after the rollback ran is refused",
+  ignore: !enabled,
+  sanitizeOps: false,
+  sanitizeResources: false,
+  fn: async () => {
+    const dir = await Deno.makeTempDir({ prefix: "wgmesh-netns2-" });
+    const applyFile = `${dir}/apply.sh`;
+    const confirmFile = `${dir}/confirm.sh`;
+    const rollbackFile = `${dir}/run-rollback.sh`;
+    await Deno.writeTextFile(applyFile, applyScript(IFACE));
+    const key = (await sh(["wg", "genkey"])).stdout.trim();
+    const hub = "H".repeat(42) + "A=";
+    const stdin = (addr: string) =>
+      `${key}\n[Interface]\nAddress = ${addr}\nListenPort = 51996\n` +
+      `PostUp = wg set '%i' private-key '/etc/wireguard/%i.key'\n` +
+      `[Peer]\nPublicKey = ${hub}\nAllowedIPs = 198.51.100.0/24\n`;
+    const cleanupSystem = async () => {
+      await sudo(["ip", "netns", "del", NS]);
+      await sudo([
+        "sh",
+        "-c",
+        `rm -rf /etc/wireguard/${IFACE}.* /etc/wireguard/.${IFACE}.*`,
+      ]);
+    };
+    const cleanup = async () => {
+      await cleanupSystem();
+      await Deno.remove(dir, { recursive: true }).catch(() => {});
+    };
+    const confirm = async (rb: string) => {
+      await Deno.writeTextFile(confirmFile, confirmScript(IFACE, rb));
+      return await inNs(["sh", confirmFile]);
+    };
+    await cleanupSystem();
+    await sudo(["ip", "netns", "add", NS]);
+    try {
+      let r = await inNs(["sh", applyFile], stdin("192.0.2.1/24"));
+      assertEquals(r.code, 0, r.stderr);
+      const rb1 = parseRollbackDir(r.stdout, IFACE);
+      assertExists(rb1);
+      assertEquals((await confirm(rb1)).code, 0);
+      // Confirming twice is harmless while the rollback is still pending.
+      assertEquals((await confirm(rb1)).code, 0);
+
+      // Live drift: the peer is removed behind our back. A re-apply of the
+      // same config repairs it, reports a change, and arms a rollback.
+      await inNs(["wg", "set", IFACE, "peer", hub, "remove"]);
+      assertEquals(
+        (await inNs(["wg", "show", IFACE, "peers"])).stdout.trim(),
+        "",
+      );
+      r = await inNs(["sh", applyFile], stdin("192.0.2.1/24"));
+      assertEquals(r.code, 0, r.stderr);
+      assertStringIncludes(r.stdout, "changed=1");
+      assertStringIncludes(
+        (await inNs(["wg", "show", IFACE, "peers"])).stdout,
+        hub,
+      );
+      const rb2 = parseRollbackDir(r.stdout, IFACE);
+      assertExists(rb2);
+      assertEquals((await confirm(rb2)).code, 0);
+
+      // Converged: the probe path leaves no pending rollback to confirm and
+      // reports no change.
+      r = await inNs(["sh", applyFile], stdin("192.0.2.1/24"));
+      assertStringIncludes(r.stdout, "changed=0");
+
+      // A change whose rollback runs before it is confirmed cannot be
+      // confirmed afterwards.
+      r = await inNs(["sh", applyFile], stdin("192.0.2.9/24"));
+      assertEquals(r.code, 0, r.stderr);
+      const rb3 = parseRollbackDir(r.stdout, IFACE);
+      assertExists(rb3);
+      await Deno.writeTextFile(
+        rollbackFile,
+        `epoch=$(cat ${rb3}/epoch); sh ${rb3}/rollback.sh 0 ${rb3} /etc/wireguard ${IFACE} 1 "$epoch"`,
+      );
+      const ran = await inNs(["sh", rollbackFile]);
+      assertEquals(ran.code, 0, ran.stderr);
+      const late = await confirm(rb3);
+      assertEquals(late.code, 3, late.stderr);
+      const addr = (await inNs(["ip", "-4", "addr", "show", IFACE])).stdout;
+      assertStringIncludes(addr, "192.0.2.1/24");
+      assertEquals(addr.includes("192.0.2.9/24"), false);
+    } finally {
+      await cleanup();
+    }
+  },
+});

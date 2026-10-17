@@ -496,3 +496,89 @@ Deno.test("the real ssh transport: strict needs pinned keys, ssh 255 is typed, k
     "pinned",
   );
 });
+
+Deno.test("first-use TOFU: the confirmation connection is pinned to the key the apply accepted", async () => {
+  const targets: SshTarget[] = [];
+  const m = createModel({
+    now: () => NOW,
+    transport: (target): Transport => (script) => {
+      targets.push(target);
+      return Promise.resolve(
+        script.includes("confirmed")
+          ? { code: 0, stdout: "confirmed\n", stderr: "" }
+          : {
+            code: 0,
+            stdout: "changed=1\nrb=/etc/wireguard/.wg0.rollback.TESTRUN\n",
+            stderr: "",
+            known_hosts:
+              `198.51.100.20 ${ACCEPTED_HOSTKEY.type} ${ACCEPTED_HOSTKEY.key}\n`,
+          },
+      );
+    },
+  });
+  const { context } = createModelTestContext({ globalArgs: {} });
+  await m.methods.apply.execute(
+    { ...applyArgs(), ssh: ACCEPT_NEW },
+    context,
+  );
+  assertEquals(targets.length, 2);
+  assertEquals(targets[0].host_key_policy, "accept-new");
+  // The second step may not trust a fresh key: it must match the first.
+  assertEquals(targets[1].host_key_policy, "strict");
+  assertEquals(targets[1].host_keys, [ACCEPTED_HOSTKEY]);
+});
+
+Deno.test("a confirmation the node refuses means the change was undone: nothing is recorded", async () => {
+  for (
+    const [code, text] of [[3, "was undone"], [4, "superseded"], [
+      75,
+      "could not be confirmed",
+    ]] as const
+  ) {
+    const m = createModel({
+      now: () => NOW,
+      transport: (): Transport => (script) =>
+        Promise.resolve(
+          script.includes("confirmed") ? { code, stdout: "", stderr: "" } : {
+            code: 0,
+            stdout: "changed=1\nrb=/etc/wireguard/.wg0.rollback.TESTRUN\n",
+            stderr: "",
+          },
+        ),
+    });
+    for (const run of ["apply", "delete"] as const) {
+      const { context, getWrittenResources } = createModelTestContext({
+        globalArgs: {},
+      });
+      const e = await assertRejects(
+        () =>
+          run === "apply"
+            ? m.methods.apply.execute(applyArgs(), context)
+            : m.methods.delete.execute(deleteArgs, context),
+        TransportError,
+        text,
+      );
+      assertEquals(e.reason, "remote");
+      assertEquals(getWrittenResources().length, 0, `${run} ${code}`);
+    }
+  }
+});
+
+Deno.test("first-use TOFU with no recorded key refuses to continue on trust", async () => {
+  const m = createModel({
+    now: () => NOW,
+    transport: (): Transport => () =>
+      Promise.resolve({
+        code: 0,
+        stdout: "changed=1\nrb=/etc/wireguard/.wg0.rollback.TESTRUN\n",
+        stderr: "",
+        known_hosts: "",
+      }),
+  });
+  const { context } = createModelTestContext({ globalArgs: {} });
+  const e = await assertRejects(
+    () => m.methods.apply.execute({ ...applyArgs(), ssh: ACCEPT_NEW }, context),
+    TransportError,
+  );
+  assertEquals(e.reason, "host-key");
+});

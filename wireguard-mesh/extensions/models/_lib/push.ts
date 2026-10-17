@@ -286,6 +286,7 @@ function launchRollbackLines(windowSeconds: number): string[] {
     '  exec 9>"$d/.$i.lock"',
     "  flock -w 60 9 || exit 1",
     "fi",
+    'if [ ! -e "$rb/epoch" ]; then exit 0; fi',
     'if [ -e "$rb/disarm" ]; then rm -rf "$rb"; exit 0; fi',
     'if [ "$(cat "$d/.$i.epoch" 2>/dev/null || echo stale)" != "$epoch" ]; then rm -rf "$rb"; exit 0; fi',
     ...restoreLines(),
@@ -387,12 +388,26 @@ export function applyScript(iface: string): string {
     'chmod 600 "$cfg" "$kf"',
     "up=0",
     'if ip link show "$i" >/dev/null 2>&1; then up=1; fi',
-    "restore_live() {",
-    '  if [ -e "$d/$i.conf" ]; then',
-    '    wg-quick strip "$d/$i.conf" > "$stage/restore.wg" 2>/dev/null || true',
-    '    wg syncconf "$i" "$stage/restore.wg" 2>/dev/null || true',
-    '    wg set "$i" private-key "$d/$i.key" 2>/dev/null || true',
+    "restore_previous() {",
+    ...restoreLines(),
+    '  if [ "$up" = 1 ] && ! ip link show "$i" >/dev/null 2>&1; then',
+    '    echo "rollback could not restore interface $i" >&2; return 1;',
     "  fi",
+    "  return 0",
+    "}",
+    // Restores the saved state and, only when that worked, disarms the rollback.
+    'fail_restore() { if restore_previous; then touch "$rb/disarm"; fi; exit 1; }',
+    // Arms a detached rollback. `$1` = 1 starts a new generation, which retires
+    // any earlier unconfirmed rollback; 0 reuses the current one.
+    "arm_rollback() {",
+    '  epoch=$(cat "$d/.$i.epoch" 2>/dev/null || echo 0)',
+    '  if [ "$1" = 1 ]; then epoch=$((epoch + 1)); echo "$epoch" > "$d/.$i.epoch"; fi',
+    ...backupLines(),
+    ...launchRollbackLines(APPLY_ROLLBACK_SECONDS),
+    "}",
+    // Peers, endpoints, allowed IPs, keepalive and listen port; no counters.
+    "live_sig() {",
+    '  wg show "$i" dump 2>/dev/null | { IFS= read -r first || true; printf "%s\\n" "$first" | cut -f2,3,4; cut -f1,3,4,8 | sort; }',
     "}",
     "changed=0",
     'if ! cmp -s "$cfg" "$d/$i.conf"; then changed=1; fi',
@@ -407,28 +422,22 @@ export function applyScript(iface: string): string {
     '  if [ "$addr_ok" = 0 ]; then',
     "    live_drift=1",
     "  else",
+    // The probe re-syncs the live interface, which is a live change: arm first.
+    "    arm_rollback 0",
     '    wg-quick strip "$cfg" > "$stage/desired.wg"',
-    '    before=$(wg show "$i" dump 2>/dev/null || true)',
-    '    if ! wg syncconf "$i" "$stage/desired.wg"; then restore_live; exit 1; fi',
-    '    if ! wg set "$i" private-key "$d/$i.key"; then restore_live; exit 1; fi',
-    '    after=$(wg show "$i" dump 2>/dev/null || true)',
+    "    before=$(live_sig)",
+    '    if ! wg syncconf "$i" "$stage/desired.wg"; then fail_restore; fi',
+    '    if ! wg set "$i" private-key "$d/$i.key"; then fail_restore; fi',
+    "    after=$(live_sig)",
     '    if [ "$before" != "$after" ]; then live_drift=1; fi',
+    '    touch "$rb/disarm"',
     "  fi",
     "fi",
     'if [ "$changed" = 0 ] && [ "$live_drift" = 0 ]; then echo "changed=0"; exit 0; fi',
-    ...bumpEpochLines(),
-    ...backupLines(),
-    "restore_previous() {",
-    ...restoreLines(),
-    '  if [ "$up" = 1 ] && ! ip link show "$i" >/dev/null 2>&1; then',
-    '    echo "rollback could not restore interface $i" >&2; return 1;',
-    "  fi",
-    "  return 0",
-    "}",
-    ...launchRollbackLines(APPLY_ROLLBACK_SECONDS),
+    "arm_rollback 1",
     ...routeSigLines(),
     'old_routes=$(route_sig "$d/$i.conf")',
-    'if ! { mv "$kf" "$d/$i.key" && mv "$cfg" "$d/$i.conf"; }; then if restore_previous; then touch "$rb/disarm"; fi; exit 1; fi',
+    'if ! { mv "$kf" "$d/$i.key" && mv "$cfg" "$d/$i.conf"; }; then fail_restore; fi',
     'new_routes=$(route_sig "$d/$i.conf")',
     "addr_ok=1",
     "for a in $(sed -n 's/^Address *= *//p' \"$d/$i.conf\" | tr ',' ' '); do",
@@ -436,16 +445,16 @@ export function applyScript(iface: string): string {
     "done",
     'if [ "$up" = 1 ] && [ "$addr_ok" = 1 ] && [ "$old_routes" = "$new_routes" ]; then',
     '  wg-quick strip "$d/$i.conf" > "$stage/committed.wg"',
-    '  if ! wg syncconf "$i" "$stage/committed.wg"; then if restore_previous; then touch "$rb/disarm"; fi; exit 1; fi',
-    '  if ! wg set "$i" private-key "$d/$i.key"; then if restore_previous; then touch "$rb/disarm"; fi; exit 1; fi',
+    '  if ! wg syncconf "$i" "$stage/committed.wg"; then fail_restore; fi',
+    '  if ! wg set "$i" private-key "$d/$i.key"; then fail_restore; fi',
     "else",
     '  if [ "$up" = 1 ]; then wg-quick down "$i" || ip link delete "$i"; fi',
-    '  if ! wg-quick up "$i"; then if restore_previous; then touch "$rb/disarm"; fi; exit 1; fi',
+    '  if ! wg-quick up "$i"; then fail_restore; fi',
     "fi",
-    'if ! ip link show "$i" >/dev/null 2>&1; then if restore_previous; then touch "$rb/disarm"; fi; exit 1; fi',
+    'if ! ip link show "$i" >/dev/null 2>&1; then fail_restore; fi',
     ...routeCheckLines(),
     "route_check",
-    'if [ "$route_ok" = 0 ]; then if restore_previous; then touch "$rb/disarm"; fi; exit 1; fi',
+    'if [ "$route_ok" = 0 ]; then fail_restore; fi',
     'echo "changed=1"',
     'echo "rb=$rb"',
   ].join("\n");
@@ -496,11 +505,23 @@ export function deleteScript(iface: string, rollbackSeconds: number): string {
   ].join("\n");
 }
 
+/** Exit codes of {@link confirmScript} when there is nothing to confirm. */
+export const CONFIRM_REFUSED = {
+  /** The rollback already ran (or never existed): the old state is back. */
+  gone: 3,
+  /** A newer generation has superseded this one. */
+  superseded: 4,
+  /** The lock could not be taken. */
+  busy: 75,
+} as const;
+
 /**
  * Remote script for a FRESH management connection after a successful `apply`
- * or `delete`: reaching the node at all proves the path survived, and then the
- * matching generation's rollback is disarmed. If this connection fails, the
- * rollback stays armed and restores the previous state.
+ * or `delete`: reaching the node at all proves the path survived. Under the
+ * same lock the rollback takes, it requires the rollback directory to still
+ * exist with the CURRENT generation and only then disarms it. If the rollback
+ * already ran, was superseded, or the lock is busy, it fails, so the caller
+ * never records a change the node has already undone.
  */
 export function confirmScript(iface: string, rollbackDir: string): string {
   assertIface(iface);
@@ -516,11 +537,21 @@ export function confirmScript(iface: string, rollbackDir: string): string {
     `d=/etc/wireguard`,
     `i='${iface}'`,
     `rb='${rollbackDir}'`,
-    'if [ -e "$rb/epoch" ] && [ -e "$d/.$i.epoch" ] && [ "$(cat "$rb/epoch")" = "$(cat "$d/.$i.epoch")" ]; then',
-    '  touch "$rb/disarm"',
-    "fi",
+    ...confirmLockLines(),
+    `if [ ! -e "$rb/epoch" ]; then echo "no pending rollback; it already ran" >&2; exit ${CONFIRM_REFUSED.gone}; fi`,
+    `if [ "$(cat "$rb/epoch")" != "$(cat "$d/.$i.epoch" 2>/dev/null || echo none)" ]; then echo "a newer change superseded this one" >&2; exit ${CONFIRM_REFUSED.superseded}; fi`,
+    'touch "$rb/disarm"',
     'echo "confirmed"',
   ].join("\n");
+}
+
+/** Lock lines for confirm: the lock is required, so no `flock` is an error. */
+function confirmLockLines(): string[] {
+  return [
+    'if ! command -v flock >/dev/null 2>&1; then echo "flock is required to confirm" >&2; exit 75; fi',
+    'exec 9>"$d/.$i.lock"',
+    `if ! flock -w 30 9; then echo "another run holds the $i lock" >&2; exit ${CONFIRM_REFUSED.busy}; fi`,
+  ];
 }
 
 /** Extracts and validates the rollback directory a mutation script printed. */

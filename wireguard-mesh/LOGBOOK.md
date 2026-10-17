@@ -144,3 +144,33 @@ Round 4 (codex astra + terra on `3c74892`), all fixed for `2026.10.17.4`:
 
 Render golden tests and the allowlist/relay-exclusion invariants were called out
 as good and are unchanged except for the quoted `PostUp` line.
+
+Round 5 (escalation fixer, on d3 5bdd12e):
+
+- HIGH-1 `confirmScript` skipped the lock and always printed "confirmed". Fixed:
+  it takes the same lock as the rollback and requires the rollback directory to
+  exist with the CURRENT generation; otherwise it exits 3 (the rollback already
+  ran) or 4 (superseded), 75 when the lock is busy or `flock` is missing. The
+  model turns those into typed errors and records nothing. A repeat confirm
+  while the rollback is still pending is harmless. The rollback itself exits
+  quietly when its directory has been removed.
+- HIGH-2 the no-op-with-live-drift path ran `wg syncconf` and `wg set` before
+  any rollback was armed. Fixed: `arm_rollback` runs before any live change on
+  every path. The drift probe arms the current generation without bumping it (so
+  an earlier unconfirmed rollback stays live), disarms it when nothing drifted,
+  and the main path then starts a new generation. The drift check now compares
+  peers, endpoints, allowed IPs, keepalive and listen port, not handshake or
+  traffic counters, so a busy node is not reported as drifting. Cost: each
+  converged re-apply leaves one sleeping, already-disarmed process for 120 s.
+- TOFU: under `accept-new` the first operation used a fresh, empty known_hosts
+  for each step, so the confirmation connection could accept a different key.
+  Fixed: the key accepted by the first connection is pinned (strict) for the
+  rest of the operation, and an `accept-new` connection that recorded no key
+  stops the operation. The key is also persisted for later runs, as before. Not
+  done: swapping in the canonical `_lib/ssh.ts`; this extension keeps its own
+  transport.
+- Evidence: `netns_test.ts`, run with `WG_MESH_NETNS=1` against real WireGuard
+  in a network namespace, passes: apply, no-op, address and route recreation,
+  delete, delete again, plus drift repair (peer removed behind the script's
+  back), double confirm, and a confirm after the rollback ran (exit 3, previous
+  address restored). It is skipped in the default test run.

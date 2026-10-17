@@ -5,6 +5,7 @@ import {
 } from "jsr:@std/assert@1.0.19";
 import {
   applyScript,
+  CONFIRM_REFUSED,
   confirmScript,
   deleteScript,
   getScript,
@@ -115,7 +116,7 @@ Deno.test("confirmScript disarms only the current generation of its own rollback
   const s = confirmScript("wg0", rb);
   assertStringIncludes(s, `rb='${rb}'`);
   assertStringIncludes(s, 'touch "$rb/disarm"');
-  assertStringIncludes(s, '"$(cat "$rb/epoch")" = "$(cat "$d/.$i.epoch")"');
+  assertStringIncludes(s, '"$(cat "$rb/epoch")" != "$(cat "$d/.$i.epoch"');
   assertThrows(() => confirmScript("wg0", "/etc/passwd"), Error, "rollback");
   assertThrows(
     () => confirmScript("wg0", "/etc/wireguard/.wg0.rollback;x"),
@@ -190,4 +191,60 @@ Deno.test("ssh transport returns the known_hosts it accepted, for TOFU pinning",
 
 Deno.test("shQuote survives single quotes in the script", () => {
   assertEquals(shQuote("echo 'a'"), `sh -c 'echo '\\''a'\\'''`);
+});
+
+Deno.test("confirmScript takes the rollback's lock and fails unless a current rollback is pending", () => {
+  const s = confirmScript("wg0", "/etc/wireguard/.wg0.rollback.AbC123");
+  const at = (t: string) => s.indexOf(t);
+  const lock = at("flock -w 30 9");
+  const gone = at(`exit ${CONFIRM_REFUSED.gone}`);
+  const stale = at(`exit ${CONFIRM_REFUSED.superseded}`);
+  const disarm = at('touch "$rb/disarm"');
+  // The lock comes first, both refusals precede the disarm, and the disarm
+  // is the only thing that precedes "confirmed".
+  assertEquals(lock > 0 && lock < gone && gone < stale && stale < disarm, true);
+  assertEquals(disarm < at('echo "confirmed"'), true);
+  // No lock tool means no confirmation, not a silent success.
+  assertStringIncludes(
+    s,
+    'command -v flock >/dev/null 2>&1; then echo "flock is required',
+  );
+  assertEquals(/exit 0/.test(s), false);
+});
+
+Deno.test("applyScript arms a rollback before any live change on every path", () => {
+  const s = applyScript("wg0");
+  const firstArm = s.indexOf("arm_rollback 0");
+  const liveChanges = [
+    "wg syncconf",
+    "wg set",
+    "wg-quick up",
+    "wg-quick down",
+    "ip link delete",
+  ];
+  // Inside the function bodies and the probe/main paths, find the first CALL
+  // of each live change after the function definitions.
+  const body = s.slice(s.indexOf("changed=0\n"));
+  const armProbe = body.indexOf("arm_rollback 0");
+  const armMain = body.indexOf("arm_rollback 1");
+  assertEquals(firstArm > 0 && armProbe > 0 && armMain > armProbe, true);
+  // Probe path: the first live change after `changed=0` is after its arm.
+  const probeStart = body.indexOf('if [ "$up" = 1 ] && [ "$changed" = 0 ]');
+  const firstLiveInProbe = Math.min(
+    ...liveChanges.map((c) => {
+      const i = body.indexOf(c, probeStart);
+      return i < 0 ? Infinity : i;
+    }),
+  );
+  assertEquals(armProbe < firstLiveInProbe, true);
+  // Main path: nothing live runs between the no-op exit and the second arm.
+  const noop = body.indexOf('echo "changed=0"; exit 0');
+  for (const c of liveChanges) {
+    const i = body.indexOf(c, noop);
+    assertEquals(i < 0 || i > armMain, true, c);
+  }
+});
+
+Deno.test("the rollback script exits quietly when its directory is gone", () => {
+  assertStringIncludes(applyScript("wg0"), '[ ! -e "$rb/epoch" ]');
 });

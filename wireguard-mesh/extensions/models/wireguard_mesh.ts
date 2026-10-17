@@ -11,6 +11,7 @@
 import { z } from "npm:zod@4.3.6";
 import {
   applyScript,
+  CONFIRM_REFUSED,
   confirmScript,
   deleteScript,
   getScript,
@@ -228,10 +229,22 @@ export function createModel(deps: Partial<Deps> = {}) {
     }
     try {
       const res = await transportFor(target)(confirmScript(iface, rb));
+      if (res.code === CONFIRM_REFUSED.gone) {
+        throw new TransportError(
+          "remote",
+          `${what} was undone: the node's rollback ran before the change could be confirmed, so the previous state is back and nothing was recorded`,
+        );
+      }
+      if (res.code === CONFIRM_REFUSED.superseded) {
+        throw new TransportError(
+          "remote",
+          `${what} was superseded by a newer change on the node and cannot be confirmed; nothing was recorded`,
+        );
+      }
       if (res.code !== 0) {
         throw new TransportError(
           "remote",
-          `${what} left the node unreachable on a fresh connection; the rollback will restore it`,
+          `${what} could not be confirmed on a fresh connection (exit ${res.code}); the rollback will restore the previous state`,
         );
       }
     } catch (e) {
@@ -258,11 +271,11 @@ export function createModel(deps: Partial<Deps> = {}) {
   ): Promise<
     {
       target: z.infer<typeof SshSchema>;
-      remember: (res: TransportResult) => Promise<void>;
+      remember: (res: TransportResult) => Promise<z.infer<typeof SshSchema>>;
     }
   > => {
     if (ssh.host_key_policy !== "accept-new") {
-      return { target: ssh, remember: () => Promise.resolve() };
+      return { target: ssh, remember: () => Promise.resolve(ssh) };
     }
     const stored = await context.readResource(`${name}-hostkeys`) as
       | z.infer<typeof HostKeysSchema>
@@ -277,14 +290,26 @@ export function createModel(deps: Partial<Deps> = {}) {
           host_key_policy: "strict",
           host_keys: stored.host_keys,
         },
-        remember: () => Promise.resolve(),
+        remember: () =>
+          Promise.resolve({
+            ...ssh,
+            host_key_policy: "strict" as const,
+            host_keys: stored.host_keys,
+          }),
       };
     }
     return {
       target: ssh,
       remember: async (res) => {
         const keys = parseKnownHosts(res.known_hosts ?? "");
-        if (keys.length === 0) return;
+        if (keys.length === 0) {
+          // Without the accepted key there is nothing to pin the later steps
+          // of this operation to, so none may run on trust-on-first-use.
+          throw new TransportError(
+            "host-key",
+            "no host key was recorded for this first connection; later steps need a pinned key",
+          );
+        }
         await context.writeResource("hostkeys", `${name}-hostkeys`, {
           node: name,
           host: ssh.host,
@@ -292,6 +317,7 @@ export function createModel(deps: Partial<Deps> = {}) {
           host_keys: keys,
           observed_at: d.now().toISOString(),
         });
+        return { ...ssh, host_key_policy: "strict" as const, host_keys: keys };
       },
     };
   };
@@ -387,7 +413,7 @@ export function createModel(deps: Partial<Deps> = {}) {
             applyScript(mesh.interface),
             `${private_key}\n${out.config}`,
           );
-          await remember(res);
+          const pinned = await remember(res);
           if (res.code !== 0) failRemote(res, "apply");
           if (noChange(res)) {
             context.logger.info("No change on {node}", {
@@ -396,7 +422,7 @@ export function createModel(deps: Partial<Deps> = {}) {
             return { dataHandles: [] };
           }
           await confirmReachability(
-            target,
+            pinned,
             mesh.interface,
             res.stdout,
             "apply",
@@ -464,13 +490,13 @@ export function createModel(deps: Partial<Deps> = {}) {
           const res = await transportFor(target)(
             deleteScript(a.interface, a.rollback_seconds),
           );
-          await remember(res);
+          const pinned = await remember(res);
           if (res.code !== 0) failRemote(res, "delete");
           if (noChange(res)) {
             context.logger.info("No change on {node}", { node: a.node });
             return { dataHandles: [] };
           }
-          await confirmReachability(target, a.interface, res.stdout, "delete");
+          await confirmReachability(pinned, a.interface, res.stdout, "delete");
           context.logger.info("Deleted {node}", { node: a.node });
           const state: NodeState = {
             node: a.node,

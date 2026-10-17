@@ -121,6 +121,13 @@ swamp CLI echoes method arguments, sensitive ones included, in `--json` output
   port (`connection-h17-web-1.example.com-p22`), shared by every user; execution
   evidence is per user (`exec-h17-web-1.example.com-p22-u4-root` and likewise
   `upload-…`). The definition name is never part of the key.
+- Vendored consumers of the transport can pass an optional
+  `{ stdin?, timeoutMs?, maxOutputBytes? }` to `exec()`. `stdin` is streamed to
+  ssh's stdin and never placed on argv. `timeoutMs` kills only the local `ssh`;
+  the remote command keeps running, so bound a mutating remote command with the
+  remote `timeout` inside a shell that survives. `maxOutputBytes` caps the
+  captured output and sets `truncated` instead of throwing. This model's `exec`
+  does not use these options and keeps its `max_output_bytes` behaviour.
 - On Ubuntu 24.04, `sshd` is socket-activated: a cloud-init that changes the SSH
   port must restart `ssh.socket`, or the new port never accepts a connection.
 

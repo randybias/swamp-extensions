@@ -102,6 +102,18 @@ export interface SshHostMethod {
   execute: (args: unknown, context: MethodContext) => Promise<MethodResult>;
 }
 
+/** A version upgrade step for model attributes. */
+export interface VersionUpgrade {
+  /** Version this step migrates to. */
+  toVersion: string;
+  /** Why the migration exists. */
+  description: string;
+  /** Returns the migrated attributes. */
+  upgradeAttributes: (
+    old: Record<string, unknown>,
+  ) => Record<string, unknown>;
+}
+
 /** The model definition returned by {@link createModel}. */
 export interface SshHostModel {
   /** Model type, `@randybias/ssh-host`. */
@@ -112,6 +124,8 @@ export interface SshHostModel {
   description: string;
   /** Empty: every method takes its own target. */
   globalArguments: z.ZodType;
+  /** Attribute migrations for version bumps. */
+  upgrades?: VersionUpgrade[];
   /** Resource specifications. */
   resources: Record<string, ResourceSpec>;
   /** Method implementations. */
@@ -472,6 +486,14 @@ export function createModel(deps: SshDeps = denoDeps): SshHostModel {
     description:
       "Run one argv vector, push bytes atomically, and wait for SSH host keys on any host. One generic definition with no host or credential in it; every method takes its target as arguments and stores evidence keyed by host, port and user.",
     globalArguments: z.strictObject({}),
+    upgrades: [
+      {
+        toVersion: "2026.10.17.3",
+        description:
+          "Additive transport exec options (stdin, timeout, truncation); no model schema or method change",
+        upgradeAttributes: (old: Record<string, unknown>) => old,
+      },
+    ],
     resources: {
       execution: {
         description:

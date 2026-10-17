@@ -17,11 +17,13 @@ import {
   type CommandResult,
   type CommandRunner,
   denoDeps,
+  denoRunner,
   exec,
   execPipeline,
   fingerprint,
   type HostKey,
   keysForHost,
+  MAX_EXEC_TIMEOUT_MS,
   parseHostKeys,
   posixQuote,
   quoteArgv,
@@ -581,6 +583,82 @@ Deno.test("a secret in stdin never appears on argv or in a transport error", asy
   for (const call of calls) {
     assertEquals(call.args.join(" ").includes(secret), false);
   }
+});
+
+Deno.test("exec rejects invalid maxOutputBytes and timeoutMs before connecting", async () => {
+  const calls: Call[] = [];
+  const deps = fakeDeps(fakeRun(calls));
+  const target = { ...STRICT_TARGET, max_output_bytes: 1000 };
+  for (const bad of [NaN, Infinity, -Infinity, 0, -1, 1.5, 1001]) {
+    await assertRejects(
+      () => exec(deps, target, ["true"], { maxOutputBytes: bad }),
+      SshConfigError,
+      "maxOutputBytes",
+    );
+  }
+  for (const bad of [NaN, Infinity, 0, -1, 1.5, MAX_EXEC_TIMEOUT_MS + 1]) {
+    await assertRejects(
+      () => exec(deps, target, ["true"], { timeoutMs: bad }),
+      SshConfigError,
+      "timeoutMs",
+    );
+  }
+  // Nothing was spawned for any rejected option.
+  assertEquals(calls.length, 0);
+  const ok = await exec(deps, target, ["true"], {
+    maxOutputBytes: 1000,
+    timeoutMs: 1,
+  });
+  assertEquals(ok.exit_code, 0);
+});
+
+Deno.test("denoRunner streams a multi-megabyte stdin while stderr floods", async () => {
+  const big = new Uint8Array(4 * 1024 * 1024);
+  for (let i = 0; i < big.length; i++) big[i] = i % 256;
+  const res = await denoRunner(
+    "sh",
+    [
+      "-c",
+      "i=0; while [ $i -lt 2000 ]; do echo flood >&2; i=$((i+1)); done; wc -c",
+    ],
+    { stdin: big, maxOutputBytes: 1024 * 1024 },
+  );
+  assertEquals(res.code, 0);
+  assertEquals(res.stdout.trim(), String(big.length));
+  assertEquals(res.truncated, false);
+});
+
+Deno.test("denoRunner truncates at the cap and returns without draining", async () => {
+  const started = Date.now();
+  const res = await denoRunner("sh", ["-c", "yes"], {
+    maxOutputBytes: 128,
+    truncate: true,
+  });
+  const elapsed = Date.now() - started;
+  assertEquals(res.truncated, true);
+  assertEquals(res.stdout.length, 128);
+  assert(elapsed < 5000, `truncation took ${elapsed}ms`);
+});
+
+Deno.test("denoRunner caps without truncation by throwing", async () => {
+  await assertRejects(
+    () => denoRunner("sh", ["-c", "printf 0123456789"], { maxOutputBytes: 4 }),
+    SshError,
+    "capture limit",
+  );
+});
+
+Deno.test("denoRunner times out a large stdin write and leaves no child", async () => {
+  const big = new Uint8Array(4 * 1024 * 1024);
+  const started = Date.now();
+  const res = await denoRunner("sh", ["-c", "exec sleep 10"], {
+    stdin: big,
+    timeoutMs: 300,
+    maxOutputBytes: 1024 * 1024,
+  });
+  const elapsed = Date.now() - started;
+  assertEquals(res.timedOut, true);
+  assert(elapsed < 5000, `timeout took ${elapsed}ms`);
 });
 
 Deno.test("strict needs pinned keys and rejects two credentials at once", async () => {

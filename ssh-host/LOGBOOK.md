@@ -353,12 +353,14 @@ commits as deletions and was discarded):
   argv and the stdout/stderr/exit code are unchanged; a test pins the full ssh
   argv (masking only the transport-internal random known_hosts path).
 - `stdin` is streamed to ssh's stdin and never placed on argv. `timeoutMs` kills
-  ssh (`AbortSignal.timeout` on the spawned process) and raises `SshError` with
-  `kind: "timeout"`; a timeout never returns partial output. `maxOutputBytes`
-  caps stdout/stderr and sets `truncated: true` instead of throwing; the runner
-  drains past the cap so the child can exit. `ExecResult` gained `truncated` and
-  `duration_ms`. Exit 255 is still a transport error and no content hash or
-  secret ever reaches argv.
+  the local ssh (the remote command keeps running; bound it with the remote
+  `timeout`) and raises `SshError` with `kind: "timeout"`; a timeout never
+  returns partial output. `maxOutputBytes` must be an integer 1..the target's
+  `max_output_bytes` and caps stdout/stderr; exceeding it sets
+  `truncated: true`, stops reading and kills ssh instead of draining an endless
+  writer. `ExecResult` gained `truncated` (the exit code is not meaningful when
+  set) and `duration_ms`. Exit 255 is still a transport error unless the result
+  was truncated, and no content hash or secret ever reaches argv.
 - Real ssh round trip against a throwaway `ubuntu:24.04` sshd (openssh-server,
   pinned host key, key over ssh-agent): `exec` with stdin containing a NUL piped
   to `sha256sum` matched locally; a 64 KiB stdin payload matched; a 128-byte cap

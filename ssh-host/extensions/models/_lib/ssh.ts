@@ -46,6 +46,9 @@ export interface RunOptions {
   timeoutMs?: number;
 }
 
+/** Per-call limits the transport entry points pass to {@link runRemote}. */
+type RunLimits = Omit<RunOptions, "env">;
+
 /** Runs an external command; injectable so tests spawn no process. */
 export type CommandRunner = (
   cmd: string,
@@ -93,7 +96,10 @@ export interface ExecResult {
   stderr: string;
   /** Remote exit code; a non-zero value is data, not an error. */
   exit_code: number;
-  /** True when stdout or stderr reached the capture cap. */
+  /**
+   * True when stdout or stderr reached the capture cap. When set, the child
+   * was killed to stop the flood, so `exit_code` is not meaningful.
+   */
   truncated: boolean;
   /** Wall-clock milliseconds spent in the transport. */
   duration_ms: number;
@@ -103,9 +109,16 @@ export interface ExecResult {
 export interface ExecOptions {
   /** Bytes or text streamed to ssh's stdin; never placed on argv. */
   stdin?: Uint8Array | string;
-  /** Kill ssh after this many milliseconds and raise a timeout. */
+  /**
+   * Kill the local ssh after this many milliseconds and raise a typed timeout.
+   * Only the local ssh is killed; the remote command keeps running unless it
+   * is itself bounded (wrap it with the remote `timeout` in a surviving shell).
+   */
   timeoutMs?: number;
-  /** Capture cap; exceeding it sets `truncated` instead of throwing. */
+  /**
+   * Capture cap; exceeding it sets `truncated` instead of throwing. At most the
+   * target's `max_output_bytes`.
+   */
   maxOutputBytes?: number;
 }
 
@@ -497,17 +510,27 @@ async function readCappedStream(
   cap: number,
   label: string,
   truncate: boolean,
+  onTruncate: () => void,
+  signal?: AbortSignal,
 ): Promise<{ bytes: Uint8Array; truncated: boolean }> {
   const reader = stream.getReader();
   const chunks: Uint8Array[] = [];
   let stored = 0;
   let truncated = false;
+  const onAbort = () => {
+    reader.cancel().catch(() => undefined);
+  };
+  signal?.addEventListener("abort", onAbort, { once: true });
   try {
     while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      // Once truncated, keep draining so the child can finish and exit.
-      if (truncated) continue;
+      let read: ReadableStreamReadResult<Uint8Array>;
+      try {
+        read = await reader.read();
+      } catch {
+        break;
+      }
+      if (read.done) break;
+      const value = read.value;
       if (stored + value.byteLength > cap) {
         if (!truncate) {
           throw new SshError(`${label} exceeded the ${cap}-byte capture limit`);
@@ -518,12 +541,16 @@ async function readCappedStream(
           stored += keep;
         }
         truncated = true;
-        continue;
+        // Stop reading and let the caller kill the child: draining a remote
+        // that never stops writing (e.g. `yes`) would never return.
+        onTruncate();
+        break;
       }
       chunks.push(value);
       stored += value.byteLength;
     }
   } finally {
+    signal?.removeEventListener("abort", onAbort);
     await reader.cancel().catch(() => undefined);
   }
   const out = new Uint8Array(stored);
@@ -570,6 +597,10 @@ export const denoRunner: CommandRunner = async (cmd, args, options = {}) => {
   const stdin = (async (): Promise<void> => {
     if (options.stdin === undefined) return;
     const writer = child.stdin.getWriter();
+    const onAbort = () => {
+      writer.abort().catch(() => undefined);
+    };
+    signal?.addEventListener("abort", onAbort, { once: true });
     try {
       await writer.write(
         typeof options.stdin === "string"
@@ -577,16 +608,33 @@ export const denoRunner: CommandRunner = async (cmd, args, options = {}) => {
           : options.stdin,
       );
       await writer.close();
-    } catch {
-      // The child exited before reading all input; the result still counts.
+    } catch (e) {
+      // A broken pipe after the child exited, or the abort, is expected; every
+      // other failure must reach the caller.
+      if (!(e instanceof Deno.errors.BrokenPipe) && !signal?.aborted) {
+        throw e;
+      }
+    } finally {
+      signal?.removeEventListener("abort", onAbort);
+      try {
+        writer.releaseLock();
+      } catch {
+        // the stream is already closed
+      }
     }
   })();
   const cap = options.maxOutputBytes;
-  try {
+  const kill = () => {
+    try {
+      child.kill();
+    } catch {
+      // already gone
+    }
+  };
+  const run = async (): Promise<CommandResult> => {
     if (cap === undefined) {
       await stdin;
       const out = await child.output();
-      if (signal?.aborted) return timedOut();
       return {
         code: out.code,
         stdout: decode(out.stdout),
@@ -595,24 +643,52 @@ export const denoRunner: CommandRunner = async (cmd, args, options = {}) => {
     }
     const truncate = options.truncate ?? false;
     const [stdout, stderr] = await Promise.all([
-      readCappedStream(child.stdout, cap, `${cmd} stdout`, truncate),
-      readCappedStream(child.stderr, cap, `${cmd} stderr`, truncate),
+      readCappedStream(
+        child.stdout,
+        cap,
+        `${cmd} stdout`,
+        truncate,
+        kill,
+        signal,
+      ),
+      readCappedStream(
+        child.stderr,
+        cap,
+        `${cmd} stderr`,
+        truncate,
+        kill,
+        signal,
+      ),
     ]);
     await stdin;
     const status = await child.status;
-    if (signal?.aborted) return timedOut();
     return {
       code: status.code,
       stdout: decode(stdout.bytes),
       stderr: decode(stderr.bytes),
       truncated: stdout.truncated || stderr.truncated,
     };
-  } catch (e) {
-    try {
-      child.kill();
-    } catch {
-      // already gone
+  };
+  try {
+    const work = run();
+    // The result is discarded on abort, so a late rejection is not unhandled.
+    work.catch(() => undefined);
+    if (signal === undefined) return await work;
+    const outcome = await Promise.race([
+      work,
+      new Promise<"aborted">((resolve) => {
+        signal.addEventListener("abort", () => resolve("aborted"), {
+          once: true,
+        });
+      }),
+    ]);
+    if (outcome === "aborted") {
+      kill();
+      return timedOut();
     }
+    return outcome;
+  } catch (e) {
+    kill();
     await child.status.catch(() => undefined);
     if (signal?.aborted) return timedOut();
     throw e;
@@ -787,14 +863,6 @@ function transportFailure(
  * caller supplies the keys it recorded on first use — the host is verified
  * against exactly those keys and a change is refused.
  */
-/** Per-call limits the public entry points may pass to {@link runRemote}. */
-interface RunLimits {
-  stdin?: Uint8Array | string;
-  maxOutputBytes?: number;
-  truncate?: boolean;
-  timeoutMs?: number;
-}
-
 async function runRemote(
   deps: SshDeps,
   target: SshTarget,
@@ -874,18 +942,19 @@ async function runRemote(
     if (res.timedOut) {
       throw new SshError(`ssh to ${t.host}:${t.port} timed out`, "timeout");
     }
-    const failure = transportFailure(t, res);
-    if (failure) throw failure;
     const truncated = res.truncated ?? false;
-    // Defense in depth for an injected runner: a production runner enforces
-    // the cap while streaming, so this only fires for one that does not.
-    if (
-      !truncated &&
-      (utf8Length(res.stdout) > cap || utf8Length(res.stderr) > cap)
-    ) {
-      throw new SshError(
-        `output from ${t.host}:${t.port} exceeded the ${cap}-byte capture limit`,
-      );
+    // A truncated result killed ssh to stop the flood, so its exit code is not
+    // meaningful and must not be classified as a transport failure.
+    if (!truncated) {
+      const failure = transportFailure(t, res);
+      if (failure) throw failure;
+      // Defense in depth for an injected runner: a production runner enforces
+      // the cap while streaming, so this only fires for one that does not.
+      if (utf8Length(res.stdout) > cap || utf8Length(res.stderr) > cap) {
+        throw new SshError(
+          `output from ${t.host}:${t.port} exceeded the ${cap}-byte capture limit`,
+        );
+      }
     }
     return {
       stdout: res.stdout,
@@ -904,28 +973,47 @@ async function runRemote(
  * word before the vector is joined, so `;`, `$()`, backticks, newlines and
  * quotes inside an element can never split into a second command.
  */
+/** Ceiling for a per-call timeout: 24 hours. */
+export const MAX_EXEC_TIMEOUT_MS = 24 * 60 * 60 * 1000;
+
+/** Validates the optional exec controls against the target's own capture cap. */
+function assertExecOptions(
+  options: ExecOptions,
+  target: NormalizedTarget,
+): void {
+  const cap = options.maxOutputBytes;
+  if (
+    cap !== undefined &&
+    (!Number.isInteger(cap) || cap < 1 || cap > target.max_output_bytes)
+  ) {
+    throw new SshConfigError(
+      `maxOutputBytes must be an integer from 1 to ${target.max_output_bytes}`,
+    );
+  }
+  const timeout = options.timeoutMs;
+  if (
+    timeout !== undefined &&
+    (!Number.isInteger(timeout) || timeout < 1 ||
+      timeout > MAX_EXEC_TIMEOUT_MS)
+  ) {
+    throw new SshConfigError(
+      `timeoutMs must be an integer from 1 to ${MAX_EXEC_TIMEOUT_MS}`,
+    );
+  }
+}
+
 export async function exec(
   deps: SshDeps,
   target: SshTarget,
   argv: string[],
   options: ExecOptions = {},
 ): Promise<ExecResult> {
-  if (
-    options.stdin === undefined &&
-    options.timeoutMs === undefined &&
-    options.maxOutputBytes === undefined
-  ) {
-    // No options: the pre-extension call, byte-identical argv.
-    return await runRemote(deps, target, quoteArgv(argv));
-  }
+  assertExecOptions(options, normalizeTarget(target));
   return await runRemote(deps, target, quoteArgv(argv), {
-    ...(options.stdin !== undefined ? { stdin: options.stdin } : {}),
-    ...(options.maxOutputBytes !== undefined
-      ? { maxOutputBytes: options.maxOutputBytes, truncate: true }
-      : {}),
-    ...(options.timeoutMs !== undefined
-      ? { timeoutMs: options.timeoutMs }
-      : {}),
+    stdin: options.stdin,
+    maxOutputBytes: options.maxOutputBytes,
+    truncate: options.maxOutputBytes !== undefined,
+    timeoutMs: options.timeoutMs,
   });
 }
 

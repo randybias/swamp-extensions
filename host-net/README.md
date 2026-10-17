@@ -80,6 +80,9 @@ configured with the same prefix length, and the route must not be `linkdown` or
 status of `netplan apply` / `networkctl reconfigure` is only logged (stderr and
 the journal as `host-net`), because a cloud-init netplan that matches an
 already-renamed NIC by MAC can exit non-zero on a host that is in fact restored.
+Known limits, both fail-safe (the arm refuses with exit 77 and changes nothing):
+a management source address that lives on `lo` or on another NIC than the
+route's device, and an IPv6 link-local peer written with a `%scope`.
 
 ### Clearing a failed restore
 

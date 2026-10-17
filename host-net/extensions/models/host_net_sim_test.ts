@@ -559,8 +559,17 @@ Deno.test("the arm refuses, changing nothing, when the management path cannot be
   const w = await world();
   try {
     await Deno.writeTextFile(`${w.root}/state/no_addr`, "");
-    await assertRejects(() => w.call("apply", net("netplan", [A])));
+    await assertRejects(
+      () => w.call("apply", net("netplan", [A])),
+      Error,
+      "management path could not be recorded",
+    );
     assertEquals(await w.files(), []);
+    // No orphan revert directory is left behind.
+    assertEquals(
+      [...Deno.readDirSync(`${w.root}/var/lib/host-net/revert`)].length,
+      0,
+    );
   } finally {
     await w.cleanup();
   }

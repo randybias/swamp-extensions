@@ -438,8 +438,13 @@ async function armRevert(
       }),
     ],
     "the revert arm",
-    [75, 76],
+    [75, 76, 77],
   );
+  if (res.exit_code === 77) {
+    throw new HostNetConfigError(
+      "the management path could not be recorded, or fails its own checks before the change; nothing was changed",
+    );
+  }
   if (res.exit_code === 75 || res.exit_code === 76) {
     throw new HostNetConfigError(
       "an earlier revert is already armed for this host",
@@ -1514,7 +1519,7 @@ export function createModel(overrides: Partial<HostNetDeps> = {}) {
     clear_failed_revert: {
       kind: "action" as const,
       description:
-        "DESTRUCTIVE. Clear a revert whose restore recorded fail, so later applies are accepted again. Refuses unless the host marker says fail and the post-restore checks (a default route and a global address on its interface) pass right now.",
+        "DESTRUCTIVE. Clear a revert whose restore recorded fail, so later applies are accepted again. Refuses unless the host marker says fail and the recorded management-path checks (route to the SSH peer, source address and prefix) pass right now.",
       arguments: ClearFailedArgs,
       execute: async (
         args: z.infer<typeof ClearFailedArgs>,

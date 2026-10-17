@@ -151,6 +151,10 @@ Deno.test("the arm script records the path actually used and refuses if it does 
     true,
   );
   assertEquals(script.includes("exit 77"), true);
+  // Every exit-77 refusal removes the directory it created.
+  for (const line of script.split("\n").filter((l) => l.includes("exit 77"))) {
+    assertEquals(line.includes('rm -rf "$DIR"'), true, line);
+  }
   assertEquals(script.includes("linkdown"), true);
   assertEquals(script.includes("prefixlen"), true);
   // The checks run before the timer is armed and before current is written.

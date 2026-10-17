@@ -8,22 +8,22 @@
 import { execSudo, probeFile, putRootFile } from "./remote.ts";
 import { readFileText, readLink } from "./observe.ts";
 import { LAYOUT_VERSION_FILE } from "./layout.ts";
-import type { SshDeps, SshTarget } from "./ssh.ts";
+import { type SshDeps, SshError, type SshTarget } from "./ssh.ts";
 
 /**
  * Classifies a served root: `missing`, `ours` when it is a real directory that
  * holds a regular `.layout-version` sentinel, or `foreign` otherwise.
  */
 export async function rootState(
-  activeDeps: SshDeps,
+  deps: SshDeps,
   target: SshTarget,
   root: string,
 ): Promise<"missing" | "ours" | "foreign"> {
-  const probe = await probeFile(activeDeps, target, root, true);
+  const probe = await probeFile(deps, target, root, true);
   if (probe.state === "missing") return "missing";
   if (probe.state !== "dir") return "foreign";
   const sentinel = await probeFile(
-    activeDeps,
+    deps,
     target,
     `${root}/${LAYOUT_VERSION_FILE}`,
     true,
@@ -43,11 +43,11 @@ export interface FileSnap {
 
 /** Captures a file's bytes, mode and owner so a rollback can restore it. */
 export async function snapFile(
-  activeDeps: SshDeps,
+  deps: SshDeps,
   target: SshTarget,
   path: string,
 ): Promise<FileSnap> {
-  const probe = await probeFile(activeDeps, target, path, true);
+  const probe = await probeFile(deps, target, path, true);
   if (probe.state !== "file") {
     return {
       path,
@@ -58,10 +58,18 @@ export async function snapFile(
       group: "root",
     };
   }
+  const content = await readFileText(deps, target, path, true);
+  if (content === null) {
+    // A probe that saw a file but a read that failed must fail the run before
+    // any mutation, or a rollback could replace a real file with an empty one.
+    throw new SshError(
+      `could not read ${path} for rollback; refusing to change the host`,
+    );
+  }
   return {
     path,
     existed: true,
-    content: (await readFileText(activeDeps, target, path, true)) ?? "",
+    content,
     mode: probe.mode ?? "0644",
     owner: probe.owner ?? "root",
     group: probe.group ?? "root",
@@ -70,15 +78,15 @@ export async function snapFile(
 
 /** Restores a file captured by {@link snapFile}, or removes it if it was absent. */
 export async function restoreFile(
-  activeDeps: SshDeps,
+  deps: SshDeps,
   target: SshTarget,
   snap: FileSnap,
 ): Promise<void> {
   if (!snap.existed) {
-    await execSudo(activeDeps, target, ["rm", "-f", snap.path]);
+    await execSudo(deps, target, ["rm", "-f", snap.path]);
     return;
   }
-  await putRootFile(activeDeps, target, {
+  await putRootFile(deps, target, {
     path: snap.path,
     content: snap.content,
     mode: snap.mode,
@@ -97,16 +105,16 @@ export interface LinkSnap {
 
 /** Captures a link or file so a rollback can restore it. */
 export async function snapLink(
-  activeDeps: SshDeps,
+  deps: SshDeps,
   target: SshTarget,
   path: string,
 ): Promise<LinkSnap> {
-  const probe = await probeFile(activeDeps, target, path, true);
+  const probe = await probeFile(deps, target, path, true);
   if (probe.state === "symlink") {
     return {
       path,
       state: "symlink",
-      target: await readLink(activeDeps, target, path, true),
+      target: await readLink(deps, target, path, true),
       content: null,
     };
   }
@@ -115,7 +123,7 @@ export async function snapLink(
       path,
       state: "file",
       target: null,
-      content: await readFileText(activeDeps, target, path, true),
+      content: await readFileText(deps, target, path, true),
     };
   }
   return { path, state: probe.state, target: null, content: null };
@@ -123,14 +131,14 @@ export async function snapLink(
 
 /** Restores a link or file captured by {@link snapLink}, or removes it. */
 export async function restoreLink(
-  activeDeps: SshDeps,
+  deps: SshDeps,
   target: SshTarget,
   snap: LinkSnap,
 ): Promise<void> {
   if (snap.state === "symlink" && snap.target !== null) {
-    await execSudo(activeDeps, target, ["ln", "-sfn", snap.target, snap.path]);
+    await execSudo(deps, target, ["ln", "-sfn", snap.target, snap.path]);
   } else if (snap.state === "file" && snap.content !== null) {
-    await putRootFile(activeDeps, target, {
+    await putRootFile(deps, target, {
       path: snap.path,
       content: snap.content,
       mode: "0644",
@@ -138,6 +146,6 @@ export async function restoreLink(
       group: "root",
     });
   } else {
-    await execSudo(activeDeps, target, ["rm", "-f", snap.path]);
+    await execSudo(deps, target, ["rm", "-f", snap.path]);
   }
 }

@@ -88,3 +88,23 @@ Deno.test("regenerateSumsScript records the path hash and skips dotfiles", async
   const sums = await Deno.readTextFile(`${root}/SHA256SUMS`);
   assertEquals(sums, `${HASH}  sha256/${HASH}/data\n`);
 });
+
+Deno.test("regenerateSumsScript ignores a newline-named directory", async () => {
+  const hasFlock = await new Deno.Command("sh", {
+    args: ["-c", "command -v flock"],
+  }).output().then((o) => o.code === 0).catch(() => false);
+  if (!hasFlock) return;
+
+  const dir = await Deno.makeTempDir();
+  const root = `${dir}/root`;
+  await Deno.mkdir(`${root}/sha256/${HASH}`, { recursive: true });
+  await Deno.writeTextFile(`${root}/sha256/${HASH}/data`, "ok\n");
+  // A directory whose name begins with a newline followed by a valid hash.
+  await Deno.mkdir(`${root}/sha256/evil\n${HASH}`, { recursive: true });
+  await Deno.writeTextFile(`${root}/sha256/evil\n${HASH}/data`, "bad\n");
+
+  assertEquals((await sh(regenerateSumsScript(root))).code, 0);
+  const sums = await Deno.readTextFile(`${root}/SHA256SUMS`);
+  assertEquals(sums, `${HASH}  sha256/${HASH}/data\n`);
+  assertEquals(sums.includes("evil"), false);
+});

@@ -27,10 +27,16 @@ export const LAYOUT_VERSION_FILE = ".layout-version";
 const FILENAME_SRC = "[A-Za-z0-9][A-Za-z0-9._-]{0,127}";
 /** A served object file name. */
 export const FILENAME_RE = new RegExp(`^${FILENAME_SRC}$`);
+/** The file-name grammar as a POSIX ERE, for shell-side validation. */
+export const FILENAME_ERE = FILENAME_SRC;
+/** A served blob path as a POSIX ERE, for shell-side validation. */
+export const BLOB_REL_ERE = `^${BLOB_DIR}/[0-9a-f]{64}/${FILENAME_SRC}$`;
 /** A blob path relative to `<root>`: `<64-hex>/<name>` (captures both). */
 export const BLOB_REL_RE = new RegExp(`^([0-9a-f]{64})/(${FILENAME_SRC})$`);
 /** A bundle directory name: a 64-hex tree hash. */
 export const BUNDLE_NAME_RE = /^[0-9a-f]{64}$/;
+/** A bundle directory name as a POSIX ERE. */
+export const BUNDLE_NAME_ERE = "^[0-9a-f]{64}$";
 /** A ref name. */
 export const REF_NAME_RE = /^[a-z0-9][a-z0-9._-]{0,63}$/;
 

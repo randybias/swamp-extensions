@@ -1,5 +1,6 @@
 /**
- * Model methods grouped by concern.
+ * Server lifecycle methods: render a config, install or uninstall the site,
+ * and observe its state.
  *
  * @module
  */
@@ -29,6 +30,7 @@ import {
   captureInstallSnaps,
   ensureLayout,
   installNginx,
+  rollbackInstall,
   verifyAndReload,
   writeCredentials,
   writeSite,
@@ -50,13 +52,7 @@ export const lifecycleMethods: Record<string, ArtifactServerMethod> = {
       if (args.tls.mode === "provided") {
         await validateTls(activeDeps, args.tls.cert_pem, args.tls.key_pem);
       }
-      const text = renderFor(
-        args.root,
-        args.listen,
-        args.server_name,
-        args.tls,
-        args.basic_auth,
-      );
+      const text = renderFor(args);
       const configSha = await sha256Hex(text);
       const base = urlBase(
         args.server_name,
@@ -99,53 +95,64 @@ export const lifecycleMethods: Record<string, ArtifactServerMethod> = {
       }
       await installNginx(activeDeps, target);
       const snaps = await captureInstallSnaps(activeDeps, target, args);
-      await ensureLayout(activeDeps, target, args);
-      const text = renderFor(
-        args.root,
-        args.listen,
-        args.server_name,
-        args.tls,
-        args.basic_auth,
-      );
-      const configSha = await sha256Hex(text);
-      let changed = await writeSite(activeDeps, target, args, text, snaps);
-      changed = (await writeCredentials(activeDeps, target, args)) || changed;
-      await verifyAndReload(activeDeps, target, snaps, changed);
-      const scheme = args.tls.mode === "provided" ? "https" : "http";
-      const base = urlBase(args.server_name, args.listen.port, scheme);
-      const handle = await context.writeResource(
-        "config",
-        `config-${instanceKey(args)}`,
-        ConfigSchema.parse({
-          config_sha256: configSha,
-          text,
-          url_base: base,
-          rendered_at: new Date(activeDeps.now()).toISOString(),
-        }),
-      );
-      context.logger.info("Installed artifact server on {host}:{port}", {
-        host: args.ssh.host,
-        port: args.listen.port,
-      });
-      return {
-        dataHandles: [handle],
-        result: { config_sha256: configSha, url_base: base, changed },
-      };
+      try {
+        await ensureLayout(activeDeps, target, args);
+        const text = renderFor(args);
+        const configSha = await sha256Hex(text);
+        // Credentials first: the site is enabled last, so a failure writing the
+        // cert can never leave an enabled link pointing at a missing file.
+        let changed = await writeCredentials(activeDeps, target, args);
+        changed = (await writeSite(activeDeps, target, args, text, snaps)) ||
+          changed;
+        await verifyAndReload(activeDeps, target);
+        const scheme = args.tls.mode === "provided" ? "https" : "http";
+        const base = urlBase(args.server_name, args.listen.port, scheme);
+        const handle = await context.writeResource(
+          "config",
+          `config-${instanceKey(args)}`,
+          ConfigSchema.parse({
+            config_sha256: configSha,
+            text,
+            url_base: base,
+            rendered_at: new Date(activeDeps.now()).toISOString(),
+          }),
+        );
+        context.logger.info("Installed artifact server on {host}:{port}", {
+          host: args.ssh.host,
+          port: args.listen.port,
+        });
+        return {
+          dataHandles: [handle],
+          result: { config_sha256: configSha, url_base: base, changed },
+        };
+      } catch (err) {
+        // Any throw after the snapshots — nginx -t, a failed credential write,
+        // a failed remove, a lost connection — rolls the host back.
+        const clean = await rollbackInstall(activeDeps, target, snaps);
+        const reason = err instanceof Error ? err.message : String(err);
+        throw new SshError(
+          `install failed; rolled back and not reloaded${
+            clean ? "" : " (the restored config also fails nginx -t)"
+          }: ${reason}`,
+        );
+      }
     },
   },
   get: {
     description:
-      "READ-ONLY. Observe nginx state (active, site config hash, TLS and basic-auth mode) and the layout summary, and persist the observation as the server resource.",
+      "READ-ONLY. Observe nginx state (active, site config hash, TLS and basic-auth mode) and the layout summary, and persist the observation; it fails when no artifact-server site is installed.",
     arguments: GetArgs,
     execute: async (rawArgs: unknown, context: MethodContext) => {
       const args = GetArgs.parse(rawArgs);
       const target = toTarget(args.ssh);
-      return await observeServer(activeDeps, target, args, context);
+      return await observeServer(activeDeps, target, args, context, {
+        requireSite: true,
+      });
     },
   },
   sync: {
     description:
-      "READ-ONLY. Refresh the observed nginx state and layout summary into the server resource, instead of failing when the site is absent.",
+      "READ-ONLY. Observe nginx state and the layout summary and persist it, succeeding even when no site is installed yet.",
     arguments: GetArgs,
     execute: async (rawArgs: unknown, context: MethodContext) => {
       const args = GetArgs.parse(rawArgs);
@@ -177,13 +184,16 @@ export const lifecycleMethods: Record<string, ArtifactServerMethod> = {
       const credentialsPresent =
         credProbes.filter((p) => p.state !== "missing").length;
       if (present || credentialsPresent > 0) {
-        await execSudo(activeDeps, target, [
+        const rm = await execSudo(activeDeps, target, [
           "rm",
           "-f",
           NGINX_ENABLED_PATH,
           NGINX_SITE_PATH,
           ...credentialPaths,
         ]);
+        if (rm.exit_code !== 0) {
+          throw new SshError("could not remove the site files");
+        }
         if (present) {
           const reload = await execSudo(activeDeps, target, [
             "systemctl",

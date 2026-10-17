@@ -6,7 +6,14 @@
  */
 
 import { posixQuote } from "./ssh.ts";
-import { BLOB_DIR, BUNDLE_DIR } from "./layout.ts";
+import { hashCmd } from "./remote.ts";
+import {
+  BLOB_DIR,
+  BLOB_REL_ERE,
+  BUNDLE_DIR,
+  BUNDLE_NAME_ERE,
+  FILENAME_ERE,
+} from "./layout.ts";
 
 /** One object whose bytes do not match what was recorded. */
 export interface VerifyFinding {
@@ -34,22 +41,35 @@ export function verifyScript(root: string): string {
   return [
     `set -u`,
     `r=${r}`,
+    `blobEre=${posixQuote(BLOB_REL_ERE)}`,
+    `treeEre=${posixQuote(BUNDLE_NAME_ERE)}`,
+    `nameEre=${posixQuote("^" + FILENAME_ERE + "$")}`,
     `if [ -d "$r/${BLOB_DIR}" ]; then`,
-    `  find "$r/${BLOB_DIR}" -type f ! -name '.*' 2>/dev/null | LC_ALL=C sort | while IFS= read -r f; do`,
-    `    rel="\${f#"$r/"}"`,
-    `    h=$( { sha256sum "$f" 2>/dev/null || shasum -a 256 "$f" 2>/dev/null; } | awk '{print $1}' )`,
-    `    printf 'BLOB\\t%s\\t%s\\n' "$rel" "$h"`,
+    `  for d in "$r/${BLOB_DIR}"/*/; do`,
+    `    [ -d "$d" ] || continue`,
+    `    for f in "$d"*; do`,
+    `      [ -f "$f" ] || continue`,
+    `      rel="\${f#"$r/"}"`,
+    `      printf '%s' "$rel" | grep -Eq "$blobEre" || continue`,
+    `      h=$(${hashCmd('"$f"')})`,
+    `      printf 'BLOB\\t%s\\t%s\\n' "$rel" "$h"`,
+    `    done`,
     `  done`,
     `fi`,
     `if [ -d "$r/${BUNDLE_DIR}" ]; then`,
     `  for d in "$r/${BUNDLE_DIR}"/*/; do`,
     `    [ -d "$d" ] || continue`,
     `    tree="\${d%/}"; tree="\${tree##*/}"`,
+    `    printf '%s' "$tree" | grep -Eq "$treeEre" || continue`,
     `    lines=$(mktemp)`,
-    `    find "$d" -type f 2>/dev/null | LC_ALL=C sort | while IFS= read -r f; do`,
-    `      sha256sum "$f" 2>/dev/null | awk -v n="\${f##*/}" '{print $1"  "n}'`,
+    `    for f in "$d"*; do`,
+    `      [ -f "$f" ] || continue`,
+    `      n="\${f##*/}"`,
+    `      printf '%s' "$n" | grep -Eq "$nameEre" || continue`,
+    `      h=$(${hashCmd('"$f"')})`,
+    `      printf '%s  %s\\n' "$h" "$n"`,
     `    done > "$lines"`,
-    `    h=$(sha256sum "$lines" 2>/dev/null | awk '{print $1}')`,
+    `    h=$(${hashCmd('"$lines"')})`,
     `    rm -f "$lines"`,
     `    printf 'BUNDLE\\t%s\\t%s\\n' "$tree" "$h"`,
     `  done`,

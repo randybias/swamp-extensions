@@ -34,7 +34,6 @@ export function toTarget(ssh: SshBlock): SshTarget {
   };
 }
 
-/** The stable data key for one target and root. */
 /** Replaces every character outside `[A-Za-z0-9._-]` with `_`. */
 function sanitizeKey(value: string): string {
   return value.replace(/[^A-Za-z0-9._-]/g, "_");
@@ -101,7 +100,3 @@ export function validateCommon(
     );
   }
 }
-
-// ---------------------------------------------------------------------------
-// Resources
-// ---------------------------------------------------------------------------

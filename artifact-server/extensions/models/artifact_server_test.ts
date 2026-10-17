@@ -1,35 +1,18 @@
 import { assertEquals, assertRejects } from "jsr:@std/assert@1.0.19";
-import { createModelTestContext } from "jsr:@swamp-club/swamp-testing@0.20261014.55";
 import { createModel } from "./artifact_server.ts";
 import { makeFakeRemote } from "./_lib/fake_remote.ts";
+import {
+  base,
+  HOST,
+  modelFor,
+  ROOT,
+  seed,
+  SITE_ARGS,
+  SSH,
+} from "./_lib/test_support.ts";
 import { sha256Hex } from "./_lib/ssh.ts";
 import { BUNDLE_DIR, SHA256SUMS_FILE, treeHash } from "./_lib/layout.ts";
 import { NGINX_ENABLED_PATH, NGINX_SITE_PATH } from "./_lib/nginx.ts";
-
-const SSH = {
-  host: "node-1.example.test",
-  user: "deploy",
-  host_key_policy: "strict" as const,
-  host_keys: [
-    "node-1.example.test ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAITestOnly",
-  ],
-};
-const ROOT = "/srv/artifacts";
-const SITE_ARGS = {
-  listen: { address: "*", port: 8080 },
-  server_name: "cdn.example.test",
-};
-const HOST = "a".repeat(64);
-
-/** The shared argument block with defaults filled in. */
-function base(overrides: Record<string, unknown> = {}) {
-  return { ssh: SSH, root: ROOT, ...overrides };
-}
-
-/** Binds the model to a fake transport and returns a fresh test context. */
-function modelFor(host: ReturnType<typeof makeFakeRemote>) {
-  return { host, m: createModel(host.deps), ...createModelTestContext({}) };
-}
 
 Deno.test("the model type, version and empty global arguments are as specified", () => {
   const m = createModel(makeFakeRemote().deps);
@@ -394,21 +377,6 @@ Deno.test("ref writes and unref removes a ref, idempotently", async () => {
 });
 
 /** Seeds a layout with one blob and one ref. */
-async function seed(host: ReturnType<typeof makeFakeRemote>) {
-  const body = "stored\n";
-  const hash = await sha256Hex(body);
-  host.setFile(`${ROOT}/.layout-version`, "1\n", "644", "user", "user");
-  host.setFile(`${ROOT}/sha256/${hash}/x.txt`, body, "644", "user", "user");
-  host.setFile(
-    `${ROOT}/${SHA256SUMS_FILE}`,
-    `${hash}  sha256/${hash}/x.txt\n`,
-    "644",
-    "user",
-    "user",
-  );
-  host.setFile(`${ROOT}/refs/stable`, `blob  ${hash}\n`, "644", "user", "user");
-  return hash;
-}
 
 Deno.test("list reads refs, blobs and bundles and persists a listing", async () => {
   const host = makeFakeRemote();
@@ -576,138 +544,4 @@ Deno.test("uninstall removes the site and, when asked, the data root", async () 
     [...host.files.keys()].some((p) => p.startsWith(`${ROOT}/`)),
     false,
   );
-});
-
-Deno.test("install refuses a populated root that holds no sentinel", async () => {
-  const host = makeFakeRemote();
-  host.setFile(`${ROOT}/not-ours.conf`, "x\n", "644", "user", "user");
-  const { m, context } = modelFor(host);
-  await assertRejects(
-    () =>
-      m.methods.install.execute(
-        base({ ...SITE_ARGS, tls: { mode: "none", plaintext_ack: true } }),
-        context,
-      ),
-    Error,
-    "sentinel",
-  );
-  // Nothing was written and no symlink was left behind.
-  assertEquals(host.files.has(NGINX_SITE_PATH), false);
-  assertEquals(host.symlinks.has(NGINX_ENABLED_PATH), false);
-});
-
-Deno.test("install rollback removes the enabled link and the site on a first install", async () => {
-  const host = makeFakeRemote();
-  host.failNginxTest = true;
-  const { m, context } = modelFor(host);
-  await assertRejects(
-    () =>
-      m.methods.install.execute(
-        base({ ...SITE_ARGS, tls: { mode: "none", plaintext_ack: true } }),
-        context,
-      ),
-    Error,
-    "rolled back",
-  );
-  // No dangling sites-enabled link, no site file, and no reload.
-  assertEquals(host.symlinks.has(NGINX_ENABLED_PATH), false);
-  assertEquals(host.files.has(NGINX_SITE_PATH), false);
-  assertEquals(
-    host.commands.some((c) => c.includes("argv:systemctl reload")),
-    false,
-  );
-});
-
-Deno.test("fetch is idempotent when the pinned object is already present", async () => {
-  const host = makeFakeRemote();
-  let downloads = 0;
-  host.curl = () => {
-    downloads++;
-    return "payload";
-  };
-  const hash = await sha256Hex("payload");
-  host.setFile(
-    `${ROOT}/sha256/${hash}/p.bin`,
-    "payload",
-    "644",
-    "user",
-    "user",
-  );
-  const { m, context } = modelFor(host);
-  const result = await m.methods.fetch.execute(
-    base({
-      url: "https://up.example.test/p.bin",
-      filename: "p.bin",
-      sha256: hash,
-    }),
-    context,
-  );
-  assertEquals((result.result as { changed: boolean }).changed, false);
-  assertEquals(downloads, 0);
-  assertEquals(
-    host.commands.some((c) => c.includes("curl -fsS")),
-    false,
-  );
-});
-
-Deno.test("publish_bundle refuses duplicate file names", async () => {
-  const host = makeFakeRemote();
-  const { m, context } = modelFor(host);
-  await assertRejects(
-    () =>
-      m.methods.publish_bundle.execute(
-        base({
-          files: [{ name: "a", content: "one" }, { name: "a", content: "two" }],
-        }),
-        context,
-      ),
-    Error,
-    "unique",
-  );
-});
-
-Deno.test("prune refuses a symlinked hash directory and deletes nothing", async () => {
-  const host = makeFakeRemote();
-  const orphan = await sha256Hex("orphan\n");
-  host.setFile(
-    `${ROOT}/sha256/${orphan}/data`,
-    "orphan\n",
-    "644",
-    "user",
-    "user",
-  );
-  // The hash directory is a symlink pointing outside the root.
-  host.symlinks.add(`${ROOT}/sha256/${orphan}`);
-  const { m, context } = modelFor(host);
-  const plan = (await m.methods.plan_prune.execute(base(), context)).result as {
-    planSha256: string;
-  };
-  await assertRejects(
-    () =>
-      m.methods.prune.execute(base({ plan_sha256: plan.planSha256 }), context),
-    Error,
-  );
-  assertEquals(host.files.has(`${ROOT}/sha256/${orphan}/data`), true);
-});
-
-Deno.test("list drops an object whose name contains a newline", async () => {
-  const host = makeFakeRemote();
-  const good = await sha256Hex("good\n");
-  host.setFile(
-    `${ROOT}/sha256/${good}/good.txt`,
-    "good\n",
-    "644",
-    "user",
-    "user",
-  );
-  host.setFile(
-    `${ROOT}/sha256/${good}/bad\nname`,
-    "bad\n",
-    "644",
-    "user",
-    "user",
-  );
-  const { m, context } = modelFor(host);
-  const result = await m.methods.list.execute(base(), context);
-  assertEquals((result.result as { blobs: number }).blobs, 1);
 });

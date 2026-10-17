@@ -1,7 +1,7 @@
 import { assertEquals } from "jsr:@std/assert@1.0.19";
 import { fetchScript } from "./fetch.ts";
 import { parseLayout } from "./observe.ts";
-import { parseVerifyOutput } from "./verify.ts";
+import { parseVerifyOutput, verifyScript } from "./verify.ts";
 
 const HASH = "a".repeat(64);
 const OTHER = "b".repeat(64);
@@ -80,4 +80,30 @@ Deno.test("fetchScript is https-only, bounded and quotes the temp and URL", () =
   assertEquals(script.includes("--proto-redir '=https'"), true);
   assertEquals(script.includes("'/srv/artifacts/.fetch.x'"), true);
   assertEquals(script.includes("'https://up.example.test/a.bin'"), true);
+});
+
+/** Runs a script through a real `sh -eu` and returns its code and stdout. */
+async function runSh(
+  script: string,
+): Promise<{ code: number; stdout: string }> {
+  const out = await new Deno.Command("sh", {
+    args: ["-eu", "-c", script],
+    stdout: "piped",
+    stderr: "piped",
+  }).output();
+  return { code: out.code, stdout: new TextDecoder().decode(out.stdout) };
+}
+
+Deno.test("verifyScript ignores a newline-named directory", async () => {
+  const dir = await Deno.makeTempDir();
+  const root = `${dir}/root`;
+  await Deno.mkdir(`${root}/sha256/${HASH}`, { recursive: true });
+  await Deno.writeTextFile(`${root}/sha256/${HASH}/data`, "ok\n");
+  await Deno.mkdir(`${root}/sha256/evil\n${HASH}`, { recursive: true });
+  await Deno.writeTextFile(`${root}/sha256/evil\n${HASH}/data`, "bad\n");
+
+  const result = await runSh(verifyScript(root));
+  assertEquals(result.code, 0);
+  assertEquals(result.stdout.includes("evil"), false);
+  assertEquals(result.stdout.includes(`sha256/${HASH}/data`), true);
 });

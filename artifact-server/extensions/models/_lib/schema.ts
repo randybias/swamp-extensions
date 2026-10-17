@@ -252,13 +252,7 @@ export const RenderConfigArgs = z.strictObject({
   basic_auth_plaintext_ack: z.boolean().nullish(),
 });
 
-export const InstallArgs = z.strictObject({
-  ...CommonArgs,
-  listen: ListenSchema,
-  server_name: ServerNameSchema,
-  tls: TlsSchema,
-  basic_auth: BasicAuthSchema.nullish(),
-  basic_auth_plaintext_ack: z.boolean().nullish(),
+export const InstallArgs = RenderConfigArgs.extend({
   disable_default_site: z.boolean().default(false).describe(
     "Remove /etc/nginx/sites-enabled/default so it cannot claim the port.",
   ),

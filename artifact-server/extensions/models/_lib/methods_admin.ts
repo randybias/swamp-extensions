@@ -1,12 +1,17 @@
 /**
- * Model methods grouped by concern.
+ * Inspection and cleanup methods: list, verify, plan and prune.
  *
  * @module
  */
 
 import type { ArtifactServerMethod, MethodContext } from "./types.ts";
-import { parseSha256Sums, planPrune, type PruneObject } from "./layout.ts";
-import { readLayout } from "./observe.ts";
+import {
+  parseSha256Sums,
+  planPrune,
+  type PruneObject,
+  type PrunePlan,
+} from "./layout.ts";
+import { type Layout, type ObjectEntry, readLayout } from "./observe.ts";
 import { regenerateSha256Sums, removeObjects } from "./ops.ts";
 import { parseVerifyOutput, verifyScript } from "./verify.ts";
 import { runScript } from "./remote.ts";
@@ -22,6 +27,28 @@ import {
 } from "./schema.ts";
 import { sha256Hex, SshError } from "./ssh.ts";
 import { instanceKey, toTarget } from "./target.ts";
+
+/** Maps a layout read onto the prune plan for a keep list. */
+async function computePlan(layout: Layout, keep: string[]): Promise<PrunePlan> {
+  const toObject = (o: ObjectEntry): PruneObject => ({
+    kind: o.kind,
+    hash: o.hash,
+    bytes: o.bytes,
+    path: o.path,
+  });
+  return await planPrune(
+    {
+      refs: layout.refs.map((r) => ({
+        name: r.name,
+        target: { kind: r.kind, hash: r.hash },
+      })),
+      blobs: layout.blobs.map(toObject),
+      bundles: layout.bundles.map(toObject),
+      keep,
+    },
+    (t) => sha256Hex(t),
+  );
+}
 
 /** The methods in this group. */
 export const adminMethods: Record<string, ArtifactServerMethod> = {
@@ -115,30 +142,7 @@ export const adminMethods: Record<string, ArtifactServerMethod> = {
       const args = PlanPruneArgs.parse(rawArgs);
       const target = toTarget(args.ssh);
       const layout = await readLayout(activeDeps, target, args.root);
-      const blobs: PruneObject[] = layout.blobs.map((b) => ({
-        kind: "blob",
-        hash: b.hash,
-        bytes: b.bytes,
-        path: b.path,
-      }));
-      const bundles: PruneObject[] = layout.bundles.map((b) => ({
-        kind: "bundle",
-        hash: b.hash,
-        bytes: b.bytes,
-        path: b.path,
-      }));
-      const plan = await planPrune(
-        {
-          refs: layout.refs.map((r) => ({
-            name: r.name,
-            target: { kind: r.kind, hash: r.hash },
-          })),
-          blobs,
-          bundles,
-          keep: args.keep,
-        },
-        (t) => sha256Hex(t),
-      );
+      const plan = await computePlan(layout, args.keep);
       const handle = await context.writeResource(
         "prune_plan",
         `prune_plan-${instanceKey(args)}`,
@@ -163,30 +167,7 @@ export const adminMethods: Record<string, ArtifactServerMethod> = {
       const args = PruneArgs.parse(rawArgs);
       const target = toTarget(args.ssh);
       const layout = await readLayout(activeDeps, target, args.root);
-      const blobs: PruneObject[] = layout.blobs.map((b) => ({
-        kind: "blob",
-        hash: b.hash,
-        bytes: b.bytes,
-        path: b.path,
-      }));
-      const bundles: PruneObject[] = layout.bundles.map((b) => ({
-        kind: "bundle",
-        hash: b.hash,
-        bytes: b.bytes,
-        path: b.path,
-      }));
-      const plan = await planPrune(
-        {
-          refs: layout.refs.map((r) => ({
-            name: r.name,
-            target: { kind: r.kind, hash: r.hash },
-          })),
-          blobs,
-          bundles,
-          keep: args.keep,
-        },
-        (t) => sha256Hex(t),
-      );
+      const plan = await computePlan(layout, args.keep);
       if (plan.planSha256 !== args.plan_sha256) {
         throw new SshError(
           "the prune plan changed since planning; nothing deleted",

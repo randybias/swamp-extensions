@@ -50,6 +50,10 @@ export interface FakeRemote {
   nginxActive: string;
   /** When true, `nginx -t` exits non-zero. */
   failNginxTest: boolean;
+  /** Paths whose reads fail even though a probe sees a file. */
+  readFails: Set<string>;
+  /** Forces a non-zero exit for any matching argv. */
+  failArgv: (argv: string[]) => boolean;
   /** Supplies a body for a fetched URL, or null for a 404. */
   curl: (url: string) => string | null;
   /** Certificate `notBefore` line returned by the fake openssl. */
@@ -130,6 +134,8 @@ export function makeFakeRemote(): FakeRemote {
     sudoArgv,
     nginxActive: "active",
     failNginxTest: false,
+    readFails: new Set<string>(),
+    failArgv: () => false,
     curl: () => null,
     certNotBefore: "notBefore=Jan  1 00:00:00 2020 GMT",
     certNotAfter: "notAfter=Jan  1 00:00:00 2100 GMT",
@@ -208,6 +214,9 @@ async function handle(
   const ok = (stdout = ""): CommandResult => ({ code: 0, stdout, stderr: "" });
 
   if (argv) {
+    if (host.failArgv(argv)) {
+      return { code: 1, stdout: "", stderr: "forced failure" };
+    }
     if (argv[0] === "nginx" && argv[1] === "-t") {
       return host.failNginxTest
         ? { code: 1, stdout: "", stderr: "nginx: configuration test failed" }
@@ -408,6 +417,9 @@ async function handle(
   }
   if (/^cat '/.test(script)) {
     const p = script.match(/^cat '([^']+)'/)![1];
+    if (host.readFails.has(p)) {
+      return { code: 1, stdout: "", stderr: "read failed" };
+    }
     const file = host.files.get(p);
     return file ? ok(file.content) : { code: 1, stdout: "", stderr: "missing" };
   }

@@ -15,6 +15,7 @@ import {
 } from "./schema.ts";
 import type { DataHandle, MethodContext, MethodResult } from "./types.ts";
 import type { SshDeps, SshTarget } from "./ssh.ts";
+import { SshError } from "./ssh.ts";
 import { readLayout, readNginxState } from "./observe.ts";
 import { NGINX_SITE_PATH } from "./nginx.ts";
 import { blobRelPath, blobUrl, bundleRelPath, bundleUrl } from "./layout.ts";
@@ -124,8 +125,12 @@ export async function observeServer(
   target: SshTarget,
   args: { ssh: SshBlock; root: string },
   context: MethodContext,
+  options: { requireSite?: boolean } = {},
 ): Promise<MethodResult> {
   const nginx = await readNginxState(deps, target, NGINX_SITE_PATH);
+  if (options.requireSite && nginx.configSha256 === null) {
+    throw new SshError(`no artifact-server site at ${NGINX_SITE_PATH}`);
+  }
   const layout = await readLayout(deps, target, args.root);
   const handle = await context.writeResource(
     "server",

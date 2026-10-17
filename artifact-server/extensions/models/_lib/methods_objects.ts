@@ -1,5 +1,5 @@
 /**
- * Model methods grouped by concern.
+ * Object methods: store, fetch, bundle and reference artifacts.
  *
  * @module
  */
@@ -89,8 +89,10 @@ export const objectMethods: Record<string, ArtifactServerMethod> = {
       if (!present) {
         const temp = `${args.root}/.fetch.${await newTempToken(activeDeps)}`;
         await downloadPinned(activeDeps, target, args, temp, dest);
-        await regenerateSha256Sums(activeDeps, target, args.root);
       }
+      // Always reindex: a stale or missing SHA256SUMS is repaired even when the
+      // object was already present.
+      await regenerateSha256Sums(activeDeps, target, args.root);
       if (args.ref != null) {
         await setRef(
           activeDeps,

@@ -7,19 +7,28 @@
 import { renderSite } from "./nginx.ts";
 import type { BasicAuthArgs, TlsArgs } from "./schema.ts";
 
+/** The inputs {@link renderFor} draws from a method's arguments. */
+export interface RenderInput {
+  /** Served root. */
+  root: string;
+  /** Listen address and port. */
+  listen: { address: string; port: number };
+  /** `server_name`. */
+  server_name: string;
+  /** The TLS argument. */
+  tls: TlsArgs;
+  /** The basic-auth argument, when used. */
+  basic_auth?: BasicAuthArgs | null;
+}
+
 /** Renders the site config for a method's inputs. */
-export const renderFor = (
-  root: string,
-  listen: { address: string; port: number },
-  serverName: string,
-  tls: TlsArgs,
-  basicAuth: BasicAuthArgs | null | undefined,
-): string =>
-  renderSite({
-    root,
-    listen,
-    serverName,
-    tlsProvided: tls.mode === "provided",
-    basicAuth: basicAuth != null,
-    basicAuthRealm: basicAuth?.realm ?? "",
+export function renderFor(args: RenderInput): string {
+  return renderSite({
+    root: args.root,
+    listen: args.listen,
+    serverName: args.server_name,
+    tlsProvided: args.tls.mode === "provided",
+    basicAuth: args.basic_auth != null,
+    basicAuthRealm: args.basic_auth?.realm ?? "",
   });
+}

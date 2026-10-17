@@ -12,7 +12,7 @@ import {
   SshError,
   type SshTarget,
 } from "./ssh.ts";
-import { runScript } from "./remote.ts";
+import { hashCmd, runScript } from "./remote.ts";
 import type { FetchArgsType } from "./schema.ts";
 
 /** A fresh, unguessable temp-file suffix. */
@@ -35,9 +35,7 @@ export function fetchScript(
     } ${posixQuote(args.url)}`,
     `s=$(stat -c %s ${posixQuote(temp)} 2>/dev/null || echo 0)`,
     `[ "$s" -le ${args.max_bytes} ] || { echo "too large" >&2; exit 4; }`,
-    `{ sha256sum ${posixQuote(temp)} 2>/dev/null || shasum -a 256 ${
-      posixQuote(temp)
-    } 2>/dev/null; } | awk '{print $1}'`,
+    `${hashCmd(posixQuote(temp))}`,
   ].join("\n");
 }
 

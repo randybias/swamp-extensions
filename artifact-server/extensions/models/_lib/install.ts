@@ -150,9 +150,11 @@ export async function writeSite(
   let changed = site.changed || enabledChanged;
   if (args.disable_default_site) {
     const rm = await execSudo(deps, target, ["rm", "-f", NGINX_DEFAULT_SITE]);
+    if (rm.exit_code !== 0) {
+      throw new SshError("could not remove the default nginx site");
+    }
     changed = changed ||
-      (rm.exit_code === 0 && snaps.default !== null &&
-        snaps.default.state !== "missing");
+      (snaps.default !== null && snaps.default.state !== "missing");
   }
   return changed;
 }
@@ -207,12 +209,15 @@ export async function writeCredentials(
   return changed;
 }
 
-/** Puts every file and link back the way {@link captureInstallSnaps} found it. */
-async function rollbackInstall(
+/**
+ * Puts every file and link back the way {@link captureInstallSnaps} found it,
+ * then re-runs `nginx -t`. Returns whether the restored config passes.
+ */
+export async function rollbackInstall(
   deps: SshDeps,
   target: SshTarget,
   snaps: InstallSnaps,
-): Promise<void> {
+): Promise<boolean> {
   await restoreFile(deps, target, snaps.site);
   await restoreLink(deps, target, snaps.enabled);
   if (snaps.default !== null) await restoreLink(deps, target, snaps.default);
@@ -221,37 +226,29 @@ async function rollbackInstall(
   if (snaps.htpasswd !== null) {
     await restoreFile(deps, target, snaps.htpasswd);
   }
+  const retest = await execSudo(deps, target, ["nginx", "-t"]);
+  return retest.exit_code === 0;
 }
 
 /**
- * Proves the rendered config with `nginx -t`. On failure it rolls the host
- * back, re-tests the restored config and throws; on success it reloads only
- * when something changed.
+ * Proves the rendered config with `nginx -t` and reloads. The reload is
+ * idempotent and always runs, so a retry after a prior reload failure picks up
+ * the config even when this run changed nothing.
  */
 export async function verifyAndReload(
   deps: SshDeps,
   target: SshTarget,
-  snaps: InstallSnaps,
-  changed: boolean,
 ): Promise<void> {
   const test = await execSudo(deps, target, ["nginx", "-t"]);
   if (test.exit_code !== 0) {
-    await rollbackInstall(deps, target, snaps);
-    const retest = await execSudo(deps, target, ["nginx", "-t"]);
     throw new SshError(
-      `nginx -t failed on the rendered config; rolled back and not reloaded${
-        retest.exit_code !== 0
-          ? " (the restored config also fails nginx -t)"
-          : ""
-      }: ${test.stderr.slice(0, 300)}`,
+      `nginx -t failed on the rendered config: ${test.stderr.slice(0, 300)}`,
     );
   }
-  if (changed) {
-    const reload = await execSudo(deps, target, [
-      "systemctl",
-      "reload",
-      "nginx",
-    ]);
-    if (reload.exit_code !== 0) throw new SshError("nginx reload failed");
-  }
+  const reload = await execSudo(deps, target, [
+    "systemctl",
+    "reload",
+    "nginx",
+  ]);
+  if (reload.exit_code !== 0) throw new SshError("nginx reload failed");
 }

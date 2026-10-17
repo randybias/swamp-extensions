@@ -1,6 +1,11 @@
 /**
- * The active transport dependencies. Production uses the real runner; tests
- * swap it once, and every module reads the same live binding.
+ * The active transport dependencies.
+ *
+ * This is deliberately a single module-level binding rather than a parameter,
+ * so `model` can be a plain object literal that the cataloguer can read. The
+ * cost is that it is shared mutable state: production sets it once (via the
+ * default), and tests bind it once per test through one shared helper, which
+ * must not run concurrently in the same worker. `setDeps` is the only writer.
  *
  * @module
  */

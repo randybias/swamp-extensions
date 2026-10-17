@@ -51,6 +51,15 @@ export async function runScript(
   return await exec(deps, target, argv);
 }
 
+/**
+ * A shell expression that prints a file's SHA-256, using GNU `sha256sum` or
+ * BSD `shasum -a 256`. `pathExpr` must already be a safe shell word (a quoted
+ * literal or a quoted variable).
+ */
+export function hashCmd(pathExpr: string): string {
+  return `{ sha256sum ${pathExpr} 2>/dev/null || shasum -a 256 ${pathExpr} 2>/dev/null; } | awk '{print $1}'`;
+}
+
 /** One file's observed state. */
 export interface FileProbe {
   /** `missing`, `file`, `symlink` or `dir`. */
@@ -79,7 +88,7 @@ export async function probeFile(
     `if [ -L "$f" ]; then echo symlink`,
     `elif [ -d "$f" ]; then echo dir`,
     `elif [ -f "$f" ]; then`,
-    `  h=$( { sha256sum "$f" 2>/dev/null || shasum -a 256 "$f" 2>/dev/null; } | awk '{print $1}' )`,
+    `  h=$(${hashCmd('"$f"')})`,
     `  m=$( { stat -c %a "$f" 2>/dev/null || stat -f %Lp "$f" 2>/dev/null; } )`,
     `  u=$( { stat -c %U "$f" 2>/dev/null; } )`,
     `  g=$( { stat -c %G "$f" 2>/dev/null; } )`,

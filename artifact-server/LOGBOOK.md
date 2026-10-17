@@ -87,6 +87,25 @@ After the review rounds, one deliberate simplification pass:
 - Tests share one `modelFor(host)` setup helper, and the shell builders are run
   through a real `sh`.
 
+## Round-2 fixes
+
+- `install` writes credentials before it enables the site, and wraps every step
+  after the snapshots in one rollback: any throw — a failed credential write, a
+  failed remove, `nginx -t`, a lost connection — restores the host and re-tests
+  the restored config.
+- After a passing `nginx -t` the reload always runs, so a retry after a prior
+  reload failure picks up the config even when nothing changed this run.
+- `snapFile` refuses to proceed when a probe sees a file but the read fails, so
+  a rollback can never replace a real file with an empty one.
+- The `SHA256SUMS` and verify scripts iterate with shell globs instead of
+  `find | while read`, and validate each path against the layout ERE, so a
+  newline-named directory cannot inject a line. One `hashCmd` helper is the
+  single SHA-256 command.
+- `plan_prune` and `prune` share one `computePlan`; `get` fails when no site is
+  installed while `sync` succeeds; `renderFor` takes its inputs as one object;
+  `InstallArgs` extends `RenderConfigArgs`.
+- Tests share one `test_support.ts` helper and are split by concern.
+
 ## Open spec questions resolved by the simplest safe option
 
 - **Listen port vs URL** — see decision 3.

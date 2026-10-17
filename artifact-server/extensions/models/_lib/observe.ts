@@ -20,7 +20,7 @@ import {
   REFS_DIR,
   SHA256SUMS_FILE,
 } from "./layout.ts";
-import { probeFile, runScript } from "./remote.ts";
+import { hashCmd, probeFile, runScript } from "./remote.ts";
 
 /** One ref as stored on disk. */
 export interface RefEntry {
@@ -241,7 +241,7 @@ export async function readNginxState(
     `echo "##ACTIVE"`,
     `systemctl is-active nginx 2>/dev/null || true`,
     `echo "##CFG"`,
-    `if [ -f ${r} ]; then sha256sum ${r} | awk '{print $1}'; fi`,
+    `if [ -f ${r} ]; then ${hashCmd(r)}; fi`,
     `echo "##TLS"`,
     `if [ -f ${r} ] && grep -q 'ssl;' ${r}; then echo yes; else echo no; fi`,
     `echo "##AUTH"`,

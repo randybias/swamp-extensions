@@ -2,6 +2,25 @@
 
 Not packaged. Notes for whoever maintains this extension.
 
+## Naming and visibility
+
+Answers to the five naming questions (naming and visibility convention, §3):
+
+visibility: public audience: general
+
+1. Private or public? Public: published to swamp-club with public visibility,
+   source in this repo.
+2. Individual or general? General: any operator running Syncthing nodes; no
+   environment, host or deployment is baked in.
+3. Does the name clearly describe and disambiguate while staying short? Yes:
+   `syncthing-peer` is the product plus the resource it manages, a peer device
+   and the folder shared with it, in two segments. Judged "keep" in the run
+   sp-20261017 naming audit.
+4. Private purpose check: not applicable (public).
+5. Would a stranger guess roughly right and wrong about nothing? Yes: it peers
+   Syncthing nodes. It does not install Syncthing or manage its global options,
+   and the name does not suggest that it does.
+
 ## Registry evaluation (before building)
 
 Searched the registry for Syncthing or generic file-sync peering:
@@ -153,3 +172,39 @@ Result 10/10 applicable cells PASS, 0 FAIL, 0 BLOCKED. Both nodes were purged
   one that stops first and the local ssh does not kill a request early.
 - Inputs and the REST contract are unchanged, so the `upgrades[]` entry is a
   no-op.
+
+## 2026-10-17 live e2e (2026.10.17.2)
+
+Run sp-20261017 on 2ef94b9, swamp 20261013.025835.0, model typeVersion
+2026.10.17.2. Two throwaway VPS nodes, `<vps5>` (A) and `<vps6>` (B), Ubuntu
+archive `syncthing 1.27.2~ds4` as a dedicated system user under the packaged
+`syncthing@` unit, API on loopback :8384 only. Transport `access=ssh`,
+`host_key_policy=strict` with pinned keys. API keys went from config.xml over
+ssh stdout into the vault on stdin; `api_key` and `private_key` were vault
+references only and no run used `--json`.
+
+| Cell                                        | Result | Detail                                                                                                                                                     |
+| ------------------------------------------- | ------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 1 get/sync both nodes                       | PASS   | rc 0, `reachable true`, `present`, device and folder counts                                                                                                |
+| 2 ensure_device A->B, B->A, repeat          | PASS   | first runs `changed true`, peer name and `tcp://<peer>:22000` on each side; repeats `changed false`                                                        |
+| 3 ensure_folder both + real sync            | PASS   | first runs `changed true`, repeats `changed false`; a 64 KiB random file written on A appeared on B with identical size and sha256 after 15 s              |
+| 4 label change is a PATCH                   | PASS   | out-of-model fields (rescanIntervalS, order, fsWatcherDelayS) and both device ids survived the label change; repeat `changed false`                        |
+| 5 remove_folder / remove_device, repeat     | PASS   | each `changed true`, `removed`; second round all `changed false`, `not_found`, rc 0                                                                        |
+| 6 folder id `..` refused before any request | PASS   | rc 1 with the folder_id grammar error; sshd on B saw no connection in the window (positive control after)                                                  |
+| 7 wrong API key                             | PASS   | `system status returned 403 (the API key was rejected)`, rc 1, no record written; the earlier wording note is resolved                                     |
+| 8 Syncthing stopped on B                    | PASS   | sync `timeout_s: 5`: `unreachable` (curl exit 7); a listener that never answers gave curl exit 28 within the timeout; restarted, `reachable true`          |
+| 9 host-key mismatch                         | PASS   | B's pins for A's address: `host key verification failed`, rc 1                                                                                             |
+| 10 argv scan                                | PASS   | ps every 50 ms on control, A and B: 0 hits for keys, substrings or their sha256 (positive control hit); the only remote command was `curl -q --config -`   |
+| 11 no remote file written (new)             | PASS   | no cache dir, `*.curlrc` or upload temp file appeared on either host during or after the run; a content scan of every new file found no API key            |
+| 12 hostile folder label (new)               | PASS   | a label with quotes, backslashes and a `url = http://example.invalid` line was stored verbatim (byte-equal read-back); all 6 requests went to the loopback |
+
+Result 12/12 PASS, 0 FAIL, 0 BLOCKED. Both nodes were purged (package, unit,
+user) and the vault emptied afterwards.
+
+- 2026-10-17 (merge-prep, main): review CLEAN at 2ef94b9, including a
+  hostile-label curl-config test against real curl. Residuals:
+  - LOW (open): after a local timeout the remote curl keeps running until its
+    own `max-time` stops it; it is bounded by curl, not killed by the model.
+  - LOW (open): remote curl stderr is passed into errors as its last line,
+    capped at 200 characters; earlier lines are dropped.
+  - LOW (open): no `docs/specs/` spec exists for this extension.

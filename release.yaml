@@ -87,3 +87,8 @@ server-host:
     2026.10.17.1: c83486edf44844afae336c57dc1273dc250985d352fecf82be84664e01e8894d
   notes:
     2026.10.17.1: 'First release, beta. Baseline hardening of a Linux server over SSH: an admin user, sshd lockdown and an nftables policy, each applied behind an armed host-side revert that fires unless a fresh management connection confirms the change. Live end to end on a throwaway VPS: 19 of 21 cells pass, then a 12 of 12 re-run on the fixes; open follow-ups are recorded in the LOGBOOK, so it stays on beta.'
+
+redfish:
+  channel: beta
+  ci: false
+  published: {}

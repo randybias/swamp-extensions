@@ -1,0 +1,11 @@
+manifestVersion: 1
+name: "@randybias/redfish"
+version: "2026.10.17.1"
+description: "Read and control a server's power and boot settings over the DMTF Redfish API. One model serves any BMC: the endpoint, system and vault-wired credentials are method arguments, the TLS policy is explicit, and no credential is ever placed in a URL, log or stored state."
+license: Apache-2.0
+repository: https://github.com/randybias/swamp-extensions
+platforms: [darwin-aarch64, darwin-x86_64, linux-x86_64, linux-aarch64]
+labels: [redfish, bmc, out-of-band, power, boot, https]
+additionalFiles: [README.md, LICENSE.txt]
+models:
+  - redfish.ts

@@ -244,7 +244,8 @@ Deno.test("config fragment is a valid top-level shape, not inline blocks", () =>
   assert(fragment.includes("dnssec-policy: managed-example-com"));
   assert(fragment.includes("remote:"));
   assert(fragment.includes("acl:"));
-  assert(fragment.includes("notify: managed-example-com-notify"));
+  assert(fragment.includes("notify: [managed-example-com"));
+  assert(fragment.includes("-notify-0]"));
   assert(!fragment.includes("disable-any"));
   assert(!/^\s+notify:$/m.test(fragment));
 });

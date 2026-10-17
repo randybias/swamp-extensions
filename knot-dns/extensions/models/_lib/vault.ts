@@ -38,6 +38,7 @@ export type KnotErrorCode =
   | "transport"
   | "tool_failed"
   | "reload_failed"
+  | "rollback_failed"
   | "verify_failed"
   | "port_busy"
   | "timeout";

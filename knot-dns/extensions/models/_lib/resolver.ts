@@ -96,23 +96,30 @@ function yamlString(s: string): string {
  */
 export function renderResolverYaml(input: ResolverInput): string {
   const lines: string[] = ["---"];
-  lines.push("listen:");
+  lines.push("network:");
+  lines.push("  listen:");
   for (const addr of input.listen) {
-    lines.push(`  - ${yamlString(addr)}`);
+    const { host, port } = splitListen(addr);
+    lines.push(`    - interface: ${yamlString(host)}`);
+    lines.push(`      port: ${port}`);
   }
   lines.push("cache:");
-  lines.push(`  size-max: ${input.cache_size_mb}MB`);
+  lines.push(`  size-max: ${input.cache_size_mb}M`);
   if (input.forwards.length > 0) {
     lines.push("forward:");
     for (const f of input.forwards) {
       lines.push(`  - subtree: ${yamlString(f.subtree)}`);
       lines.push("    servers:");
-      for (const s of f.servers) lines.push(`      - ${yamlString(s)}`);
-      const options: string[] = [];
-      if (f.transport === "tls") options.push("      transport: tls");
-      if (f.tls_hostname) {
-        options.push(`      tls_hostname: ${yamlString(f.tls_hostname)}`);
+      for (const s of f.servers) {
+        lines.push(`      - address: ${yamlString(s)}`);
+        if (f.transport === "tls") {
+          lines.push("        transport: tls");
+          if (f.tls_hostname) {
+            lines.push(`        hostname: ${yamlString(f.tls_hostname)}`);
+          }
+        }
       }
+      const options: string[] = [];
       if (f.authoritative) options.push("      authoritative: true");
       if (f.dnssec) options.push("      dnssec: true");
       if (options.length > 0) {
@@ -122,13 +129,13 @@ export function renderResolverYaml(input: ResolverInput): string {
     }
   }
   const allow = input.allow_query_from ?? ["127.0.0.0/8", "::1/128"];
-  lines.push("view:");
+  lines.push("views:");
   lines.push("  - subnets:");
   for (const cidr of allow) lines.push(`      - ${yamlString(cidr)}`);
   lines.push("    answer: allow");
   lines.push("  - subnets:");
   lines.push('      - "0.0.0.0/0"');
   lines.push('      - "::/0"');
-  lines.push("    answer: deny");
+  lines.push("    answer: refused");
   return `${lines.join("\n")}\n`;
 }

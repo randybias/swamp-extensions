@@ -31,14 +31,15 @@ import {
   finalizeZoneScript,
   getDsScript,
   installScript,
-  KNOT_CONF_DIR,
   observeScript,
   parseKeyValues,
   parseServed,
+  portCheckScript,
   removeResolverScript,
   removeZoneScript,
   resolverObserveScript,
   restoreZoneScript,
+  STAGED_LISTEN,
   zonePaths,
 } from "./_lib/scripts.ts";
 import { parseDsLines } from "./_lib/parse.ts";
@@ -68,8 +69,6 @@ const RESOLVER_YAML = "/etc/knot-resolver/config.yaml";
 const RESOLVER_YAML_STAGED = "/etc/knot-resolver/.config.yaml.staged";
 /** Backup of the package's resolver configuration. */
 const RESOLVER_PACKAGE_BACKUP = "/etc/knot-resolver/config.yaml.package";
-/** Host-global authoritative listen fragment. */
-const LISTEN_FRAGMENT = `${KNOT_CONF_DIR}/40-managed-listen.conf`;
 
 const SshShape = {
   ssh: z.strictObject({
@@ -175,6 +174,7 @@ const StateZoneSchema = z.strictObject({
   served_serial: z.string().optional(),
   applied_at: z.string().optional(),
   declared: z.array(z.string()).optional(),
+  listen: z.array(z.string()).optional(),
 });
 
 const StateResolverSchema = z.strictObject({
@@ -318,6 +318,21 @@ function mapScriptError(stderr: string, exit: number): KnotError {
   if (stderr.includes("STOP_FAILED")) {
     return new KnotError("reload_failed", "could not stop the resolver");
   }
+  if (stderr.includes("CHOWN_FAILED")) {
+    return new KnotError(
+      "tool_failed",
+      "could not set root:knot ownership on a managed file",
+    );
+  }
+  if (stderr.includes("RESTORE_RELOAD_FAILED")) {
+    return new KnotError(
+      "reload_failed",
+      "the rollback reload failed; the backup was not removed",
+    );
+  }
+  if (stderr.includes("PROBE_FAILED")) {
+    return new KnotError("tool_failed", "a live probe failed");
+  }
   if (stderr.includes("NO_BACKUP")) {
     return new KnotError("reload_failed", "the backup directory is missing");
   }
@@ -348,45 +363,72 @@ async function persistZone(
   return await context.writeResource("zone", name, data);
 }
 
-/** Enforces wildcard, disjointness and port-53 preconditions for a zone. */
+/** Normalizes `addr` or `addr@port` to host and port for comparison. */
+function listenPort(addr: string): { host: string; port: string } {
+  const at = addr.indexOf("@");
+  return at === -1
+    ? { host: addr, port: "53" }
+    : { host: addr.slice(0, at), port: addr.slice(at + 1) };
+}
+
+/** Returns the overlapping pair when the two listen sets can share a socket. */
+function listenOverlap(
+  a: string[],
+  b: string[] | undefined,
+): string | undefined {
+  for (const x of a) {
+    for (const y of b ?? []) {
+      const lx = listenPort(x);
+      const ly = listenPort(y);
+      if (lx.port !== ly.port) continue;
+      const wild = (h: string) => h === "0.0.0.0" || h === "::";
+      if (lx.host === ly.host || wild(lx.host) || wild(ly.host)) {
+        return `${x} and ${y}`;
+      }
+    }
+  }
+  return undefined;
+}
+
+/** Enforces wildcard and authoritative/resolver disjointness preconditions. */
 function assertListenAcceptable(
   a: { listen: string[]; listen_any_ack: boolean },
   resolverListen: string[] | undefined,
 ): void {
   for (const addr of a.listen) {
-    const host = addr.split("@")[0];
+    const host = listenPort(addr).host;
     if ((host === "0.0.0.0" || host === "::") && !a.listen_any_ack) {
       throw new KnotError(
         "invalid_input",
         "a wildcard listen address needs listen_any_ack",
       );
     }
-    if (resolverListen?.includes(addr)) {
-      throw new KnotError(
-        "invalid_input",
-        `the authoritative and resolver listen sets overlap at ${addr}`,
-      );
-    }
+  }
+  const overlap = listenOverlap(a.listen, resolverListen);
+  if (overlap !== undefined) {
+    throw new KnotError(
+      "invalid_input",
+      `the authoritative and resolver listen sets overlap at ${overlap}`,
+    );
   }
 }
 
 /** Precheck that port 53 is not held by something other than Knot. */
-async function assertPortFree(
+/** Precheck that each requested listen address/port is free or held by Knot. */
+async function assertPortsFree(
   target: SshTarget,
-  overtime = false,
+  listens: string[],
 ): Promise<void> {
-  void overtime;
   const res = await sshExec(deps, target, [
     "sh",
     "-c",
-    "command -v ss >/dev/null 2>&1 || exit 0\n" +
-    "ss -lntup 2>/dev/null | awk '/:(53)[[:space:]]/ {print $0}' | grep -v knotd | grep -q . " +
-    "&& { echo PORT_BUSY >&2; exit 9; } || true",
+    portCheckScript(listens),
   ]);
-  if (res.exit_code !== 0 && res.stderr.includes("PORT_BUSY")) {
+  if (res.exit_code !== 0) {
+    const detail = res.stderr.split("\n").find((l) => l.includes("PORT_BUSY"));
     throw new KnotError(
       "port_busy",
-      "port 53 is held by a process other than Knot",
+      detail ?? "a requested listen port is busy",
     );
   }
 }
@@ -417,9 +459,12 @@ async function observe(
       const stored = await context.readResource(
         await instanceName(["zone", a.ssh.host, apex]),
       ) as z.infer<typeof StateZoneSchema> | null;
-      const declared: DiffEntry[] = (stored?.declared ?? []).map((s) => {
-        const [name, type, data] = s.split("|");
-        return { name, type, data };
+      const declared: DiffEntry[] = (stored?.declared ?? []).flatMap((s) => {
+        try {
+          return [JSON.parse(s) as DiffEntry];
+        } catch {
+          return [];
+        }
       });
       const diff = diffDeclared(declared, served);
       const fileDrift = stored !== null && stored.rendered_sha256 !== "" &&
@@ -590,23 +635,48 @@ export const model = {
           await instanceName(["resolver", a.ssh.host]),
         ) as z.infer<typeof StateResolverSchema> | null;
         assertListenAcceptable(a, resolverState?.listen);
-        await assertPortFree(target);
-        // Host-global authoritative listen, rendered from this zone's input.
+        // The authoritative listen is host-global: use the union of every
+        // recorded zone's listens on this host plus this zone's.
+        const union = new Set<string>(a.listen);
+        try {
+          const records = await context.readModelData?.(
+            context.definition?.name,
+            "zone",
+          ) ?? [];
+          for (const r of records) {
+            const attrs =
+              (r as { attributes?: { host?: string; listen?: string[] } })
+                .attributes;
+            if (attrs?.host === a.ssh.host && Array.isArray(attrs.listen)) {
+              attrs.listen.forEach((x) => union.add(x));
+            }
+          }
+        } catch {
+          // readModelData is unavailable (for example in a unit test); use
+          // this zone's listens only.
+        }
+        const listens = [...union].sort();
+        await assertPortsFree(target, listens);
+        const listenContent = listens.length === 0
+          ? ""
+          : `server:\n  listen: [${
+            listens.map((x) => JSON.stringify(x)).join(", ")
+          }]\n`;
         await sshUpload(deps, target, {
-          path: LISTEN_FRAGMENT,
-          content: `listen:\n${
-            a.listen.map((x) => `  - ${JSON.stringify(x)}`).join("\n")
-          }\n`,
+          path: STAGED_LISTEN,
+          content: listenContent,
           mode: "0644",
         });
-        const hasTsig = a.tsig_keys.length > 0;
-        if (hasTsig) {
-          await sshUpload(deps, target, {
-            path: zonePaths(zone).stagedTsig,
-            content: await renderTsigFragment(context, a.tsig_keys),
-            mode: "0640",
-          });
-        }
+        // Upload the staged TSIG fragment every time, empty when there are no
+        // keys, so a removed key is actually removed and a stale staged file
+        // from a failed run cannot be installed later.
+        await sshUpload(deps, target, {
+          path: zonePaths(zone).stagedTsig,
+          content: a.tsig_keys.length > 0
+            ? await renderTsigFragment(context, a.tsig_keys)
+            : "",
+          mode: "0640",
+        });
         await sshUpload(deps, target, {
           path: zonePaths(zone).stagedZone,
           content: file,
@@ -620,7 +690,7 @@ export const model = {
         const res = await sshExec(deps, target, [
           "sh",
           "-c",
-          applyZoneScript({ apex: zone, signed: a.dnssec !== "off", hasTsig }),
+          applyZoneScript({ apex: zone }),
         ]);
         if (res.exit_code !== 0) {
           throw mapScriptError(res.stderr, res.exit_code);
@@ -631,12 +701,22 @@ export const model = {
         const expected = declaredTuples(zone, a.soa, all);
         const diff = diffDeclared(expected, served);
         if (diff.added.length > 0 || diff.removed.length > 0) {
-          if (backup) {
-            await sshExec(deps, target, [
-              "sh",
-              "-c",
-              restoreZoneScript({ apex: zone, backup }),
-            ]);
+          if (!backup) {
+            throw new KnotError(
+              "verify_failed",
+              "served records differ from the declaration and no backup was kept; repair by hand",
+            );
+          }
+          const restored = await sshExec(deps, target, [
+            "sh",
+            "-c",
+            restoreZoneScript({ apex: zone, backup }),
+          ]);
+          if (restored.exit_code !== 0) {
+            throw new KnotError(
+              "rollback_failed",
+              `served records differ and the rollback failed; the backup is kept at ${backup}`,
+            );
           }
           throw new KnotError(
             "verify_failed",
@@ -655,7 +735,8 @@ export const model = {
           dnssec: a.dnssec !== "off",
           ...(kv.serial ? { served_serial: kv.serial } : {}),
           applied_at: new Date().toISOString(),
-          declared: expected.map((t) => `${t.name}|${t.type}|${t.data}`),
+          declared: expected.map((t) => JSON.stringify(t)),
+          listen: listens,
         });
         return {
           dataHandles: [handle],

@@ -571,15 +571,25 @@ export interface ZoneConfigInput {
   tsigKeyNames: string[];
 }
 
+/** A short deterministic hash for building unique config ids. */
+function shortHash(s: string): string {
+  let h = 5381;
+  for (let i = 0; i < s.length; i++) {
+    h = ((h << 5) + h + s.charCodeAt(i)) >>> 0;
+  }
+  return h.toString(16).padStart(8, "0").slice(0, 8);
+}
+
 /**
  * Renders the top-level `policy:`/`remote:`/`acl:` sections and the `zone:`
- * entry for one managed zone. Notify and ACL targets must be top-level
- * sections referenced by id (inline blocks are rejected by `knotc
- * conf-check`), and `disable-any` is not a valid item on vendor Knot.
+ * entry for one managed zone. Notify targets get one `remote:` each (several
+ * addresses in one remote are alternatives, not a fan-out), and an ACL with
+ * no TSIG key omits `key:` entirely.
  */
 export function renderZoneConfig(input: ZoneConfigInput): string {
   const zone = normalizeApex(input.apex);
-  const base = `managed-${stripDot(zone).replace(/[^A-Za-z0-9-]/g, "-")}`;
+  const slug = stripDot(zone).replace(/[^A-Za-z0-9-]/g, "-");
+  const base = `managed-${slug}-${shortHash(zone)}`;
   const lines: string[] = [];
   if (input.signed) {
     lines.push("policy:");
@@ -593,15 +603,18 @@ export function renderZoneConfig(input: ZoneConfigInput): string {
       lines.push(`    zsk-lifetime: ${input.dnssec.zsk_lifetime}`);
     }
   }
-  const wantsTransfer = input.allowTransfer.length > 0 ||
-    input.tsigKeyNames.length > 0;
+  const remoteIds: string[] = [];
   if (input.notifySecondaries.length > 0) {
     lines.push("remote:");
-    lines.push(`  - id: ${base}-notify`);
-    for (const addr of input.notifySecondaries) {
+    input.notifySecondaries.forEach((addr, i) => {
+      const id = `${base}-notify-${i}`;
+      remoteIds.push(id);
+      lines.push(`  - id: ${id}`);
       lines.push(`    address: ${JSON.stringify(addr)}`);
-    }
+    });
   }
+  const wantsTransfer = input.allowTransfer.length > 0 ||
+    input.tsigKeyNames.length > 0;
   if (wantsTransfer) {
     lines.push("acl:");
     lines.push(`  - id: ${base}-transfer`);
@@ -611,8 +624,8 @@ export function renderZoneConfig(input: ZoneConfigInput): string {
     lines.push("    action: transfer");
     if (input.tsigKeyNames.length === 1) {
       lines.push(`    key: ${input.tsigKeyNames[0]}`);
-    } else {
-      lines.push(`    key: ${input.tsigKeyNames.length > 1}`);
+    } else if (input.tsigKeyNames.length > 1) {
+      lines.push(`    key: [${input.tsigKeyNames.join(", ")}]`);
     }
   }
   lines.push("zone:");
@@ -624,8 +637,8 @@ export function renderZoneConfig(input: ZoneConfigInput): string {
   lines.push("    serial-policy: unixtime");
   lines.push(`    dnssec-signing: ${input.signed ? "on" : "off"}`);
   if (input.signed) lines.push(`    dnssec-policy: ${base}`);
-  if (input.notifySecondaries.length > 0) {
-    lines.push(`    notify: ${base}-notify`);
+  if (remoteIds.length > 0) {
+    lines.push(`    notify: [${remoteIds.join(", ")}]`);
   }
   if (wantsTransfer) lines.push(`    acl: ${base}-transfer`);
   return `${lines.join("\n")}\n`;

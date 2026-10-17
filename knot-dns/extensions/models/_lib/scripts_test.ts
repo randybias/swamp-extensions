@@ -34,7 +34,7 @@ const SCRIPTS: [string, string][] = [
   ["install", installScript({ resolver: true })],
   [
     "apply_zone",
-    applyZoneScript({ apex: "example.com.", signed: true, hasTsig: true }),
+    applyZoneScript({ apex: "example.com." }),
   ],
   [
     "remove_zone",
@@ -83,8 +83,6 @@ Deno.test("zone paths and quoting are stable", () => {
 Deno.test("apply script validates before swapping and rolls back on reload failure", () => {
   const script = applyZoneScript({
     apex: "example.com.",
-    signed: false,
-    hasTsig: false,
   });
   assert(script.includes("kzonecheck"));
   assert(script.includes("knotc -c"));
@@ -129,8 +127,6 @@ Deno.test("resolver apply script validates with kresctl before swapping", () => 
 Deno.test("apply script blocks on reload and keeps the backup", () => {
   const script = applyZoneScript({
     apex: "example.com.",
-    signed: true,
-    hasTsig: true,
   });
   assert(script.includes("knotc -b reload"));
   assert(script.includes("knotc -b zone-reload"));

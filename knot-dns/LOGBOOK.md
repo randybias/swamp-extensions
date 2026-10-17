@@ -130,3 +130,54 @@ knot-resolver6 6.5.0.
   succeed.
 - `purge_keys_ack` now runs `knotc zone-purge` for the journal; KASP key
   deletion is left to `keymgr` and is a residual.
+
+## Review round 2 (HEAD 15b7978) dispositions
+
+- HIGH CHGRP bug: the ownership loop now uses `"$x"` and fails the script
+  (`CHOWN_FAILED`) when it cannot set ownership; the generated apply and restore
+  scripts run clean under dash `set -eu` (verified in ubuntu:24.04 with stub
+  tools), which would have caught the old `$1` unbound-variable abort.
+- HIGH listen: the authoritative listen is now host-global and staged as
+  `server:\n  listen: [...]` (a top-level `listen:` and a dash block are both
+  rejected); it is conf-checked, backed up, swapped and restored under the same
+  `flock`, and the model renders the union of the recorded zones' listens.
+  Verified with real `knotc conf-check` on knot 3.3.4 and 3.6.1.
+- HIGH kzonecheck: dropped `-d on`; a signed zone's input file is checked
+  unsigned and Knot signs after load. Verified rc=0 on 3.3.4 and 3.6.1.
+- HIGH ACL key: `key: [k1, k2]` for several keys and `key:` omitted when there
+  are none; verified conf-check clean.
+- HIGH resolver: `cache.size-max: 256M`, per-server `address`/`transport: tls`/
+  `hostname`, `network.listen` (`interface` + `port`) and `views`
+  `answer:
+  refused`, all from `kresctl schema`. Verified `kresctl validate`
+  6.5.0 reports "Basic validation was successful".
+- HIGH TSIG change detection: the staged TSIG fragment is uploaded every time
+  (empty when there are no keys) and takes part in the change comparison and the
+  install/remove decision, so a rotation or a removal is applied and a stale
+  staged file cannot be installed later.
+- HIGH rollback: the restore exit status is checked and a failed rollback raises
+  `rollback_failed` with the backup path; the restore script fails if its reload
+  fails.
+- HIGH port-53 precheck: only the requested listen address/port pairs are
+  checked (with wildcard coverage) and a Knot listener is allowed, so a
+  co-hosted systemd-resolved stub or kresd on a disjoint address is fine.
+- MEDIUM: one `remote:` per secondary with `notify: [ids]`; `remove_zone` runs
+  under `flock` and backs up/restores the TSIG fragment; `ListenSchema` parses
+  addresses and ports; `notify_secondaries`/`allow_transfer` now require address
+  grammar; the listen overlap check normalizes addresses; declared tuples are
+  stored as JSON; the config id includes a digest; `observe` fails the probe
+  instead of persisting when a read fails.
+
+## Real-tool receipts
+
+Renders were checked against the containers the lead named:
+
+- `knotc -c knot.conf conf-check`: **valid** on `knot-check:local2` (3.6.1) and
+  `knot-distro:local` (3.3.4), for the signed and unsigned fragments with
+  `server.listen`, `key`, `policy`, `remote`, `acl` and `zone` sections.
+- `kzonecheck -o example.com. example.com.zone`: **rc=0** on both.
+- `kresctl validate config.yaml`: **"Basic validation was successful"** on
+  `knot-check:local2` (6.5.0).
+- `applyZoneScript` under `sh -eu` (dash) in `ubuntu:24.04` with stub
+  `knotc`/`kzonecheck`/`chown`/`chgrp`: **rc=0**, `backup=` and `changed=yes`
+  printed, so no unbound-variable abort.

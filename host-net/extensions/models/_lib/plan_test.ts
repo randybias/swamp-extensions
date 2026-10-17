@@ -1,0 +1,88 @@
+import { assertEquals, assertThrows } from "jsr:@std/assert@1.0.19";
+import {
+  armArgv,
+  assertArmBeforeApply,
+  mtuLowerOrder,
+  mtuRaiseOrder,
+  planApply,
+  planRemove,
+  revertNowArgv,
+  type Step,
+} from "./plan.ts";
+import type { NetConfig } from "./validate.ts";
+
+const CFG: NetConfig = {
+  backend: "netplan",
+  bridgeType: "linux",
+  mode: "additive",
+  managementInterface: "enp1s0",
+  ethernets: [{ name: "enp1s0", mtu: 9000 }],
+  vlans: [{
+    id: 100,
+    link: "enp1s0",
+    mtu: 9000,
+    addresses: ["198.51.100.10/24"],
+    optional: true,
+  }],
+  bridge: { name: "br0", interfaces: ["enp1s0.100"], mtu: 9000, addresses: [] },
+};
+
+Deno.test("MTU raise is parent-first; lower is child-first", () => {
+  assertEquals(mtuRaiseOrder(CFG).map((n) => n.name), [
+    "enp1s0",
+    "enp1s0.100",
+    "br0",
+  ]);
+  assertEquals(mtuLowerOrder(CFG).map((n) => n.name), [
+    "br0",
+    "enp1s0.100",
+    "enp1s0",
+  ]);
+});
+
+Deno.test("arm precedes every mtu/write/apply step", () => {
+  const steps = planApply(CFG, {
+    token: "0000000000000000",
+    revertAfterS: 300,
+    writtenPaths: ["/etc/netplan/90-host-net.yaml"],
+  });
+  assertArmBeforeApply(steps);
+  const armAt = steps.findIndex((s) => s.kind === "arm");
+  for (const kind of ["mtu", "write", "apply"] as const) {
+    const at = steps.findIndex((s) => s.kind === kind);
+    assertEquals(at > armAt, true, `${kind} after arm`);
+  }
+  const remove = planRemove(CFG, {
+    token: "0000000000000000",
+    revertAfterS: 300,
+  });
+  assertArmBeforeApply(remove);
+});
+
+Deno.test("a plan with the arm moved after the apply fails the invariant", () => {
+  const steps: Step[] = [
+    { kind: "apply", id: "apply-config", description: "apply" },
+    { kind: "arm", id: "arm", description: "arm" },
+  ];
+  assertThrows(() => assertArmBeforeApply(steps), Error, "precedes the arm");
+  const stageAsArm: Step[] = [
+    { kind: "stage", id: "arm", description: "stage pretending to be arm" },
+    { kind: "mtu", id: "mtu", description: "raise" },
+  ];
+  assertThrows(() => assertArmBeforeApply(stageAsArm), Error);
+});
+
+Deno.test("arm arg is a systemd-run timer; revert_now runs the restore script", () => {
+  assertEquals(armArgv("0000000000000000", 300), [
+    "systemd-run",
+    "--unit=host-net-revert-0000000000000000",
+    "--on-active=300",
+    "--timer-property=AccuracySec=1s",
+    "/var/lib/host-net/restore.sh",
+    "0000000000000000",
+  ]);
+  assertEquals(revertNowArgv("0000000000000000"), [
+    "/var/lib/host-net/restore.sh",
+    "0000000000000000",
+  ]);
+});

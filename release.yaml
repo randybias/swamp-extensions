@@ -249,10 +249,13 @@ ubuntu-autoinstall:
 
 k0s-multinode:
   channel: beta
-  ci: false
+  ci: true
   visibility: public
   audience: general
-  published: {}
+  published:
+    2026.10.17.1: 94ed5e943d212c898481c57ac383ceceedfc30bc0cc34b83a34bf37e64768f09
+  notes:
+    2026.10.17.1: 'First release, beta. Plan and operate a multi-node k0s cluster over SSH through one controller, with per-node install and reset delegated to @randybias/k0s-cluster: plan the ordered join or remove steps, mint short-lived join tokens into a caller-named vault key (state and output carry only the token ID, role and expiry; the token is invalidated on any doubt), wait for a node to join, drain under PodDisruptionBudgets, uncordon, and detach a drained node with etcd quorum and last-controller refusals. get and sync persist the live nodes, etcd members, tokens and membership drift. Two workflows: create-cluster bootstraps the first controller, then joins controllers before workers through the join-node child workflow, which pairs every mint with an invalidate. Host keys are strict only. Live end to end on three throwaway VPS (one controller, two workers, published k0s-cluster 2026.10.17.3, k0s v1.36.4): 11 of 12 cells, then 5 of 5 on the final code after fixing the one failure (sync drift was not persisted) and worker roles; 0 token values on any argv. Residuals: HA with 3 controllers is not live-tested; the add, remove, upgrade and reset workflows and render_config are deferred; sync compares membership only; a worker''s version is the kubelet string; nested workflow inputs must be passed explicitly.'
 
 knot-dns:
   channel: beta

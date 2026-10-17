@@ -387,12 +387,9 @@ Deno.test("a restore whose post-checks fail records fail and blocks later applie
     await Deno.remove(`${w.root}/state/no_addr`);
     const cleared = await w.call("clear_failed_revert", { ...SSH });
     assertEquals(cleared.cleared, true);
-    // Nothing left to clear.
-    await assertRejects(
-      () => w.call("clear_failed_revert", { ...SSH }),
-      Error,
-      "no revert marker",
-    );
+    // A second clear is a no-op, and applies are accepted again.
+    const again = await w.call("clear_failed_revert", { ...SSH });
+    assertEquals(again.converged, true);
     await w.call("apply", net("netplan", [A]));
   } finally {
     await w.cleanup();
@@ -419,6 +416,9 @@ for (
     ["route_other_dev", "a default route through another NIC"],
     ["other_addr", "a global address that is not the management address"],
     ["ll_only", "a link-local address only"],
+    ["gw_changed", "the same device through another gateway"],
+    ["linkdown", "a linkdown route"],
+    ["prefix_changed", "the address back with another prefix length"],
   ] as const
 ) {
   Deno.test(`a restore with apply failing and ${why} is judged fail`, async () => {
@@ -490,6 +490,9 @@ Deno.test("clear_failed_revert converges on a retry and only updates the matchin
     const again = await w.call("clear_failed_revert", { ...SSH });
     assertEquals(again.cleared, true);
     assertEquals(typeof w.store.get(`revert-${KEY}`)!.clearedAt, "string");
+    // A third call after convergence is a no-op, not an error.
+    const third = await w.call("clear_failed_revert", { ...SSH });
+    assertEquals(third.cleared, true);
     // With no host marker and a record that is not a failed one, there is
     // nothing to converge: the clear refuses and the record is untouched.
     const pending: Record<string, any> = {
@@ -504,6 +507,85 @@ Deno.test("clear_failed_revert converges on a retry and only updates the matchin
       "no revert marker",
     );
     assertEquals(w.store.get(`revert-${KEY}`)!.clearedAt, undefined);
+  } finally {
+    await w.cleanup();
+  }
+});
+
+for (
+  const [flagName, why] of [
+    ["nondefault", "a management NIC that does not carry the default route"],
+    ["v6only", "IPv6-only management"],
+  ] as const
+) {
+  Deno.test(`a correctly restored host with ${why} is judged pass`, async () => {
+    if (!await simAvailable()) return;
+    const w = await world();
+    try {
+      // The flag is in place before the arm, so the arm records that path.
+      await Deno.writeTextFile(`${w.root}/state/${flagName}`, "");
+      const armed = await w.call("apply", net("netplan", [A]));
+      await Deno.writeTextFile(`${w.root}/state/apply_fails`, "");
+      const fired = await w.call("revert_now", {
+        ...SSH,
+        token: armed.revert_token,
+      });
+      assertEquals(fired.result, "pass");
+    } finally {
+      await w.cleanup();
+    }
+  });
+}
+
+Deno.test("losing the IPv6 path while IPv4 stays up is judged fail on a dual-stack-managed host", async () => {
+  if (!await simAvailable()) return;
+  const w = await world();
+  try {
+    await Deno.writeTextFile(`${w.root}/state/v6only`, "");
+    const armed = await w.call("apply", net("netplan", [A]));
+    await Deno.writeTextFile(`${w.root}/state/lost_v6`, "");
+    await assertRejects(
+      () => w.call("revert_now", { ...SSH, token: armed.revert_token }),
+      Error,
+      "restore reported fail",
+    );
+  } finally {
+    await w.cleanup();
+  }
+});
+
+Deno.test("the arm refuses, changing nothing, when the management path cannot be recorded", async () => {
+  if (!await simAvailable()) return;
+  const w = await world();
+  try {
+    await Deno.writeTextFile(`${w.root}/state/no_addr`, "");
+    await assertRejects(() => w.call("apply", net("netplan", [A])));
+    assertEquals(await w.files(), []);
+  } finally {
+    await w.cleanup();
+  }
+});
+
+Deno.test("a tampered or empty checks.sh makes the clear exit as a failed check, and the record does not converge", async () => {
+  if (!await simAvailable()) return;
+  const w = await world();
+  try {
+    const armed = await w.call("apply", net("netplan", [A]));
+    await Deno.writeTextFile(`${w.root}/state/no_addr`, "");
+    await assertRejects(() =>
+      w.call("revert_now", { ...SSH, token: armed.revert_token })
+    );
+    await Deno.remove(`${w.root}/state/no_addr`);
+    const dir = `${w.root}/var/lib/host-net/revert/${armed.revert_token}`;
+    for (const body of ["", "syntax error (\n", "CHECK=pass; exit 3\n"]) {
+      await Deno.writeTextFile(`${dir}/checks.sh`, body);
+      await assertRejects(
+        () => w.call("clear_failed_revert", { ...SSH }),
+        Error,
+        "post-restore checks",
+      );
+      assertEquals(w.store.get(`revert-${KEY}`)!.clearedAt, undefined);
+    }
   } finally {
     await w.cleanup();
   }

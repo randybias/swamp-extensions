@@ -386,9 +386,6 @@ interface ArmInput {
   staleFiles: string[];
   /** Parent MTUs this change raises, with the pre-change value. */
   parentMtus: { name: string; mtu: number }[];
-  /** The management path before the change: its interface and global CIDRs. */
-  managementInterface: string;
-  managementAddrs: string[];
   /** The rendered config identity. */
   armedSha256: string;
   /** SHA-256 over the owned file contents only. */
@@ -408,8 +405,6 @@ function revertContext(token: string, input: ArmInput): RevertContext {
     // puts them back.
     ownedFiles: [...new Set([...input.ownedFiles, ...input.staleFiles])],
     parentMtus: input.parentMtus,
-    managementInterface: input.managementInterface,
-    managementAddrs: input.managementAddrs,
   };
 }
 
@@ -953,8 +948,6 @@ export function createModel(overrides: Partial<HostNetDeps> = {}) {
           staleDevices,
           staleFiles,
           parentMtus,
-          managementInterface: live.managementInterface,
-          managementAddrs: live.managementAddrs,
           armedSha256: render.sha256,
           contentSha256: desiredContentSha,
           operation: "apply",
@@ -1386,8 +1379,6 @@ export function createModel(overrides: Partial<HostNetDeps> = {}) {
           staleDevices: [],
           staleFiles: [],
           parentMtus: recordMtus,
-          managementInterface: live.managementInterface,
-          managementAddrs: live.managementAddrs,
           armedSha256: String(config?.configSha256 ?? ""),
           contentSha256: String(config?.contentSha256 ?? ""),
           operation: "remove",
@@ -1551,16 +1542,17 @@ export function createModel(overrides: Partial<HostNetDeps> = {}) {
             clearedAt: stamp,
           });
         };
-        if (res.exit_code === 2) {
+        if (res.exit_code === 10) {
           // A retry after the host clear succeeded but the reply or the record
           // write was lost: the host has no marker and the record still says
           // fail, so converge the record.
           if (
             recorded !== null && recorded.result === "fail" &&
-            typeof recorded.clearedAt !== "string" &&
             typeof recorded.token === "string"
           ) {
-            await write(recorded.token);
+            if (typeof recorded.clearedAt !== "string") {
+              await write(recorded.token);
+            }
             return {
               result: { host: args.host, cleared: true, converged: true },
             };

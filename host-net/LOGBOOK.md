@@ -234,3 +234,10 @@ Every one of those tests fails on the previous round's code.
   checks, so a refused call never writes the marker; `clear_failed_revert`
   updates only the record whose token it cleared and converges on a retry;
   README gives the by-hand clear without a blanket `rm -rf`.
+- Round 6 review 2: the post-restore checks follow the path actually used (peer
+  address, device, gateway, source, prefix length; both families) instead of an
+  IPv4 default route, so a management NIC off the default route and IPv6-only
+  management restore as `pass`, while a lost IPv6 path under working IPv4 is
+  `fail`. The arm records and self-tests the path before changing anything. The
+  clear's "no marker" is exit 10 (a broken checks.sh is exit 5), and a repeated
+  clear is a no-op.

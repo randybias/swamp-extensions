@@ -69,14 +69,17 @@ connection proves the management path, and `revert_now` fires it early. If the
 restore itself fails, the marker records `fail` and further applies are refused
 until an operator clears it — the model never reboots the host.
 
-The restore judges itself by two checks after it re-applies the network: a
-default route leaves through the management interface, and that interface still
-carries every address it had before the change (recorded at arm time). A route
-or a global address on another NIC, or a link-local address, does not count. The
-exit status of `netplan apply` / `networkctl reconfigure` is only logged (to
-stderr and the journal as `host-net`), because a cloud-init netplan that matches
-an already-renamed NIC by MAC can exit non-zero on a host that is in fact
-restored.
+The restore judges itself by the management path the SSH session actually used.
+At arm time the host records the peer address and the device, gateway and source
+address `ip route get <peer>` picks for it (IPv4 or IPv6), plus the source's
+prefix length, and refuses to arm (exit 77, nothing changed) if it cannot or if
+that path does not pass its own checks. After the restore the same route lookup
+must give the same device, gateway and source, the source must still be
+configured with the same prefix length, and the route must not be `linkdown` or
+`dead`. A default route or address on another NIC proves nothing. The exit
+status of `netplan apply` / `networkctl reconfigure` is only logged (stderr and
+the journal as `host-net`), because a cloud-init netplan that matches an
+already-renamed NIC by MAC can exit non-zero on a host that is in fact restored.
 
 ### Clearing a failed restore
 

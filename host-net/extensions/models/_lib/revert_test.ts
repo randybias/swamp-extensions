@@ -19,8 +19,6 @@ const CTX: RevertContext = {
   createdBridges: ["br0"],
   ownedFiles: ["/etc/netplan/90-host-net.yaml"],
   parentMtus: [{ name: "enp1s0", mtu: 1500 }],
-  managementInterface: "enp1s0",
-  managementAddrs: ["192.0.2.10/24"],
 };
 
 Deno.test("restore deletes only created devices (bridge first) and never flushes OVS", () => {
@@ -55,9 +53,8 @@ Deno.test("restore is token-guarded, fail-closed and never reboots", () => {
   assertEquals(script.includes("systemctl reboot"), false);
   assertEquals(script.includes("shutdown -r"), false);
   // The default-route check must require a non-empty route.
-  assertEquals(script.includes('route="$(ip -j -4 route show default'), true);
-  assertEquals(script.includes('"dev\\":\\"$MGMT\\""'), true);
-  assertEquals(script.includes(`'"local":"192.0.2.10"'`), true);
+  assertEquals(script.includes('. "$DIR/checks.sh"'), true);
+  assertEquals(script.includes('[ "$CHECK" = pass ] || CHECK=fail'), true);
   // The apply exit status is advisory: captured, logged, never fatal.
   assertEquals(script.includes("netplan apply || applyrc=$?"), true);
   assertEquals(script.includes("logger -t host-net"), true);
@@ -140,4 +137,22 @@ Deno.test("marker round-trips; the read script only cats the current marker", ()
   };
   assertEquals(JSON.parse(renderMarker(marker)).token, CTX.token);
   assertEquals(renderMarkerReadScript().includes("cat"), true);
+});
+
+Deno.test("the arm script records the path actually used and refuses if it does not pass its own checks", () => {
+  const script = renderArmScript(CTX, {
+    revertAfterS: 300,
+    armedSha256: "a".repeat(64),
+    contentSha256: "b".repeat(64),
+    operation: "apply",
+  });
+  assertEquals(script.includes('ip -j route get "$peer"'), true);
+  assertEquals(script.includes("exit 77"), true);
+  assertEquals(script.includes("linkdown"), true);
+  assertEquals(script.includes("prefixlen"), true);
+  // The checks run before the timer is armed and before current is written.
+  assertEquals(
+    script.indexOf("its own checks") < script.indexOf("systemd-run"),
+    true,
+  );
 });

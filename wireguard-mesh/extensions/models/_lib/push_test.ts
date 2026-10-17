@@ -11,8 +11,6 @@ import {
   getScript,
   parseKnownHosts,
   parseRollbackDir,
-  shQuote,
-  sshTransport,
 } from "./push.ts";
 
 Deno.test("scripts accept only valid interface names", () => {
@@ -153,44 +151,6 @@ Deno.test("parseKnownHosts keeps unique type/key pairs and ignores comments", ()
     { type: "ssh-ed25519", key: "AAAAC3NzaC1lZDI1NTE5AAAAIEXAMPLE" },
     { type: "ssh-rsa", key: "AAAAB3NzaC1yc2EAAAAEXAMPLE" },
   ]);
-});
-
-Deno.test("ssh transport returns the known_hosts it accepted, for TOFU pinning", async () => {
-  const path = await Deno.makeTempFile({ prefix: "wgmesh-kh-test-" });
-  const spawn = (cmd: string) => {
-    if (cmd === "ssh") {
-      // Simulate ssh's accept-new appending the accepted key.
-      Deno.writeTextFileSync(
-        path,
-        Deno.readTextFileSync(path) +
-          "198.51.100.20 ssh-ed25519 AAAATOFUPINNED\n",
-      );
-    }
-    return Promise.resolve({ code: 0, stdout: "", stderr: "" });
-  };
-  const t = sshTransport(
-    {
-      host: "198.51.100.20",
-      user: "root",
-      port: 22,
-      host_key_policy: "accept-new",
-      host_keys: [],
-    },
-    spawn,
-    { tempFile: () => Promise.resolve(path) },
-  );
-  const res = await t("true");
-  assertEquals(parseKnownHosts(res.known_hosts ?? ""), [
-    { type: "ssh-ed25519", key: "AAAATOFUPINNED" },
-  ]);
-  assertEquals(
-    await Deno.stat(path).then(() => true).catch(() => false),
-    false,
-  );
-});
-
-Deno.test("shQuote survives single quotes in the script", () => {
-  assertEquals(shQuote("echo 'a'"), `sh -c 'echo '\\''a'\\'''`);
 });
 
 Deno.test("confirmScript takes the rollback's lock and fails unless a current rollback is pending", () => {

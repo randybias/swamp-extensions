@@ -5,15 +5,17 @@ import {
   assertStringIncludes,
 } from "jsr:@std/assert@1.0.19";
 import { createModelTestContext } from "jsr:@swamp-club/swamp-testing@0.20261014.55";
+import { z } from "npm:zod@4.3.6";
 import { fullMesh, hubSelf, hubSpoke, key } from "./_lib/fixtures.ts";
 import {
-  type CommandResult,
-  sshArgv,
+  sha256Hex,
   type SshTarget,
+  sshTransport,
   type Transport,
   TransportError,
   type TransportResult,
 } from "./_lib/push.ts";
+import type { CommandRunner, SshDeps } from "./_lib/ssh.ts";
 import { MeshSchema } from "./_lib/render.ts";
 import { createModel, model, type as modelType } from "./wireguard_mesh.ts";
 
@@ -23,7 +25,9 @@ const SSH = {
   user: "root",
   port: 22,
   host_key_policy: "strict" as const,
-  host_keys: [{ type: "ssh-ed25519", key: "AAAAC3NzaC1lZDI1NTE5AAAAIEXAMPLE" }],
+  host_keys: [
+    "198.51.100.20 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIEXAMPLE",
+  ],
 };
 const NOW = new Date("2026-10-17T00:00:00Z");
 
@@ -301,28 +305,25 @@ Deno.test("delete is an action, requires the risk acknowledgement, and is a clea
 
 const ACCEPT_NEW = {
   ...SSH,
-  host_key_policy: "accept-new" as const,
+  host_key_policy: "insecure_tofu" as const,
   host_keys: [],
 };
-const ACCEPTED_HOSTKEY = {
-  type: "ssh-ed25519",
-  key: "AAAAC3NzaC1lZDI1NTE5AAAAIFIRSTHOSTKEY",
-};
+const ACCEPTED_HOSTKEY =
+  "198.51.100.20 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFIRSTHOSTKEY";
 
-Deno.test("accept-new is real TOFU: the first key is accepted, pinned, and enforced later", async () => {
+Deno.test("insecure_tofu is real TOFU: the first key is accepted, pinned, and enforced later", async () => {
   const first = stub({
     stdout: "changed=0\n",
-    known_hosts:
-      `198.51.100.20 ${ACCEPTED_HOSTKEY.type} ${ACCEPTED_HOSTKEY.key}\n`,
+    known_hosts: `${ACCEPTED_HOSTKEY}\n`,
   });
   const ctx1 = createModelTestContext({ globalArgs: {} });
   await first.m.methods.apply.execute(
     { ...applyArgs(), ssh: ACCEPT_NEW },
     ctx1.context,
   );
-  assertEquals(first.calls[0].target.host_key_policy, "accept-new");
+  assertEquals(first.calls[0].target.host_key_policy, "insecure_tofu");
   const recorded = ctx1.getWrittenResources().find((r) =>
-    r.name === "spoke-1-hostkeys"
+    r.name === "spoke-1-hostkeys-198.51.100.20-22"
   );
   assertExists(recorded);
   assertEquals(
@@ -334,7 +335,7 @@ Deno.test("accept-new is real TOFU: the first key is accepted, pinned, and enfor
   const ctx2 = createModelTestContext({
     globalArgs: {},
     storedResources: {
-      "spoke-1-hostkeys": {
+      "spoke-1-hostkeys-198.51.100.20-22": {
         node: "spoke-1",
         host: "198.51.100.20",
         port: 22,
@@ -351,21 +352,12 @@ Deno.test("accept-new is real TOFU: the first key is accepted, pinned, and enfor
   assertEquals(second.calls[0].target.host_keys, [ACCEPTED_HOSTKEY]);
 });
 
-Deno.test("insecure never records host keys", async () => {
-  const { m } = stub({
-    known_hosts:
-      `198.51.100.20 ${ACCEPTED_HOSTKEY.type} ${ACCEPTED_HOSTKEY.key}\n`,
-  });
+Deno.test("strict never records host keys", async () => {
+  const { m } = stub({ known_hosts: `${ACCEPTED_HOSTKEY}\n` });
   const { context, getWrittenResources } = createModelTestContext({
     globalArgs: {},
   });
-  await m.methods.apply.execute(
-    {
-      ...applyArgs(),
-      ssh: { ...SSH, host_key_policy: "insecure", host_keys: [] },
-    },
-    context,
-  );
+  await m.methods.apply.execute({ ...applyArgs(), ssh: SSH }, context);
   assertEquals(
     getWrittenResources().some((r) => r.name.endsWith("-hostkeys")),
     false,
@@ -373,10 +365,10 @@ Deno.test("insecure never records host keys", async () => {
 });
 
 Deno.test("schema bounds ssh host keys and relay lists", () => {
-  const tooManyKeys = Array.from({ length: 65 }, (_, i) => ({
-    type: "ssh-ed25519",
-    key: `key${i}`,
-  }));
+  const tooManyKeys = Array.from(
+    { length: 65 },
+    (_, i) => `198.51.100.20 ssh-ed25519 AAAAkey${i}`,
+  );
   assertEquals(
     model.methods.apply.arguments.safeParse({
       ...applyArgs(),
@@ -404,7 +396,7 @@ Deno.test("methods carry the documented description prefixes", () => {
   assertStringIncludes(model.methods.get.description, "READ-ONLY.");
   assertStringIncludes(model.methods.delete.description, "DESTRUCTIVE.");
   assertStringIncludes(model.description, "WireGuard");
-  assertEquals(model.version, "2026.10.17.4");
+  assertEquals(model.version, "2026.10.17.5");
   assertEquals(model.type, modelType);
 });
 
@@ -414,7 +406,7 @@ Deno.test("packaging: the manifest and license describe this extension", async (
   );
   assertStringIncludes(manifest, 'name: "@randybias/wireguard-mesh"');
   assertStringIncludes(manifest, "license: Apache-2.0");
-  assertStringIncludes(manifest, 'version: "2026.10.17.4"');
+  assertStringIncludes(manifest, 'version: "2026.10.17.5"');
   assertStringIncludes(manifest, "README.md");
   assertStringIncludes(manifest, "LICENSE.txt");
   const license = await Deno.readTextFile(
@@ -423,38 +415,122 @@ Deno.test("packaging: the manifest and license describe this extension", async (
   assertStringIncludes(license, "Apache License");
 });
 
-Deno.test("ssh argv: host-key policy, no secret, no option injection", () => {
-  const kh = "/tmp/kh";
-  const a = sshArgv(SSH, "script", kh);
-  assertEquals(a.includes("StrictHostKeyChecking=yes"), true);
-  assertEquals(a.includes(`UserKnownHostsFile=${kh}`), true);
-  assertEquals(a.at(-2), "198.51.100.20");
-  assertEquals(a.indexOf("--") < a.indexOf("198.51.100.20"), true);
-  const ins = sshArgv({ ...SSH, host_key_policy: "insecure" }, "s", kh);
-  assertEquals(ins.includes("StrictHostKeyChecking=no"), true);
-  for (const host of ["-oProxyCommand=x", "a b", "h;x", "h$(x)"]) {
-    try {
-      sshArgv({ ...SSH, host }, "s", kh);
-      throw new Error(`accepted ${host}`);
-    } catch (e) {
-      assertEquals(e instanceof TransportError, true, host);
+/** Records ssh invocations and answers the canonical upload/exec probes. */
+function recordSsh(): {
+  deps: SshDeps;
+  calls: { cmd: string; args: string[]; stdin?: string }[];
+} {
+  const calls: { cmd: string; args: string[]; stdin?: string }[] = [];
+  const run: CommandRunner = (cmd, args, _o = {}) => {
+    const stdin = typeof _o.stdin === "string"
+      ? _o.stdin
+      : _o.stdin instanceof Uint8Array
+      ? new TextDecoder().decode(_o.stdin)
+      : undefined;
+    calls.push({ cmd, args, stdin });
+    if (cmd === "ssh-agent") {
+      return Promise.resolve(
+        args[0] === "-s"
+          ? {
+            code: 0,
+            stdout:
+              "SSH_AUTH_SOCK=/tmp/a.sock;\nexport SSH_AUTH_SOCK;\nSSH_AGENT_PID=1;\nexport SSH_AGENT_PID;\n",
+            stderr: "",
+          }
+          : { code: 0, stdout: "", stderr: "" },
+      );
     }
+    if (cmd === "ssh-add") {
+      return Promise.resolve({ code: 0, stdout: "", stderr: "" });
+    }
+    if (cmd !== "ssh") {
+      return Promise.resolve({ code: 0, stdout: "", stderr: "" });
+    }
+    const remote = args[args.length - 1] ?? "";
+    if (remote.includes("'mktemp'")) {
+      return Promise.resolve({
+        code: 0,
+        stdout: "/tmp/wgmesh.AbC123XY\n",
+        stderr: "",
+      });
+    }
+    if (remote.includes("echo MISSING")) {
+      return Promise.resolve({ code: 0, stdout: "MISSING\n", stderr: "" });
+    }
+    if (remote.includes(".ssh-host-upload")) {
+      const mode = /chmod '([0-7]{3,4})'/.exec(remote)?.[1] ?? "0600";
+      return sha256Hex(stdin ?? "").then((h) => ({
+        code: 0,
+        stdout: `${h} ${mode}\n`,
+        stderr: "",
+      }));
+    }
+    return Promise.resolve({
+      code: 0,
+      stdout: "changed=1\nrb=/etc/wireguard/.wg0.rollback.X\n",
+      stderr: "",
+    });
+  };
+  return {
+    deps: { run, now: () => 0, sleep: () => Promise.resolve() },
+    calls,
+  };
+}
+
+const STRICT_TARGET: SshTarget = {
+  host: "198.51.100.20",
+  user: "root",
+  port: 22,
+  host_key_policy: "strict",
+  host_keys: [
+    "198.51.100.20 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIEXAMPLE",
+  ],
+};
+
+Deno.test("sshTransport: stdin is uploaded, never on argv; non-applicable pins are refused", async () => {
+  const rec = recordSsh();
+  const t = sshTransport(STRICT_TARGET, rec.deps);
+  const res = await t("echo hi", "TOPSECRET\n");
+  assertEquals(res.code, 0);
+  for (const c of rec.calls) {
+    assertEquals(c.args.join(" ").includes("TOPSECRET"), false, c.cmd);
   }
+  const upload = rec.calls.find((c) =>
+    c.args.at(-1)?.includes(".ssh-host-upload")
+  );
+  assertEquals(upload?.stdin?.includes("TOPSECRET"), true);
+  // The script unlinks the temp file before it runs, so the key is never at
+  // rest even if the script cuts the SSH path.
+  const body = rec.calls.map((c) => c.args.at(-1) ?? "").find((c) =>
+    c.includes("exec 3<")
+  )!;
+  assertEquals(body.includes("umask 077"), true);
+  assertEquals(body.includes("exec 3<"), true);
+  assertEquals(body.includes("/tmp/wgmesh.AbC123XY/stdin"), true);
+  assertEquals(body.includes("rm -f --"), true);
+  assertEquals(body.indexOf("rm -f --") < body.indexOf("echo hi"), true);
+  // A supplied pin that applies to no host is refused, not silently accepted.
+  const bad = sshTransport(
+    { ...STRICT_TARGET, host_keys: ["203.0.113.9 ssh-ed25519 AAAA"] },
+    rec.deps,
+  );
+  const e = await assertRejects(() => bad("echo hi"), TransportError);
+  assertEquals(e.reason, "host-key");
 });
 
-Deno.test("the real ssh transport: strict needs pinned keys, ssh 255 is typed, key goes to ssh-add stdin", async () => {
+Deno.test("the canonical transport: ssh 255 is typed, the key goes to ssh-add stdin", async () => {
   const seen: { cmd: string; args: string[]; stdin?: string }[] = [];
-  const spawn = (
-    cmd: string,
-    args: string[],
-    o?: { stdin?: string },
-  ): Promise<CommandResult> => {
-    seen.push({ cmd, args, stdin: o?.stdin });
+  const run: CommandRunner = (cmd, args, o = {}) => {
+    seen.push({
+      cmd,
+      args,
+      stdin: typeof o.stdin === "string" ? o.stdin : undefined,
+    });
     if (cmd === "ssh-agent" && args[0] === "-s") {
       return Promise.resolve({
         code: 0,
         stdout:
-          "SSH_AUTH_SOCK=/tmp/agent.sock; export SSH_AUTH_SOCK;\nSSH_AGENT_PID=42; export SSH_AGENT_PID;\n",
+          "SSH_AUTH_SOCK=/tmp/agent.sock;\nexport SSH_AUTH_SOCK;\nSSH_AGENT_PID=42;\nexport SSH_AGENT_PID;\n",
         stderr: "",
       });
     }
@@ -468,7 +544,9 @@ Deno.test("the real ssh transport: strict needs pinned keys, ssh 255 is typed, k
     }
     return Promise.resolve({ code: 0, stdout: "", stderr: "" });
   };
-  const m = createModel({ spawn });
+  const m = createModel({
+    ssh: { run, now: () => 0, sleep: () => Promise.resolve() },
+  });
   const { context } = createModelTestContext({ globalArgs: {} });
   const e = await assertRejects(
     () =>
@@ -510,8 +588,7 @@ Deno.test("first-use TOFU: the confirmation connection is pinned to the key the 
             code: 0,
             stdout: "changed=1\nrb=/etc/wireguard/.wg0.rollback.TESTRUN\n",
             stderr: "",
-            known_hosts:
-              `198.51.100.20 ${ACCEPTED_HOSTKEY.type} ${ACCEPTED_HOSTKEY.key}\n`,
+            known_hosts: `${ACCEPTED_HOSTKEY}\n`,
           },
       );
     },
@@ -522,7 +599,7 @@ Deno.test("first-use TOFU: the confirmation connection is pinned to the key the 
     context,
   );
   assertEquals(targets.length, 2);
-  assertEquals(targets[0].host_key_policy, "accept-new");
+  assertEquals(targets[0].host_key_policy, "insecure_tofu");
   // The second step may not trust a fresh key: it must match the first.
   assertEquals(targets[1].host_key_policy, "strict");
   assertEquals(targets[1].host_keys, [ACCEPTED_HOSTKEY]);
@@ -581,4 +658,551 @@ Deno.test("first-use TOFU with no recorded key refuses to continue on trust", as
     TransportError,
   );
   assertEquals(e.reason, "host-key");
+});
+
+Deno.test("insecure_tofu on a non-22 port pins [host]:port and reuses it strictly", async () => {
+  const scans: string[] = [];
+  const runs: string[] = [];
+  const run: CommandRunner = (cmd, args, _o = {}) => {
+    if (cmd === "ssh-keyscan") {
+      scans.push(args.join(" "));
+      return Promise.resolve({
+        code: 0,
+        stdout: "[198.51.100.20]:2222 ssh-ed25519 AAAASCAN\n",
+        stderr: "",
+      });
+    }
+    if (cmd === "ssh-agent") {
+      return Promise.resolve(
+        args[0] === "-s"
+          ? {
+            code: 0,
+            stdout:
+              "SSH_AUTH_SOCK=/tmp/a.sock;\nexport SSH_AUTH_SOCK;\nSSH_AGENT_PID=1;\nexport SSH_AGENT_PID;\n",
+            stderr: "",
+          }
+          : { code: 0, stdout: "", stderr: "" },
+      );
+    }
+    if (cmd === "ssh-add") {
+      return Promise.resolve({ code: 0, stdout: "", stderr: "" });
+    }
+    if (cmd === "ssh") {
+      runs.push(args.join(" "));
+      return Promise.resolve({ code: 0, stdout: "", stderr: "" });
+    }
+    return Promise.resolve({ code: 0, stdout: "", stderr: "" });
+  };
+  const deps: SshDeps = { run, now: () => 0, sleep: () => Promise.resolve() };
+  const toTarget = {
+    host: "198.51.100.20",
+    user: "root",
+    port: 2222,
+    host_key_policy: "insecure_tofu" as const,
+    host_keys: [] as string[],
+  };
+  const first = await sshTransport(toTarget, deps)("true");
+  assertEquals(
+    first.known_hosts,
+    "[198.51.100.20]:2222 ssh-ed25519 AAAASCAN\n",
+  );
+  // The learned pin applies on the next run: strict with that exact line works.
+  const pin = "[198.51.100.20]:2222 ssh-ed25519 AAAASCAN";
+  const second = await sshTransport({
+    ...toTarget,
+    host_key_policy: "strict",
+    host_keys: [pin],
+  }, deps)("true");
+  assertEquals(second.code, 0);
+  assertEquals(scans.length > 0, true);
+  assertEquals(runs.every((r) => !r.includes("AAAASCAN")), true);
+});
+
+Deno.test("an upload failure still triggers the temp-file cleanup", async () => {
+  const calls: string[] = [];
+  const run: CommandRunner = (cmd, args, _o = {}) => {
+    if (cmd === "ssh-agent") {
+      return Promise.resolve(
+        args[0] === "-s"
+          ? {
+            code: 0,
+            stdout:
+              "SSH_AUTH_SOCK=/tmp/a.sock;\nexport SSH_AUTH_SOCK;\nSSH_AGENT_PID=1;\nexport SSH_AGENT_PID;\n",
+            stderr: "",
+          }
+          : { code: 0, stdout: "", stderr: "" },
+      );
+    }
+    if (cmd === "ssh-add") {
+      return Promise.resolve({ code: 0, stdout: "", stderr: "" });
+    }
+    if (cmd !== "ssh") {
+      return Promise.resolve({ code: 0, stdout: "", stderr: "" });
+    }
+    const remote = args[args.length - 1] ?? "";
+    calls.push(remote);
+    if (remote.includes("'mktemp'")) {
+      return Promise.resolve({
+        code: 0,
+        stdout: "/tmp/wgmesh.AbC123XY\n",
+        stderr: "",
+      });
+    }
+    if (remote.includes("echo MISSING")) {
+      return Promise.resolve({ code: 0, stdout: "MISSING\n", stderr: "" });
+    }
+    if (remote.includes(".ssh-host-upload")) {
+      // A mismatched hash makes upload() throw after the temp file was written.
+      return Promise.resolve({
+        code: 0,
+        stdout: `${"0".repeat(64)} 0600\n`,
+        stderr: "",
+      });
+    }
+    return Promise.resolve({ code: 0, stdout: "", stderr: "" });
+  };
+  const deps: SshDeps = { run, now: () => 0, sleep: () => Promise.resolve() };
+  await assertRejects(
+    () => sshTransport(STRICT_TARGET, deps)("echo hi", "SECRET\n"),
+    TransportError,
+  );
+  assertEquals(calls.some((c) => c.includes("rmdir")), true);
+});
+
+Deno.test("legacy ssh inputs are migrated: object host_keys, accept-new, insecure", () => {
+  const args = model.methods.apply.arguments;
+  const ok = args.parse({
+    ...applyArgs(),
+    ssh: { ...SSH, host_keys: [{ type: "ssh-ed25519", key: "AAAAEXAMPLE" }] },
+  }) as { ssh: { host_keys: string[] } };
+  assertEquals(ok.ssh.host_keys, ["ssh-ed25519 AAAAEXAMPLE"]);
+  assertEquals(
+    (args.parse({
+      ...applyArgs(),
+      ssh: { ...SSH, host_key_policy: "accept-new" },
+    }) as {
+      ssh: { host_key_policy: string };
+    }).ssh.host_key_policy,
+    "insecure_tofu",
+  );
+  const bad = args.safeParse({
+    ...applyArgs(),
+    ssh: { ...SSH, host_key_policy: "insecure" },
+  });
+  assertEquals(bad.success, false);
+  if (!bad.success) {
+    assertEquals(
+      bad.error.issues.some((i) => i.message.includes("insecure_tofu")),
+      true,
+    );
+  }
+});
+
+Deno.test("ssh host_keys lines are grammar-checked", () => {
+  const args = model.methods.apply.arguments;
+  for (
+    const good of [
+      "198.51.100.20 ssh-ed25519 AAAAEXAMPLE",
+      "ssh-ed25519 AAAAEXAMPLE",
+      "[198.51.100.20]:2222 ssh-ed25519 AAAAEXAMPLE",
+    ]
+  ) {
+    assertEquals(
+      args.safeParse({ ...applyArgs(), ssh: { ...SSH, host_keys: [good] } })
+        .success,
+      true,
+      good,
+    );
+  }
+  for (
+    const bad of [
+      "198.51.100.20 ssh-ed25519",
+      "198.51.100.20 ssh-ed25519 AAAA extra",
+      "ssh-ed25519 has spaces in blob",
+      "; rm -rf /",
+    ]
+  ) {
+    assertEquals(
+      args.safeParse({ ...applyArgs(), ssh: { ...SSH, host_keys: [bad] } })
+        .success,
+      false,
+      bad,
+    );
+  }
+});
+
+Deno.test("a legacy {type,key} hostkeys record is migrated to a port-aware line", async () => {
+  const targets: SshTarget[] = [];
+  const m = createModel({
+    now: () => NOW,
+    transport: (target): Transport => (script) => {
+      targets.push(target);
+      return Promise.resolve(
+        script.includes("confirmed")
+          ? { code: 0, stdout: "confirmed\n", stderr: "" }
+          : { code: 0, stdout: "changed=0\n", stderr: "" },
+      );
+    },
+  });
+  const ctx = createModelTestContext({
+    globalArgs: {},
+    storedResources: {
+      "spoke-1-hostkeys": {
+        node: "spoke-1",
+        host: "198.51.100.20",
+        port: 2222,
+        host_keys: [{ type: "ssh-ed25519", key: "AAAAEXAMPLE" }],
+        observed_at: NOW.toISOString(),
+      },
+    },
+  });
+  await m.methods.apply.execute({
+    ...applyArgs(),
+    ssh: {
+      ...SSH,
+      port: 2222,
+      host_key_policy: "insecure_tofu",
+      host_keys: [],
+    },
+  }, ctx.context);
+  const line = "[198.51.100.20]:2222 ssh-ed25519 AAAAEXAMPLE";
+  assertEquals(targets[0].host_key_policy, "strict");
+  assertEquals(targets[0].host_keys, [line]);
+  const rewritten = ctx.getWrittenResources().find((r) =>
+    r.name === "spoke-1-hostkeys-198.51.100.20-2222"
+  );
+  assertExists(rewritten);
+  assertEquals((rewritten.data as { host_keys: string[] }).host_keys, [line]);
+});
+
+Deno.test("a failed cleanup surfaces that the temp file may still hold the key", async () => {
+  const run: CommandRunner = (cmd, args, _o = {}) => {
+    if (cmd === "ssh-agent") {
+      return Promise.resolve(
+        args[0] === "-s"
+          ? {
+            code: 0,
+            stdout:
+              "SSH_AUTH_SOCK=/tmp/a.sock;\nexport SSH_AUTH_SOCK;\nSSH_AGENT_PID=1;\nexport SSH_AGENT_PID;\n",
+            stderr: "",
+          }
+          : { code: 0, stdout: "", stderr: "" },
+      );
+    }
+    if (cmd === "ssh-add") {
+      return Promise.resolve({ code: 0, stdout: "", stderr: "" });
+    }
+    if (cmd !== "ssh") {
+      return Promise.resolve({ code: 0, stdout: "", stderr: "" });
+    }
+    const remote = args[args.length - 1] ?? "";
+    if (remote.includes("'mktemp'")) {
+      return Promise.resolve({
+        code: 0,
+        stdout: "/tmp/wgmesh.AbC123XY\n",
+        stderr: "",
+      });
+    }
+    if (remote.includes("echo MISSING")) {
+      return Promise.resolve({ code: 0, stdout: "MISSING\n", stderr: "" });
+    }
+    if (remote.includes(".ssh-host-upload")) {
+      // The cleanup command is the one with rmdir and without umask 077.
+      return sha256Hex("SECRET\n").then((h) => ({
+        code: 0,
+        stdout: `${h} 0600\n`,
+        stderr: "",
+      }));
+    }
+    if (remote.includes("rmdir") && !remote.includes("umask 077")) {
+      return Promise.resolve({ code: 1, stdout: "", stderr: "rm failed" });
+    }
+    return Promise.resolve({ code: 0, stdout: "", stderr: "" });
+  };
+  const deps: SshDeps = { run, now: () => 0, sleep: () => Promise.resolve() };
+  await assertRejects(
+    () => sshTransport(STRICT_TARGET, deps)("echo hi", "SECRET\n"),
+    TransportError,
+    "may still hold the key",
+  );
+});
+
+Deno.test("a stored hostkey record that cannot be normalized fails closed", async () => {
+  const m = createModel({
+    now: () => NOW,
+    transport: (): Transport => () =>
+      Promise.resolve({ code: 0, stdout: "changed=0\n", stderr: "" }),
+  });
+  const ctx = createModelTestContext({
+    globalArgs: {},
+    storedResources: {
+      "spoke-1-hostkeys": {
+        node: "spoke-1",
+        host: "198.51.100.20",
+        port: 22,
+        host_keys: [{ type: "ssh-rsa", key: "A".repeat(3000) }],
+        observed_at: NOW.toISOString(),
+      },
+    },
+  });
+  await assertRejects(
+    () =>
+      m.methods.apply.execute({
+        ...applyArgs(),
+        ssh: { ...SSH, host_key_policy: "insecure_tofu", host_keys: [] },
+      }, ctx.context),
+    TransportError,
+    "delete it to re-learn",
+  );
+});
+
+Deno.test("model type describe: the ssh schema still renders its enum and item shape", () => {
+  const schema = z.toJSONSchema(
+    model.methods.apply.arguments,
+  ) as unknown as {
+    properties: {
+      ssh: {
+        properties: {
+          host_key_policy: { enum?: string[]; description?: string };
+          host_keys: {
+            items?: { type?: string };
+            anyOf?: { items?: { type?: string } }[];
+          };
+        };
+      };
+    };
+  };
+  const ssh = schema.properties.ssh.properties;
+  assertEquals(ssh.host_key_policy.enum, ["strict", "insecure_tofu"]);
+  assertEquals(typeof ssh.host_key_policy.description, "string");
+  const items = ssh.host_keys.items ?? ssh.host_keys.anyOf?.[0]?.items;
+  assertEquals(items?.type, "string");
+});
+
+const TOFU = (port: number) => ({
+  ...SSH,
+  port,
+  host_key_policy: "insecure_tofu" as const,
+  host_keys: [],
+});
+const keyFor = (port: number) =>
+  `[198.51.100.20]:${port} ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIPORT${port}`;
+const line22 = "198.51.100.20 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIPORT22";
+
+Deno.test("TOFU pins are per host and port: :22 then :2222 then :22 stays pinned", async () => {
+  // One persistent store shared by three runs, like the real data store.
+  const store: Record<string, Record<string, unknown>> = {};
+  const run = async (port: number, known?: string) => {
+    const s = stub({ stdout: "changed=0\n", known_hosts: known });
+    const ctx = createModelTestContext({
+      globalArgs: {},
+      storedResources: structuredClone(store),
+    });
+    await s.m.methods.apply.execute(
+      { ...applyArgs(), ssh: TOFU(port) },
+      ctx.context,
+    );
+    for (const w of ctx.getWrittenResources()) {
+      store[w.name] = w.data as Record<string, unknown>;
+    }
+    return s.calls[0].target;
+  };
+  // :22 learns and pins.
+  const first = await run(22, `${line22}\n`);
+  assertEquals(first.host_key_policy, "insecure_tofu");
+  // :2222 is a new endpoint: it learns, and does not touch the :22 pin.
+  const other = await run(2222, `${keyFor(2222)}\n`);
+  assertEquals(other.host_key_policy, "insecure_tofu");
+  assertEquals(
+    Object.keys(store).filter((k) => k.includes("hostkeys")).sort(),
+    [
+      "spoke-1-hostkeys-198.51.100.20-2222",
+      "spoke-1-hostkeys-198.51.100.20-22",
+    ].sort(),
+  );
+  // Back on :22: still pinned to the key learned the first time.
+  const again = await run(22);
+  assertEquals(again.host_key_policy, "strict");
+  assertEquals(again.host_keys, [line22]);
+  const back = await run(2222);
+  assertEquals(back.host_key_policy, "strict");
+  assertEquals(back.host_keys, [keyFor(2222)]);
+});
+
+Deno.test("a legacy per-node record pins its own endpoint only and is never overwritten by another", async () => {
+  const s = stub({ stdout: "changed=0\n", known_hosts: `${keyFor(2222)}\n` });
+  const legacy = {
+    node: "spoke-1",
+    host: "198.51.100.20",
+    port: 22,
+    host_keys: [line22],
+    observed_at: NOW.toISOString(),
+  };
+  const ctx = createModelTestContext({
+    globalArgs: {},
+    storedResources: { "spoke-1-hostkeys": legacy },
+  });
+  // A different port is a new endpoint (TOFU) and the legacy record stays.
+  await s.m.methods.apply.execute(
+    { ...applyArgs(), ssh: TOFU(2222) },
+    ctx.context,
+  );
+  assertEquals(s.calls[0].target.host_key_policy, "insecure_tofu");
+  assertEquals(
+    ctx.getWrittenResources().some((r) => r.name === "spoke-1-hostkeys"),
+    false,
+  );
+  // The legacy endpoint itself is still pinned, and moves to its keyed record.
+  const s2 = stub({ stdout: "changed=0\n" });
+  const ctx2 = createModelTestContext({
+    globalArgs: {},
+    storedResources: { "spoke-1-hostkeys": legacy },
+  });
+  await s2.m.methods.apply.execute(
+    { ...applyArgs(), ssh: TOFU(22) },
+    ctx2.context,
+  );
+  assertEquals(s2.calls[0].target.host_key_policy, "strict");
+  assertEquals(s2.calls[0].target.host_keys, [line22]);
+  assertExists(
+    ctx2.getWrittenResources().find((r) =>
+      r.name === "spoke-1-hostkeys-198.51.100.20-22"
+    ),
+  );
+});
+
+Deno.test("records only tampering could produce fail closed instead of re-learning", async () => {
+  const keyed = "spoke-1-hostkeys-198.51.100.20-22";
+  const base = {
+    node: "spoke-1",
+    host: "198.51.100.20",
+    port: 22,
+    host_keys: [line22],
+    observed_at: NOW.toISOString(),
+  };
+  const bad: [string, string, Record<string, unknown>][] = [
+    ["empty host_keys", keyed, { ...base, host_keys: [] }],
+    ["port as a string", keyed, { ...base, port: "22" }],
+    ["host mismatch inside the keyed record", keyed, {
+      ...base,
+      host: "203.0.113.9",
+    }],
+    ["unparseable keys", keyed, { ...base, host_keys: ["not a key line"] }],
+    ["an unreadable legacy record", "spoke-1-hostkeys", {
+      ...base,
+      port: "22",
+    }],
+  ];
+  for (const [label, name, record] of bad) {
+    const s = stub({ stdout: "changed=0\n", known_hosts: `${line22}\n` });
+    const ctx = createModelTestContext({
+      globalArgs: {},
+      storedResources: { [name]: record },
+    });
+    await assertRejects(
+      () =>
+        s.m.methods.apply.execute(
+          { ...applyArgs(), ssh: TOFU(22) },
+          ctx.context,
+        ),
+      TransportError,
+      "delete it to re-learn",
+      label,
+    );
+    assertEquals(s.calls.length, 0, label);
+    assertEquals(ctx.getWrittenResources().length, 0, label);
+  }
+});
+
+Deno.test("legacy host key objects must be exactly {type, key} strings", () => {
+  const parse = (host_keys: unknown) =>
+    model.methods.apply.arguments.safeParse({
+      ...applyArgs(),
+      ssh: { ...SSH, host_keys },
+    }).success;
+  assertEquals(parse([{ type: "ssh-ed25519", key: "AAAAEXAMPLE" }]), true);
+  assertEquals(
+    parse([{ type: "ssh-ed25519", key: "AAAAEXAMPLE", extra: 1 }]),
+    false,
+  );
+  assertEquals(parse([{ type: 5, key: "AAAAEXAMPLE" }]), false);
+  assertEquals(
+    parse([{ type: "ssh-ed25519", key: { toString: () => "x" } }]),
+    false,
+  );
+  assertEquals(parse([{ type: "ssh-ed25519" }]), false);
+});
+
+Deno.test("under dash a TERM, HUP or INT stops the script, exits non-zero and cleans up", async () => {
+  const ok = await new Deno.Command("sh", {
+    args: ["-c", "true"],
+    stdout: "null",
+    stderr: "null",
+  }).output().then((o) => o.success, () => false);
+  if (!ok) return;
+  for (
+    const [sig, code] of [["TERM", 143], ["HUP", 129], ["INT", 130]] as const
+  ) {
+    const dir = await Deno.makeTempDir({ prefix: "wgmesh." });
+    // The transport only accepts /tmp/wgmesh.<alnum> directories.
+    const real = `/tmp/wgmesh.${sig}${crypto.randomUUID().slice(0, 6)}`;
+    await Deno.rename(dir, real).catch(async () => {
+      await Deno.mkdir(real);
+    });
+    await Deno.writeTextFile(`${real}/stdin`, "SECRET\n");
+    let body: { code: number; stdout: string } | undefined;
+    const run: CommandRunner = async (cmd, args, _o = {}) => {
+      if (cmd === "ssh-agent") {
+        return {
+          code: 0,
+          stdout: args[0] === "-s"
+            ? "SSH_AUTH_SOCK=/tmp/a.sock;\nSSH_AGENT_PID=1;\n"
+            : "",
+          stderr: "",
+        };
+      }
+      if (cmd !== "ssh") return { code: 0, stdout: "", stderr: "" };
+      const remote = args[args.length - 1] ?? "";
+      if (remote.includes("'mktemp'")) {
+        return { code: 0, stdout: `${real}\n`, stderr: "" };
+      }
+      if (remote.includes("echo MISSING")) {
+        return { code: 0, stdout: "MISSING\n", stderr: "" };
+      }
+      if (remote.includes(".ssh-host-upload")) {
+        return {
+          code: 0,
+          stdout: `${await sha256Hex("SECRET\n")} 0600\n`,
+          stderr: "",
+        };
+      }
+      if (remote.includes("exec 3<")) {
+        // The real script body, run under the system sh (dash).
+        const o = await new Deno.Command("sh", {
+          args: ["-c", remote.replace(/^'sh' '-c' /, "sh -c ")],
+          stdout: "piped",
+          stderr: "piped",
+        }).output();
+        body = {
+          code: o.code,
+          stdout: new TextDecoder().decode(o.stdout),
+        };
+        return { code: o.code, stdout: body.stdout, stderr: "" };
+      }
+      return { code: 0, stdout: "", stderr: "" };
+    };
+    const deps: SshDeps = { run, now: () => 0, sleep: () => Promise.resolve() };
+    await sshTransport(STRICT_TARGET, deps)(
+      `kill -${sig} $$; echo SHOULD-NOT-RUN`,
+      "SECRET\n",
+    ).catch(() => undefined);
+    assertEquals(body?.code, code, sig);
+    assertEquals(body?.stdout.includes("SHOULD-NOT-RUN"), false, sig);
+    // The EXIT trap removed the directory (the stdin file was unlinked first).
+    assertEquals(
+      await Deno.stat(real).then(() => true, () => false),
+      false,
+      `${sig}: temp dir removed`,
+    );
+  }
 });

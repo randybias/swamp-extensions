@@ -271,3 +271,106 @@ byte-identical to the one reviewed.
   (dry-run uncatalogued-model); no behaviour change.
 - Transport: this extension keeps its own SSH push transport rather than the
   vendored `_lib/ssh.ts`; accepted by the lead.
+
+## Transport convergence (2026.10.17.5)
+
+Audit of the local transport in `_lib/push.ts` against the three canonical
+properties and TRIAGE 4h:
+
+- **No content digest on argv or script text (TRIAGE 4h) — already held.** The
+  config and the private key travel on ssh stdin; `sha256Hex` is only computed
+  locally and never reaches an argv or a script. No digest appeared on argv.
+- **exit 255 is a typed error — held, with a gap.** `sshTransport` mapped
+  `res.code === 255` through `classifySshFailure`, but the fallback classified
+  an unrecognized 255 as `reason: "remote"` (a remote script failure) rather
+  than a transport failure, and it classified by stderr text. The canonical
+  transport treats _any_ 255 as a typed `SshError` with a `kind`/`sessionCause`
+  before the caller sees it.
+- **Supplied non-applicable pins refused — did NOT hold.** For `accept-new` the
+  local transport wrote the supplied pins to `known_hosts` but still passed
+  `StrictHostKeyChecking=accept-new`, so a pin set that applied to no host fell
+  back to accepting a new key; `insecure` used `/dev/null` and ignored pins
+  entirely. Only `strict` refused.
+
+Replaced the local transport with a **byte-identical** copy of
+`ssh-host/extensions/models/_lib/ssh.ts` from `origin/main` (git hash-object
+`fe0139f08c42e3fdae0061b9688fb5c534174957`) plus its `ssh_test.ts`. The
+`Transport` seam and every script (armed revert, host-side `flock`, generation
+guards) are unchanged; only delivery changed:
+
+- `sshTransport(target, deps)` builds the canonical `SshTarget` and runs the
+  script through `exec`. `stdin` (key + config) is uploaded to a remote temp
+  file (mode 0600) and piped into the script, so nothing sensitive is on argv.
+- A first `insecure_tofu` call learns the keys with `waitConnection`, returns
+  them as `known_hosts` for the model to pin, and uses them for the rest of the
+  operation; the model's TOFU flow is otherwise unchanged.
+- `host_key_policy` is now `strict | insecure_tofu` (the local `accept-new` and
+  `insecure` values are gone); `ssh.host_keys` is ssh-keyscan-format lines.
+- The model's spawner seam became the canonical `SshDeps`; tests drive it with a
+  fake `CommandRunner`.
+
+99 tests pass (3 env-gated netns tests ignored).
+
+## Transport-convergence round 1 fixes
+
+- **Port-aware TOFU pins (HIGH).** Learned keys are written with the canonical
+  host field: `host` on port 22, `[host]:port` otherwise (via
+  `buildKnownHosts`), both for the in-operation pins and the returned/persisted
+  `known_hosts` lines. A non-22 first `insecure_tofu` run now pins a key the
+  next `strict` run accepts.
+- **Legacy migration (HIGH).** `SshSchema` accepts the published `accept-new`
+  (mapped to `insecure_tofu`) and rejects `insecure` with a message naming the
+  replacement; `ssh.host_keys` entries that are `{type, key}` objects are
+  transformed to ssh-keyscan lines; and a stored `<node>-hostkeys` record in the
+  old object shape is normalized to port-aware lines and rewritten in place on
+  first use, so a 2026.10.17.4 upgrade does not fail closed. Documented in the
+  README and the 2026.10.17.5 upgrade description.
+- **Private temp directory (HIGH).** `stdin` is written into a `mktemp -d`
+  directory (0700); the script opens it on fd 3 and unlinks it before running
+  the script body, with a `trap` for the directory. The upload is inside the
+  try, the final cleanup runs in all cases, and a cleanup failure is surfaced as
+  a typed error rather than swallowed.
+- **Host-key line grammar (MEDIUM).** Each `ssh.host_keys` line must be an
+  optional host field plus a key type plus a base64 payload; extra or malformed
+  tokens are rejected.
+
+## Transport-convergence round 2 fixes
+
+- **Cleanup exit codes (HIGH).** The remote cleanup is now
+  `rm -f -- tmp && { rmdir -- dir 2>/dev/null || [ ! -e dir/stdin ]; }`, so only
+  a failed `rm` of the key file is non-zero, and the transport surfaces "may
+  still hold the key". The script body checks each prep step
+  (`exec 3<tmp || exit 70; rm -f -- tmp || exit 70; [ ! -e tmp ] || exit 70`)
+  before running the script, so a failed unlink stops the run instead of letting
+  the script execute.
+- **Fail closed on an unreadable stored pin (HIGH).** When a `<node>-hostkeys`
+  record matches host/port but none of its entries normalizes (an over-long
+  blob, corrupt or tampered), `establish` throws
+  `TransportError("host-key", "stored host-key record for <node> is unreadable;
+  delete it to re-learn")`
+  instead of falling through to a fresh insecure_tofu and overwriting the pin.
+- **Stored object grammar (MEDIUM).** `normalizeStoredKeys` now validates each
+  built line with `isHostKeyLine` before using it.
+- **JSON Schema (MEDIUM).** `host_key_policy` and `host_keys` use `z.preprocess`
+  instead of `z.transform`, so `swamp model type describe` renders the enum,
+  description and array-of-string item shape; `accept-new` maps to
+  `insecure_tofu` and `insecure` fails with the clear replacement message.
+- **Rewrite after success (MEDIUM).** A legacy `<node>-hostkeys` record is
+  rewritten inside `remember()`, i.e. after the operation succeeds, not at read
+  time.
+- **Docs (LOW).** The README no longer claims the key is "never at rest"; it now
+  says the file stays on disk only for the upload-to-unlink window.
+
+## Round 4 (r3 review, lane/b2-wg)
+
+- HIGH: the TOFU pin was one `<node>-hostkeys` record, so a run for another host
+  or port re-learned and overwrote it (a MITM window on every alternate run).
+  Pins are now `<node>-hostkeys-<host>-<port>`, never overwritten across
+  endpoints; a 2026.10.17.4 per-node record pins its own endpoint and moves to
+  the keyed record on first use. An existing record that fails the schema, names
+  another endpoint, or has no usable line is "unreadable; delete it to
+  re-learn".
+- MEDIUM: the signal traps now exit (129/130/143) and the EXIT trap does the
+  cleanup; tested under the system sh (dash).
+- MEDIUM: legacy `{type,key}` host keys must be exactly those two string keys.
+- LOW: the "never at rest" wording corrected.

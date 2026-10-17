@@ -60,7 +60,7 @@ cherry-servers:
 
 wireguard-mesh:
   channel: beta
-  ci: true
+  ci: false
   published:
     2026.10.17.4: f74daacaa223888d33da7a3018ca6d2beb22520f2d04f1e44a50913882eb7957
   notes:

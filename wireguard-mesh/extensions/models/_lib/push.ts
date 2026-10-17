@@ -1,13 +1,28 @@
 /**
- * Push half: applies a rendered config to one node over an injectable
- * transport. Every value that reaches the remote shell is validated against a
- * grammar and quoted, and each script is a fixed template; the private key and
- * the config travel on stdin, never on argv.
+ * Push half: applies a rendered config to one node through the canonical
+ * vendored SSH transport (`_lib/ssh.ts`). Every value that reaches the remote
+ * shell is validated against a grammar and quoted, and each script is a fixed
+ * template; the private key and the config travel in an uploaded temp file
+ * piped into the script, never on argv. An ssh exit 255 is the transport's
+ * typed `SshError`, and supplied host-key pins that do not apply to the host
+ * are refused rather than silently accepted.
  *
  * @module
  */
 
 import { IFACE_RE } from "./render.ts";
+import {
+  buildKnownHosts,
+  exec,
+  type ExecResult,
+  type HostKeyInfo,
+  SshConfigError,
+  type SshDeps,
+  SshError,
+  type SshTarget as CanonicalTarget,
+  upload,
+  waitConnection,
+} from "./ssh.ts";
 
 /** Result of running a command. */
 export interface CommandResult {
@@ -19,18 +34,15 @@ export interface CommandResult {
   stderr: string;
 }
 
-/** Result of a transport call. `known_hosts` is the key file after the run. */
+/**
+ * Result of a transport call. `known_hosts` carries the ssh-keyscan-format
+ * lines learned on a first trust-on-first-use contact, so the caller can pin
+ * them.
+ */
 export interface TransportResult extends CommandResult {
-  /** Contents of the known_hosts file used for the connection, if readable. */
+  /** Host keys learned on this call, when it was a first `insecure_tofu` run. */
   known_hosts?: string;
 }
-
-/** Spawns a local process; injectable so tests need no real binaries. */
-export type Spawner = (
-  cmd: string,
-  args: string[],
-  options?: { stdin?: string; env?: Record<string, string> },
-) => Promise<CommandResult>;
 
 /** Runs a fixed shell script on the node, with `stdin` piped to it. */
 export type Transport = (
@@ -38,7 +50,7 @@ export type Transport = (
   stdin?: string,
 ) => Promise<TransportResult>;
 
-/** SSH target block. */
+/** SSH target block; the host-key policy is never a silent default. */
 export interface SshTarget {
   /** Host name or IP literal. */
   host: string;
@@ -46,10 +58,16 @@ export interface SshTarget {
   user: string;
   /** SSH port. */
   port: number;
-  /** Host-key policy; never a silent default. */
-  host_key_policy: "strict" | "accept-new" | "insecure";
-  /** Pinned host keys as `type base64` pairs; required for strict. */
-  host_keys: { type: string; key: string }[];
+  /** Host-key policy. */
+  host_key_policy: "strict" | "insecure_tofu";
+  /** Pinned ssh-keyscan-format lines; required for strict. */
+  host_keys: string[];
+  /** Private key text, loaded into a short-lived ssh-agent over stdin. */
+  private_key?: string;
+  /** Connection timeout in seconds. */
+  connect_timeout_s?: number;
+  /** Cap in bytes on captured output. */
+  max_output_bytes?: number;
 }
 
 /** A transport failure: unreachable host, rejected auth or host key. */
@@ -64,140 +82,179 @@ export class TransportError extends Error {
   }
 }
 
-const HOST_RE =
-  /^(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)*$|^[0-9a-fA-F:.]{2,45}$/;
-const USER_RE = /^[a-z_][a-z0-9_-]{0,31}$/;
-
-/**
- * Builds the argv for `ssh` to run `script` on the target. Host-key
- * verification options follow `host_key_policy`; `knownHosts` is the path of a
- * file holding the pinned keys.
- */
-export function sshArgv(
-  t: SshTarget,
-  script: string,
-  knownHosts: string,
-): string[] {
-  if (!HOST_RE.test(t.host) || t.host.startsWith("-")) {
-    throw new TransportError("unreachable", `invalid ssh host ${t.host}`);
-  }
-  if (!USER_RE.test(t.user)) {
-    throw new TransportError("auth", `invalid ssh user ${t.user}`);
-  }
-  const strict = t.host_key_policy === "strict"
-    ? "yes"
-    : t.host_key_policy === "accept-new"
-    ? "accept-new"
-    : "no";
-  return [
-    "-F",
-    "/dev/null",
-    "-o",
-    "BatchMode=yes",
-    "-o",
-    `StrictHostKeyChecking=${strict}`,
-    "-o",
-    `UserKnownHostsFile=${
-      t.host_key_policy === "insecure" ? "/dev/null" : knownHosts
-    }`,
-    "-o",
-    "GlobalKnownHostsFile=/dev/null",
-    "-o",
-    "ConnectTimeout=10",
-    "-p",
-    String(t.port),
-    "-l",
-    t.user,
-    "--",
-    t.host,
-    script,
-  ];
-}
-
-/** Maps a failed ssh exit to a typed transport error. */
-export function classifySshFailure(res: CommandResult): TransportError {
-  const why = /Host key verification failed/i.test(res.stderr)
-    ? "host-key"
-    : /Permission denied/i.test(res.stderr)
-    ? "auth"
-    : /Connection (refused|timed out|closed|reset)|timed out|No route|Could not resolve/i
-        .test(res.stderr)
-    ? "unreachable"
-    : "remote";
-  return new TransportError(why, `ssh failed (exit ${res.code}): ${why}`);
-}
-
-/**
- * Builds the ssh-backed transport. `ssh_private_key`, when set, is loaded into
- * a temporary ssh-agent over stdin; otherwise the caller's agent is used. The
- * known_hosts file after the run is returned so callers can implement
- * trust-on-first-use by pinning the accepted keys on later runs.
- */
-export function sshTransport(
-  t: SshTarget,
-  spawn: Spawner,
-  opts: { ssh_private_key?: string; tempFile?: () => Promise<string> } = {},
-): Transport {
-  return async (script, stdin) => {
-    if (t.host_key_policy === "strict" && t.host_keys.length === 0) {
-      throw new TransportError(
-        "host-key",
-        "host_key_policy strict requires pinned host_keys",
-      );
-    }
-    const knownHosts = await (opts.tempFile ?? defaultTempFile)();
-    const hostField = t.port === 22 ? t.host : `[${t.host}]:${t.port}`;
-    await Deno.writeTextFile(
-      knownHosts,
-      t.host_keys.map((k) => `${hostField} ${k.type} ${k.key}`).join("\n") +
-        "\n",
+function canonicalTarget(t: SshTarget): CanonicalTarget {
+  if (t.host_key_policy === "strict" && t.host_keys.length === 0) {
+    throw new TransportError(
+      "host-key",
+      "host_key_policy strict requires pinned host_keys",
     );
-    let env: Record<string, string> | undefined;
-    try {
-      if (opts.ssh_private_key) {
-        const agent = await spawn("ssh-agent", ["-s"]);
-        const sock = /SSH_AUTH_SOCK=([^;]+);/.exec(agent.stdout)?.[1];
-        const agentPid = /SSH_AGENT_PID=(\d+);/.exec(agent.stdout)?.[1];
-        if (agent.code !== 0 || !sock || !agentPid) {
-          throw new TransportError("auth", "could not start ssh-agent");
-        }
-        env = { SSH_AUTH_SOCK: sock, SSH_AGENT_PID: agentPid };
-        const k = opts.ssh_private_key;
-        const added = await spawn("ssh-add", ["-q", "-"], {
-          stdin: k.endsWith("\n") ? k : `${k}\n`,
-          env,
-        });
-        if (added.code !== 0) {
-          throw new TransportError("auth", "ssh-add rejected the private key");
-        }
-      }
-      const res = await spawn("ssh", sshArgv(t, shQuote(script), knownHosts), {
-        stdin: stdin ?? "",
-        env,
-      });
-      // 255 is ssh's own failure; anything else is the remote script's code.
-      if (res.code === 255) throw classifySshFailure(res);
-      let known: string | undefined;
-      try {
-        known = await Deno.readTextFile(knownHosts);
-      } catch {
-        // The file was written above; a read failure only means no key to pin.
-      }
-      return { ...res, known_hosts: known };
-    } finally {
-      await Deno.remove(knownHosts).catch(() => {});
-      if (env) await spawn("ssh-agent", ["-k"], { env }).catch(() => undefined);
-    }
+  }
+  return {
+    host: t.host,
+    port: t.port,
+    user: t.user,
+    host_key_policy: t.host_key_policy,
+    ...(t.host_keys.length > 0 ? { host_keys: t.host_keys } : {}),
+    ...(t.private_key !== undefined ? { private_key: t.private_key } : {}),
+    connect_timeout_s: t.connect_timeout_s ?? 15,
+    ...(t.max_output_bytes !== undefined
+      ? { max_output_bytes: t.max_output_bytes }
+      : {}),
   };
 }
 
-function defaultTempFile(): Promise<string> {
-  return Deno.makeTempFile({ prefix: "wgmesh-kh-" });
+/** Maps a canonical transport error to the model's typed transport error. */
+function toTransportError(e: unknown): TransportError {
+  if (e instanceof SshError) {
+    return new TransportError("unreachable", e.message);
+  }
+  if (e instanceof SshConfigError) {
+    return new TransportError("host-key", e.message);
+  }
+  if (e instanceof TransportError) return e;
+  return new TransportError("remote", (e as Error).message);
 }
 
-/** Wraps a script as `sh -c '<script>'` so any login shell runs it as POSIX sh. */
-export function shQuote(script: string): string {
-  return `sh -c '${script.replaceAll("'", `'\\''`)}'`;
+/** ssh-keyscan-format lines for learned keys, with a port-aware host field. */
+function knownHostsLines(
+  host: string,
+  port: number,
+  keys: HostKeyInfo[],
+): string {
+  return buildKnownHosts(host, port, keys);
+}
+
+/**
+ * Builds the ssh-backed transport on the canonical `_lib/ssh.ts`. A first
+ * `insecure_tofu` call with no pins learns the host keys (returned in
+ * `known_hosts`, `[host]:port` for a non-default port) and pins them for the
+ * rest of the operation; `stdin` is written to a private `mktemp -d` directory
+ * and the script unlinks it as soon as it is opened on fd 3, so the key and
+ * config are unlinked before the script runs (removed by a checked cleanup) and never on argv. An ssh exit 255 is the canonical
+ * typed `SshError`, rethrown here as a `TransportError`.
+ */
+export function sshTransport(t: SshTarget, deps: SshDeps): Transport {
+  const target = canonicalTarget(t);
+  return async (script, stdin) => {
+    let learnedLines: string | undefined;
+    if (
+      target.host_key_policy === "insecure_tofu" &&
+      (target.host_keys?.length ?? 0) === 0
+    ) {
+      let waited;
+      try {
+        waited = await waitConnection(deps, target, {
+          timeout_s: target.connect_timeout_s,
+        });
+      } catch (e) {
+        throw toTransportError(e);
+      }
+      if (!waited.reachable || waited.host_keys.length === 0) {
+        throw new TransportError("unreachable", "the node did not answer SSH");
+      }
+      learnedLines = knownHostsLines(t.host, t.port, waited.host_keys);
+      target.host_keys = learnedLines.split("\n").filter((l) => l !== "");
+    }
+    let dir: string | undefined;
+    let tmp: string | undefined;
+    let result: TransportResult | undefined;
+    let failure: TransportError | undefined;
+    try {
+      if (stdin !== undefined) {
+        let made: ExecResult;
+        try {
+          made = await exec(deps, target, [
+            "mktemp",
+            "-d",
+            "-p",
+            "/tmp",
+            "wgmesh.XXXXXXXX",
+          ]);
+        } catch (e) {
+          throw toTransportError(e);
+        }
+        if (made.exit_code !== 0) {
+          throw new TransportError(
+            "remote",
+            "could not create a private temp directory on the node",
+          );
+        }
+        dir = made.stdout.trim();
+        if (!/^\/tmp\/wgmesh\.[A-Za-z0-9]{6,}$/.test(dir)) {
+          throw new TransportError(
+            "remote",
+            "mktemp returned an unexpected path",
+          );
+        }
+        tmp = `${dir}/stdin`;
+        try {
+          await upload(deps, target, {
+            path: tmp,
+            content: stdin,
+            mode: "0600",
+          });
+        } catch (e) {
+          throw toTransportError(e);
+        }
+      }
+      const body = tmp === undefined || dir === undefined ? script : [
+        "umask 077",
+        // Open the file, then unlink it before the script body runs. Each step
+        // is checked, so a failed open or unlink stops before the script can
+        // touch the host.
+        `exec 3<'${tmp}' || exit 70`,
+        `rm -f -- '${tmp}' || exit 70`,
+        `[ ! -e '${tmp}' ] || exit 70`,
+        // The EXIT trap does the cleanup; a signal makes the shell exit (with
+        // the conventional status) so the trap runs and the script stops.
+        `trap 'rm -f -- "${tmp}"; rmdir -- "${dir}" 2>/dev/null || true' EXIT`,
+        "trap 'exit 129' HUP",
+        "trap 'exit 130' INT",
+        "trap 'exit 143' TERM",
+        "{",
+        script,
+        "} <&3",
+      ].join("\n");
+      let res: ExecResult;
+      try {
+        res = await exec(deps, target, ["sh", "-c", body]);
+      } catch (e) {
+        throw toTransportError(e);
+      }
+      result = {
+        code: res.exit_code,
+        stdout: res.stdout,
+        stderr: res.stderr,
+        ...(learnedLines !== undefined ? { known_hosts: learnedLines } : {}),
+      };
+    } catch (e) {
+      failure = e instanceof TransportError ? e : toTransportError(e);
+    }
+    let cleanupFailure: TransportError | undefined;
+    if (tmp !== undefined) {
+      let cleaned: ExecResult | undefined;
+      try {
+        cleaned = await exec(deps, target, [
+          "sh",
+          "-c",
+          // Only a failed rm of the key file is an error; an absent directory
+          // (or one still holding the file) is handled by the trailing test.
+          `rm -f -- '${tmp}' && { rmdir -- '${dir}' 2>/dev/null || [ ! -e '${dir}/stdin' ]; }`,
+        ]);
+      } catch {
+        cleaned = undefined;
+      }
+      if (cleaned === undefined || cleaned.exit_code !== 0) {
+        cleanupFailure = new TransportError(
+          "remote",
+          `the remote temp file ${tmp} may still hold the key; remove it by hand`,
+        );
+      }
+    }
+    if (cleanupFailure !== undefined) throw cleanupFailure;
+    if (failure !== undefined) throw failure;
+    return result!;
+  };
 }
 
 /** Hex SHA-256 of text. */
@@ -213,6 +270,27 @@ export async function sha256Hex(text: string): Promise<string> {
 /** Throws unless `name` is a valid interface name. */
 export function assertIface(name: string): void {
   if (!IFACE_RE.test(name)) throw new Error(`Invalid interface name: ${name}`);
+}
+
+const KEY_TYPE_RE = /^[a-z0-9@.-]{1,40}$/;
+const KEY_B64_RE = /^[A-Za-z0-9+/=]{1,2048}$/;
+const HOST_FIELD_RE = /^[A-Za-z0-9.,:_\[\]-]{1,512}$/;
+
+/**
+ * True for an ssh-keyscan line: an optional host field (a hostname, an IP, a
+ * comma list, or `[host]:port`), a key type and a base64 payload. Any other
+ * token count is rejected.
+ */
+export function isHostKeyLine(value: string): boolean {
+  const parts = value.trim().split(/\s+/);
+  if (parts.length === 2) {
+    return KEY_TYPE_RE.test(parts[0]) && KEY_B64_RE.test(parts[1]);
+  }
+  if (parts.length === 3) {
+    return HOST_FIELD_RE.test(parts[0]) && KEY_TYPE_RE.test(parts[1]) &&
+      KEY_B64_RE.test(parts[2]);
+  }
+  return false;
 }
 
 /** A host key parsed from a known_hosts or ssh-keyscan line. */

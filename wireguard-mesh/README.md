@@ -130,10 +130,25 @@ echoes method arguments, so pass the key as a vault reference only.
 - Rendering one node echoes that node's own `endpoint` back as `node_endpoint`,
   ready to paste into the other nodes' peer entries.
 - SSH host keys are pinned (`strict`) or handled through `host_key_policy`,
-  which has no default. `strict` requires `ssh.host_keys`. With `accept-new`,
-  the first accepted key is stored under `<node>-hostkeys` and pinned as
-  `strict` on every later run, so a key that changes is refused rather than
-  retrusted; `insecure` never records keys.
+  which has no default. `strict` requires `ssh.host_keys`. With `insecure_tofu`,
+  the first accepted key is stored per node, host and port
+  (`<node>-hostkeys-<host>-<port>`) and pinned as `strict` on every later run of
+  that endpoint, so a key that changes is refused rather than retrusted. A
+  different host or port is a new endpoint that may learn its own key; it never
+  overwrites another endpoint's pin. A record that exists for an endpoint but is
+  unreadable (empty keys, wrong types, no usable line) is an error, not a
+  re-learn: delete it to re-learn. The transport is the canonical vendored
+  `_lib/ssh.ts`: an ssh exit 255 is a typed error, supplied pins that apply to
+  no host are refused, and no config, key or digest is ever placed on `argv`.
+  The key and config are written to a private `mktemp -d` directory and the
+  script unlinks the file as soon as it opens it, so they are unlinked before
+  the script runs and removed by a checked cleanup.
+- Upgrading from 2026.10.17.4: `host_key_policy: accept-new` now maps to
+  `insecure_tofu` and `insecure` is refused (the transport cannot honour it
+  safely); `ssh.host_keys` entries that are `{type, key}` objects are accepted
+  and converted to ssh-keyscan lines; and a per-node `<node>-hostkeys` record
+  pins its own host and port, is converted to port-aware (`[host]:port`) lines
+  and moves to the keyed record on first use.
 - Data is stored under the node name, e.g.
   `data.latest("wg-node", "spoke-1").attributes.config_sha256`.
 

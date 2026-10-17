@@ -307,26 +307,28 @@ export const WRITE_TIMEOUT_MS = 120_000;
 export const SHA_TIMEOUT_MS = 60_000;
 
 /**
- * The one remote script that turns the secret streamed on stdin into the
- * destination file. The destination must be a file, and an atomic publish
- * requires a temporary file in the destination directory, so this keeps the
- * verified `mktemp` + `trap` path: stdin streams straight into that script, with
- * no transport-level temp file, and a failure removes the temp.
+ * The remote script that turns the secret streamed on stdin into the
+ * destination. An atomic publish needs a temp in the destination directory; the
+ * temp and its cleanup stay on the remote, and the script refuses a short read
+ * or a symlink/directory destination before the rename.
  */
 export function stageWriteScript(
   path: string,
   mode: string,
+  expectedBytes: number,
   spec?: string,
 ): string {
   const f = posixQuote(path);
   const dir = path.slice(0, path.lastIndexOf("/")) || "/";
   const lines = [
-    "set -euo pipefail",
+    "set -eu",
     `f=${f}`,
     `d=${posixQuote(dir)}`,
     't=$(mktemp "$d/.secret-stage-XXXXXXXX")',
-    "trap 'rm -f \"$t\"' EXIT HUP INT TERM",
+    "trap 'rm -f \"$t\"' EXIT",
+    "trap 'exit 1' HUP INT TERM",
     'cat > "$t"',
+    `[ "$(wc -c < "$t" | tr -d '[:space:]')" -eq ${expectedBytes} ]`,
     `chmod ${posixQuote(mode)} "$t"`,
   ];
   if (spec !== undefined) lines.push(`chown -h ${posixQuote(spec)} "$t"`);
@@ -610,6 +612,16 @@ async function writeState(
   );
 }
 
+/** Attribute migrations; identity because the method inputs are unchanged. */
+const UPGRADES: Upgrade[] = [
+  {
+    toVersion: "2026.10.17.2",
+    description:
+      "Re-vendored the canonical ssh transport and stream the secret straight on stdin into one remote write script instead of the transport upload temp file; no stored-attribute changes",
+    upgradeAttributes: (old: Record<string, unknown>) => old,
+  },
+];
+
 /**
  * Builds the model with injectable dependencies. The production export is
  * `createModel()`; tests pass a fake runner, clock and sleep so no process is
@@ -621,14 +633,7 @@ export function createModel(deps: SshDeps = denoDeps): SecretFileModel {
     version: "2026.10.17.2",
     description:
       "Write a secret file onto one host over SSH from vault values delivered over stdin, atomically and idempotently by content hash, with settable owner and group and a remove action. State holds metadata and at most a keyed HMAC of the content, never the value.",
-    upgrades: [
-      {
-        toVersion: "2026.10.17.2",
-        description:
-          "Re-vendored the canonical ssh transport and stream the secret straight on stdin into one remote write script instead of the transport upload temp file; no stored-attribute changes",
-        upgradeAttributes: (old: Record<string, unknown>) => old,
-      },
-    ],
+    upgrades: UPGRADES,
     globalArguments: z.strictObject({}),
     resources: {
       secretFile: {
@@ -670,14 +675,15 @@ export function createModel(deps: SshDeps = denoDeps): SecretFileModel {
             }
           }
           if (changed) {
-            // Stream the bytes straight into the one remote script over stdin;
-            // no transport-level temp file is created, and the script's trap
-            // removes its own temp on any failure.
             requireOk(
               await sshExec(
                 deps,
                 target,
-                ["sh", "-c", stageWriteScript(args.path, args.mode, spec)],
+                [
+                  "sh",
+                  "-c",
+                  stageWriteScript(args.path, args.mode, bytes.length, spec),
+                ],
                 { stdin: bytes, timeoutMs: WRITE_TIMEOUT_MS },
               ),
               `write ${args.path}`,
@@ -857,13 +863,5 @@ export const model = {
   ...createModel(),
   type: "@randybias/secret-file",
   version: "2026.10.17.2",
-  // The registry's upgrade check reads this literal chain from the export.
-  upgrades: [
-    {
-      toVersion: "2026.10.17.2",
-      description:
-        "Re-vendored the canonical ssh transport and stream the secret straight on stdin into one remote write script instead of the transport upload temp file; no stored-attribute changes",
-      upgradeAttributes: (old: Record<string, unknown>) => old,
-    },
-  ],
+  upgrades: UPGRADES,
 } satisfies SecretFileModel;

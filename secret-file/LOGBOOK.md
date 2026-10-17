@@ -131,9 +131,9 @@ Delta review of 34dd922 over 770114a: 0 Critical/High. Residuals carried:
   canonical runner tests.
 - Dropped the transport upload temp file for the secret. `write` now streams the
   value on `exec` stdin straight into one remote `sh -c` script
-  (`stageWriteScript`) that creates a mode-0700 temp with `mktemp`, `cat`s stdin
-  into it, `chmod`s and `chown -h`s it, re-checks the destination with no-follow
-  and renames with `mv -T`; the `trap` removes the temp on any failure. No
+  (`stageWriteScript`) that creates a 0600 temp with `mktemp`, `cat`s stdin into
+  it, `chmod`s and `chown -h`s it, re-checks the destination with no-follow and
+  renames with `mv -T`; the `trap` removes the temp on any failure. No
   transport-level temp file is created. A file destination needs a temp in its
   own directory for the atomic rename, so the verified `mktemp` + `trap` path is
   kept and this is why.

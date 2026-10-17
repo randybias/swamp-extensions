@@ -299,16 +299,108 @@ Deno.test("write uploads over stdin, never on argv, and stores no value", async 
 });
 
 Deno.test("stageWriteScript writes, chmods, chowns and renames atomically", () => {
-  const script = stageWriteScript(PATH, "0600", "1000:svc");
-  assert(script.includes("set -euo pipefail"));
+  const script = stageWriteScript(PATH, "0600", 18, "1000:svc");
+  assert(script.includes("set -eu"));
+  assertEquals(script.includes("pipefail"), false, "dash rejects pipefail");
   assert(script.includes("mktemp"));
   assert(script.includes("trap 'rm -f"));
+  assert(script.includes("trap 'exit 1' HUP INT TERM"));
   assert(script.includes('cat > "$t"'));
+  assert(script.includes("wc -c"));
+  assert(script.includes("-eq 18"));
   assert(script.includes(`chmod '0600' "$t"`));
   assert(script.includes(`chown -h '1000:svc' "$t"`));
   assert(script.includes('mv -T "$t"'));
   assert(script.includes("trap - EXIT"));
-  assertEquals(stageWriteScript(PATH, "0640").includes("chown"), false);
+  assertEquals(stageWriteScript(PATH, "0640", 18).includes("chown"), false);
+});
+
+/** The first POSIX shell available, preferring dash. */
+async function posixShell(): Promise<string> {
+  for (const candidate of ["dash", "sh"]) {
+    try {
+      const out = await new Deno.Command(candidate, { args: ["-c", "true"] })
+        .output();
+      if (out.code === 0) return candidate;
+    } catch {
+      // not installed
+    }
+  }
+  return "sh";
+}
+
+/** Runs one generated script under a real shell with `stdin`. */
+async function runScript(
+  shell: string,
+  script: string,
+  stdin: Uint8Array,
+): Promise<{ code: number; stderr: string }> {
+  const child = new Deno.Command(shell, {
+    args: ["-c", script],
+    stdin: "piped",
+    stdout: "piped",
+    stderr: "piped",
+  }).spawn();
+  const writer = child.stdin.getWriter();
+  await writer.write(stdin);
+  await writer.close();
+  const out = await child.output();
+  return { code: out.code, stderr: new TextDecoder().decode(out.stderr) };
+}
+
+async function localExists(path: string): Promise<boolean> {
+  return await Deno.lstat(path).then(() => true).catch(() => false);
+}
+
+Deno.test("stageWriteScript runs under a real POSIX sh", async () => {
+  const shell = await posixShell();
+  const dir = await Deno.makeTempDir({ prefix: "sf-stage-" });
+  const bytes = new TextEncoder().encode("HELLO-SECRET\n");
+  try {
+    const dest = `${dir}/secret.env`;
+    const ok = await runScript(
+      shell,
+      stageWriteScript(dest, "0600", bytes.length),
+      bytes,
+    );
+    assertEquals(ok.code, 0, ok.stderr);
+    assertEquals(await Deno.readTextFile(dest), "HELLO-SECRET\n");
+    assertEquals((await Deno.stat(dest)).mode! & 0o777, 0o600);
+
+    const short = `${dir}/short.env`;
+    const shortRes = await runScript(
+      shell,
+      stageWriteScript(short, "0600", 100),
+      new TextEncoder().encode("PART"),
+    );
+    assert(shortRes.code !== 0, "a short read must fail before the rename");
+    assertEquals(await localExists(short), false);
+
+    const target = `${dir}/real.env`;
+    await Deno.writeTextFile(target, "ORIGINAL\n");
+    const link = `${dir}/link.env`;
+    await Deno.symlink(target, link);
+    const symRes = await runScript(
+      shell,
+      stageWriteScript(link, "0600", bytes.length),
+      bytes,
+    );
+    assert(symRes.code !== 0, "a symlink destination must be refused");
+    assertEquals(await Deno.readTextFile(target), "ORIGINAL\n");
+    assertEquals((await Deno.lstat(link)).isSymlink, true);
+
+    const asDir = `${dir}/asdir`;
+    await Deno.mkdir(asDir);
+    const dirRes = await runScript(
+      shell,
+      stageWriteScript(asDir, "0600", bytes.length),
+      bytes,
+    );
+    assert(dirRes.code !== 0, "a directory destination must be refused");
+    assertEquals((await Deno.stat(asDir)).isDirectory, true);
+  } finally {
+    await Deno.remove(dir, { recursive: true });
+  }
 });
 
 Deno.test("write streams the secret into one sh -c script, not upload commands", async () => {

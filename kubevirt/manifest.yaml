@@ -1,0 +1,12 @@
+manifestVersion: 1
+name: "@randybias/kubevirt"
+version: "2026.10.17.1"
+description: "Install and upgrade KubeVirt on an existing Kubernetes cluster from a SHA-256-pinned operator manifest, and manage one VirtualMachine from a digest-pinned containerDisk image or a CDI DataVolume. Two model types over kubectl, with the kubeconfig supplied as a vault reference and never placed on a command line."
+license: Apache-2.0
+repository: https://github.com/randybias/swamp-extensions
+platforms: [darwin-aarch64, darwin-x86_64, linux-x86_64, linux-aarch64]
+labels: [kubernetes, kubevirt, virtualization, vm, kubectl, kubeconfig, cdi]
+additionalFiles: [README.md, LICENSE.txt]
+models:
+  - kubevirt.ts
+  - kubevirt_vm.ts

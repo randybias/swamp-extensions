@@ -558,7 +558,7 @@ Deno.test("apply_firewall: a /0 without acknowledgement is refused", async () =>
       m.methods.apply_firewall.execute(
         m.methods.apply_firewall.arguments.parse({
           ...FIREWALL_ARGS,
-          management_cidrs: ["0.0.0.0/0"],
+          management_cidrs: ["0.0.0.0/0"], // leak-allow(address-space halves are the case under test)
         }),
         context,
       ),
@@ -999,9 +999,13 @@ Deno.test("strict: pinned keys are used as given and nothing is scanned", async 
 });
 
 Deno.test("commit: an armed revert the model never recorded is found through the host's marker", async () => {
+  const liveHash = await managedTableSha256("");
   const f = fakeTransport((c) => {
     if (c.includes("/var/lib/server-host/current") && c.includes("cat")) {
-      return { code: 0, stdout: `${TOKEN} ${Math.floor(NOW / 1000) + 200}\n` };
+      return {
+        code: 0,
+        stdout: `${TOKEN} ${Math.floor(NOW / 1000) + 200} ${liveHash}\n`,
+      };
     }
     if (c.includes("'systemctl' 'is-active'")) {
       return { code: 0, stdout: "active\n" };
@@ -1036,4 +1040,106 @@ Deno.test("commit is described as DESTRUCTIVE", () => {
     createModel().methods.commit.description.startsWith("DESTRUCTIVE."),
     true,
   );
+});
+
+Deno.test("commit: the marker fallback refuses when the host recorded no ruleset hash", async () => {
+  const f = fakeTransport((c) => {
+    if (c.includes("/var/lib/server-host/current") && c.includes("cat")) {
+      return { code: 0, stdout: `${TOKEN} ${Math.floor(NOW / 1000) + 200}\n` };
+    }
+    if (c.includes("'systemctl' 'is-active'")) {
+      return { code: 0, stdout: "active\n" };
+    }
+    return { code: 0 };
+  });
+  const m = modelWith(f);
+  const ctx = createModelTestContext({ globalArgs: {} });
+  await assertRejects(
+    () =>
+      m.methods.commit.execute(
+        m.methods.commit.arguments.parse({ ...SSH }),
+        ctx.context,
+      ),
+    Error,
+    "unverified",
+  );
+  assertEquals(f.commands.some(isDisarm), false);
+  assertEquals(
+    f.commands.some((c) => c.includes('systemctl stop "$unit.timer"')),
+    false,
+  );
+});
+
+Deno.test("marker read: an unreadable, truncated or garbled marker is an error, never 'no revert'", async () => {
+  const cases: [string, { code: number; stdout?: string }][] = [
+    ["read failure", { code: 1 }],
+    ["garbled", { code: 0, stdout: "not a marker\n" }],
+    ["half a marker", { code: 0, stdout: `${TOKEN}\n` }],
+  ];
+  for (const [name, reply] of cases) {
+    const f = fakeTransport((c) =>
+      c.includes("/var/lib/server-host/current") && c.includes("cat")
+        ? reply
+        : { code: 0 }
+    );
+    const m = modelWith(f);
+    const ctx = createModelTestContext({ globalArgs: {} });
+    await assertRejects(
+      () =>
+        m.methods.get.execute(
+          m.methods.get.arguments.parse({ ...SSH }),
+          ctx.context,
+        ),
+      Error,
+      "",
+      name,
+    );
+  }
+});
+
+Deno.test("marker read: absent marker (empty output) is no revert", async () => {
+  const f = fakeTransport();
+  const m = modelWith(f);
+  const ctx = createModelTestContext({ globalArgs: {} });
+  const out = await m.methods.get.execute(
+    m.methods.get.arguments.parse({ ...SSH }),
+    ctx.context,
+  );
+  assertEquals(out.result.revert_armed, false);
+});
+
+Deno.test("management_cidrs: halves of the address space need the SSH-from-anywhere acknowledgement", async () => {
+  const m = createModel();
+  const ctx = createModelTestContext({ globalArgs: {} });
+  for (
+    const cidrs of [
+      ["0.0.0.0/1", "128.0.0.0/1"], // leak-allow(address-space halves are the case under test)
+      ["::/1", "8000::/1"], // leak-allow(address-space halves are the case under test)
+      ["0.0.0.0/2", "64.0.0.0/2", "128.0.0.0/1"], // leak-allow(address-space halves are the case under test)
+      ["0.0.0.0/1"], // leak-allow(address-space halves are the case under test)
+      ["2000::/3"], // leak-allow(address-space halves are the case under test)
+    ]
+  ) {
+    const args = {
+      host: SSH.host,
+      management_cidrs: cidrs,
+    };
+    await assertRejects(
+      () =>
+        m.methods.render_firewall.execute(
+          m.methods.render_firewall.arguments.parse(args),
+          ctx.context,
+        ),
+      Error,
+      "(nearly) everyone",
+    );
+    // With the acknowledgement the same input renders.
+    await m.methods.render_firewall.execute(
+      m.methods.render_firewall.arguments.parse({
+        ...args,
+        allow_ssh_from_anywhere: true,
+      }),
+      ctx.context,
+    );
+  }
 });

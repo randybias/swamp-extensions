@@ -10,7 +10,7 @@
  * @module
  */
 
-import { HostConfigError, isDefaultRoute } from "./validate.ts";
+import { HostConfigError, isEffectivelyAnywhere } from "./validate.ts";
 
 /** Everything that determines the rendered ruleset. */
 export interface FirewallRules {
@@ -152,10 +152,10 @@ export async function managedTableSha256(text: string): Promise<string> {
 export function assertFirewallRules(rules: FirewallRules): void {
   if (
     !rules.allowSshFromAnywhere && rules.managementCidrs.length > 0 &&
-    rules.managementCidrs.some(isDefaultRoute)
+    isEffectivelyAnywhere(rules.managementCidrs)
   ) {
     throw new HostConfigError(
-      "management_cidrs may not contain a /0 network unless allow_ssh_from_anywhere is true",
+      "management_cidrs may not open SSH to (nearly) everyone, whether by a /0, a network wider than /8 (IPv4) or /16 (IPv6), or CIDRs that together cover every address, unless allow_ssh_from_anywhere is true",
     );
   }
   if (!rules.allowSshFromAnywhere && rules.managementCidrs.length === 0) {

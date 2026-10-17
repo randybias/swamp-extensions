@@ -19,6 +19,7 @@ import {
 import { HostConfigError } from "./validate.ts";
 
 const TOKEN = "0".repeat(16);
+const SHA = "c".repeat(64);
 
 Deno.test("token: paths and units reject anything but lowercase hex", () => {
   assertEquals(TOKEN_RE.test(TOKEN), true);
@@ -89,7 +90,7 @@ Deno.test("revert script: restores only while it is still the current revert", (
 });
 
 Deno.test("arm: under the host lock, snapshots, records the marker, then starts the timer", () => {
-  const argv = renderArmArgv(TOKEN, 300, true);
+  const argv = renderArmArgv(TOKEN, 300, true, SHA);
   assertEquals(argv.slice(0, 4), ["sudo", "-n", "sh", "-c"]);
   const s = argv[4];
   assertEquals(s.indexOf("flock 9") > 0, true);
@@ -110,7 +111,7 @@ Deno.test("arm: under the host lock, snapshots, records the marker, then starts 
     true,
   );
   for (const bad of [59, 1801, 0, -1, 1.5]) {
-    assertThrows(() => renderArmArgv(TOKEN, bad, false), HostConfigError);
+    assertThrows(() => renderArmArgv(TOKEN, bad, false, SHA), HostConfigError);
   }
 });
 
@@ -158,7 +159,7 @@ Deno.test("probe: reads the timer state without changing it", () => {
 });
 
 Deno.test("arm: refuses (75) while an earlier revert's timer OR service is busy, or its files remain", () => {
-  const s = renderArmArgv(TOKEN, 300, false)[2];
+  const s = renderArmArgv(TOKEN, 300, false, SHA)[2];
   assertEquals(s.includes('busy "$ou.timer" || busy "$ou.service"'), true);
   assertEquals(s.includes("exit 75"), true);
   // "Inactive" alone is not enough: artifacts within the grace window still block.

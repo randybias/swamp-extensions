@@ -449,6 +449,7 @@ export function createModel(overrides: Partial<HostDeps> = {}) {
       revertAfterS: args.revert_after_s,
       sudo: args.sudo,
       rulesText: ruleset,
+      managedSha256: managed_sha256,
     });
     let armed = false;
     let attempted = false;
@@ -785,6 +786,13 @@ export function createModel(overrides: Partial<HostDeps> = {}) {
                 `No armed revert is recorded for ${args.host}`,
               );
             }
+            // Without the hash the live-ruleset checks below cannot run, so
+            // the fallback refuses rather than cancel an unverified change.
+            if (!live.current_managed_sha256) {
+              throw new HostConfigError(
+                `The armed revert on ${args.host} has no recorded ruleset hash; refusing to commit it unverified`,
+              );
+            }
             stored = {
               host: args.host,
               token: live.current_token,
@@ -793,6 +801,7 @@ export function createModel(overrides: Partial<HostDeps> = {}) {
               expires_at: live.current_expires_at!,
               armed_at: live.observed_at,
               ruleset_sha256: "",
+              managed_sha256: live.current_managed_sha256,
             };
           }
           if (

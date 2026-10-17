@@ -14,6 +14,7 @@ import {
 } from "./armed_revert.ts";
 
 const A = "a".repeat(16);
+const SHA = "c".repeat(64);
 const B = "b".repeat(16);
 
 interface Box {
@@ -101,7 +102,7 @@ async function arm(b: Box, token: string, secs = 300, now = 1000) {
     `${b.state}/revert-${token}.sh`,
     renderRevertScript(token).replaceAll(STATE_DIR, b.state),
   );
-  return await b.run(scriptOf(renderArmArgv(token, secs, false)), "", now);
+  return await b.run(scriptOf(renderArmArgv(token, secs, false, SHA)), "", now);
 }
 
 Deno.test("shell: arm snapshots, records the marker, starts the timer; apply then succeeds", async () => {
@@ -109,7 +110,7 @@ Deno.test("shell: arm snapshots, records the marker, starts the timer; apply the
   try {
     await b.put("live", "table inet original\n");
     assertEquals(await arm(b, A), 0);
-    assertEquals(await b.file("state/current"), `${A} 1300\n`);
+    assertEquals(await b.file("state/current"), `${A} 1300 ${SHA}\n`);
     assertEquals(
       await b.file(`state/revert-${A}.nft`),
       "table inet original\n",

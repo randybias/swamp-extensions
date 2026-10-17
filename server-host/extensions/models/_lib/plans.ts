@@ -328,6 +328,8 @@ export interface FirewallChangeInput {
   sudo: boolean;
   /** Rendered nftables script to apply. */
   rulesText: string;
+  /** SHA-256 of the managed table the apply installs; recorded on the host. */
+  managedSha256: string;
 }
 
 /**
@@ -358,7 +360,12 @@ export function planFirewallChange(input: FirewallChangeInput): Step[] {
     {
       kind: "arm",
       label: "arm revert timer",
-      argv: renderArmArgv(input.token, input.revertAfterS, input.sudo),
+      argv: renderArmArgv(
+        input.token,
+        input.revertAfterS,
+        input.sudo,
+        input.managedSha256,
+      ),
       check: true,
     },
     {
@@ -431,6 +438,8 @@ export interface ProbeResult {
   current_token?: string;
   /** ISO-8601 expiry of that revert, if any. */
   current_expires_at?: string;
+  /** Managed-table hash the host recorded for that revert, if any. */
+  current_managed_sha256?: string;
   /** ISO-8601 time of the probe. */
   observed_at: string;
 }
@@ -473,7 +482,17 @@ export async function probeState(
       `Reading the revert marker on ${target.host} failed with exit code ${marked.exit_code}; refusing to record firewall state`,
     );
   }
+  if (marked.truncated) {
+    throw new HostOpsError(
+      `The revert marker on ${target.host} was truncated; refusing to record firewall state`,
+    );
+  }
   const marker = parseMarker(marked.stdout);
+  if (marker === null && marked.stdout.trim() !== "") {
+    throw new HostOpsError(
+      `The revert marker on ${target.host} is not readable; refusing to record firewall state`,
+    );
+  }
   const token = input.token ?? marker?.token;
   let armed = false;
   if (token) {
@@ -502,6 +521,9 @@ export async function probeState(
       ? {
         current_token: marker.token,
         current_expires_at: new Date(marker.expires_at_s * 1000).toISOString(),
+        ...(marker.managed_sha256
+          ? { current_managed_sha256: marker.managed_sha256 }
+          : {}),
       }
       : {}),
     observed_at: new Date(deps.now()).toISOString(),

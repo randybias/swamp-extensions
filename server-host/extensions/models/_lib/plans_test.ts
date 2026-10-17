@@ -40,6 +40,7 @@ const RULES: FirewallRules = {
 
 const KEY = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFakeKeyMaterialForTests";
 const TOKEN = "0".repeat(16);
+const SHA = "c".repeat(64);
 
 interface Fake {
   deps: SshDeps;
@@ -84,6 +85,7 @@ function fakeTransport(
 
 Deno.test("armed-revert: the arm step precedes the apply step in the plan", () => {
   const steps = planFirewallChange({
+    managedSha256: SHA,
     token: TOKEN,
     revertAfterS: 300,
     sudo: true,
@@ -102,6 +104,7 @@ Deno.test("armed-revert: the arm step precedes the apply step in the plan", () =
 Deno.test("armed-revert: the emitted command stream arms before it applies", async () => {
   const f = fakeTransport();
   const steps = planFirewallChange({
+    managedSha256: SHA,
     token: TOKEN,
     revertAfterS: 300,
     sudo: true,
@@ -129,6 +132,7 @@ Deno.test("pre-check failure stops the plan before apply", async () => {
     c.includes("'nft' '-c' '-f' '-'") ? { code: 1 } : { code: 0 }
   );
   const steps = planFirewallChange({
+    managedSha256: SHA,
     token: TOKEN,
     revertAfterS: 60,
     sudo: false,

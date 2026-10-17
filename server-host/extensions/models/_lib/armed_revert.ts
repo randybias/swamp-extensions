@@ -34,7 +34,7 @@ export function scriptPath(token: string): string {
 
 /** The host-side lock serializing arm, apply, restore and cancel. */
 export const LOCK_PATH = `${STATE_DIR}/revert.lock`;
-/** The host-side record of the one current revert: `<token> <expiry epoch>`. */
+/** The host-side record of the one current revert: `<token> <expiry epoch> <managed sha256>`. */
 export const CURRENT_PATH = `${STATE_DIR}/current`;
 
 /** The base name of the transient timer unit for `token`. */
@@ -106,7 +106,11 @@ export function renderArmArgv(
   token: string,
   revertAfterS: number,
   sudo: boolean,
+  managedSha256: string,
 ): string[] {
+  if (!/^[0-9a-f]{64}$/.test(managedSha256)) {
+    throw new HostConfigError("managed table hash must be 64 lowercase hex");
+  }
   if (
     !Number.isInteger(revertAfterS) || revertAfterS < 60 || revertAfterS > 1800
   ) {
@@ -121,7 +125,7 @@ flock 9
 ${BUSY_FN}cur="${CURRENT_PATH}"
 if [ -f "$cur" ]; then
   otok=; oexp=0
-  read otok oexp < "$cur" || true
+  read otok oexp _ < "$cur" || true
   case "$otok" in ""|*[!0-9a-f]*) otok= ;; esac
   case "$oexp" in ""|*[!0-9]*) oexp=0 ;; esac
   if [ -n "$otok" ] && [ "$otok" != '${token}' ]; then
@@ -138,7 +142,7 @@ if [ -f "$cur" ]; then
   fi
 fi
 nft list ruleset > "${snapshotPath(token)}"
-printf '%s %s\n' '${token}' "$(( $(date +%s) + ${revertAfterS} ))" > "$cur.tmp"
+printf '%s %s %s\n' '${token}' "$(( $(date +%s) + ${revertAfterS} ))" '${managedSha256}' > "$cur.tmp"
 mv -f "$cur.tmp" "$cur"
 if ! systemd-run --on-active=${revertAfterS}s --unit=${unit} --collect --description='server-host armed revert' --quiet '${
     scriptPath(token)
@@ -176,7 +180,7 @@ exec 9>"${LOCK_PATH}"
 flock 9
 [ -f "${CURRENT_PATH}" ] || exit ${APPLY_REFUSED.superseded}
 ctok=; cexp=0
-read ctok cexp < "${CURRENT_PATH}" || true
+read ctok cexp _ < "${CURRENT_PATH}" || true
 [ "$ctok" = '${token}' ] || exit ${APPLY_REFUSED.superseded}
 [ -f "${snapshotPath(token)}" ] || exit ${APPLY_REFUSED.restored}
 case "$cexp" in ""|*[!0-9]*) exit ${APPLY_REFUSED.expired} ;; esac
@@ -235,17 +239,27 @@ export function renderMarkerArgv(sudo: boolean): string[] {
   return withSudo(sudo, [
     "sh",
     "-c",
-    `cat "${CURRENT_PATH}" 2>/dev/null || true`,
+    // Empty only when the marker is absent; any read error exits non-zero.
+    `if [ -e "${CURRENT_PATH}" ]; then cat "${CURRENT_PATH}"; fi`,
   ]);
 }
 
-/** Parses the marker `<token> <expiry epoch>`; null when absent or malformed. */
+/**
+ * Parses the marker `<token> <expiry epoch> [<managed table sha256>]`; null
+ * when absent or malformed.
+ */
 export function parseMarker(
   stdout: string,
-): { token: string; expires_at_s: number } | null {
-  const m = /^([0-9a-f]{16,64}) ([0-9]{1,12})\s*$/.exec(stdout);
+): { token: string; expires_at_s: number; managed_sha256?: string } | null {
+  const m = /^([0-9a-f]{16,64}) ([0-9]{1,12})(?: ([0-9a-f]{64}))?\s*$/.exec(
+    stdout,
+  );
   return m && TOKEN_RE.test(m[1])
-    ? { token: m[1], expires_at_s: Number(m[2]) }
+    ? {
+      token: m[1],
+      expires_at_s: Number(m[2]),
+      ...(m[3] ? { managed_sha256: m[3] } : {}),
+    }
     : null;
 }
 

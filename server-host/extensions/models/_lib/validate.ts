@@ -19,7 +19,6 @@ export class HostConfigError extends Error {
 
 const V4_OCTET = "(?:25[0-5]|2[0-4]\\d|1\\d\\d|[1-9]?\\d)";
 const ADDR_V4 = new RegExp(`^(?:${V4_OCTET}\\.){3}${V4_OCTET}$`);
-const CIDR_RE = /^(.+)\/(\d{1,3})$/;
 /** Grammar for Debian package names. */
 export const PACKAGE_RE = /^[a-z0-9][a-z0-9+.-]{0,63}(?::[a-z0-9-]{1,32})?$/;
 /** Grammar for conventional POSIX account names. */
@@ -39,22 +38,74 @@ export const AUTHORIZED_KEY_RE = new RegExp(
 );
 const MAX_TEXT = 4096;
 
+/** A parsed CIDR: family, prefix length and the masked network address. */
+export interface ParsedCidr {
+  /** Address family. */
+  family: 4 | 6;
+  /** Prefix length in bits. */
+  prefix: number;
+  /** Network address (host bits cleared) as an integer. */
+  network: bigint;
+}
+
+function parseV4(addr: string): bigint | null {
+  if (!ADDR_V4.test(addr)) return null;
+  return addr.split(".").reduce((n, o) => (n << 8n) | BigInt(o), 0n);
+}
+
+const HEX_GROUP = /^[0-9A-Fa-f]{1,4}$/;
+
+/** Strict IPv6 grammar: hex groups, at most one `::`, optional trailing dotted IPv4. */
+function parseV6(addr: string): bigint | null {
+  if (!/^[0-9A-Fa-f:.]+$/.test(addr)) return null;
+  const halves = addr.split("::");
+  if (halves.length > 2) return null;
+  const words = (part: string): number[] | null => {
+    if (part === "") return [];
+    const out: number[] = [];
+    const groups = part.split(":");
+    for (let i = 0; i < groups.length; i++) {
+      const g = groups[i];
+      if (g.includes(".")) {
+        // A dotted IPv4 tail is only valid as the very last group.
+        const v4 = i === groups.length - 1 ? parseV4(g) : null;
+        if (v4 === null) return null;
+        out.push(Number(v4 >> 16n), Number(v4 & 0xffffn));
+      } else if (HEX_GROUP.test(g)) {
+        out.push(parseInt(g, 16));
+      } else {
+        return null;
+      }
+    }
+    return out;
+  };
+  const head = words(halves[0]);
+  const tail = halves.length === 2 ? words(halves[1]) : [];
+  if (head === null || tail === null) return null;
+  if (halves.length === 2 && halves[0].includes(".")) return null;
+  const total = head.length + tail.length;
+  if (halves.length === 1 ? total !== 8 : total > 7) return null;
+  const all = [...head, ...Array(8 - total).fill(0), ...tail];
+  return all.reduce((n, w) => (n << 16n) | BigInt(w), 0n);
+}
+
+/** Parses a CIDR with a strict grammar; null when it is not one. */
+export function parseCidr(s: string): ParsedCidr | null {
+  const m = /^([0-9A-Fa-f:.]+)\/(\d{1,3})$/.exec(s);
+  if (!m) return null;
+  const v6 = m[1].includes(":");
+  const bits = v6 ? 128 : 32;
+  const prefix = Number(m[2]);
+  if (prefix > bits) return null;
+  const addr = v6 ? parseV6(m[1]) : parseV4(m[1]);
+  if (addr === null) return null;
+  const host = BigInt(bits - prefix);
+  return { family: v6 ? 6 : 4, prefix, network: (addr >> host) << host };
+}
+
 /** True when `s` is a syntactically valid IPv4 or IPv6 CIDR block. */
 export function isCidr(s: string): boolean {
-  const m = CIDR_RE.exec(s);
-  if (!m) return false;
-  const bits = Number(m[2]);
-  const addr = m[1];
-  if (addr.includes(":")) {
-    if (bits > 128) return false;
-    try {
-      new URL(`http://[${addr}]`);
-      return true;
-    } catch {
-      return false;
-    }
-  }
-  return bits <= 32 && ADDR_V4.test(addr);
+  return parseCidr(s) !== null;
 }
 
 /**
@@ -63,8 +114,36 @@ export function isCidr(s: string): boolean {
  * `192.0.2.0/0`). Assumes `s` already passed {@link isCidr}.
  */
 export function isDefaultRoute(s: string): boolean {
-  const m = CIDR_RE.exec(s);
-  return m !== null && isCidr(s) && Number(m[2]) === 0;
+  return parseCidr(s)?.prefix === 0;
+}
+
+/** Shortest prefixes accepted without acknowledging "SSH from anywhere". */
+export const MIN_PREFIX = { 4: 8, 6: 16 } as const;
+
+/**
+ * True when `cidrs` open the SSH port to (nearly) everyone: any network wider
+ * than {@link MIN_PREFIX}, or a family whose networks together cover the whole
+ * address space, such as `0.0.0.0/1` plus `128.0.0.0/1`.
+ */
+export function isEffectivelyAnywhere(cidrs: readonly string[]): boolean {
+  const parsed = cidrs.map(parseCidr).filter((c): c is ParsedCidr =>
+    c !== null
+  );
+  if (parsed.some((c) => c.prefix < MIN_PREFIX[c.family])) return true;
+  for (const family of [4, 6] as const) {
+    const bits = family === 4 ? 32 : 128;
+    const spans = parsed.filter((c) => c.family === family).map((c) => ({
+      lo: c.network,
+      hi: c.network + (1n << BigInt(bits - c.prefix)) - 1n,
+    })).sort((a, b) => (a.lo < b.lo ? -1 : a.lo > b.lo ? 1 : 0));
+    let next = 0n;
+    for (const sp of spans) {
+      if (sp.lo > next) break;
+      if (sp.hi + 1n > next) next = sp.hi + 1n;
+    }
+    if (spans.length > 0 && next >= (1n << BigInt(bits))) return true;
+  }
+  return false;
 }
 
 /** Throws unless `s` is a valid CIDR block. */

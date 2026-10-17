@@ -12,6 +12,7 @@ import {
   HostConfigError,
   isCidr,
   isDefaultRoute,
+  isEffectivelyAnywhere,
   isPort,
 } from "./validate.ts";
 
@@ -25,8 +26,8 @@ Deno.test("cidr: accepts documentation ranges and both families, rejects junk", 
       "203.0.113.128/25",
       "192.0.2.128/26",
       "2001:db8::/32",
-      "::/0",
-      "0.0.0.0/0",
+      "::/0", // leak-allow(address-space halves are the case under test)
+      "0.0.0.0/0", // leak-allow(address-space halves are the case under test)
     ]
   ) {
     assertEquals(isCidr(good), true, good);
@@ -46,8 +47,8 @@ Deno.test("cidr: accepts documentation ranges and both families, rejects junk", 
     assertEquals(isCidr(bad), false, bad);
     assertThrows(() => assertCidr(bad), HostConfigError);
   }
-  assertEquals(isDefaultRoute("0.0.0.0/0"), true);
-  assertEquals(isDefaultRoute("::/0"), true);
+  assertEquals(isDefaultRoute("0.0.0.0/0"), true); // leak-allow(address-space halves are the case under test)
+  assertEquals(isDefaultRoute("::/0"), true); // leak-allow(address-space halves are the case under test)
   assertEquals(isDefaultRoute("192.0.2.0/24"), false);
 });
 
@@ -131,12 +132,12 @@ Deno.test("dedupe: stable sorted sets", () => {
 Deno.test("isDefaultRoute: any numerically zero prefix is anywhere, in any spelling", () => {
   for (
     const anywhere of [
-      "0.0.0.0/0",
-      "::/0",
+      "0.0.0.0/0", // leak-allow(address-space halves are the case under test)
+      "::/0", // leak-allow(address-space halves are the case under test)
       "0:0:0:0:0:0:0:0/0", // leak-allow(expanded IPv6 zero is the case under test)
       "0000:0000:0000:0000:0000:0000:0000:0000/0", // leak-allow(zero-padded IPv6 zero is the case under test)
-      "::/00",
-      "0.0.0.0/00",
+      "::/00", // leak-allow(address-space halves are the case under test)
+      "0.0.0.0/00", // leak-allow(address-space halves are the case under test)
       "192.0.2.0/0",
       "2001:db8::/000",
     ]
@@ -144,9 +145,72 @@ Deno.test("isDefaultRoute: any numerically zero prefix is anywhere, in any spell
     assertEquals(isCidr(anywhere), true, anywhere);
     assertEquals(isDefaultRoute(anywhere), true, anywhere);
   }
-  for (const narrow of ["192.0.2.0/24", "2001:db8::/32", "::/1", "0.0.0.0/1"]) {
+  for (const narrow of ["192.0.2.0/24", "2001:db8::/32", "::/1", "0.0.0.0/1"]) { // leak-allow(address-space halves are the case under test)
     assertEquals(isDefaultRoute(narrow), false, narrow);
   }
   // Not a CIDR at all: never reported as a default route.
   assertEquals(isDefaultRoute("not-a-cidr/0"), false);
+});
+
+Deno.test("isCidr: IPv6 follows a strict grammar and refuses injected characters", () => {
+  for (
+    const ok of [
+      "2001:db8::1/64",
+      "2001:db8::/32",
+      "::1/128",
+      "::ffff:192.0.2.1/128", // leak-allow(grammar edge case under test)
+      "2001:DB8:0:0:0:0:0:1/64",
+      "2001:db8::/10",
+    ]
+  ) {
+    assertEquals(isCidr(ok), true, ok);
+  }
+  for (
+    const bad of [
+      "2001:db8::1]/x/64",
+      "::1]#x/64",
+      "[2001:db8::1]/64",
+      "2001:db8::1 /64",
+      "2001:db8::1@x/64",
+      "2001:db8::1/129",
+      "2001::db8::1/64",
+      "1:2:3:4:5:6:7/64", // leak-allow(grammar edge case under test)
+      "1:2:3:4:5:6:7:8:9/64", // leak-allow(grammar edge case under test)
+      "12345::/64",
+      ":::/0",
+      "::192.0.2.1:1/64", // leak-allow(grammar edge case under test)
+      "192.0.2.1::/64", // leak-allow(grammar edge case under test)
+      "2001:db8::1%eth0/64",
+      "2001:db8::1/64\n",
+      "2001:db8::1/6 4",
+    ]
+  ) {
+    assertEquals(isCidr(bad), false, JSON.stringify(bad));
+  }
+});
+
+Deno.test("isEffectivelyAnywhere: wide networks and covering unions, but not ordinary ranges", () => {
+  for (
+    const wide of [
+      ["0.0.0.0/1", "128.0.0.0/1"], // leak-allow(address-space halves are the case under test)
+      ["::/1", "8000::/1"], // leak-allow(address-space halves are the case under test)
+      ["0.0.0.0/2", "64.0.0.0/2", "128.0.0.0/2", "192.0.0.0/2"], // leak-allow(address-space halves are the case under test)
+      ["0.0.0.0/7"], // leak-allow(address-space halves are the case under test)
+      ["2000::/15"], // leak-allow(address-space halves are the case under test)
+      ["192.0.2.0/24", "0.0.0.0/0"], // leak-allow(address-space halves are the case under test)
+    ]
+  ) {
+    assertEquals(isEffectivelyAnywhere(wide), true, wide.join());
+  }
+  for (
+    const fine of [
+      ["203.0.113.0/8"],
+      ["192.0.2.0/24", "198.51.100.0/24"],
+      ["2001:db8::/32"],
+      ["0.0.0.0/8", "128.0.0.0/8"], // leak-allow(address-space halves are the case under test)
+      [],
+    ]
+  ) {
+    assertEquals(isEffectivelyAnywhere(fine), false, fine.join());
+  }
 });

@@ -1122,6 +1122,13 @@ export interface PolicyAnalysis {
   declaresSecureTransport: boolean;
   /** Normalised statements. */
   statements: NormalisedStatement[];
+  /**
+   * The validated document re-serialised from the parsed value. This, not the
+   * caller's text, is what is sent: a duplicate JSON key resolves to its last
+   * value in the parser that validated it, and the server's parser could pick
+   * the other one.
+   */
+  document: string;
 }
 
 function isObject(v: JsonValue | undefined): v is { [k: string]: JsonValue } {
@@ -1348,6 +1355,7 @@ export function analysePolicy(
     statementCount: statements.length,
     declaresSecureTransport,
     statements,
+    document: JSON.stringify(parsed),
   };
 }
 
@@ -1395,23 +1403,32 @@ function statementTargetsOwner(
 }
 
 /**
- * True when a Deny's Condition can never change the outcome: no Condition at
- * all, or a Bool `aws:SecureTransport` that matches both true and false (so it
- * applies on every request and equally locks the owner out).
+ * True when a Deny's Condition applies to every request the owner makes. The
+ * gateway is reached over https only, so every such request has
+ * `aws:SecureTransport` true: no Condition at all, or a Bool on
+ * `aws:SecureTransport` that can match true (alone, or together with false),
+ * applies on all of them and locks the owner out. A Deny gated on false (the
+ * usual "refuse plain HTTP" rule) never applies over https and is fine.
  */
 function conditionAlwaysApplies(condition: JsonValue | undefined): boolean {
   if (condition === undefined) return true;
   if (!isObject(condition)) return false;
   const operators = Object.keys(condition);
-  if (operators.length !== 1 || operators[0] !== "Bool") return false;
-  const bool = condition.Bool;
+  if (
+    operators.length !== 1 ||
+    (operators[0] !== "Bool" && operators[0] !== "BoolIfExists")
+  ) {
+    return false;
+  }
+  const bool = condition[operators[0]];
   if (!isObject(bool)) return false;
   const keys = Object.keys(bool);
-  if (keys.length !== 1 || keys[0] !== "aws:SecureTransport") return false;
-  const values = conditionList(bool["aws:SecureTransport"]);
+  if (keys.length !== 1 || keys[0].toLowerCase() !== "aws:securetransport") {
+    return false;
+  }
+  const values = conditionList(bool[keys[0]]);
   if (values === null) return false;
-  const lowered = new Set(values.map((v) => v.toLowerCase()));
-  return lowered.has("true") && lowered.has("false");
+  return values.some((v) => v.toLowerCase() === "true");
 }
 
 /**
@@ -2205,7 +2222,7 @@ export async function bucketPolicyEnsure(
         path: `/${ctx.bucket}`,
         query: { policy: "" },
         headers: { "content-type": "application/json" },
-        body: encoder.encode(args.policyDocument),
+        body: encoder.encode(analysis.document),
         signed: true,
       });
       if (put.kind === "answered") {

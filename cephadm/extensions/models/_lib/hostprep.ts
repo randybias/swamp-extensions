@@ -474,6 +474,22 @@ export async function probeCephadmVersion(
   return { healthy, token, code: r.code, stdout: r.stdout, stderr: r.stderr };
 }
 
+/**
+ * The remote script that downloads cephadm. The URL reaches curl only as a
+ * config read from a here-document, never as an argument.
+ */
+export function curlDownloadScript(url: string): string {
+  if (/[\x00-\x1f\x7f"\\]/.test(url)) {
+    fail("validate", "invalid cephadmUrl", { field: "cephadmUrl" });
+  }
+  return [
+    `curl --fail --silent --show-error -o ${CEPHADM_PATH} -K - <<'CEPHADM_URL_CONFIG'`,
+    `url = "${url}"`,
+    "CEPHADM_URL_CONFIG",
+    "",
+  ].join("\n");
+}
+
 /** Ensures the pinned cephadm binary is present and healthy, returning its evidence. */
 export async function ensureCephadm(
   session: SshSession,
@@ -505,13 +521,12 @@ export async function ensureCephadm(
     reinstalledBroken = true;
     alreadyPresent = false;
   }
-  // The URL is delivered on stdin, not on the ssh argv, so a query token is
-  // never visible in the process list.
+  // The URL travels on stdin twice over: the script itself, and inside it the
+  // URL goes to curl as a config on curl's own stdin (`-K -`), so a query token
+  // is on no command line, neither the ssh argv nor the remote curl's.
   const curl = await session.run({
     command: "bash -s --",
-    stdin: `curl --fail --silent --show-error -o ${CEPHADM_PATH} ${
-      quote(opts.url)
-    }\n`,
+    stdin: curlDownloadScript(opts.url),
     sudo: true,
     allowNonZero: true,
   });

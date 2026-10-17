@@ -1,9 +1,14 @@
-import { assertEquals, assertRejects } from "jsr:@std/assert@1.0.19";
+import {
+  assertEquals,
+  assertRejects,
+  assertThrows,
+} from "jsr:@std/assert@1.0.19";
 import { PhaseError, SudoPolicyError, TransportError } from "./errors.ts";
 import {
   busyProbeScript,
   cephadmHealth,
   classifyProbe,
+  curlDownloadScript,
   discoveryScript,
   ensureCephadm,
   ensureTimeSync,
@@ -484,4 +489,48 @@ Deno.test("the busy phase with a budget ends at apt-busy without sleeping past i
     "apt-busy",
   );
   assertEquals(sleeps.every((s) => s <= 10_000 && s >= 1), true);
+});
+
+Deno.test("the download URL reaches curl as a config on stdin, never as an argument", () => {
+  const url = "https://download.example.com/cephadm?token=PLACEHOLDER-TOKEN";
+  const script = curlDownloadScript(url);
+  const [command] = script.split("\n");
+  assertEquals(command.includes("PLACEHOLDER-TOKEN"), false);
+  assertEquals(command.includes("-K -"), true);
+  assertEquals(script.includes(`url = "${url}"`), true);
+  // Anything that could break out of the config or the here-document is refused.
+  for (
+    const bad of [
+      'https://a.example.com/x"y',
+      "https://a.example.com/x\ny",
+      "https://a.example.com/x\\y",
+    ]
+  ) {
+    assertThrows(() => curlDownloadScript(bad));
+  }
+});
+
+Deno.test("the install script is the only place the URL appears on the wire", async () => {
+  const { session, calls } = fakeSession((opts) => {
+    if (opts.command.startsWith("test -x ")) return ok("", 1);
+    if (opts.command === "bash -s --") return ok();
+    if (opts.command.startsWith("chmod ")) return ok();
+    if (opts.command.endsWith(" version")) {
+      return ok("cephadm version 19.2.1 (x)");
+    }
+    throw new Error(`unexpected ${opts.command}`);
+  });
+  await ensureCephadm(session, {
+    url: "https://download.example.com/cephadm?token=PLACEHOLDER-TOKEN",
+    version: "19.2.1",
+  });
+  for (const c of calls) {
+    assertEquals(c.command.includes("PLACEHOLDER-TOKEN"), false);
+  }
+  const install = calls.find((c) => c.command === "bash -s --")!;
+  assertEquals((install.stdin ?? "").includes("PLACEHOLDER-TOKEN"), true);
+  assertEquals(
+    (install.stdin ?? "").split("\n")[0].includes("PLACEHOLDER-TOKEN"),
+    false,
+  );
 });

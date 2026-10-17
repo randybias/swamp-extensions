@@ -1634,3 +1634,96 @@ Deno.test("policy: a failed PAB lift restores the original block and says so", a
   assertEquals(message.includes("restored"), true);
   assertEquals(full, true);
 });
+
+Deno.test("policy: the validated, re-serialised document is what is sent", async () => {
+  // Two Statement keys: JSON.parse keeps the last, which is what was validated.
+  const ignored = {
+    Effect: "Allow",
+    Principal: "*",
+    Action: "s3:GetObject",
+    Resource: "arn:aws:s3:::data-01/*",
+  };
+  const text = `{"Version":"2012-10-17","Statement":${
+    JSON.stringify(ignored)
+  },"Statement":${
+    JSON.stringify({
+      Effect: "Deny",
+      Principal: "*",
+      Action: "s3:*",
+      Resource: "arn:aws:s3:::data-01/*",
+      Condition: { Bool: { "aws:SecureTransport": "false" } },
+    })
+  }}`;
+  const { fetch, calls } = fakeFetch(policyHandler({ pab: "full" }));
+  await bucketPolicyEnsure(
+    { fetch, now: () => NOW },
+    { ...ARGS, policyDocument: text },
+  );
+  const put = calls.find((c) =>
+    c.method === "PUT" && new URL(c.url).search.includes("policy")
+  )!;
+  assertEquals(put.body, JSON.stringify(JSON.parse(text)));
+  assertEquals(put.body.includes("s3:GetObject"), false);
+  assertEquals(put.body === text, false);
+});
+
+Deno.test("owner lockout: a Deny on SecureTransport true locks out over https, false does not", () => {
+  const deny = (value: unknown, operator = "Bool") =>
+    analysePolicy(
+      JSON.stringify({
+        Version: "2012-10-17",
+        Statement: {
+          Effect: "Deny",
+          Principal: "*",
+          Action: "s3:*",
+          Resource: "arn:aws:s3:::data-01",
+          Condition: { [operator]: { "aws:SecureTransport": value } },
+        },
+      }),
+      "data-01",
+    );
+  for (
+    const locked of [
+      deny("true"),
+      deny(true),
+      deny(["true"]),
+      deny(["false", "true"]),
+      deny("TRUE"),
+      deny("true", "BoolIfExists"),
+    ]
+  ) {
+    assertEquals(
+      ownerLockout(locked.statements, "owner-1", "data-01").length > 0,
+      true,
+    );
+  }
+  for (
+    const fine of [deny("false"), deny(false), deny("false", "BoolIfExists")]
+  ) {
+    assertEquals(ownerLockout(fine.statements, "owner-1", "data-01").length, 0);
+  }
+});
+
+Deno.test("policy: a SecureTransport-true Deny is refused as self-lockout before any write", async () => {
+  const doc = JSON.stringify({
+    Version: "2012-10-17",
+    Statement: {
+      Effect: "Deny",
+      Principal: "*",
+      Action: "s3:*",
+      Resource: "arn:aws:s3:::data-01",
+      Condition: { Bool: { "aws:SecureTransport": "true" } },
+    },
+  });
+  const { fetch, calls } = fakeFetch(policyHandler({ pab: "full" }));
+  await assertRejects(
+    () =>
+      bucketPolicyEnsure(
+        { fetch, now: () => NOW },
+        { ...ARGS, policyDocument: doc },
+      ),
+    Error,
+    "cephadm[self-lockout]",
+  );
+  assertEquals(calls.some((c) => c.method === "PUT"), false);
+});

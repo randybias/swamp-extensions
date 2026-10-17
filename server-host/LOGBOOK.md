@@ -470,3 +470,47 @@ Review of 16f38c5:
   documented).
 - The shell tests ignore a broken stdin pipe when the script exits before
   reading.
+
+### Live e2e 2026-10-17: the server stack (2026.10.17.2 and 2026.10.17.3)
+
+Folded from the server-stack acceptance receipts (run sp-20261017). Real
+addresses, hostnames, DNS names and provider ids are redacted: `<stack1>` and
+`<stack2>` are the throwaway hosts, `<mesh-hub>` the WireGuard hub, `<control>`
+the control host, `<outside>` the outside probe source, `<mesh-addr>` the host's
+mesh address. server-host ran inside the `@randybias/server-stack` workflows
+(apply-base, apply-firewall + commit, lockdown + commit), installed from local
+sources, never the registry.
+
+| Part | Head                          | Cells               | server-host result                                                                                                                                                                                                                             |
+| ---- | ----------------------------- | ------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 1    | 0cfe601 (17.1) on `<stack1>`  | 13 pass, 2 fail, 15 | apply-base, firewall and lockdown committed over the mesh; the `input`/`forward` drop policies cut a k0s node's pods off (`kube-bridge`); passed only with a manual firewall workaround (fixed in 17.2)                                        |
+| 2    | 16f38c5, cec6bfd (17.2)       | offline             | `trusted_interfaces`; 163 of 163 tests including real `nft -c`, a double apply and the JSON read-back on nftables 1.0.9; unset input byte-identical to 17.1                                                                                    |
+| 3    | cec6bfd (17.2) on `<stack2>`  | 14 pass, 3 fail, 17 | k0s Ready with no manual rule; public 22/4222/6443/8222/10250 closed from `<outside>`; FAIL: a rebuilt host handed a deleted host's address inherited its record (apply-base 0 steps); FAIL: adopt re-applied SSH-from-anywhere for about 20 s |
+| 4    | fd3716d (17.3), stack e8aad54 | 8 pass, 0 fail, 8   | see below                                                                                                                                                                                                                                      |
+
+Part 4 on fd3716d, a fresh `<stack2>`:
+
+| Cell                                                  | Result | Detail                                                                                                            |
+| ----------------------------------------------------- | ------ | ----------------------------------------------------------------------------------------------------------------- |
+| fresh provision, one uninterrupted run, no workaround | PASS   | 8m55s: apply-base 9 steps, firewall + lockdown committed, k0s Ready, NATS over the mesh, DNS created              |
+| adopt: no second server, no second record             | PASS   | `Ensuring server`, no order; DNS create skipped                                                                   |
+| adopt: firewall and lockdown are no-ops               | PASS   | `firewall on <mesh-addr>: ruleset already live, no-op`; same for lockdown; both commits skipped (no revert armed) |
+| adopt never reopens public SSH                        | PASS   | `<outside>` probed public :22 once a second for the whole run: 57 probes, 0 open                                  |
+| adopt: NATS still answers, k0s still Ready            | PASS   | probe-nats, check-nats, wait-k0s                                                                                  |
+| teardown runs `forget` on both records                | PASS   | the public-address and mesh-address records hold only `host, forgotten_at, observed_at`                           |
+| teardown proof against the providers                  | PASS   | server and DNS record deleted; provider server and record counts equal the before snapshots                       |
+| teardown again                                        | PASS   | delete steps skipped, verify steps pass                                                                           |
+
+Not exercised live: a record carrying a mismatching identity (refusal covered by
+tests only) and a rebuilt host receiving a deleted host's address (the provider
+handed out a new address in Part 4).
+
+Residuals on 2026.10.17.3 (beta):
+
+- `forget` does not check the record's revert identity, is not idempotent, and
+  can be left half-written if it fails between records.
+- Revert records drop the identity when it is omitted.
+- Records written before 17.3 (no identity) are adopted silently and stamped.
+- Widening guard: a deliberate `ssh_port` change can bypass the management-only
+  to open check.
+- `_lib/ssh.ts` is not the canonical transport (see 7860bb0); convergence debt.

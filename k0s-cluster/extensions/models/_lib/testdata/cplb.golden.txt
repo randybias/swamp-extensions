@@ -1,0 +1,25 @@
+apiVersion: k0s.k0sproject.io/v1beta1
+kind: ClusterConfig
+metadata:
+  name: k0s-lab
+spec:
+  api:
+    port: 6443
+    sans:
+      - "192.0.2.10"
+      - k0s.example.com
+  network:
+    podCIDR: "192.0.2.0/24"
+    serviceCIDR: "198.51.100.0/24"
+    controlPlaneLoadBalancing:
+      enabled: true
+      type: Keepalived
+      keepalived:
+        vrrpInstances:
+          - virtualIPs:
+              - "192.0.2.10/24"
+            authPass: abc12345
+  storage:
+    type: etcd
+  telemetry:
+    enabled: false

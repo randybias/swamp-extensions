@@ -28,7 +28,7 @@ export const K0S_VERSION_RE = /^v?\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?$/;
 /** A 64-character hex digest. */
 export const SHA256_RE = /^[0-9a-f]{64}$/i;
 /** A cluster role the host may be installed as. */
-export type K0sRole = "single" | "controller" | "worker";
+export type K0sRole = "single" | "controller" | "controller_worker" | "worker";
 
 /** A host's CPU architecture as k0s names it in a release artifact. */
 export type K0sArch = "amd64" | "arm64";
@@ -81,6 +81,14 @@ export interface K0sConfigInput {
   storage_type: "etcd" | "kine";
   /** Whether anonymous telemetry is enabled. */
   telemetry_enabled: boolean;
+  /** Advertised API address for clients (VIP or external LB); omit for none. */
+  external_address?: string;
+  /** Enable node-local load balancing; omit or false keeps the default. */
+  node_local_load_balancing?: boolean;
+  /** Control-plane keepalived VIPs (CIDR); omit for none. */
+  control_plane_load_balancing?: { virtual_ips: string[]; auth_pass: string };
+  /** etcd peer address; omit keeps k0s's default (the API address). */
+  etcd_peer_address?: string;
   /** Helm extensions to declare. */
   helm: HelmChartInput[];
 }
@@ -198,6 +206,55 @@ export function archFromUname(uname: string): K0sArch {
   }
 }
 
+/** A parsed k0s version: Kubernetes major/minor/patch plus the k0s revision. */
+export interface K0sVersion {
+  /** Kubernetes major. */
+  major: number;
+  /** Kubernetes minor. */
+  minor: number;
+  /** Kubernetes patch. */
+  patch: number;
+  /** The `k0s.N` revision, 0 when absent. */
+  revision: number;
+}
+
+/** Parses a k0s version, or null when it is not one. */
+export function tryK0sVersion(version: string): K0sVersion | null {
+  const m = /^v?(\d+)\.(\d+)\.(\d+)(?:\+k0s\.(\d+))?/.exec(version.trim());
+  if (!m) return null;
+  return {
+    major: Number(m[1]),
+    minor: Number(m[2]),
+    patch: Number(m[3]),
+    revision: m[4] ? Number(m[4]) : 0,
+  };
+}
+
+/**
+ * Compares two k0s versions by Kubernetes major/minor/patch and then the k0s
+ * revision, so a patch or revision downgrade is refused, not only a minor one.
+ * Negative when `a` is lower, 0 when equal, positive when higher.
+ */
+export function compareK0sVersion(a: string, b: string): number {
+  const x = tryK0sVersion(a);
+  const y = tryK0sVersion(b);
+  if (!x || !y) throw new Error(`cannot compare k0s versions ${a} and ${b}`);
+  for (const key of ["major", "minor", "patch", "revision"] as const) {
+    if (x[key] !== y[key]) return x[key] - y[key];
+  }
+  return 0;
+}
+
+/** Fixed placeholder that replaces every secret value in a public render. */
+export const REDACTED_SECRET = "REDACTED";
+
+/** The major.minor of a k0s/Kubernetes version, for skew checks. */
+export function k8sMinor(version: string): number {
+  const m = /^v?(\d+)\.(\d+)/.exec(version);
+  if (!m) throw new Error(`cannot read a Kubernetes minor from ${version}`);
+  return Number(m[1]) * 1000 + Number(m[2]);
+}
+
 /** Returns the pinned release URL, or the caller's override. */
 export function downloadUrl(
   version: string,
@@ -228,13 +285,23 @@ export async function verifyBinary(
  * ever scheduled. (`--single` would also do it but switches the datastore to
  * kine, overriding the `storage_type` input, so the two explicit flags are used.)
  */
-export function installArgs(role: K0sRole, force = false): string[] {
-  const base = role === "single"
-    ? ["install", "controller", "--enable-worker", "--no-taints"]
-    : role === "controller"
-    ? ["install", "controller"]
-    : ["install", "worker", "--token-file", K0S_WORKER_TOKEN_PATH];
-  return force ? [...base, "--force"] : base;
+export function installArgs(
+  role: K0sRole,
+  options: { noTaints?: boolean; force?: boolean; join?: boolean } = {},
+): string[] {
+  const { noTaints = false, force = false, join = false } = options;
+  const args = ["install", role === "worker" ? "worker" : "controller"];
+  if (role === "single" || role === "controller_worker") {
+    args.push("--enable-worker");
+  }
+  if (role === "single" || (role === "controller_worker" && noTaints)) {
+    args.push("--no-taints");
+  }
+  if (role === "worker" || join) {
+    args.push("--token-file", K0S_WORKER_TOKEN_PATH);
+  }
+  if (force) args.push("--force");
+  return args;
 }
 
 /** How an installed k0scontroller unit was set up. */
@@ -407,6 +474,9 @@ export function renderK0sConfig(input: K0sConfigInput): string {
     lines.push(`    address: ${yamlScalar(input.api_address)}`);
   }
   lines.push(`    port: ${input.api_port}`);
+  if (input.external_address) {
+    lines.push(`    externalAddress: ${yamlScalar(input.external_address)}`);
+  }
   // The API address is always a SAN, or clients on that address would fail
   // certificate verification.
   const sans = input.api_address && !input.api_sans.includes(input.api_address)
@@ -421,7 +491,33 @@ export function renderK0sConfig(input: K0sConfigInput): string {
   lines.push("  network:");
   lines.push(`    podCIDR: ${yamlScalar(input.pod_cidr)}`);
   lines.push(`    serviceCIDR: ${yamlScalar(input.service_cidr)}`);
+  if (input.control_plane_load_balancing) {
+    // k0s puts authPass and the CIDR virtualIPs on the keepalived vrrpInstance,
+    // not on controlPlaneLoadBalancing; a top-level virtualIP is ignored.
+    lines.push("    controlPlaneLoadBalancing:");
+    lines.push("      enabled: true");
+    lines.push("      type: Keepalived");
+    lines.push("      keepalived:");
+    lines.push("        vrrpInstances:");
+    for (const vip of input.control_plane_load_balancing.virtual_ips) {
+      lines.push("          - virtualIPs:");
+      lines.push(`              - ${yamlScalar(vip)}`);
+      lines.push(
+        `            authPass: ${
+          yamlScalar(input.control_plane_load_balancing.auth_pass)
+        }`,
+      );
+    }
+  }
+  if (input.node_local_load_balancing) {
+    lines.push("    nodeLocalLoadBalancing:");
+    lines.push("      enabled: true");
+  }
   lines.push("  storage:");
+  if (input.etcd_peer_address) {
+    lines.push("    etcd:");
+    lines.push(`      peerAddress: ${yamlScalar(input.etcd_peer_address)}`);
+  }
   lines.push(`    type: ${yamlScalar(input.storage_type)}`);
   lines.push("  telemetry:");
   lines.push(`    enabled: ${input.telemetry_enabled}`);

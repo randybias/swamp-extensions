@@ -32,6 +32,7 @@ import {
   chartBaseName,
   type ChartStatus,
   classifyControllerExecStart,
+  compareK0sVersion,
   type ControllerMode,
   defaultFetcher,
   downloadUrl,
@@ -45,6 +46,7 @@ import {
   K0S_VERSION_RE,
   K0S_WORKER_TOKEN_PATH,
   type K0sConfigInput,
+  k8sMinor,
   type NodeStatus,
   ok,
   parseCharts,
@@ -55,10 +57,12 @@ import {
   parsePods,
   parseSha256,
   type PodStatus,
+  REDACTED_SECRET,
   renderK0sConfig,
   serviceName,
   SHA256_RE,
   systemPodsHealthy,
+  tryK0sVersion,
   verifyBinary,
   withServer,
 } from "./_lib/k0s.ts";
@@ -185,6 +189,41 @@ const clusterFields = {
   telemetry_enabled: z.boolean().default(false).describe(
     "Whether anonymous telemetry is enabled.",
   ),
+  external_address: z.string().max(253).refine(
+    (v) => isIp(v) || HOST_RE.test(v),
+    "must be an IP address or hostname",
+  ).describe(
+    "Advertised API address for clients, for example an external load balancer or VIP; written to spec.api.externalAddress. Do not combine with node_local_load_balancing.",
+  ).nullish(),
+  node_local_load_balancing: z.boolean().default(false).describe(
+    "Enable k0s node-local load balancing (EnvoyProxy) so every node reaches the API locally; off keeps the previous behaviour.",
+  ),
+  control_plane_load_balancing: z.strictObject({
+    virtual_ips: z.array(
+      z.string().max(64).refine(isCidr, "must be a CIDR"),
+    ).min(1).max(16).describe("VIPs shared by the controllers, as CIDRs."),
+    auth_pass: z.string().min(1).max(8).meta({ sensitive: true }).describe(
+      "keepalived VRRP auth password, at most 8 characters; wire with a vault reference.",
+    ),
+  }).describe("Control-plane keepalived VIP; omit for none.").nullish(),
+  etcd_peer_address: z.string().max(45).refine(isIp, "must be an IP address")
+    .describe(
+      "etcd peer address written to spec.storage.etcd.peerAddress; use the private or mesh address when the API address is not directly reachable between nodes.",
+    ).nullish(),
+};
+
+const externalAndLocalLbRefine = (v: {
+  external_address?: string | null;
+  node_local_load_balancing?: boolean;
+}, ctx: z.RefinementCtx) => {
+  if (v.external_address && v.node_local_load_balancing) {
+    ctx.addIssue({
+      code: "custom",
+      message:
+        "external_address and node_local_load_balancing cannot be combined; k0s refuses node-local load balancing with an external API address",
+      path: ["node_local_load_balancing"],
+    });
+  }
 };
 
 const RenderArgs = z.strictObject({
@@ -196,7 +235,7 @@ const RenderArgs = z.strictObject({
   helm: z.array(HELM_CHART).max(64).default([]).describe(
     "Helm extensions declared in k0s.yaml.",
   ),
-});
+}).superRefine(externalAndLocalLbRefine);
 
 const InstallArgs = z.strictObject({
   ssh: SSH,
@@ -209,12 +248,17 @@ const InstallArgs = z.strictObject({
     .describe(
       "Bearer token for a private release mirror, sent as an Authorization header; wire with a vault.get(...) expression.",
     ),
-  role: z.enum(["single", "controller", "worker"]).default("single").describe(
-    "single installs a controller that also runs a worker; worker joins an existing cluster with join_token.",
+  role: z.enum(["single", "controller", "controller_worker", "worker"]).default(
+    "single",
+  ).describe(
+    "single installs a controller that also runs a worker with no control-plane taint; controller_worker installs a controller with --enable-worker (tainted unless no_taints); controller is control-plane only; worker joins an existing cluster with join_token.",
   ),
-  join_token: z.string().max(16384).meta({ sensitive: true }).nullish()
+  no_taints: z.boolean().default(false).describe(
+    "For role controller_worker, also pass --no-taints so workloads schedule on it; ignored for other roles and off keeps the previous behaviour.",
+  ),
+  join_token: z.string().min(1).max(16384).meta({ sensitive: true }).nullish()
     .describe(
-      "Join token for role worker, written to a root-only token file over stdin; never placed on a command line.",
+      "Join token for a worker, or for a controller/controller_worker joining an existing control plane, written to a root-only token file over stdin; never placed on a command line. Required for role worker.",
     ),
   force_reinstall: z.boolean().default(false).describe(
     "Reinstall over an existing service of the same role rather than adopting it.",
@@ -225,6 +269,31 @@ const InstallArgs = z.strictObject({
   ...clusterFields,
   helm: z.array(HELM_CHART).max(64).default([]).describe(
     "Helm extensions declared in k0s.yaml.",
+  ),
+}).superRefine(externalAndLocalLbRefine).superRefine((v, ctx) => {
+  if (v.role === "single" && v.join_token) {
+    ctx.addIssue({
+      code: "custom",
+      message:
+        "join_token is only used to join an existing cluster; role single is its own cluster",
+      path: ["join_token"],
+    });
+  }
+});
+
+const UpgradeArgs = z.strictObject({
+  ssh: SSH,
+  k0s_version: VERSION,
+  k0s_binary_sha256: SHA256,
+  k0s_download_url: URL.nullish().describe(
+    "Optional binary URL override; the SHA-256 check still applies.",
+  ),
+  k0s_download_token: z.string().max(4096).meta({ sensitive: true }).nullish()
+    .describe(
+      "Bearer token for a private release mirror, sent as an Authorization header; wire with a vault.get(...) expression.",
+    ),
+  ready_timeout_s: z.number().int().min(10).max(7200).default(600).describe(
+    "Give up waiting for the new version to become healthy after this many seconds.",
   ),
 });
 
@@ -291,11 +360,13 @@ const StateSchema = z.strictObject({
   host: z.string(),
   port: z.number().int(),
   user: z.string(),
-  role: z.enum(["single", "controller", "worker"]).nullable(),
+  role: z
+    .enum(["single", "controller", "controller_worker", "worker"])
+    .nullable(),
   k0s_version: z.string().nullable(),
   binary_sha256: z.string().nullable(),
   config_sha256: z.string().nullable(),
-  config_file_sha256: z.string().nullable().meta({ sensitive: true }),
+  has_helm_values: z.boolean().optional(),
   service: z.string().nullable(),
   installed: z.boolean(),
   adopted: z.boolean(),
@@ -389,7 +460,7 @@ const StatusSchema = z.strictObject({
   node: NodeViewSchema.nullable(),
   nodes: z.array(NodeViewSchema),
   system_pods: z.array(PodViewSchema),
-  config_file_sha256: z.string().nullable().meta({ sensitive: true }),
+  config_sha256: z.string().nullable(),
   stacks: z.array(z.string()),
   helm_releases: z.array(
     z.strictObject({
@@ -588,6 +659,13 @@ function renderInput(args: {
   service_cidr: string;
   storage_type: "etcd" | "kine";
   telemetry_enabled: boolean;
+  external_address?: string | null;
+  node_local_load_balancing?: boolean;
+  control_plane_load_balancing?: {
+    virtual_ips: string[];
+    auth_pass: string;
+  } | null;
+  etcd_peer_address?: string | null;
   helm: z.infer<typeof HELM_CHART>[];
 }): K0sConfigInput {
   return {
@@ -599,6 +677,18 @@ function renderInput(args: {
     service_cidr: args.service_cidr,
     storage_type: args.storage_type,
     telemetry_enabled: args.telemetry_enabled,
+    ...(args.external_address
+      ? { external_address: args.external_address }
+      : {}),
+    ...(args.node_local_load_balancing
+      ? { node_local_load_balancing: true }
+      : {}),
+    ...(args.control_plane_load_balancing
+      ? { control_plane_load_balancing: args.control_plane_load_balancing }
+      : {}),
+    ...(args.etcd_peer_address
+      ? { etcd_peer_address: args.etcd_peer_address }
+      : {}),
     helm: args.helm.map((chart) => ({
       chart: chart.chart,
       repo: chart.repo,
@@ -609,11 +699,52 @@ function renderInput(args: {
   };
 }
 
-async function remoteConfigSha(
+/**
+ * The public render: the text callers see, the config file stores and
+ * `config_sha256` covers. Helm values and the keepalived auth password are
+ * secrets, so they are stripped or replaced here; the install path uploads the
+ * real render and only the digest and this copy are public.
+ */
+function publicRender(input: K0sConfigInput): string {
+  return renderK0sConfig({
+    ...input,
+    helm: input.helm.map((chart) => ({ ...chart, values: undefined })),
+    control_plane_load_balancing: input.control_plane_load_balancing
+      ? { ...input.control_plane_load_balancing, auth_pass: REDACTED_SECRET }
+      : undefined,
+  });
+}
+
+/**
+ * Hash of the on-host k0s.yaml with every canonical authPass value replaced by
+ * the fixed placeholder, so drift can be compared without the secret leaving
+ * the host or a secret-derived hash being stored. The script runs on the node
+ * and fails closed (no digest, so drift is unknown) whenever it cannot prove
+ * the file has no secret it is about to hash: an unreadable file, a
+ * non-canonical or block authPass line, or a helm `values:` key.
+ */
+export function publicShaScript(configPath: string): string {
+  return [
+    `f='${configPath.replaceAll("'", "'\\''")}'`,
+    `[ -r "$f" ] || exit 3`,
+    `grep -n authPass "$f" | grep -qvE '^[0-9]+:[[:space:]]*authPass:[[:space:]]+[^|>]' && exit 4`,
+    `grep -qE '^[[:space:]]*values:' "$f" && exit 5`,
+    `tmp=$(mktemp) || exit 6`,
+    `trap 'rm -f "$tmp"' EXIT`,
+    `sed -E 's/^([[:space:]]*authPass:).*/\\1 ${REDACTED_SECRET}/' "$f" > "$tmp" || exit 7`,
+    `sha256sum "$tmp"`,
+  ].join("; ");
+}
+
+async function remotePublicSha(
   deps: K0sDeps,
   target: SshTarget,
 ): Promise<string | null> {
-  const result = await deps.ssh.exec(target, ["sha256sum", K0S_CONFIG_PATH]);
+  const result = await deps.ssh.exec(target, [
+    "sh",
+    "-c",
+    publicShaScript(K0S_CONFIG_PATH),
+  ]);
   return ok(result) ? parseSha256(result.stdout) : null;
 }
 
@@ -815,7 +946,7 @@ async function readLive(
     node: nodes.find((node) => node.ready) ?? nodes[0] ?? null,
     nodes,
     system_pods: pods,
-    config_file_sha256: installed ? await remoteConfigSha(deps, target) : null,
+    config_sha256: null,
     stacks: installed ? await remoteStacks(deps, target) : [],
     helm_releases: installed
       ? (await remoteHelmReleases(deps, target)).map((release) => ({
@@ -892,18 +1023,22 @@ async function cleanupK0sResidue(
   return { binary_removed: true };
 }
 
+/** The API server gitVersion from `k0s kubectl version -o json`, or null. */
+function readServerGitVersion(stdout: string): string | null {
+  try {
+    const parsed = JSON.parse(stdout) as {
+      serverVersion?: { gitVersion?: string };
+    };
+    return parsed.serverVersion?.gitVersion ?? null;
+  } catch {
+    return null;
+  }
+}
+
 function buildK0sModel(deps: K0sDeps) {
   return {
     type: "@randybias/k0s-cluster",
-    version: "2026.10.17.2",
-    upgrades: [
-      {
-        toVersion: "2026.10.17.2",
-        description:
-          "reset now also removes /etc/k0s and the k0s binary it installed; stored attributes are unchanged",
-        upgradeAttributes: (old: Record<string, unknown>) => old,
-      },
-    ],
+    version: "2026.10.17.3",
     description:
       "Install, inspect and reset a SHA-256-pinned k0s Kubernetes cluster on one host over SSH, including the rendered k0s.yaml, readiness, the admin kubeconfig, manifest stacks and Helm charts. One definition serves any host; state is keyed by the target host.",
     globalArguments: z.strictObject({}),
@@ -972,23 +1107,16 @@ function buildK0sModel(deps: K0sDeps) {
           const hasValues = args.helm.some((chart) =>
             chart.values != null && Object.keys(chart.values).length > 0
           );
-          // Helm values often carry passwords, so a render that includes them
-          // is never persisted or returned; callers get a redacted copy and a
-          // flag saying so.
-          const returnedYaml = hasValues
-            ? renderK0sConfig({
-              ...input,
-              helm: input.helm.map((chart) => ({
-                ...chart,
-                values: undefined,
-              })),
-            })
-            : yaml;
-          // The digest covers the values-free render, so it reveals nothing
-          // about chart values that may be secret.
+          const hasCplb = input.control_plane_load_balancing != null;
+          const hasSecrets = hasValues || hasCplb;
+          // Helm values and the keepalived auth password are secrets, so a
+          // render that holds them is never returned or persisted; callers get
+          // a redacted copy, and the digest covers that copy, so state and logs
+          // reveal nothing about the secret.
+          const returnedYaml = hasSecrets ? publicRender(input) : yaml;
           const configSha = await sha256Hex(encoder.encode(returnedYaml));
           const dataHandles: unknown[] = [];
-          if (!hasValues) {
+          if (!hasSecrets) {
             const writer = context.createFileWriter(
               "config",
               `${instanceName(args.cluster_name)}-config`,
@@ -1012,7 +1140,7 @@ function buildK0sModel(deps: K0sDeps) {
               k0s_version: args.k0s_version,
               k0s_yaml: returnedYaml,
               config_sha256: configSha,
-              values_redacted: hasValues,
+              values_redacted: hasSecrets,
               manifests: manifestPlan,
               helm_charts: args.helm.map((chart) => ({
                 chart: chart.chart,
@@ -1037,6 +1165,10 @@ function buildK0sModel(deps: K0sDeps) {
           );
           const now = deps.now();
           const service = serviceName(args.role);
+          const join = Boolean(args.join_token);
+          const hasHelmValues = args.helm.some((chart) =>
+            chart.values != null && Object.keys(chart.values).length > 0
+          );
           const otherService = service === "k0sworker"
             ? "k0scontroller"
             : "k0sworker";
@@ -1066,17 +1198,8 @@ function buildK0sModel(deps: K0sDeps) {
           }
 
           const yaml = renderK0sConfig(renderInput(args));
-          const configFileSha = await sha256Hex(encoder.encode(yaml));
           const configSha = await sha256Hex(
-            encoder.encode(
-              renderK0sConfig({
-                ...renderInput(args),
-                helm: renderInput(args).helm.map((chart) => ({
-                  ...chart,
-                  values: undefined,
-                })),
-              }),
-            ),
+            encoder.encode(publicRender(renderInput(args))),
           );
           // A unit that exists but is stopped is adopted and started, not
           // reinstalled over: `k0s install` would fail on it.
@@ -1090,9 +1213,11 @@ function buildK0sModel(deps: K0sDeps) {
           // change like any other.
           if (unitPresent && service === "k0scontroller") {
             const mode = await controllerMode(deps, target);
-            const wanted: ControllerMode = args.role === "single"
-              ? "single"
-              : "controller";
+            const wanted: ControllerMode = args.role === "controller"
+              ? "controller"
+              : args.role === "controller_worker" && !args.no_taints
+              ? "controller+worker"
+              : "single";
             if (mode !== wanted) {
               if (args.confirm_role_change?.toLowerCase() !== target.host) {
                 throw new Error(
@@ -1178,7 +1303,7 @@ function buildK0sModel(deps: K0sDeps) {
                 k0s_version: args.k0s_version,
                 binary_sha256: args.k0s_binary_sha256.toLowerCase(),
                 config_sha256: configSha,
-                config_file_sha256: configFileSha,
+                has_helm_values: hasHelmValues,
                 service,
                 installed: true,
                 adopted,
@@ -1268,7 +1393,7 @@ function buildK0sModel(deps: K0sDeps) {
               content: encoder.encode(yaml),
               mode: SECRET_MODE,
             });
-            if (args.role === "worker") {
+            if (join) {
               // Sent only once the install is certain to proceed, never to a
               // host that is about to be adopted or refused.
               await deps.ssh.upload(target, {
@@ -1284,7 +1409,11 @@ function buildK0sModel(deps: K0sDeps) {
 
             const installed = await deps.ssh.exec(target, [
               K0S_BINARY_PATH,
-              ...installArgs(args.role, args.force_reinstall),
+              ...installArgs(args.role, {
+                noTaints: args.no_taints,
+                force: args.force_reinstall,
+                join,
+              }),
             ]);
             if (!ok(installed)) {
               throw new Error(
@@ -1323,7 +1452,6 @@ function buildK0sModel(deps: K0sDeps) {
                 k0s_version: null,
                 binary_sha256: null,
                 config_sha256: null,
-                config_file_sha256: null,
                 service: newUnit ? service : null,
                 installed: false,
                 adopted: false,
@@ -1353,7 +1481,7 @@ function buildK0sModel(deps: K0sDeps) {
               k0s_version: args.k0s_version,
               binary_sha256: binarySha,
               config_sha256: configSha,
-              config_file_sha256: configFileSha,
+              has_helm_values: hasHelmValues,
               service,
               installed: true,
               adopted: false,
@@ -1361,6 +1489,315 @@ function buildK0sModel(deps: K0sDeps) {
             }),
           );
           return { dataHandles: [...handles, handle], result };
+        },
+      },
+
+      upgrade: {
+        kind: "action" as const,
+        description:
+          "DESTRUCTIVE. Upgrade the installed k0s binary to the pinned version, verifying the new binary before anything is stopped; a lower version and a Kubernetes minor skip are refused, and the same version is a no-op. On any failure after the stop the previous binary is restored and the unit restarted.",
+        arguments: UpgradeArgs,
+        execute: async (args: z.infer<typeof UpgradeArgs>, context: Ctx) => {
+          const { target, handles } = await resolveTarget(
+            deps,
+            context,
+            args.ssh,
+          );
+          const stored = await context.readResource(targetId(target)) as
+            | z.infer<typeof StateSchema>
+            | null;
+          if (!stored?.installed || !stored.service) {
+            throw new Error(
+              `no installed k0s service recorded for ${target.host}; run install first`,
+            );
+          }
+          const service = stored.service;
+          const to = args.k0s_version;
+          // The host is the source of truth; a stale record must not skip a gate.
+          const reported = await deps.ssh.exec(target, [
+            K0S_BINARY_PATH,
+            "version",
+          ]);
+          const hostVersion = ok(reported) ? reported.stdout.trim() : "";
+          if (!tryK0sVersion(hostVersion)) {
+            throw new Error(
+              `could not read the installed k0s version on ${target.host}; refusing to upgrade`,
+            );
+          }
+          if (stored.k0s_version && stored.k0s_version !== hostVersion) {
+            throw new Error(
+              `${target.host} reports k0s ${hostVersion}, not the recorded ${stored.k0s_version}; run sync first`,
+            );
+          }
+          const comparison = compareK0sVersion(to, hostVersion);
+          if (comparison === 0) {
+            return {
+              dataHandles: handles,
+              result: { upgraded: false, k0s_version: to },
+            };
+          }
+          if (comparison < 0) {
+            throw new Error(
+              `refusing to downgrade k0s ${hostVersion} -> ${to}`,
+            );
+          }
+          if (k8sMinor(to) - k8sMinor(hostVersion) > 1) {
+            throw new Error(
+              `refusing to skip a Kubernetes minor: ${hostVersion} -> ${to}`,
+            );
+          }
+          // One upgrade at a time on a host; a second would clobber k0s.old.
+          const lockDir = "/run/k0s-upgrade.lock";
+          const locked = await deps.ssh.exec(target, ["mkdir", lockDir]);
+          if (!ok(locked)) {
+            throw new Error(
+              `another k0s upgrade is in progress on ${target.host} (${lockDir} exists)`,
+            );
+          }
+          const stagedPath = `${K0S_BINARY_PATH}.new`;
+          const backupPath = `${K0S_BINARY_PATH}.old`;
+          try {
+            // A backup left by an earlier rollback means the host is in a state
+            // a clean upgrade should not start from.
+            const stale = await deps.ssh.exec(target, ["ls", "-d", backupPath]);
+            if (ok(stale) && stale.stdout.includes(backupPath)) {
+              throw new Error(
+                `${backupPath} already exists on ${target.host} (a previous rollback did not finish); refusing to upgrade`,
+              );
+            }
+            // Everything that can fail without touching the host is done first.
+            const uname = await deps.ssh.exec(target, ["uname", "-m"]);
+            if (!ok(uname)) {
+              throw new Error(
+                `could not read the architecture of ${target.host} (exit ${uname.exit_code})`,
+              );
+            }
+            const arch = archFromUname(uname.stdout);
+            const url = downloadUrl(
+              to,
+              arch,
+              args.k0s_download_url ?? undefined,
+            );
+            const token = args.k0s_download_token ??
+              Deno.env.get("K0S_DOWNLOAD_TOKEN");
+            const bytes = await deps.fetch(
+              url,
+              token
+                ? { headers: { Authorization: `Bearer ${token}` } }
+                : undefined,
+            );
+            const binarySha = await verifyBinary(
+              bytes,
+              args.k0s_binary_sha256,
+              url,
+            );
+            await deps.ssh.upload(target, {
+              path: stagedPath,
+              content: bytes,
+              mode: "0755",
+            });
+            const stagedSha = parseSha256(
+              (await deps.ssh.exec(target, ["sha256sum", stagedPath])).stdout,
+            );
+            if (stagedSha !== binarySha) {
+              await deps.ssh.exec(target, ["rm", "-f", stagedPath]);
+              throw new Error(
+                `the staged k0s binary on ${target.host} does not match the pinned SHA-256; removed it before stopping anything`,
+              );
+            }
+            /**
+             * Puts the previous binary back when the host still has one, starts
+             * or restarts the unit and waits for health. It asks the host
+             * whether k0s.old exists rather than trusting this process's
+             * memory, because an ssh drop after the move may hide the ack.
+             * Returns whether a backup was restored. Throws only when recovery
+             * fails, naming where the good binary is, and never deletes it.
+             */
+            const restore = async (): Promise<boolean> => {
+              await deps.ssh.exec(target, ["rm", "-f", stagedPath]);
+              const listed = await deps.ssh.exec(target, [
+                "ls",
+                "-d",
+                backupPath,
+              ]);
+              const hasBackup = ok(listed) &&
+                listed.stdout.includes(backupPath);
+              if (hasBackup) {
+                const back = await deps.ssh.exec(target, [
+                  "mv",
+                  backupPath,
+                  K0S_BINARY_PATH,
+                ]);
+                if (!ok(back)) {
+                  throw new Error(
+                    `ROLLBACK FAILED on ${target.host}: ${K0S_BINARY_PATH} holds the new binary and the previous one is at ${backupPath}; the unit may be down`,
+                  );
+                }
+              }
+              const restarted = await deps.ssh.exec(target, [
+                "systemctl",
+                hasBackup ? "restart" : "start",
+                service,
+              ]);
+              let recovered = false;
+              if (ok(restarted)) {
+                try {
+                  await waitUnitHealthy(deps, target, service, 90);
+                  recovered = true;
+                } catch {
+                  recovered = false;
+                }
+              }
+              if (!recovered) {
+                // A successful mv put the good binary at the real path; with
+                // no backup the original was already there.
+                throw new Error(
+                  `ROLLBACK FAILED on ${target.host}: the good binary is at ${K0S_BINARY_PATH} and the unit may be down`,
+                );
+              }
+              return hasBackup;
+            };
+            // The stop is inside the transaction, so a failing ssh call after it
+            // still restarts the unit.
+            try {
+              const stopped = await deps.ssh.exec(target, [
+                "systemctl",
+                "stop",
+                service,
+              ]);
+              if (!ok(stopped)) {
+                throw new Error(
+                  `systemctl stop ${service} failed on ${target.host} (exit ${stopped.exit_code})`,
+                );
+              }
+              const saved = await deps.ssh.exec(target, [
+                "mv",
+                K0S_BINARY_PATH,
+                backupPath,
+              ]);
+              if (!ok(saved)) {
+                throw new Error(
+                  `could not move the running k0s binary aside on ${target.host} (exit ${saved.exit_code})`,
+                );
+              }
+              const promoted = await deps.ssh.exec(target, [
+                "mv",
+                stagedPath,
+                K0S_BINARY_PATH,
+              ]);
+              if (!ok(promoted)) {
+                throw new Error(
+                  `could not promote the new k0s binary on ${target.host} (exit ${promoted.exit_code})`,
+                );
+              }
+              const started = await deps.ssh.exec(target, [
+                "systemctl",
+                "start",
+                service,
+              ]);
+              if (!ok(started)) {
+                throw new Error(
+                  `systemctl start ${service} failed on ${target.host} (exit ${started.exit_code})`,
+                );
+              }
+              await waitUnitHealthy(
+                deps,
+                target,
+                service,
+                args.ready_timeout_s,
+              );
+              // Prove the running server is the new version, not the file just
+              // written. A controller (or single) asks the API; k0s reports the
+              // server as "<x.y.z>+k0s" without the .N revision. A worker has
+              // no kubeconfig, so it can only check its own binary.
+              if (service === "k0scontroller") {
+                const server = await deps.ssh.exec(target, [
+                  K0S_BINARY_PATH,
+                  "kubectl",
+                  "version",
+                  "-o",
+                  "json",
+                ]);
+                const gitVersion = ok(server)
+                  ? readServerGitVersion(server.stdout)
+                  : null;
+                if (gitVersion !== `${to.split("+")[0]}+k0s`) {
+                  throw new Error(
+                    `${target.host} reports API server ${
+                      gitVersion ?? "unknown"
+                    }, not ${to} after the upgrade`,
+                  );
+                }
+              } else {
+                const version = await deps.ssh.exec(target, [
+                  K0S_BINARY_PATH,
+                  "version",
+                ]);
+                if (!ok(version) || version.stdout.trim() !== to) {
+                  throw new Error(
+                    `${target.host} did not report k0s ${to} after the upgrade`,
+                  );
+                }
+              }
+            } catch (error) {
+              const restored = await restore();
+              throw new Error(
+                `${(error as Error).message}; ${
+                  restored
+                    ? "restored the previous binary"
+                    : "the unit was started on the unchanged binary"
+                }`,
+              );
+            }
+            const handle = await context.writeResource(
+              "state",
+              targetId(target),
+              StateSchema.parse({
+                ...whoOf(target),
+                role: stored.role,
+                k0s_version: to,
+                binary_sha256: binarySha,
+                config_sha256: stored.config_sha256,
+                has_helm_values: stored.has_helm_values,
+                service,
+                installed: true,
+                adopted: stored.adopted,
+                observed_at: iso(deps.now()),
+              }),
+            );
+            const cleared = await deps.ssh.exec(target, [
+              "rm",
+              "-f",
+              backupPath,
+            ]);
+            if (!ok(cleared)) {
+              throw new Error(
+                `the upgrade to ${to} succeeded but ${backupPath} could not be removed on ${target.host} (exit ${cleared.exit_code}); delete it before the next upgrade, which will otherwise refuse`,
+              );
+            }
+            context.logger.info("Upgraded k0s on {host}: {from} -> {to}", {
+              host: target.host,
+              from: hostVersion,
+              to,
+            });
+            return {
+              dataHandles: [...handles, handle],
+              result: {
+                upgraded: true,
+                from: hostVersion,
+                k0s_version: to,
+                binary_sha256: binarySha,
+              },
+            };
+          } finally {
+            const unlocked = await deps.ssh.exec(target, ["rmdir", lockDir]);
+            if (!ok(unlocked)) {
+              context.logger.warn(
+                "{lock} could not be removed on {host} (exit {code}); remove it if it still exists, or the next upgrade or reset will refuse",
+                { lock: lockDir, host: target.host, code: unlocked.exit_code },
+              );
+            }
+          }
         },
       },
 
@@ -1787,7 +2224,6 @@ function buildK0sModel(deps: K0sDeps) {
             `${targetId(target)}~status`,
             status,
           );
-          const { config_file_sha256: configFile, ...publicStatus } = status;
           context.logger.info("Read k0s status for {host}: version {version}", {
             host: target.host,
             version: status.k0s_version ?? "not installed",
@@ -1795,8 +2231,8 @@ function buildK0sModel(deps: K0sDeps) {
           return {
             dataHandles: [...handles, handle],
             result: {
-              ...publicStatus,
-              config_present: configFile !== null,
+              ...status,
+              config_present: status.installed,
               kubeconfig_present: recorded !== null,
             },
           };
@@ -1814,8 +2250,17 @@ function buildK0sModel(deps: K0sDeps) {
             args.ssh,
           );
           const now = deps.now();
-          const status = await readLive(deps, target, now);
           const stored = await context.readResource(targetId(target));
+          // Hash the on-host config only when the record proves there are no
+          // helm values, so a health-ish status hash never covers a Helm
+          // secret; otherwise config_sha256 stays null (drift unknown).
+          const liveSha = stored !== null && stored.has_helm_values === false
+            ? await remotePublicSha(deps, target)
+            : null;
+          const status = StatusSchema.parse({
+            ...(await readLive(deps, target, now)),
+            config_sha256: liveSha,
+          });
           const diffs: string[] = [];
           if (!stored) {
             diffs.push("no recorded install; run install first");
@@ -1832,8 +2277,21 @@ function buildK0sModel(deps: K0sDeps) {
                 }`,
               );
             }
-            if (stored.config_file_sha256 !== status.config_file_sha256) {
-              diffs.push("config changed on the host since it was recorded");
+            // Compare the redacted config hashes. Helm values are removed
+            // from the recorded hash, so that case is reported as unknown
+            // rather than silently clean.
+            if (stored.config_sha256) {
+              if (stored.has_helm_values !== false) {
+                diffs.push(
+                  "config drift unknown: helm values are not part of the recorded hash",
+                );
+              } else if (status.config_sha256 === null) {
+                diffs.push(
+                  "config drift unknown: the on-host k0s.yaml could not be hashed",
+                );
+              } else if (stored.config_sha256 !== status.config_sha256) {
+                diffs.push("config changed on the host since it was recorded");
+              }
             }
           }
           const handle = await context.writeResource(
@@ -1895,7 +2353,6 @@ function buildK0sModel(deps: K0sDeps) {
                 k0s_version: null,
                 binary_sha256: null,
                 config_sha256: null,
-                config_file_sha256: null,
                 service: null,
                 installed: false,
                 adopted: false,
@@ -1903,26 +2360,129 @@ function buildK0sModel(deps: K0sDeps) {
                 ...extra,
               }),
             );
-          const singleUnit = serviceName("single");
-          const workerUnit = serviceName("worker");
-          const unit = (await unitExists(deps, target, singleUnit))
-            ? singleUnit
-            : (await unitExists(deps, target, workerUnit))
-            ? workerUnit
-            : null;
-          if (!unit) {
-            if (!pending) {
-              context.logger.info(
-                "No k0s service on {host}; reset is a no-op",
-                { host: target.host },
-              );
-              const handle = await writeState({});
+          const lockDir = "/run/k0s-upgrade.lock";
+          const locked = await deps.ssh.exec(target, ["mkdir", lockDir]);
+          if (!ok(locked)) {
+            throw new Error(
+              `an upgrade or another reset is in progress on ${target.host} (${lockDir} exists); refusing to reset`,
+            );
+          }
+          try {
+            const singleUnit = serviceName("single");
+            const workerUnit = serviceName("worker");
+            const unit = (await unitExists(deps, target, singleUnit))
+              ? singleUnit
+              : (await unitExists(deps, target, workerUnit))
+              ? workerUnit
+              : null;
+            if (!unit) {
+              if (!pending) {
+                context.logger.info(
+                  "No k0s service on {host}; reset is a no-op",
+                  { host: target.host },
+                );
+                const handle = await writeState({});
+                return {
+                  dataHandles: [...handles, handle],
+                  result: { reset: false, binary_removed: false },
+                };
+              }
+              // An earlier reset removed the unit but did not finish its cleanup.
+              let cleanup: { binary_removed: boolean; reason?: string };
+              try {
+                cleanup = await cleanupK0sResidue(
+                  deps,
+                  target,
+                  recorded,
+                  context,
+                );
+              } catch (e) {
+                await writeState({
+                  binary_sha256: recorded?.binary_sha256 ?? null,
+                  cleanup_pending: true,
+                });
+                throw e;
+              }
+              context.logger.info("Finished reset cleanup on {host}", {
+                host: target.host,
+              });
+              const handle = await writeState({
+                binary_removed: cleanup.binary_removed,
+                ...(cleanup.reason
+                  ? { binary_removal_reason: cleanup.reason }
+                  : {}),
+              });
               return {
                 dataHandles: [...handles, handle],
-                result: { reset: false, binary_removed: false },
+                result: { reset: true, ...cleanup },
               };
             }
-            // An earlier reset removed the unit but did not finish its cleanup.
+            // A k0s unit that is already stopped (after a crash or a reboot) makes
+            // `k0s stop` exit non-zero with "already stopped"; skip it when the
+            // unit is inactive, and never trust stderr text alone.
+            const active = await deps.ssh.exec(target, [
+              "systemctl",
+              "is-active",
+              unit,
+            ]);
+            const unitState = active.stdout.trim();
+            const stoppedStates = ["inactive", "failed"];
+            if (unitState === "active") {
+              const stopped = await deps.ssh.exec(target, [
+                K0S_BINARY_PATH,
+                "stop",
+              ]);
+              if (!ok(stopped)) {
+                const after = await deps.ssh.exec(target, [
+                  "systemctl",
+                  "is-active",
+                  unit,
+                ]);
+                const afterState = after.stdout.trim();
+                if (afterState === "active") {
+                  throw new Error(
+                    `k0s stop failed on ${target.host} (exit ${stopped.exit_code}) and ${unit} is still active`,
+                  );
+                }
+                if (!stoppedStates.includes(afterState)) {
+                  throw new ResetStateError(
+                    `k0s stop failed on ${target.host} and ${unit} is ${
+                      afterState || "in an unknown state"
+                    } (systemctl is-active exit ${after.exit_code})`,
+                  );
+                }
+                context.logger.info(
+                  "k0s stop reported {code} but {unit} is {state}; continuing",
+                  { code: stopped.exit_code, unit, state: afterState },
+                );
+              }
+            } else if (!stoppedStates.includes(unitState)) {
+              throw new ResetStateError(
+                `could not tell whether ${unit} is running on ${target.host}: systemctl is-active reported ${
+                  unitState || "no output"
+                } (exit ${active.exit_code})`,
+              );
+            }
+            const result = await deps.ssh.exec(target, [
+              K0S_BINARY_PATH,
+              "reset",
+            ]);
+            if (!ok(result)) {
+              throw new Error(
+                `k0s reset failed on ${target.host} (exit ${result.exit_code})`,
+              );
+            }
+            const cleaned = await deps.ssh.exec(target, [
+              "rm",
+              "-f",
+              K0S_CONFIG_PATH,
+              K0S_WORKER_TOKEN_PATH,
+            ]);
+            if (!ok(cleaned)) {
+              throw new Error(
+                `could not remove the k0s configuration on ${target.host} (exit ${cleaned.exit_code})`,
+              );
+            }
             let cleanup: { binary_removed: boolean; reason?: string };
             try {
               cleanup = await cleanupK0sResidue(
@@ -1938,9 +2498,7 @@ function buildK0sModel(deps: K0sDeps) {
               });
               throw e;
             }
-            context.logger.info("Finished reset cleanup on {host}", {
-              host: target.host,
-            });
+            context.logger.info("Reset k0s on {host}", { host: target.host });
             const handle = await writeState({
               binary_removed: cleanup.binary_removed,
               ...(cleanup.reason
@@ -1951,94 +2509,9 @@ function buildK0sModel(deps: K0sDeps) {
               dataHandles: [...handles, handle],
               result: { reset: true, ...cleanup },
             };
+          } finally {
+            await deps.ssh.exec(target, ["rmdir", lockDir]);
           }
-          // A k0s unit that is already stopped (after a crash or a reboot) makes
-          // `k0s stop` exit non-zero with "already stopped"; skip it when the
-          // unit is inactive, and never trust stderr text alone.
-          const active = await deps.ssh.exec(target, [
-            "systemctl",
-            "is-active",
-            unit,
-          ]);
-          const unitState = active.stdout.trim();
-          const stoppedStates = ["inactive", "failed"];
-          if (unitState === "active") {
-            const stopped = await deps.ssh.exec(target, [
-              K0S_BINARY_PATH,
-              "stop",
-            ]);
-            if (!ok(stopped)) {
-              const after = await deps.ssh.exec(target, [
-                "systemctl",
-                "is-active",
-                unit,
-              ]);
-              const afterState = after.stdout.trim();
-              if (afterState === "active") {
-                throw new Error(
-                  `k0s stop failed on ${target.host} (exit ${stopped.exit_code}) and ${unit} is still active`,
-                );
-              }
-              if (!stoppedStates.includes(afterState)) {
-                throw new ResetStateError(
-                  `k0s stop failed on ${target.host} and ${unit} is ${
-                    afterState || "in an unknown state"
-                  } (systemctl is-active exit ${after.exit_code})`,
-                );
-              }
-              context.logger.info(
-                "k0s stop reported {code} but {unit} is {state}; continuing",
-                { code: stopped.exit_code, unit, state: afterState },
-              );
-            }
-          } else if (!stoppedStates.includes(unitState)) {
-            throw new ResetStateError(
-              `could not tell whether ${unit} is running on ${target.host}: systemctl is-active reported ${
-                unitState || "no output"
-              } (exit ${active.exit_code})`,
-            );
-          }
-          const result = await deps.ssh.exec(target, [
-            K0S_BINARY_PATH,
-            "reset",
-          ]);
-          if (!ok(result)) {
-            throw new Error(
-              `k0s reset failed on ${target.host} (exit ${result.exit_code})`,
-            );
-          }
-          const cleaned = await deps.ssh.exec(target, [
-            "rm",
-            "-f",
-            K0S_CONFIG_PATH,
-            K0S_WORKER_TOKEN_PATH,
-          ]);
-          if (!ok(cleaned)) {
-            throw new Error(
-              `could not remove the k0s configuration on ${target.host} (exit ${cleaned.exit_code})`,
-            );
-          }
-          let cleanup: { binary_removed: boolean; reason?: string };
-          try {
-            cleanup = await cleanupK0sResidue(deps, target, recorded, context);
-          } catch (e) {
-            await writeState({
-              binary_sha256: recorded?.binary_sha256 ?? null,
-              cleanup_pending: true,
-            });
-            throw e;
-          }
-          context.logger.info("Reset k0s on {host}", { host: target.host });
-          const handle = await writeState({
-            binary_removed: cleanup.binary_removed,
-            ...(cleanup.reason
-              ? { binary_removal_reason: cleanup.reason }
-              : {}),
-          });
-          return {
-            dataHandles: [...handles, handle],
-            result: { reset: true, ...cleanup },
-          };
         },
       },
     },
@@ -2057,5 +2530,19 @@ export function createModel(deps: K0sDeps): K0sClusterModel {
 export const model = {
   ...buildK0sModel(defaultK0sDeps),
   type: "@randybias/k0s-cluster",
-  version: "2026.10.17.2",
-} satisfies K0sClusterModel;
+  version: "2026.10.17.3",
+  upgrades: [
+    {
+      toVersion: "2026.10.17.2",
+      description:
+        "reset now also removes /etc/k0s and the k0s binary it installed; stored attributes are unchanged",
+      upgradeAttributes: (old: Record<string, unknown>) => old,
+    },
+    {
+      toVersion: "2026.10.17.3",
+      description:
+        "adds the upgrade action, controller_worker + no_taints, a controller join_token, etcd_peer_address and optional HA config inputs; config_file_sha256 is removed; stored attributes are otherwise unchanged",
+      upgradeAttributes: (old: Record<string, unknown>) => old,
+    },
+  ],
+};

@@ -315,3 +315,59 @@ the triage checks, no Critical/High. `_lib/ssh.ts` is the canonical blob
 - LOW: hash-then-`rm` race on the binary; a replacement written between the
   `sha256sum` and the `rm` is removed (terra HIGH, downgraded: needs a
   concurrent root writer on the target).
+
+## Backlog (after the upgrade action)
+
+- Optional `binary_source: "control-host" | "host-download"` (default
+  `control-host`, byte-identical to today). With `host-download` the HOST
+  fetches the pinned k0s release URL itself over https with a bounded timeout,
+  computes its own sha256, and returns the hash; the model compares it and
+  installs only on a match, otherwise deletes the file and fails. The expected
+  hash never reaches the host argv. Live finding: pushing the ~261 MB binary
+  from the control host over SSH stdin through a lossy mesh took over an hour.
+  The upgrade action must use the same path.
+
+- `k0s config validate` (v1.36.4) is lenient about unknown fields, so a render
+  is checked against the upstream ClusterConfig shape with goldens, not by that
+  command alone.
+
+- Prior art: the registry has no k0s package. `@shelson/k3s` and `@rjeschmi/vm`
+  are adjacent but do not cover a k0s cluster.
+
+- 2026-10-17 (17.3): reset crashed live with "Secret
+  '...root~***~22-config_file_sha256' not found in local vault".
+  `config_file_sha256` was marked sensitive, so swamp stored it in the vault
+  under a key derived from the resource data name, which embeds the host
+  (`user~host~port`); on a later read swamp masks an IP-shaped host to `***`, so
+  the host-derived key could not be resolved. install and reset both derive the
+  target from the method input, so the fix is to stop vaulting this field: it is
+  a drift-detection hash, not a secret, and it is now stored in state. Any
+  future sensitive resource field on this model must use a data name that cannot
+  be masked, or persist the exact vault key at write time.
+
+- 2026-10-17 (17.3): after de-sensitising config_file_sha256, review noted it is
+  a hash of the REAL on-host k0s.yaml — which carries the plaintext keepalived
+  authPass when CPLB is set — so storing it (vaulted or not) lets the 8-char
+  authPass be brute-forced. The field is removed entirely; drift detection
+  relies on config_sha256, which is over the redacted render. A CPLB install
+  test asserts no written state contains the authPass or a config_file_sha256.
+
+- 2026-10-17 (17.3): live repro (lab 3585): a 17.2 record whose host was stored
+  from a vault ref (`{vault, key}`, so the host read back as `***`) crashed in
+  swamp's vault resolution before the method body ran. The offline test "reset
+  ignores a legacy config_file_sha256 field and a masked host" cannot reproduce
+  that resolution step (createModelTestContext does not resolve vaults), so it
+  only proves the methods tolerate a masked host and an unknown legacy field;
+  the live crash is recorded here.
+
+- 2026-10-17 (17.3): drift restored without a secret-derived hash. sync hashes
+  the on-host k0s.yaml only when the record says `has_helm_values === false`,
+  via a fixed fail-closed node script (publicShaScript): it exits non-zero (so
+  drift is unknown) on an unreadable file, any authPass line that is not a
+  canonical `<indent>authPass: <scalar>` (list item, flow map, quoted key and
+  block scalar are all refused), or any helm `values:` key; otherwise it
+  replaces each canonical authPass value with REDACTED and hashes the result. A
+  real-`sh` test runs the script text and asserts the canonical digest equals
+  the redacted digest and that every smuggle form is refused. Legacy 17.2
+  records (has_helm_values undefined) report config drift unknown rather than a
+  false "config changed".

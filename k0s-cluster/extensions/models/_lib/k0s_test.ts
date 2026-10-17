@@ -488,3 +488,59 @@ Deno.test("classifyControllerExecStart reads the argv[] field of the real system
     assertEquals(threw, true, bad);
   }
 });
+
+Deno.test("HA config inputs render goldens and leave the base byte-identical", async () => {
+  const base = renderK0sConfig(BASE);
+  assertEquals(base.includes("externalAddress"), false);
+  assertEquals(base.includes("nodeLocalLoadBalancing"), false);
+  assertEquals(base.includes("controlPlaneLoadBalancing"), false);
+  assertEquals(
+    renderK0sConfig({ ...BASE, external_address: "192.0.2.10" }),
+    await golden("external-address.golden.txt"),
+  );
+  assertEquals(
+    renderK0sConfig({ ...BASE, node_local_load_balancing: true }),
+    await golden("nllb.golden.txt"),
+  );
+  assertEquals(
+    renderK0sConfig({
+      ...BASE,
+      control_plane_load_balancing: {
+        virtual_ips: ["192.0.2.10/24"],
+        auth_pass: "abc12345",
+      },
+    }),
+    await golden("cplb.golden.txt"),
+  );
+  assertEquals(
+    renderK0sConfig({ ...BASE, etcd_peer_address: "192.0.2.11" }),
+    await golden("etcd-peer.golden.txt"),
+  );
+});
+
+Deno.test("installArgs: controller_worker enables a worker and honors no_taints", () => {
+  assertEquals(installArgs("controller_worker"), [
+    "install",
+    "controller",
+    "--enable-worker",
+  ]);
+  assertEquals(installArgs("controller_worker", { noTaints: true }), [
+    "install",
+    "controller",
+    "--enable-worker",
+    "--no-taints",
+  ]);
+  assertEquals(installArgs("single"), [
+    "install",
+    "controller",
+    "--enable-worker",
+    "--no-taints",
+  ]);
+  assertEquals(installArgs("controller"), ["install", "controller"]);
+  assertEquals(installArgs("controller_worker", { force: true }), [
+    "install",
+    "controller",
+    "--enable-worker",
+    "--force",
+  ]);
+});

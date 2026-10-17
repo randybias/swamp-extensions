@@ -17,17 +17,18 @@ single definition can drive a fleet and `host:22` never shares a record with
 every later connection is pinned to them; if a host is rebuilt, supply
 `host_keys` or delete the recorded keys.
 
-| Method            | Description                                                                       |
-| ----------------- | --------------------------------------------------------------------------------- |
-| `render_config`   | Render the deterministic `k0s.yaml` for the given inputs (read-only)              |
-| `install`         | Verify, upload and install the pinned binary and role, then start the service     |
-| `wait_ready`      | Poll until a node is Ready and kube-system pods are running                       |
-| `kubeconfig`      | Fetch the admin kubeconfig into a sensitive value or a vault key you name         |
-| `apply_manifests` | Place a named manifest stack under the k0s manifest directory; remove stale files |
-| `apply_helm`      | Reconcile the declared Helm extensions in `k0s.yaml`                              |
-| `get`             | Read the k0s version, node status, stacks and Helm releases (read-only)           |
-| `sync`            | Compare the recorded install with the host and report drift (read-only)           |
-| `reset`           | DESTRUCTIVE: stop and uninstall k0s and remove its configuration                  |
+| Method            | Description                                                                                             |
+| ----------------- | ------------------------------------------------------------------------------------------------------- |
+| `render_config`   | Render the deterministic `k0s.yaml` for the given inputs (read-only)                                    |
+| `install`         | Verify, upload and install the pinned binary and role, then start the service                           |
+| `wait_ready`      | Poll until a node is Ready and kube-system pods are running                                             |
+| `kubeconfig`      | Fetch the admin kubeconfig into a sensitive value or a vault key you name                               |
+| `apply_manifests` | Place a named manifest stack under the k0s manifest directory; remove stale files                       |
+| `apply_helm`      | Reconcile the declared Helm extensions in `k0s.yaml`                                                    |
+| `get`             | Read the k0s version, node status, stacks and Helm releases (read-only)                                 |
+| `sync`            | Compare the recorded install with the host and report drift (read-only)                                 |
+| `reset`           | DESTRUCTIVE: stop and uninstall k0s and remove its configuration                                        |
+| `upgrade`         | DESTRUCTIVE: swap in a pinned newer k0s binary, verifying it first and restoring the old one on failure |
 
 ## Dependencies
 
@@ -186,6 +187,18 @@ manifest where possible.
   in place (the command still invokes the path's binary to stop and reset,
   because that is what the unit runs). A unit that is already stopped is not
   sent another `k0s stop`, so a reset after a crash or reboot works.
+- `upgrade` is an action: it verifies the pinned new binary before stopping
+  anything, refuses a downgrade and a Kubernetes minor skip, locks the host for
+  the whole swap, and restores the previous binary and restarts the unit if any
+  step fails. A controller or single node must answer `/readyz` with the new API
+  server version. A worker has no kubeconfig, so an upgrade can only verify its
+  unit is active; confirm the node is Ready with the new kubelet version from a
+  controller afterwards. Upgrade HA controllers one at a time: the model locks
+  one host, not the cluster.
+- A record written by 2026.10.17.2 whose `host` came from a vault or another
+  expression can stay unreadable (swamp-club lab 3585): the host is stored
+  masked and the record cannot be resolved on a later read. Recover by running
+  `install` again to adopt the host and write a fresh record.
 - Every caller-supplied value that reaches the remote shell is validated against
   an allowlist grammar and quoted as a single argv element; remote exit codes
   are returned as data, except a local `ssh` failure (exit 255), which is raised

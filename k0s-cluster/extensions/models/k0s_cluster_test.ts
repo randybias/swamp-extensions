@@ -17,6 +17,7 @@ import type { SshTransport } from "./_lib/transport.ts";
 import {
   createModel,
   type K0sDeps,
+  publicShaScript,
   ResetCleanupError,
   ResetStateError,
   targetId,
@@ -291,6 +292,67 @@ Deno.test("render_config renders the golden and stores the file", async () => {
   assertEquals(files.length, 1);
   assertEquals(new TextDecoder().decode(files[0].content), expected);
   assertEquals(fake.execs.length, 0);
+});
+
+Deno.test("render_config with a keepalived VIP never exposes authPass", async () => {
+  const secret = "abc12345";
+  const fake = makeDeps();
+  const model = createModel(fake.deps);
+  const args = model.methods.render_config.arguments.parse({
+    k0s_version: VERSION,
+    ...CLUSTER,
+    manifests: [],
+    helm: [],
+    control_plane_load_balancing: {
+      virtual_ips: ["192.0.2.10/24"],
+      auth_pass: secret,
+    },
+  });
+  const { context, getWrittenFiles } = createModelTestContext();
+  const out = await model.methods.render_config.execute(args, context);
+  assertEquals(out.result.values_redacted, true);
+  assertEquals(out.result.k0s_yaml.includes(secret), false);
+  assertEquals(out.result.k0s_yaml.includes("authPass: REDACTED"), true);
+  assertEquals(out.result.k0s_yaml.includes("vrrpInstances:"), true);
+  assertEquals(out.result.k0s_yaml.includes("virtualIPs:"), true);
+  assertEquals(
+    out.result.config_sha256,
+    await sha256Hex(encoder.encode(out.result.k0s_yaml)),
+  );
+  assertEquals(getWrittenFiles().length, 0);
+});
+
+Deno.test("external_address and node_local_load_balancing are rejected together", () => {
+  const model = createModel(makeDeps().deps);
+  const bad = model.methods.render_config.arguments.safeParse({
+    k0s_version: VERSION,
+    ...CLUSTER,
+    manifests: [],
+    helm: [],
+    external_address: "192.0.2.10",
+    node_local_load_balancing: true,
+  });
+  assertEquals(bad.success, false);
+});
+
+Deno.test("external_address must be an IP or hostname", () => {
+  const model = createModel(makeDeps().deps);
+  const bad = model.methods.render_config.arguments.safeParse({
+    k0s_version: VERSION,
+    ...CLUSTER,
+    manifests: [],
+    helm: [],
+    external_address: "bad host\nname",
+  });
+  assertEquals(bad.success, false);
+  const ok = model.methods.render_config.arguments.safeParse({
+    k0s_version: VERSION,
+    ...CLUSTER,
+    manifests: [],
+    helm: [],
+    external_address: "lb.example.com",
+  });
+  assertEquals(ok.success, true);
 });
 
 Deno.test("install verifies, uploads and starts a single-node cluster", async () => {
@@ -1198,6 +1260,124 @@ Deno.test("reset persists the binary-removal outcome in state", async () => {
   );
 });
 
+Deno.test("reset ignores a legacy config_file_sha256 field and a masked host", async () => {
+  const fake = makeDeps({
+    exec: (argv) => {
+      if (
+        argv[0] === "systemctl" && argv[1] === "cat" &&
+        argv[2] === "k0scontroller"
+      ) {
+        return { code: 0, stdout: "unit\n" };
+      }
+      if (argv[0] === "systemctl" && argv[1] === "is-active") {
+        return { code: 3, stdout: "inactive\n" };
+      }
+      if (argv[0] === "systemctl" && argv[1] === "cat") return ABSENT;
+      return { code: 0, stdout: "" };
+    },
+  });
+  const model = createModel(fake.deps);
+  const args = model.methods.reset.arguments.parse({
+    ssh: SSH,
+    confirm_host: HOST,
+  });
+  const { context } = createModelTestContext({
+    storedResources: {
+      [targetId({ host: HOST, port: 22, user: "root" })]: {
+        host: "***",
+        port: 22,
+        user: "root",
+        role: "single",
+        k0s_version: "v1.31.2+k0s.0",
+        binary_sha256: PAYLOAD_SHA,
+        config_sha256: "c".repeat(64),
+        config_file_sha256: {
+          vault: "default",
+          key: "install-state-root~***~22-config_file_sha256",
+        },
+        service: "k0scontroller",
+        installed: true,
+        adopted: false,
+        observed_at: new Date().toISOString(),
+      },
+    },
+  });
+  const out = await model.methods.reset.execute(args, context);
+  assertEquals(out.result.reset, true);
+});
+
+Deno.test("upgrade refuses when a stale k0s.old exists", async () => {
+  const fake = makeDeps({
+    exec: upgradeRouter((argv) =>
+      argv[0] === "ls" && argv[2] === `${K0S_BINARY_PATH}.old`
+        ? { code: 0, stdout: `${K0S_BINARY_PATH}.old\n` }
+        : undefined
+    ),
+    fetch: () => Promise.resolve(PAYLOAD),
+  });
+  const model = createModel(fake.deps);
+  await assertRejects(
+    () =>
+      model.methods.upgrade.execute(upgradeArgs(), upgradeContext().context),
+    Error,
+    "already exists",
+  );
+});
+
+Deno.test("upgrade restores from the backup the host still has after an ssh drop", async () => {
+  const fake = makeDeps({
+    exec: upgradeRouter(),
+    fetch: () => Promise.resolve(PAYLOAD),
+  });
+  const inner = fake.deps.ssh.exec;
+  fake.deps.ssh.exec = (t, argv) =>
+    argv[0] === "mv" && argv[1] === `${K0S_BINARY_PATH}.new`
+      ? Promise.reject(new Error("ssh dropped"))
+      : inner(t, argv);
+  const model = createModel(fake.deps);
+  await assertRejects(
+    () =>
+      model.methods.upgrade.execute(upgradeArgs(), upgradeContext().context),
+    Error,
+    "restored the previous binary",
+  );
+});
+
+Deno.test("upgrade starts an untouched binary when the stop fails", async () => {
+  const fake = makeDeps({
+    exec: upgradeRouter((argv) =>
+      argv[0] === "systemctl" && argv[1] === "stop" ? { code: 1 } : undefined
+    ),
+    fetch: () => Promise.resolve(PAYLOAD),
+  });
+  const model = createModel(fake.deps);
+  await assertRejects(
+    () =>
+      model.methods.upgrade.execute(upgradeArgs(), upgradeContext().context),
+    Error,
+    "started on the unchanged binary",
+  );
+  assertEquals(
+    fake.execs.some((a) => a[0] === "systemctl" && a[1] === "restart"),
+    false,
+  );
+});
+
+Deno.test("upgrade releases the lock in finally", async () => {
+  const fake = makeDeps({
+    exec: upgradeRouter(),
+    fetch: () => Promise.resolve(PAYLOAD),
+  });
+  const model = createModel(fake.deps);
+  await model.methods.upgrade.execute(upgradeArgs(), upgradeContext().context);
+  assertEquals(
+    fake.execs.some((a) =>
+      a[0] === "rmdir" && a[1] === "/run/k0s-upgrade.lock"
+    ),
+    true,
+  );
+});
+
 Deno.test("reset refuses a confirm_host that does not match", async () => {
   const fake = makeDeps();
   const model = createModel(fake.deps);
@@ -1210,6 +1390,26 @@ Deno.test("reset refuses a confirm_host that does not match", async () => {
     () => model.methods.reset.execute(args, context),
     Error,
     "does not match",
+  );
+});
+
+Deno.test("install accepts role controller_worker and no_taints", () => {
+  const model = createModel(makeDeps().deps);
+  assertEquals(
+    model.methods.install.arguments.safeParse(
+      installArgs({ role: "controller_worker", no_taints: true }),
+    ).success,
+    true,
+  );
+  assertEquals(
+    model.methods.install.arguments.safeParse({
+      ssh: SSH,
+      k0s_version: VERSION,
+      k0s_binary_sha256: PAYLOAD_SHA,
+      ...CLUSTER,
+      role: "bogus",
+    }).success,
+    false,
   );
 });
 
@@ -1827,9 +2027,12 @@ Deno.test("sensitive digests are not returned by get, apply_manifests or render_
   assertEquals(JSON.stringify(applied.result).includes("sha256"), false);
   const rs = model.resources.manifests.schema.shape.files.element.shape;
   assertEquals(rs.sha256.meta()?.sensitive, true);
+  // The config file hash is not persisted at all: over a secret-bearing
+  // k0s.yaml it would let the keepalived authPass be brute-forced, and a
+  // sensitive field would be keyed by the host-derived data name swamp masks.
   assertEquals(
-    model.resources.state.schema.shape.config_file_sha256.meta()?.sensitive,
-    true,
+    "config_file_sha256" in model.resources.state.schema.shape,
+    false,
   );
 });
 
@@ -2484,32 +2687,657 @@ Deno.test("kubeconfig builds the server URL from api_address and stores that kub
   assertEquals(v6.result.server, "https://[2001:db8::7]:6444");
 });
 
-Deno.test("the exact install argv for single, controller and worker", async () => {
-  const cases: [string, string[]][] = [
-    ["single", ["install", "controller", "--enable-worker", "--no-taints"]],
-    ["controller", ["install", "controller"]],
-    [
-      "worker",
-      ["install", "worker", "--token-file", "/etc/k0s/worker-token"],
-    ],
+const UP_FROM = "v1.31.2+k0s.2";
+const UP_TO = "v1.32.0+k0s.0";
+function upgradeState(overrides: Record<string, unknown> = {}) {
+  return {
+    host: HOST,
+    port: 22,
+    user: "root",
+    role: "single",
+    k0s_version: UP_FROM,
+    binary_sha256: PAYLOAD_SHA,
+    config_sha256: "c".repeat(64),
+    config_file_sha256: "d".repeat(64),
+    service: "k0scontroller",
+    installed: true,
+    adopted: false,
+    observed_at: new Date().toISOString(),
+    ...overrides,
+  };
+}
+function upgradeRouter(
+  overrides: (
+    argv: string[],
+  ) => { code?: number; stdout?: string } | undefined = () => undefined,
+) {
+  let promoted = false;
+  let hasOld = false;
+  return (argv: string[]) => {
+    const override = overrides(argv);
+    if (override) return override;
+    if (
+      argv[0] === "mv" && argv[1] === K0S_BINARY_PATH &&
+      argv[2] === `${K0S_BINARY_PATH}.old`
+    ) hasOld = true;
+    if (argv[0] === "mv" && argv[1] === `${K0S_BINARY_PATH}.old`) {
+      hasOld = false;
+    }
+    if (
+      argv[0] === "ls" && argv[1] === "-d" &&
+      argv[2] === `${K0S_BINARY_PATH}.old`
+    ) {
+      return hasOld
+        ? { code: 0, stdout: `${K0S_BINARY_PATH}.old\n` }
+        : { code: 2, stdout: "" };
+    }
+    if (argv[0] === "uname") return { code: 0, stdout: "x86_64\n" };
+    if (argv[0] === "sha256sum" && argv[1] === `${K0S_BINARY_PATH}.new`) {
+      return { code: 0, stdout: `${PAYLOAD_SHA}  ${K0S_BINARY_PATH}.new\n` };
+    }
+    if (argv[0] === "systemctl" && argv[1] === "is-active") {
+      return { code: 0, stdout: "active\n" };
+    }
+    if (argv[0] === "mv" && argv[1] === `${K0S_BINARY_PATH}.new`) {
+      promoted = true;
+    }
+    if (argv[0] === K0S_BINARY_PATH && argv[1] === "version") {
+      return { code: 0, stdout: `${promoted ? UP_TO : UP_FROM}\n` };
+    }
+    if (
+      argv[0] === K0S_BINARY_PATH && argv[1] === "kubectl" &&
+      argv[2] === "version"
+    ) {
+      // k0s reports the API server as "<x.y.z>+k0s", without the .N revision.
+      const server = `${(promoted ? UP_TO : UP_FROM).split("+")[0]}+k0s`;
+      const client = UP_TO.split("+")[0];
+      return {
+        code: 0,
+        stdout:
+          `{"clientVersion":{"gitVersion":"${client}"},"serverVersion":{"gitVersion":"${server}"}}\n`,
+      };
+    }
+    if (argv[0] === K0S_BINARY_PATH && argv[1] === "kubectl") {
+      return { code: 0, stdout: "ok\n" };
+    }
+    return { code: 0, stdout: "", stderr: "" };
+  };
+}
+function upgradeArgs(overrides: Record<string, unknown> = {}) {
+  return createModel(makeDeps().deps).methods.upgrade.arguments.parse({
+    ssh: SSH,
+    k0s_version: UP_TO,
+    k0s_binary_sha256: PAYLOAD_SHA,
+    ...overrides,
+  });
+}
+function upgradeContext(overrides: Record<string, unknown> = {}) {
+  return createModelTestContext({
+    storedResources: {
+      [targetId({ host: HOST, port: 22, user: "root" })]: upgradeState(
+        overrides,
+      ),
+    },
+  });
+}
+
+Deno.test("a keepalived VIP stores no hash over the secret-bearing config", async () => {
+  const secret = "abc12345";
+  const fake = makeDeps({
+    exec: installRouter,
+    fetch: () => Promise.resolve(PAYLOAD),
+  });
+  const model = createModel(fake.deps);
+  const { context, getWrittenResources } = createModelTestContext();
+  await model.methods.install.execute(
+    installArgs({
+      control_plane_load_balancing: {
+        virtual_ips: ["192.0.2.10/24"],
+        auth_pass: secret,
+      },
+    }),
+    context,
+  );
+  for (const row of getWrittenResources()) {
+    const data = row.data as Record<string, unknown>;
+    assertEquals(JSON.stringify(data).includes(secret), false);
+    assertEquals("config_file_sha256" in data, false);
+  }
+});
+
+Deno.test("the drift script redacts a canonical authPass and refuses to hash a secret", async () => {
+  const dir = await Deno.makeTempDir();
+  const file = `${dir}/k0s.yaml`;
+  const run = async (text: string) => {
+    await Deno.writeTextFile(file, text);
+    const out = await new Deno.Command("sh", {
+      args: ["-c", publicShaScript(file)],
+      stdout: "piped",
+      stderr: "piped",
+    }).output();
+    return {
+      code: out.code,
+      hash: new TextDecoder().decode(out.stdout).trim().split(/\s+/)[0],
+    };
+  };
+  const lines = [
+    "apiVersion: k0s.k0sproject.io/v1beta1",
+    "spec:",
+    "  network:",
+    "    controlPlaneLoadBalancing:",
+    "      keepalived:",
+    "        vrrpInstances:",
+    "          - virtualIPs: [192.0.2.10/24]",
+    '            authPass: "abc\\"123"',
+    "",
   ];
-  for (const [role, expected] of cases) {
+  const withSecret = lines.join("\n");
+  const canonical = await run(withSecret);
+  assertEquals(canonical.code, 0);
+  assertEquals(canonical.hash.length, 64);
+  const redacted = await run(
+    lines.map((l) => l.replace(/authPass:.*/, "authPass: REDACTED")).join("\n"),
+  );
+  assertEquals(canonical.hash, redacted.hash);
+  const smuggle = (replacement: string) =>
+    lines.map((l) => l.includes("authPass:") ? replacement : l).join("\n");
+  const cases: Record<string, string> = {
+    "list item": "          - authPass: x",
+    "flow map": "          {authPass: x}",
+    "quoted key": '          "authPass": x',
+    "block scalar": "            authPass: >-\n              x",
+  };
+  for (const [name, form] of Object.entries(cases)) {
+    assertEquals(
+      (await run(smuggle(form))).code === 0,
+      false,
+      `accepted a ${name} authPass`,
+    );
+  }
+  const helm = await run(
+    withSecret.replace(
+      "  network:",
+      "  helm:\n    values:\n      secret: x\n  network:",
+    ),
+  );
+  assertEquals(helm.code === 0, false, "accepted helm values");
+  await Deno.remove(dir, { recursive: true });
+});
+
+Deno.test("drift sees an on-host config edit with CPLB set, without a secret-derived hash", async () => {
+  const secret = "abc12345";
+  const ifake = makeDeps({
+    exec: installRouter,
+    fetch: () => Promise.resolve(PAYLOAD),
+  });
+  const im = createModel(ifake.deps);
+  const ictx = createModelTestContext();
+  await im.methods.install.execute(
+    installArgs({
+      control_plane_load_balancing: {
+        virtual_ips: ["192.0.2.10/24"],
+        auth_pass: secret,
+      },
+    }),
+    ictx.context,
+  );
+  const state = ictx.getWrittenResources().find((r) => r.specName === "state")!
+    .data as Record<string, unknown>;
+  assertEquals(JSON.stringify(state).includes(secret), false);
+  assertEquals(state.has_helm_values, false);
+  const stored = state.config_sha256 as string;
+
+  const syncRouter = (configHash: string) => (argv: string[]) => {
+    if (argv[0] === "sh" && argv[1] === "-c") {
+      return { code: 0, stdout: `${configHash}  -\n` };
+    }
+    if (argv[0] === K0S_BINARY_PATH && argv[1] === "version") {
+      return { code: 0, stdout: `k0s ${VERSION}\n` };
+    }
+    if (argv[0] === "systemctl" && argv[1] === "is-active") {
+      return { code: 0, stdout: "active\n" };
+    }
+    if (argv[0] === "systemctl" && argv[1] === "cat") {
+      return { code: 0, stdout: "unit\n" };
+    }
+    return { code: 0, stdout: "" };
+  };
+  const sync = async (hash: string) => {
+    const model = createModel(
+      makeDeps({ exec: syncRouter(hash) }).deps,
+    );
+    const { context } = createModelTestContext({
+      storedResources: {
+        [targetId({ host: HOST, port: 22, user: "root" })]: state,
+      },
+    });
+    return await model.methods.sync.execute(
+      model.methods.sync.arguments.parse({ ssh: SSH }),
+      context,
+    );
+  };
+  assertEquals((await sync(stored)).result.in_sync, true);
+  const drifted = await sync("a".repeat(64));
+  assertEquals(drifted.result.in_sync, false);
+  assertEquals(
+    (drifted.result.diffs as string[]).some((d) =>
+      d.includes("config changed")
+    ),
+    true,
+  );
+});
+
+Deno.test("etcd_peer_address must be an IP and the join_token rules hold", () => {
+  const model = createModel(makeDeps().deps);
+  assertEquals(
+    model.methods.install.arguments.safeParse({
+      ssh: SSH,
+      k0s_version: VERSION,
+      k0s_binary_sha256: PAYLOAD_SHA,
+      ...CLUSTER,
+      etcd_peer_address: "not-an-ip",
+    }).success,
+    false,
+  );
+  assertEquals(
+    model.methods.install.arguments.safeParse({
+      ssh: SSH,
+      k0s_version: VERSION,
+      k0s_binary_sha256: PAYLOAD_SHA,
+      ...CLUSTER,
+      join_token: "",
+    }).success,
+    false,
+  );
+  assertEquals(
+    model.methods.install.arguments.safeParse({
+      ssh: SSH,
+      k0s_version: VERSION,
+      k0s_binary_sha256: PAYLOAD_SHA,
+      ...CLUSTER,
+      role: "single",
+      join_token: "PLACEHOLDER-JOIN-TOKEN",
+    }).success,
+    false,
+  );
+});
+
+Deno.test("install and render_config share a redacted config_sha256 for a keepalived VIP", async () => {
+  const secret = "abc12345";
+  const cplb = {
+    control_plane_load_balancing: {
+      virtual_ips: ["192.0.2.10/24"],
+      auth_pass: secret,
+    },
+  };
+  const rm = createModel(makeDeps().deps);
+  const rctx = createModelTestContext();
+  const rout = await rm.methods.render_config.execute(
+    rm.methods.render_config.arguments.parse({
+      k0s_version: VERSION,
+      ...CLUSTER,
+      manifests: [],
+      helm: [],
+      ...cplb,
+    }),
+    rctx.context,
+  );
+  const fake = makeDeps({
+    exec: installRouter,
+    fetch: () => Promise.resolve(PAYLOAD),
+  });
+  const im = createModel(fake.deps);
+  const ictx = createModelTestContext();
+  const iout = await im.methods.install.execute(
+    installArgs(cplb),
+    ictx.context,
+  );
+  assertEquals(iout.result.config_sha256, rout.result.config_sha256);
+  assertEquals(JSON.stringify(iout.result).includes(secret), false);
+  assertEquals(
+    JSON.stringify(ictx.getWrittenResources()).includes(secret),
+    false,
+  );
+  assertEquals(rout.result.k0s_yaml.includes(secret), false);
+});
+
+Deno.test("the exact install argv for each role and join", async () => {
+  const cases: [Record<string, unknown>, string[]][] = [
+    [{ role: "single" }, [
+      "install",
+      "controller",
+      "--enable-worker",
+      "--no-taints",
+    ]],
+    [{ role: "controller" }, ["install", "controller"]],
+    [{ role: "worker", join_token: "PLACEHOLDER-JOIN-TOKEN" }, [
+      "install",
+      "worker",
+      "--token-file",
+      "/etc/k0s/worker-token",
+    ]],
+    [{ role: "controller", join_token: "PLACEHOLDER-JOIN-TOKEN" }, [
+      "install",
+      "controller",
+      "--token-file",
+      "/etc/k0s/worker-token",
+    ]],
+    [{ role: "controller_worker" }, [
+      "install",
+      "controller",
+      "--enable-worker",
+    ]],
+    [{ role: "controller_worker", no_taints: true }, [
+      "install",
+      "controller",
+      "--enable-worker",
+      "--no-taints",
+    ]],
+  ];
+  for (const [overrides, expected] of cases) {
     const fake = makeDeps({
       exec: installRouter,
       fetch: () => Promise.resolve(PAYLOAD),
     });
     const model = createModel(fake.deps);
     const { context } = createModelTestContext();
-    await model.methods.install.execute(
-      installArgs({ role, join_token: "PLACEHOLDER-JOIN-TOKEN" }),
-      context,
-    );
+    await model.methods.install.execute(installArgs(overrides), context);
     assertEquals(
       fake.execs.find((argv) => argv[1] === "install"),
       [K0S_BINARY_PATH, ...expected],
-      role,
+      JSON.stringify(overrides),
     );
   }
+});
+
+Deno.test("upgrade to the same version is a no-op", async () => {
+  const fake = makeDeps({
+    exec: upgradeRouter(),
+    fetch: () => Promise.resolve(PAYLOAD),
+  });
+  const model = createModel(fake.deps);
+  const { context } = upgradeContext();
+  const out = await model.methods.upgrade.execute(
+    upgradeArgs({ k0s_version: UP_FROM }),
+    context,
+  );
+  assertEquals(out.result.upgraded, false);
+  assertEquals(fake.execs.some((a) => a[1] === "stop"), false);
+});
+
+Deno.test("upgrade refuses a downgrade and a skipped minor", async () => {
+  const model = createModel(
+    makeDeps({ exec: upgradeRouter(), fetch: () => Promise.resolve(PAYLOAD) })
+      .deps,
+  );
+  const { context } = upgradeContext();
+  await assertRejects(
+    () =>
+      model.methods.upgrade.execute(
+        upgradeArgs({ k0s_version: "v1.30.0+k0s.0" }),
+        context,
+      ),
+    Error,
+    "downgrade",
+  );
+  await assertRejects(
+    () =>
+      model.methods.upgrade.execute(
+        upgradeArgs({ k0s_version: "v1.33.0+k0s.0" }),
+        context,
+      ),
+    Error,
+    "skip",
+  );
+});
+
+Deno.test("upgrade verifies the binary before stopping anything", async () => {
+  const fake = makeDeps({
+    exec: upgradeRouter(),
+    fetch: () => Promise.resolve(new TextEncoder().encode("wrong payload")),
+  });
+  const model = createModel(fake.deps);
+  const { context } = upgradeContext();
+  await assertRejects(
+    () => model.methods.upgrade.execute(upgradeArgs(), context),
+    Error,
+  );
+  assertEquals(
+    fake.execs.some((a) => a[0] === "systemctl" && a[1] === "stop"),
+    false,
+  );
+});
+
+Deno.test("upgrade restores the previous binary when the start fails", async () => {
+  const fake = makeDeps({
+    exec: upgradeRouter((argv) =>
+      argv[0] === "systemctl" && argv[1] === "start" ? { code: 1 } : undefined
+    ),
+    fetch: () => Promise.resolve(PAYLOAD),
+  });
+  const model = createModel(fake.deps);
+  const { context } = upgradeContext();
+  await assertRejects(
+    () => model.methods.upgrade.execute(upgradeArgs(), context),
+    Error,
+    "restored",
+  );
+  const restoreAt = fake.execs.findIndex((a) =>
+    a[0] === "mv" && a[1] === `${K0S_BINARY_PATH}.old` &&
+    a[2] === K0S_BINARY_PATH
+  );
+  assertEquals(restoreAt > 0, true);
+  assertEquals(
+    fake.execs.slice(restoreAt).some((a) =>
+      a[0] === "systemctl" && a[1] === "restart"
+    ),
+    true,
+  );
+});
+
+Deno.test("upgrade rolls back on a readiness timeout and on a server-version mismatch", async () => {
+  const timeout = makeDeps({
+    exec: upgradeRouter((argv) =>
+      argv[0] === K0S_BINARY_PATH && argv[1] === "kubectl" && argv[2] === "get"
+        ? { code: 1 }
+        : undefined
+    ),
+    fetch: () => Promise.resolve(PAYLOAD),
+  });
+  const tm = createModel(timeout.deps);
+  const tctx = upgradeContext();
+  await assertRejects(
+    () =>
+      tm.methods.upgrade.execute(
+        upgradeArgs({ ready_timeout_s: 10 }),
+        tctx.context,
+      ),
+    Error,
+  );
+  assertEquals(
+    timeout.execs.some((a) =>
+      a[0] === "mv" && a[1] === `${K0S_BINARY_PATH}.old`
+    ),
+    true,
+  );
+
+  const badVersion = makeDeps({
+    exec: upgradeRouter((argv) =>
+      argv[0] === K0S_BINARY_PATH && argv[1] === "kubectl" &&
+        argv[2] === "version"
+        ? {
+          code: 0,
+          stdout: `{"clientVersion":{"gitVersion":"${
+            UP_TO.split("+")[0]
+          }"},"serverVersion":{"gitVersion":"${UP_FROM.split("+")[0]}+k0s"}}\n`,
+        }
+        : undefined
+    ),
+    fetch: () => Promise.resolve(PAYLOAD),
+  });
+  const bm = createModel(badVersion.deps);
+  const bctx = upgradeContext();
+  await assertRejects(
+    () => bm.methods.upgrade.execute(upgradeArgs(), bctx.context),
+    Error,
+    "restored",
+  );
+});
+
+Deno.test("upgrade refuses patch, revision and minor-skew downgrades, and a stale or unknown host version", async () => {
+  const model = createModel(
+    makeDeps({ exec: upgradeRouter(), fetch: () => Promise.resolve(PAYLOAD) })
+      .deps,
+  );
+  const { context } = upgradeContext();
+  for (const target_ of ["v1.31.2+k0s.1", "v1.31.1+k0s.0"]) {
+    await assertRejects(
+      () =>
+        model.methods.upgrade.execute(
+          upgradeArgs({ k0s_version: target_ }),
+          context,
+        ),
+      Error,
+      "downgrade",
+    );
+  }
+  // 1.31 -> 1.33 skips a minor.
+  await assertRejects(
+    () =>
+      model.methods.upgrade.execute(
+        upgradeArgs({ k0s_version: "v1.33.0+k0s.0" }),
+        context,
+      ),
+    Error,
+    "skip",
+  );
+  // A host whose version cannot be read is refused.
+  const unknown = createModel(
+    makeDeps({
+      exec: upgradeRouter((argv) =>
+        argv[0] === K0S_BINARY_PATH && argv[1] === "version"
+          ? { code: 1 }
+          : undefined
+      ),
+    }).deps,
+  );
+  await assertRejects(
+    () =>
+      unknown.methods.upgrade.execute(upgradeArgs(), upgradeContext().context),
+    Error,
+    "could not read",
+  );
+});
+
+Deno.test("upgrade refuses when the lock is held and leaves another's lock", async () => {
+  const fake = makeDeps({
+    exec: upgradeRouter((argv) =>
+      argv[0] === "mkdir" && argv[1] === "/run/k0s-upgrade.lock"
+        ? { code: 1 }
+        : undefined
+    ),
+    fetch: () => Promise.resolve(PAYLOAD),
+  });
+  const model = createModel(fake.deps);
+  const { context } = upgradeContext();
+  await assertRejects(
+    () => model.methods.upgrade.execute(upgradeArgs(), context),
+    Error,
+    "in progress",
+  );
+  assertEquals(fake.execs.some((a) => a[0] === "rmdir"), false);
+});
+
+Deno.test("reset refuses while an upgrade lock is held", async () => {
+  const fake = makeDeps({
+    exec: (argv) =>
+      argv[0] === "mkdir"
+        ? { code: 1 }
+        : argv[0] === "systemctl"
+        ? ABSENT
+        : { code: 0, stdout: "" },
+  });
+  const model = createModel(fake.deps);
+  const args = model.methods.reset.arguments.parse({
+    ssh: SSH,
+    confirm_host: HOST,
+  });
+  await assertRejects(
+    () => model.methods.reset.execute(args, createModelTestContext().context),
+    Error,
+    "in progress",
+  );
+});
+
+Deno.test("upgrade rolls back when the restart during restore fails", async () => {
+  const fake = makeDeps({
+    exec: upgradeRouter((argv) => {
+      if (argv[0] === "systemctl" && argv[1] === "start") return { code: 1 };
+      if (argv[0] === "systemctl" && argv[1] === "restart") return { code: 1 };
+      return undefined;
+    }),
+    fetch: () => Promise.resolve(PAYLOAD),
+  });
+  const model = createModel(fake.deps);
+  const { context } = upgradeContext();
+  await assertRejects(
+    () => model.methods.upgrade.execute(upgradeArgs(), context),
+    Error,
+    "ROLLBACK FAILED",
+  );
+});
+
+Deno.test("upgrade succeeds on a worker and checks the promoted binary", async () => {
+  const fake = makeDeps({
+    exec: upgradeRouter(),
+    fetch: () => Promise.resolve(PAYLOAD),
+  });
+  const model = createModel(fake.deps);
+  const { context } = upgradeContext({ role: "worker", service: "k0sworker" });
+  const out = await model.methods.upgrade.execute(upgradeArgs(), context);
+  assertEquals(out.result.upgraded, true);
+  assertEquals(
+    fake.execs.some((a) => a[0] === K0S_BINARY_PATH && a[1] === "kubectl"),
+    false,
+  );
+});
+
+Deno.test("upgrade reports a failed rollback and keeps the backup", async () => {
+  const fake = makeDeps({
+    exec: upgradeRouter((argv) => {
+      if (argv[0] === "systemctl" && argv[1] === "start") return { code: 1 };
+      if (argv[0] === "mv" && argv[1] === `${K0S_BINARY_PATH}.old`) {
+        return { code: 1 };
+      }
+      return undefined;
+    }),
+    fetch: () => Promise.resolve(PAYLOAD),
+  });
+  const model = createModel(fake.deps);
+  const { context } = upgradeContext();
+  await assertRejects(
+    () => model.methods.upgrade.execute(upgradeArgs(), context),
+    Error,
+    "ROLLBACK FAILED",
+  );
+  assertEquals(
+    fake.execs.some((a) => a[0] === "rm" && a[2] === `${K0S_BINARY_PATH}.old`),
+    false,
+  );
+});
+
+Deno.test("upgrade swaps the binary and records the new version", async () => {
+  const fake = makeDeps({
+    exec: upgradeRouter(),
+    fetch: () => Promise.resolve(PAYLOAD),
+  });
+  const model = createModel(fake.deps);
+  const { context, getWrittenResources } = upgradeContext();
+  const out = await model.methods.upgrade.execute(upgradeArgs(), context);
+  assertEquals(out.result.upgraded, true);
+  assertEquals(out.result.k0s_version, UP_TO);
+  const state = getWrittenResources().find((r) => r.specName === "state");
+  assertEquals((state!.data as { k0s_version: string }).k0s_version, UP_TO);
 });
 
 Deno.test("an install in the old tainted single mode is detected, never silently adopted", async () => {

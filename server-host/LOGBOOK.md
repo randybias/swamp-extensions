@@ -138,3 +138,41 @@ Round 3 (codex astra + terra on cbe62a8):
 - MEDIUM-5 `apply_base` marked `DESTRUCTIVE.` (it replaces the managed keys).
 - LOW: `LockdownArgs`/`ApplyFirewallArgs` merged into `FirewallChangeArgs`; the
   model reuses `rulesetSha256` instead of a private hash helper.
+
+Round 4 (escalation fixer, on d4 8b292f5; findings from codex astra + terra):
+
+- HIGH-1 persist-before-arm. Fixed: the syntax check (`nft -c`) now runs before
+  anything is armed. The model writes the `revert` record the moment the arm
+  step succeeds, before the apply. A definitely rejected apply disarms its own
+  timer and marks the record `cancelled_at`; any other failure after arming
+  (including a lost connection) leaves the timer armed and the record open.
+  `commit` also finds a revert the model never recorded through the host's own
+  marker.
+- HIGH-2 apply vs restore. Fixed: the apply is a single script that takes the
+  host lock and runs `nft -f -` only while its token is the current revert, its
+  snapshot exists, it has not expired and its timer is active (exit 70-73
+  otherwise). The restore holds the same lock for its whole run, so they cannot
+  interleave. The apply step has a 30 s transport timeout.
+- HIGH-3 timer vs service window. Fixed: arm runs under the same lock and
+  refuses (exit 75) while the previous revert's timer OR service is active, or
+  its files remain within 120 s of expiry; only then are dead leftovers cleared.
+  The restore is a no-op unless it is still the current revert, so a late or
+  superseded restore cannot overwrite newer rules. The snapshot is now taken by
+  the arm step, under the lock.
+- HIGH-4 per-step TOFU. Fixed with `pinHostKeys`: under `insecure_tofu` the host
+  keys are scanned once per method and every step runs with strict pinning to
+  them. Not done: vendoring item 2's `_lib/ssh.ts` byte-identically, as the spec
+  asks; this transport keeps its own `Target`/`exec` API, so swapping it is a
+  separate change that rewrites every call site and the 600-line transport
+  suite.
+- HIGH-5 `/0`. Fixed: `isDefaultRoute` now tests for a numerically zero prefix
+  after CIDR validation, so `0:0:0:0:0:0:0:0/0`, `::/00` and `192.0.2.0/0` need
+  the acknowledgement. Not covered: two halves such as `0.0.0.0/1` plus
+  `128.0.0.0/1`, which also cover everything.
+- LOW-6 `commit` description starts with `DESTRUCTIVE.`.
+- LOW: the model now uses `isTimerActive` instead of a second timer parser, and
+  `apply_firewall`/`lockdown` share one lifecycle function.
+- The host scripts are exercised under a real `sh` with stub `nft`, `systemctl`
+  and `systemd-run` (`armed_revert_shell_test.ts`); breaking the busy check or
+  the snapshot-exists check makes those tests fail. Not exercised: real systemd
+  timer behaviour, which needs the live matrix.

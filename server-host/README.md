@@ -16,20 +16,34 @@ One host, described per call by its SSH target and the phase inputs.
 | ----------------- | --------------------------------------------------------------------------------------------------- |
 | `apply_base`      | Install packages, create the admin user and keys, write sysctl and journald settings, set time sync |
 | `render_firewall` | Render the deterministic nftables ruleset and its SHA-256 without touching a host                   |
-| `apply_firewall`  | Arm a revert, pre-check with `nft -c`, then apply the ruleset with `nft -f`                         |
+| `apply_firewall`  | Pre-check with `nft -c`, arm a revert, then apply the ruleset with `nft -f`                         |
 | `lockdown`        | Restrict the SSH port to management CIDRs, armed before the change and reverted unless committed    |
-| `commit`          | Cancel the armed revert after confirming the host is still reachable                                |
+| `commit`          | Cancel the armed revert for good after confirming the host is still reachable                       |
 | `get`             | Report recorded phase state, the live ruleset SHA-256 and whether a revert is still armed           |
 | `sync`            | Probe the host and report drift between recorded state and the live ruleset and timer               |
 
 ### Armed revert
 
-`apply_firewall` and `lockdown` snapshot the ruleset, then arm a
-`systemd-run --on-active` transient timer that restores the snapshot after
+`apply_firewall` and `lockdown` check the ruleset syntax with `nft -c`, then,
+under one host-side lock, snapshot the ruleset and arm a
+`systemd-run
+--on-active` transient timer that restores the snapshot after
 `revert_after_s` seconds. The timer lives on the host, so it fires even if the
 SSH session that armed it dies. The change is not permanent until `commit`
 cancels the timer; an operator who locks themselves out recovers without console
-access. The arm step is always emitted before the apply step.
+access.
+
+The host is the source of truth. The apply runs under the same lock as the
+restore and is refused once its revert has expired, fired or been superseded, so
+the two never interleave. A new change is refused while an earlier revert's
+timer or service is still active, or its files remain within two minutes of its
+expiry. If a step fails after arming and the outcome is unknown, the timer stays
+armed and restores the host; if the apply was definitely rejected, the change
+cancels its own timer.
+
+Under `insecure_tofu` the host key is read once at the start of a method and
+pinned for every step of it, so a host cannot present a different key to a later
+step.
 
 ## Install
 

@@ -60,6 +60,10 @@ interface Fake {
   commands: string[];
   stdins: string[];
   secrets: [string, string][];
+  /** Arguments of every ssh-keyscan call. */
+  scans: string[][];
+  /** known_hosts text written for each ssh invocation's session. */
+  knownHosts: string[];
 }
 
 /** A fake transport that records ssh commands, stdin and secret lookups. */
@@ -71,6 +75,8 @@ function fakeTransport(
   const commands: string[] = [];
   const stdins: string[] = [];
   const secrets: [string, string][] = [];
+  const scans: string[][] = [];
+  const knownHosts: string[] = [];
   const run: CommandRunner = async (cmd, args, options = {}) => {
     await Promise.resolve();
     if (options.stdin) stdins.push(new TextDecoder().decode(options.stdin));
@@ -84,6 +90,14 @@ function fakeTransport(
         : { code: 0, stdout: "", stderr: "" };
     }
     if (cmd === "ssh-add") return { code: 0, stdout: "", stderr: "" };
+    if (cmd === "ssh-keyscan") {
+      scans.push(args);
+      return {
+        code: 0,
+        stdout: `${SSH.host} ${KEY}\n`,
+        stderr: "",
+      };
+    }
     if (cmd !== "ssh") return { code: 0, stdout: "", stderr: "" };
     const command = args[args.length - 1];
     commands.push(command);
@@ -93,7 +107,10 @@ function fakeTransport(
   const deps: Partial<HostDeps> = {
     run,
     makeTempDir: () => Promise.resolve("/tmp/t"),
-    writeFile: () => Promise.resolve(),
+    writeFile: (_path, text) => {
+      knownHosts.push(text);
+      return Promise.resolve();
+    },
     removeDir: () => Promise.resolve(),
     now: () => NOW,
     sleep: () => Promise.resolve(),
@@ -103,8 +120,14 @@ function fakeTransport(
       return Promise.resolve(PEM);
     },
   };
-  return { deps, commands, stdins, secrets };
+  return { deps, commands, stdins, secrets, scans, knownHosts };
 }
+
+/** The apply step: the guarded `nft -f -` script that checks the revert first. */
+const isGuardedApply = (c: string) =>
+  c.includes("nft -f -") && c.includes("exit 70");
+const isArm = (c: string) => c.includes("systemd-run");
+const isDisarm = (c: string) => c.includes('"$unit.timer" 2>/dev/null || true');
 
 function modelWith(f: Fake) {
   return createModel(f.deps);
@@ -375,17 +398,15 @@ Deno.test("apply_firewall: the ssh command stream arms before it applies", async
     c.includes("revert-") && c.includes("mktemp")
   );
   const armAt = f.commands.findIndex((c) => c.includes("systemd-run"));
-  const applyAt = f.commands.findIndex((c) =>
-    c.includes("'nft' '-f' '-'") && !c.includes("'-c'")
+  const applyAt = f.commands.findIndex(isGuardedApply);
+  const checkAt = f.commands.findIndex((c) =>
+    c.includes("'nft' '-c' '-f' '-'")
   );
+  assertEquals(checkAt >= 0 && checkAt < stageAt, true, "syntax check first");
   assertEquals(stageAt >= 0, true, "revert script staged");
   assertEquals(stageAt < armAt, true, "script staged before timer");
   assertEquals(armAt >= 0, true, "timer armed");
   assertEquals(applyAt > armAt, true, "timer armed before apply");
-  assertEquals(
-    f.commands.some((c) => c.includes("'nft' '-c' '-f' '-'")),
-    true,
-  );
 });
 
 Deno.test("apply_firewall: a matching ruleset that is still live is a no-op", async () => {
@@ -458,44 +479,11 @@ Deno.test("apply_firewall: a stale record re-applies instead of trusting the sha
   assertEquals(f.commands.some((c) => c.includes("systemd-run")), true);
 });
 
-Deno.test("apply_firewall: refuses a new change while a revert is armed", async () => {
-  const rendered = renderRuleset(FIREWALL);
-  const managed_sha256 = await managedTableSha256(rendered);
-  const f = fakeTransport((c) => {
-    if (c.includes("'nft' 'list' 'ruleset'")) {
-      return { code: 0, stdout: rendered };
-    }
-    if (c.includes("'systemctl' 'is-active'")) {
-      return { code: 0, stdout: "active\n" };
-    }
-    return { code: 0 };
-  });
+Deno.test("apply_firewall: the host refusing to arm (earlier revert busy) is a clear error and cleans up", async () => {
+  const f = fakeTransport((c) => isArm(c) ? { code: 75 } : { code: 0 });
   const m = modelWith(f);
-  const { context } = createModelTestContext({
+  const { context, getWrittenResources } = createModelTestContext({
     globalArgs: {},
-    storedResources: {
-      [`state-${hostInstance(SSH.host)}`]: {
-        host: SSH.host,
-        firewall: {
-          ruleset_sha256: "different",
-          managed_sha256: "different",
-          mode: "firewall",
-          ssh_exposure: "anywhere",
-          applied_at: "2026-01-01T00:00:00.000Z",
-        },
-        observed_at: "2026-01-01T00:00:00.000Z",
-      },
-      [`revert-${hostInstance(SSH.host)}`]: {
-        host: SSH.host,
-        token: TOKEN,
-        phase: "lockdown",
-        unit: `server-host-revert-${TOKEN}`,
-        expires_at: new Date(NOW + 60_000).toISOString(),
-        armed_at: "2026-01-01T00:00:00.000Z",
-        ruleset_sha256: PLACEHOLDER_SHA,
-        managed_sha256,
-      },
-    },
   });
   await assertRejects(
     () =>
@@ -504,9 +492,12 @@ Deno.test("apply_firewall: refuses a new change while a revert is armed", async 
         context,
       ),
     Error,
-    "still active",
+    "still active or firing",
   );
-  assertEquals(f.commands.some((c) => c.includes("systemd-run")), false);
+  // Nothing was applied, nothing was recorded, and this attempt's files are removed.
+  assertEquals(f.commands.some(isGuardedApply), false);
+  assertEquals(getWrittenResources().length, 0);
+  assertEquals(f.commands.some(isDisarm), true);
 });
 
 Deno.test("lockdown: an identical live ruleset with an armed revert is a no-op, not a stack", async () => {
@@ -598,9 +589,7 @@ Deno.test("lockdown: never allows SSH from anywhere and arms before applying", a
   assertEquals(out.result.revert_token, TOKEN);
   assertEquals(
     f.commands.findIndex((c) => c.includes("systemd-run")) <
-      f.commands.findIndex((c) =>
-        c.includes("'nft' '-f' '-'") && !c.includes("'-c'")
-      ),
+      f.commands.findIndex(isGuardedApply),
     true,
   );
 });
@@ -843,4 +832,208 @@ Deno.test("host key policy: strict without pinned keys is refused before any spa
     Error,
   );
   assertEquals(f.commands.length, 0);
+});
+
+/** Reads which resources were written, in order. */
+const writes = (
+  r: { getWrittenResources(): { name: string; spec?: string }[] },
+) => r.getWrittenResources().map((w) => w.name);
+
+Deno.test("apply_firewall: the revert is recorded when arming succeeds, BEFORE the apply runs", async () => {
+  let recordedAtApply: string[] = [];
+  const ctxRef = createModelTestContext({ globalArgs: {} });
+  const f = fakeTransport((c) => {
+    if (isGuardedApply(c)) recordedAtApply = writes(ctxRef);
+    return { code: 0 };
+  });
+  const m = modelWith(f);
+  await m.methods.apply_firewall.execute(
+    m.methods.apply_firewall.arguments.parse(FIREWALL_ARGS),
+    ctxRef.context,
+  );
+  assertEquals(recordedAtApply, [`revert-${hostInstance(SSH.host)}`]);
+});
+
+Deno.test("apply_firewall: a step failing after arming leaves the timer armed and the record open", async () => {
+  // The read-back fails after the apply went through: the outcome is unknown,
+  // so the host must keep the revert that will restore it.
+  const f = fakeTransport((c) =>
+    c.includes("'list' 'table'") ? { code: 1 } : { code: 0 }
+  );
+  const m = modelWith(f);
+  const ctx = createModelTestContext({ globalArgs: {} });
+  await assertRejects(
+    () =>
+      m.methods.apply_firewall.execute(
+        m.methods.apply_firewall.arguments.parse(FIREWALL_ARGS),
+        ctx.context,
+      ),
+    Error,
+    "read table back",
+  );
+  assertEquals(f.commands.some(isDisarm), false);
+  const rec = ctx.getWrittenResources().find((w) =>
+    w.name.startsWith("revert-")
+  );
+  assertEquals(rec !== undefined, true);
+  assertEquals(
+    (rec!.data as { cancelled_at?: string }).cancelled_at,
+    undefined,
+  );
+});
+
+Deno.test("apply_firewall: a definite apply failure disarms its own timer and marks the record cancelled", async () => {
+  const f = fakeTransport((c) => isGuardedApply(c) ? { code: 1 } : { code: 0 });
+  const m = modelWith(f);
+  const ctx = createModelTestContext({ globalArgs: {} });
+  await assertRejects(
+    () =>
+      m.methods.apply_firewall.execute(
+        m.methods.apply_firewall.arguments.parse(FIREWALL_ARGS),
+        ctx.context,
+      ),
+    Error,
+    "apply ruleset",
+  );
+  assertEquals(f.commands.some(isDisarm), true);
+  const last = ctx.getWrittenResources().filter((w) =>
+    w.name.startsWith("revert-")
+  ).at(-1)!;
+  assertEquals(
+    typeof (last.data as { cancelled_at?: string }).cancelled_at,
+    "string",
+  );
+  // A cancelled record no longer blocks: a retry starts a fresh change.
+  const again = await ctx.context.readResource(
+    `revert-${hostInstance(SSH.host)}`,
+  );
+  assertEquals(again !== null, true);
+});
+
+Deno.test("apply_firewall: a failing syntax check arms nothing and needs no cleanup", async () => {
+  const f = fakeTransport((c) =>
+    c.includes("'nft' '-c' '-f' '-'") ? { code: 1 } : { code: 0 }
+  );
+  const m = modelWith(f);
+  const ctx = createModelTestContext({ globalArgs: {} });
+  await assertRejects(
+    () =>
+      m.methods.apply_firewall.execute(
+        m.methods.apply_firewall.arguments.parse(FIREWALL_ARGS),
+        ctx.context,
+      ),
+    Error,
+    "nft syntax check",
+  );
+  assertEquals(f.commands.some(isArm), false);
+  assertEquals(f.commands.some(isDisarm), false);
+  assertEquals(ctx.getWrittenResources().length, 0);
+});
+
+Deno.test("apply_firewall: a retry after a failed change does not depend on any model record to be safe", async () => {
+  // The record is lost; the host's own refusal (75) is what stops a stacked timer.
+  const f = fakeTransport((c) => isArm(c) ? { code: 75 } : { code: 0 });
+  const m = modelWith(f);
+  const ctx = createModelTestContext({ globalArgs: {} });
+  await assertRejects(
+    () =>
+      m.methods.lockdown.execute(
+        m.methods.lockdown.arguments.parse(FIREWALL_ARGS),
+        ctx.context,
+      ),
+    Error,
+    "still active or firing",
+  );
+});
+
+Deno.test("insecure_tofu: the host key is scanned once and pinned strictly for every step", async () => {
+  const f = fakeTransport();
+  const m = modelWith(f);
+  const ctx = createModelTestContext({ globalArgs: {} });
+  await m.methods.apply_firewall.execute(
+    m.methods.apply_firewall.arguments.parse(FIREWALL_ARGS),
+    ctx.context,
+  );
+  assertEquals(f.scans.length, 1);
+  assertEquals(f.scans[0].at(-1), SSH.host);
+  // Every ssh step ran with the same pinned known_hosts, none with an empty one.
+  assertEquals(f.knownHosts.length, f.commands.length);
+  assertEquals(new Set(f.knownHosts).size, 1);
+  assertEquals(f.knownHosts[0], `${SSH.host} ${KEY}\n`);
+});
+
+Deno.test("insecure_tofu: a host offering no key fails before any command runs", async () => {
+  const f = fakeTransport();
+  const run = f.deps.run!;
+  f.deps.run = (cmd, args, o) =>
+    cmd === "ssh-keyscan"
+      ? Promise.resolve({ code: 0, stdout: "", stderr: "" })
+      : run(cmd, args, o);
+  const m = modelWith(f);
+  const ctx = createModelTestContext({ globalArgs: {} });
+  await assertRejects(
+    () =>
+      m.methods.apply_firewall.execute(
+        m.methods.apply_firewall.arguments.parse(FIREWALL_ARGS),
+        ctx.context,
+      ),
+    Error,
+    "No host keys",
+  );
+  assertEquals(f.commands.length, 0);
+});
+
+Deno.test("strict: pinned keys are used as given and nothing is scanned", async () => {
+  const f = fakeTransport();
+  const m = modelWith(f);
+  const ctx = createModelTestContext({ globalArgs: {} });
+  await m.methods.apply_firewall.execute(
+    m.methods.apply_firewall.arguments.parse({
+      ...FIREWALL_ARGS,
+      host_key_policy: "strict",
+      host_keys: [`${SSH.host} ${KEY}`],
+    }),
+    ctx.context,
+  );
+  assertEquals(f.scans.length, 0);
+});
+
+Deno.test("commit: an armed revert the model never recorded is found through the host's marker", async () => {
+  const f = fakeTransport((c) => {
+    if (c.includes("/var/lib/server-host/current") && c.includes("cat")) {
+      return { code: 0, stdout: `${TOKEN} ${Math.floor(NOW / 1000) + 200}\n` };
+    }
+    if (c.includes("'systemctl' 'is-active'")) {
+      return { code: 0, stdout: "active\n" };
+    }
+    return { code: 0 };
+  });
+  const ctx = createModelTestContext({ globalArgs: {} });
+  // The first probe sees it armed, the post-cancel probe must not.
+  let cancelled = false;
+  const base = f.deps.run!;
+  f.deps.run = (cmd, args, o) => {
+    if (
+      cmd === "ssh" && args.at(-1)!.includes('systemctl stop "$unit.timer"')
+    ) {
+      cancelled = true;
+    }
+    if (cmd === "ssh" && cancelled && args.at(-1)!.includes("'is-active'")) {
+      return Promise.resolve({ code: 3, stdout: "inactive\n", stderr: "" });
+    }
+    return base(cmd, args, o);
+  };
+  const m = modelWith(f);
+  const out = await m.methods.commit.execute(
+    m.methods.commit.arguments.parse({ ...SSH }),
+    ctx.context,
+  );
+  assertEquals(out.result.committed, true);
+});
+
+Deno.test("commit is described as DESTRUCTIVE", () => {
+  assertEquals(
+    createModel().methods.commit.description.startsWith("DESTRUCTIVE."),
+    true,
+  );
 });

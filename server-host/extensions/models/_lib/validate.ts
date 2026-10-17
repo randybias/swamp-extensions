@@ -57,9 +57,14 @@ export function isCidr(s: string): boolean {
   return bits <= 32 && ADDR_V4.test(addr);
 }
 
-/** True when the CIDR covers every address (`0.0.0.0/0` or `::/0`). */
+/**
+ * True when the CIDR has a numerically zero prefix, so it covers every address
+ * of its family whatever the spelling (`0.0.0.0/0`, `::/0`, `0:0:0:0:0:0:0:0/00`,
+ * `192.0.2.0/0`). Assumes `s` already passed {@link isCidr}.
+ */
 export function isDefaultRoute(s: string): boolean {
-  return s === "0.0.0.0/0" || s === "::/0";
+  const m = CIDR_RE.exec(s);
+  return m !== null && isCidr(s) && Number(m[2]) === 0;
 }
 
 /** Throws unless `s` is a valid CIDR block. */

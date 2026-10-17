@@ -19,11 +19,15 @@
 
 import { exec, type SshDeps, type Target } from "./ssh.ts";
 import {
+  isTimerActive,
+  parseMarker,
   renderArmArgv,
   renderCommitArgv,
+  renderDisarmArgv,
+  renderGuardedApplyArgv,
+  renderMarkerArgv,
   renderProbeArgv,
   renderRevertScript,
-  renderSnapshotArgv,
   scriptPath,
   STATE_DIR,
   withSudo,
@@ -33,7 +37,6 @@ import { HostConfigError } from "./validate.ts";
 
 /** The risk class of a step, used to assert ordering. */
 export type StepKind =
-  | "snapshot"
   | "stage"
   | "arm"
   | "precheck"
@@ -54,6 +57,8 @@ export interface Step {
   stdin?: Uint8Array;
   /** When true, a non-zero remote exit stops the plan. */
   check?: boolean;
+  /** Per-step transport timeout in seconds; defaults to {@link STEP_TIMEOUT_S}. */
+  timeoutS?: number;
 }
 
 /** A step after execution, with its result summarised for logging and tests. */
@@ -69,6 +74,11 @@ export interface EmittedStep {
 }
 
 const enc = new TextEncoder();
+
+/** Default per-step timeout. */
+export const STEP_TIMEOUT_S = 600;
+/** Timeout of the guarded apply, kept well under the shortest revert (60 s). */
+export const APPLY_TIMEOUT_S = 30;
 
 /**
  * True when the timer-activation step (`arm`) precedes the first mutating
@@ -321,18 +331,20 @@ export interface FirewallChangeInput {
 }
 
 /**
- * Builds the ordered firewall-change stream: snapshot, write the revert script
- * (stage), activate the timer (arm), pre-check with `nft -c`, apply with
- * `nft -f`, then read the table back. The timer activation always precedes the
- * apply step.
+ * Builds the ordered firewall-change stream: `nft -c` syntax check (no side
+ * effects, so it runs before anything is armed), write the revert script
+ * (stage), arm (which snapshots and starts the timer under the host lock),
+ * apply under the same lock only while the revert still guards the change,
+ * then read the table back.
  */
 export function planFirewallChange(input: FirewallChangeInput): Step[] {
   const rules = enc.encode(input.rulesText);
   const steps: Step[] = [
     {
-      kind: "snapshot",
-      label: "snapshot ruleset",
-      argv: renderSnapshotArgv(input.token, input.sudo),
+      kind: "precheck",
+      label: "nft syntax check",
+      argv: withSudo(input.sudo, ["nft", "-c", "-f", "-"]),
+      stdin: rules,
       check: true,
     },
     writeFileStep(
@@ -350,18 +362,12 @@ export function planFirewallChange(input: FirewallChangeInput): Step[] {
       check: true,
     },
     {
-      kind: "precheck",
-      label: "nft syntax check",
-      argv: withSudo(input.sudo, ["nft", "-c", "-f", "-"]),
-      stdin: rules,
-      check: true,
-    },
-    {
       kind: "apply",
       label: "apply ruleset",
-      argv: withSudo(input.sudo, ["nft", "-f", "-"]),
+      argv: renderGuardedApplyArgv(input.token, input.sudo),
       stdin: rules,
       check: true,
+      timeoutS: APPLY_TIMEOUT_S,
     },
     {
       kind: "verify",
@@ -390,6 +396,19 @@ export function planCommit(token: string, sudo: boolean): Step[] {
   }];
 }
 
+/**
+ * The step that abandons a revert after a change that definitely did not
+ * happen. Tolerant and idempotent; see {@link renderDisarmArgv}.
+ */
+export function planDisarm(token: string, sudo: boolean): Step[] {
+  return [{
+    kind: "cleanup",
+    label: "disarm revert timer",
+    argv: renderDisarmArgv(token, sudo),
+    check: true,
+  }];
+}
+
 /** Inputs to the READ-ONLY probe. */
 export interface ReadInput {
   /** Wrap privileged commands in `sudo -n`. */
@@ -406,8 +425,12 @@ export interface ProbeResult {
   managed_sha256: string;
   /** True when the managed table is present. */
   managed_table: boolean;
-  /** True when a recorded revert timer is still active. */
+  /** True when the revert timer (the recorded one, else the host's) is active. */
   armed: boolean;
+  /** Token of the revert the host itself records as current, if any. */
+  current_token?: string;
+  /** ISO-8601 expiry of that revert, if any. */
+  current_expires_at?: string;
   /** ISO-8601 time of the probe. */
   observed_at: string;
 }
@@ -439,16 +462,29 @@ export async function probeState(
     );
   }
   const managed = listed.stdout.includes("table inet server_host");
+  const marked = await exec(
+    deps,
+    target,
+    renderMarkerArgv(input.sudo),
+    { timeoutS: 30 },
+  );
+  if (marked.exit_code !== 0) {
+    throw new HostOpsError(
+      `Reading the revert marker on ${target.host} failed with exit code ${marked.exit_code}; refusing to record firewall state`,
+    );
+  }
+  const marker = parseMarker(marked.stdout);
+  const token = input.token ?? marker?.token;
   let armed = false;
-  if (input.token) {
+  if (token) {
     const probe = await exec(
       deps,
       target,
-      renderProbeArgv(input.token, input.sudo),
+      renderProbeArgv(token, input.sudo),
       { timeoutS: 30 },
     );
     if (probe.exit_code === 0) {
-      armed = probe.stdout.trim() === "active";
+      armed = isTimerActive(probe.stdout);
     } else if (probe.exit_code === 3 || probe.exit_code === 4) {
       armed = false;
     } else {
@@ -462,6 +498,12 @@ export async function probeState(
     managed_sha256: await managedTableSha256(listed.stdout),
     managed_table: managed,
     armed,
+    ...(marker
+      ? {
+        current_token: marker.token,
+        current_expires_at: new Date(marker.expires_at_s * 1000).toISOString(),
+      }
+      : {}),
     observed_at: new Date(deps.now()).toISOString(),
   };
 }
@@ -469,22 +511,27 @@ export async function probeState(
 /**
  * Runs `steps` through the transport in order and returns what was emitted. A
  * step marked `check` throws {@link HostOpsError} on a non-zero remote exit,
- * so a failed `nft -c` pre-check stops the plan before the apply step.
+ * so a failed `nft -c` pre-check stops the plan before anything is armed.
+ * `after` runs once each step has succeeded, before the next one starts; the
+ * model uses it to persist the armed revert before the change is applied.
  */
 export async function executePlan(
   deps: SshDeps,
   target: Target,
   steps: Step[],
+  after?: (step: Step) => Promise<void>,
 ): Promise<EmittedStep[]> {
   const emitted: EmittedStep[] = [];
   for (const step of steps) {
     const res = await exec(deps, target, step.argv, {
       stdin: step.stdin,
-      timeoutS: 600,
+      timeoutS: step.timeoutS ?? STEP_TIMEOUT_S,
     });
     if (step.check && res.exit_code !== 0) {
       throw new HostOpsError(
         `Remote step "${step.label}" failed with exit code ${res.exit_code}`,
+        step.kind,
+        res.exit_code,
       );
     }
     emitted.push({
@@ -493,16 +540,23 @@ export async function executePlan(
       argv: step.argv,
       exit_code: res.exit_code,
     });
+    if (after) await after(step);
   }
   return emitted;
 }
 
 /** A remote step failed or a plan violated an invariant. */
 export class HostOpsError extends Error {
+  /** The kind of step that failed, when the failure was a remote exit. */
+  readonly stepKind?: StepKind;
+  /** The remote exit code, when the failure was a remote exit. */
+  readonly exitCode?: number;
   /** Creates a host-operations error. */
-  constructor(message: string) {
+  constructor(message: string, stepKind?: StepKind, exitCode?: number) {
     super(message);
     this.name = "HostOpsError";
+    this.stepKind = stepKind;
+    this.exitCode = exitCode;
   }
 }
 

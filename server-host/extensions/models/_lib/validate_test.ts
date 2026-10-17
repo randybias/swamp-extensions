@@ -127,3 +127,26 @@ Deno.test("dedupe: stable sorted sets", () => {
   assertEquals(dedupeSorted(["b", "a", "b", "c"]), ["a", "b", "c"]);
   assertEquals(dedupeSortedNumbers([443, 80, 443, 22]), [22, 80, 443]);
 });
+
+Deno.test("isDefaultRoute: any numerically zero prefix is anywhere, in any spelling", () => {
+  for (
+    const anywhere of [
+      "0.0.0.0/0",
+      "::/0",
+      "0:0:0:0:0:0:0:0/0", // leak-allow(expanded IPv6 zero is the case under test)
+      "0000:0000:0000:0000:0000:0000:0000:0000/0", // leak-allow(zero-padded IPv6 zero is the case under test)
+      "::/00",
+      "0.0.0.0/00",
+      "192.0.2.0/0",
+      "2001:db8::/000",
+    ]
+  ) {
+    assertEquals(isCidr(anywhere), true, anywhere);
+    assertEquals(isDefaultRoute(anywhere), true, anywhere);
+  }
+  for (const narrow of ["192.0.2.0/24", "2001:db8::/32", "::/1", "0.0.0.0/1"]) {
+    assertEquals(isDefaultRoute(narrow), false, narrow);
+  }
+  // Not a CIDR at all: never reported as a default route.
+  assertEquals(isDefaultRoute("not-a-cidr/0"), false);
+});

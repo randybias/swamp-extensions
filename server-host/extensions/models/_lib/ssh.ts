@@ -422,6 +422,38 @@ export function classifyFailure(
   return new SshError("transport", `SSH to ${t.host} failed`);
 }
 
+/**
+ * Fixes the host identity for one logical operation. Under `strict` the
+ * target is returned unchanged. Under `insecure_tofu` the host's keys are
+ * scanned ONCE and the returned target pins them with strict checking, so
+ * every later `exec` of the operation must see the same keys: a host that
+ * offers a different key on a later step fails with a `host_key` error
+ * instead of being trusted afresh each time. Nothing is persisted.
+ */
+export async function pinHostKeys(
+  deps: SshDeps,
+  t: Target,
+): Promise<Target> {
+  assertTarget(t);
+  if (t.hostKeyPolicy === "strict") return t;
+  const scanned = await deps.run("ssh-keyscan", [
+    "-T",
+    String(t.connectTimeoutS),
+    "-p",
+    String(t.port),
+    t.host,
+  ]);
+  const keys = parseKeyscan(scanned.stdout);
+  if (keys.length === 0) {
+    throw new SshError("host_key", `No host keys offered by ${t.host}`);
+  }
+  return {
+    ...t,
+    hostKeyPolicy: "strict",
+    hostKeys: formatHostKeys(keys, t.host, t.port),
+  };
+}
+
 /** The result of `exec`. */
 export interface ExecResult {
   /** The remote command's exit status. */

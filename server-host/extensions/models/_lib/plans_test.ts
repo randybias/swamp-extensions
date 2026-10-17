@@ -93,9 +93,9 @@ Deno.test("armed-revert: the arm step precedes the apply step in the plan", () =
   assertArmedBeforeApply(steps);
   const kinds = steps.map((s) => s.kind);
   assertEquals(kinds.indexOf("stage") < kinds.indexOf("arm"), true);
-  assertEquals(kinds.indexOf("snapshot") < kinds.indexOf("stage"), true);
-  assertEquals(kinds.indexOf("arm") < kinds.indexOf("precheck"), true);
-  assertEquals(kinds.indexOf("precheck") < kinds.indexOf("apply"), true);
+  // The syntax check has no side effects and runs before anything is armed.
+  assertEquals(kinds.indexOf("precheck") < kinds.indexOf("stage"), true);
+  assertEquals(kinds.indexOf("precheck") < kinds.indexOf("arm"), true);
   assertEquals(kinds.indexOf("apply") < kinds.indexOf("verify"), true);
 });
 
@@ -109,19 +109,19 @@ Deno.test("armed-revert: the emitted command stream arms before it applies", asy
   });
   const emitted = await executePlan(f.deps, TARGET, steps);
   assertEquals(
-    emitted.map((e) => e.kind).join(",").includes("arm,precheck,apply"),
-    true,
+    emitted.map((e) => e.kind).join(","),
+    "precheck,stage,arm,apply,verify",
   );
   const armAt = f.commands.findIndex((c) => c.includes("systemd-run"));
   const checkAt = f.commands.findIndex((c) =>
     c.includes("'nft' '-c' '-f' '-'")
   );
   const applyAt = f.commands.findIndex((c) =>
-    c.includes("'nft' '-f' '-'") && !c.includes("'-c'")
+    c.includes("nft -f -") && c.includes("exit 70")
   );
   assertEquals(armAt >= 0, true, "arm emitted");
-  assertEquals(checkAt > armAt, true, "pre-check after arm");
-  assertEquals(applyAt > checkAt, true, "apply after pre-check");
+  assertEquals(checkAt >= 0 && checkAt < armAt, true, "pre-check before arm");
+  assertEquals(applyAt > armAt, true, "apply after arm");
 });
 
 Deno.test("pre-check failure stops the plan before apply", async () => {

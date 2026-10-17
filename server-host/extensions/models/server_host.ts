@@ -16,7 +16,12 @@
  */
 
 import { z } from "npm:zod@4.3.6";
-import { denoDeps, type SshDeps, type Target } from "./_lib/ssh.ts";
+import {
+  denoDeps,
+  pinHostKeys,
+  type SshDeps,
+  type Target,
+} from "./_lib/ssh.ts";
 import {
   assertAuthorizedKey,
   assertCidr,
@@ -44,13 +49,15 @@ import {
 import {
   type EmittedStep,
   executePlan,
+  HostOpsError,
   planApplyBase,
   planCommit,
+  planDisarm,
   planFirewallChange,
   probeState,
   renderSysctlConf,
 } from "./_lib/plans.ts";
-import { TOKEN_RE } from "./_lib/armed_revert.ts";
+import { TOKEN_RE, unitName } from "./_lib/armed_revert.ts";
 
 /** Reads one secret from a swamp vault. Implemented by the runtime. */
 export interface VaultReader {
@@ -224,6 +231,7 @@ const RevertSchema = z.strictObject({
   ruleset_sha256: z.string(),
   managed_sha256: z.string().optional(),
   committed_at: z.string().optional(),
+  cancelled_at: z.string().optional(),
 });
 
 const RenderStateSchema = z.strictObject({
@@ -273,38 +281,19 @@ function renderName(host: string): string {
   return `render-${hostInstance(host)}`;
 }
 
-/** The recorded, uncommitted revert for `host`, if there is one. */
+/** True when a recorded revert was neither committed nor cancelled. */
+function isOpen(record: Revert | null): record is Revert {
+  return record !== null && record.committed_at === undefined &&
+    record.cancelled_at === undefined;
+}
+
+/** The recorded, still-open revert for `host`, if there is one. */
 async function currentRevert(
   context: Ctx,
   host: string,
 ): Promise<Revert | null> {
   const record = await context.readResource(revertName(host)) as Revert | null;
-  return record && record.committed_at === undefined ? record : null;
-}
-
-/**
- * Refuses a new destructive firewall change while a recorded revert is still
- * armed: a second timer would outlive the first commit and silently undo it.
- * A recorded revert whose timer already fired or was lost is stale and is
- * ignored; the caller overwrites it with the new one.
- */
-async function assertNoActiveRevert(
-  deps: HostDeps,
-  t: Target,
-  args: { sudo: boolean },
-  record: Revert | null,
-  host: string,
-): Promise<void> {
-  if (!record) return;
-  const probe = await probeState(deps, t, {
-    sudo: args.sudo,
-    token: record.token,
-  });
-  if (probe.armed) {
-    throw new HostConfigError(
-      `An armed revert (${record.phase}, expires ${record.expires_at}) is still active on ${host}; commit it or let it fire before making another firewall change`,
-    );
-  }
+  return isOpen(record) ? record : null;
 }
 
 /**
@@ -394,6 +383,191 @@ function sameStrings(a: readonly string[], b: readonly string[]): boolean {
 /** Builds the model with overridable dependencies (spawner, clock, token). */
 export function createModel(overrides: Partial<HostDeps> = {}) {
   const deps: HostDeps = { ...denoHostDeps, ...overrides };
+
+  /** Resolves the key and fixes the host identity once for a whole operation. */
+  async function openTarget(
+    context: Ctx,
+    a: Parameters<typeof target>[0] & {
+      ssh_key_ref: { vault: string; key: string };
+    },
+  ): Promise<Target> {
+    const key = await resolvePrivateKey(deps, context, a.ssh_key_ref);
+    return await pinHostKeys(deps, target(a, key));
+  }
+
+  /**
+   * The shared firewall-change lifecycle. The host is the source of truth: its
+   * lock serializes arm, apply and restore, and its current-revert marker
+   * decides whether a new change may start. The model's record is written the
+   * moment arming is confirmed and before anything is applied, so an armed
+   * timer is never untracked; a change that definitely did not happen cancels
+   * its own timer, and an ambiguous one leaves it armed to restore the host.
+   */
+  async function changeFirewall(
+    context: Ctx,
+    args: z.infer<typeof FirewallChangeArgs>,
+    phase: "firewall" | "lockdown",
+    rules: FirewallRules,
+    exposure: "management-only" | "anywhere",
+  ) {
+    const t = await openTarget(context, args);
+    const ruleset = renderRuleset(rules);
+    const ruleset_sha256 = await rulesetSha256(ruleset);
+    const managed_sha256 = await managedTableSha256(ruleset);
+    const stored = await context.readResource(stateName(args.host)) as
+      | HostState
+      | null;
+    const record = await currentRevert(context, args.host);
+    if (stored?.firewall?.ruleset_sha256 === ruleset_sha256) {
+      const probe = await probeState(deps, t, {
+        sudo: args.sudo,
+        token: record?.token,
+      });
+      if (probe.managed_table && probe.managed_sha256 === managed_sha256) {
+        context.logger.info(
+          "{phase} on {host}: ruleset already live, no-op",
+          { phase, host: args.host },
+        );
+        const stillArmed = record !== null && probe.armed;
+        return {
+          result: {
+            host: args.host,
+            ruleset_sha256,
+            managed_sha256,
+            revert_token: stillArmed ? record.token : null,
+            expires_at: stillArmed ? record.expires_at : null,
+            changed: false,
+          },
+        };
+      }
+    }
+    const token = deps.token();
+    const expires_at = new Date(deps.now() + args.revert_after_s * 1000)
+      .toISOString();
+    const steps = planFirewallChange({
+      token,
+      revertAfterS: args.revert_after_s,
+      sudo: args.sudo,
+      rulesText: ruleset,
+    });
+    let armed = false;
+    let attempted = false;
+    let revertHandle: { name: string } | undefined;
+    const emitted: EmittedStep[] = [];
+    try {
+      for (const step of steps) {
+        // The syntax check changes nothing, so a failure there needs no cleanup.
+        if (step.kind !== "precheck") attempted = true;
+        emitted.push(...await executePlan(deps, t, [step]));
+        if (step.kind !== "arm") continue;
+        revertHandle = await context.writeResource(
+          "revert",
+          revertName(args.host),
+          {
+            host: args.host,
+            token,
+            phase,
+            unit: unitName(token),
+            expires_at,
+            armed_at: new Date(deps.now()).toISOString(),
+            ruleset_sha256,
+            managed_sha256,
+          },
+        );
+        armed = true;
+      }
+    } catch (e) {
+      await settleFailedChange(context, t, args, token, armed, attempted, e);
+      throw busyAsConfigError(e, args.host);
+    }
+    const stateHandle = await writeFirewallState(
+      context,
+      stateName(args.host),
+      args.host,
+      stored,
+      { ruleset_sha256, managed_sha256 },
+      phase,
+      exposure,
+      deps.now(),
+    );
+    context.logger.info("{phase} on {host}: armed {token}, {count} steps", {
+      phase,
+      host: args.host,
+      token,
+      count: emitted.length,
+    });
+    return {
+      dataHandles: [revertHandle!, stateHandle],
+      result: {
+        host: args.host,
+        ruleset_sha256,
+        managed_sha256,
+        revert_token: token,
+        expires_at,
+        changed: true,
+      },
+    };
+  }
+
+  /**
+   * After a failed change: a refused or failed arm cleans up its own token; an
+   * apply the host definitively rejected (`nft -f` is atomic, so nothing
+   * changed) disarms and marks the record cancelled; any other failure after
+   * arming leaves the timer armed and the record open, so the host restores
+   * itself and a retry is refused until it has.
+   */
+  async function settleFailedChange(
+    context: Ctx,
+    t: Target,
+    args: { host: string; sudo: boolean },
+    token: string,
+    armed: boolean,
+    attempted: boolean,
+    error: unknown,
+  ): Promise<void> {
+    if (!armed && !attempted) return;
+    const definite = error instanceof HostOpsError &&
+      error.exitCode !== undefined;
+    if (armed && !(definite && (error as HostOpsError).stepKind === "apply")) {
+      context.logger.warning(
+        "Change on {host} failed after arming; revert {token} stays armed and will restore the host",
+        { host: args.host, token },
+      );
+      return;
+    }
+    try {
+      await executePlan(deps, t, planDisarm(token, args.sudo));
+    } catch {
+      context.logger.warning(
+        "Could not disarm revert {token} on {host}; it stays armed and will restore the host",
+        { host: args.host, token },
+      );
+      return;
+    }
+    if (!armed) return;
+    const rec = await context.readResource(revertName(args.host)) as
+      | Revert
+      | null;
+    if (rec && rec.token === token) {
+      await context.writeResource("revert", revertName(args.host), {
+        ...rec,
+        cancelled_at: new Date(deps.now()).toISOString(),
+      });
+    }
+  }
+
+  /** Turns the host's "earlier revert still active" refusal into a clear error. */
+  function busyAsConfigError(error: unknown, host: string): unknown {
+    if (
+      error instanceof HostOpsError && error.stepKind === "arm" &&
+      error.exitCode === 75
+    ) {
+      return new HostConfigError(
+        `An earlier armed revert is still active or firing on ${host}; commit it or let it fire, then retry`,
+      );
+    }
+    return error;
+  }
   return {
     type: "@randybias/server-host",
     version: "2026.10.17.1",
@@ -440,11 +614,7 @@ export function createModel(overrides: Partial<HostDeps> = {}) {
             assertSysctlValue(v);
           }
           assertTimezone(args.timezone);
-          const privateKey = await resolvePrivateKey(
-            deps,
-            context,
-            args.ssh_key_ref,
-          );
+          const t = await openTarget(context, args);
           const stored = await context.readResource(stateName(args.host)) as
             | HostState
             | null;
@@ -488,11 +658,7 @@ export function createModel(overrides: Partial<HostDeps> = {}) {
             sysctl: args.sysctl,
             timezone: args.timezone,
           }, changed);
-          const emitted = await executePlan(
-            deps,
-            target(args, privateKey),
-            steps,
-          );
+          const emitted = await executePlan(deps, t, steps);
           context.logger.info("apply_base on {host}: {count} steps", {
             host: args.host,
             count: emitted.length,
@@ -557,107 +723,25 @@ export function createModel(overrides: Partial<HostDeps> = {}) {
       },
       apply_firewall: {
         description:
-          "DESTRUCTIVE. Snapshot the current ruleset, arm a host-side revert timer, then pre-check and apply the rendered ruleset with nft; a wrong ruleset can cut management access, so the host restores the snapshot unless commit cancels the timer. Idempotent: a matching ruleset that is still live is a no-op.",
+          "DESTRUCTIVE. Pre-check the rendered ruleset with nft, snapshot the current one, arm a host-side revert timer, then apply it with nft; a wrong ruleset can cut management access, so the host restores the snapshot unless commit cancels the timer. Idempotent: a matching ruleset that is still live is a no-op. Refuses while an earlier revert is still active or firing.",
         kind: "action" as const,
         arguments: FirewallChangeArgs,
         execute: async (
           args: z.infer<typeof FirewallChangeArgs>,
           context: Ctx,
         ) => {
-          const privateKey = await resolvePrivateKey(
-            deps,
+          return await changeFirewall(
             context,
-            args.ssh_key_ref,
-          );
-          const ruleset = renderRuleset(rulesFrom(args));
-          const ruleset_sha256 = await rulesetSha256(ruleset);
-          const managed_sha256 = await managedTableSha256(ruleset);
-          const t = target(args, privateKey);
-          const stored = await context.readResource(stateName(args.host)) as
-            | HostState
-            | null;
-          const record = await currentRevert(context, args.host);
-          if (stored?.firewall?.ruleset_sha256 === ruleset_sha256) {
-            const probe = await probeState(deps, t, {
-              sudo: args.sudo,
-              token: record?.token,
-            });
-            if (
-              probe.managed_table && probe.managed_sha256 === managed_sha256
-            ) {
-              context.logger.info(
-                "apply_firewall on {host}: ruleset already live, no-op",
-                { host: args.host },
-              );
-              const stillArmed = record !== null && probe.armed;
-              return {
-                result: {
-                  host: args.host,
-                  ruleset_sha256,
-                  managed_sha256,
-                  revert_token: stillArmed ? record.token : null,
-                  expires_at: stillArmed ? record.expires_at : null,
-                  changed: false,
-                },
-              };
-            }
-          }
-          await assertNoActiveRevert(deps, t, args, record, args.host);
-          const token = deps.token();
-          const expires_at = new Date(
-            deps.now() + args.revert_after_s * 1000,
-          ).toISOString();
-          const steps = planFirewallChange({
-            token,
-            revertAfterS: args.revert_after_s,
-            sudo: args.sudo,
-            rulesText: ruleset,
-          });
-          const emitted: EmittedStep[] = await executePlan(deps, t, steps);
-          const revertHandle = await context.writeResource(
-            "revert",
-            revertName(args.host),
-            {
-              host: args.host,
-              token,
-              phase: "firewall",
-              unit: `server-host-revert-${token}`,
-              expires_at,
-              armed_at: new Date(deps.now()).toISOString(),
-              ruleset_sha256,
-              managed_sha256,
-            },
-          );
-          const stateHandle = await writeFirewallState(
-            context,
-            stateName(args.host),
-            args.host,
-            stored,
-            { ruleset_sha256, managed_sha256 },
+            args,
             "firewall",
+            rulesFrom(args),
             args.allow_ssh_from_anywhere ? "anywhere" : "management-only",
-            deps.now(),
           );
-          context.logger.info(
-            "apply_firewall on {host}: armed {token}, {count} steps",
-            { host: args.host, token, count: emitted.length },
-          );
-          return {
-            dataHandles: [revertHandle, stateHandle],
-            result: {
-              host: args.host,
-              ruleset_sha256,
-              managed_sha256,
-              revert_token: token,
-              expires_at,
-              changed: true,
-            },
-          };
         },
       },
       lockdown: {
         description:
-          "DESTRUCTIVE. Restrict the SSH port to management_cidrs, snapshotting the ruleset and arming a host-side revert timer before the change. Returns the revert token and expiry; unless commit cancels the timer the host restores the snapshot.",
+          "DESTRUCTIVE. Restrict the SSH port to management_cidrs, pre-checking the ruleset, snapshotting the current one and arming a host-side revert timer before the change. Returns the revert token and expiry; unless commit cancels the timer the host restores the snapshot.",
         kind: "action" as const,
         arguments: FirewallChangeArgs,
         execute: async (
@@ -670,121 +754,46 @@ export function createModel(overrides: Partial<HostDeps> = {}) {
             );
           }
           for (const c of args.management_cidrs) assertCidr(c);
-          const privateKey = await resolvePrivateKey(
-            deps,
+          return await changeFirewall(
             context,
-            args.ssh_key_ref,
-          );
-          const ruleset = renderRuleset(rulesFrom({
-            ...args,
-            allow_ssh_from_anywhere: false,
-          }));
-          const ruleset_sha256 = await rulesetSha256(ruleset);
-          const managed_sha256 = await managedTableSha256(ruleset);
-          const t = target(args, privateKey);
-          const stored = await context.readResource(stateName(args.host)) as
-            | HostState
-            | null;
-          const record = await currentRevert(context, args.host);
-          if (stored?.firewall?.ruleset_sha256 === ruleset_sha256) {
-            const probe = await probeState(deps, t, {
-              sudo: args.sudo,
-              token: record?.token,
-            });
-            if (
-              probe.managed_table && probe.managed_sha256 === managed_sha256
-            ) {
-              context.logger.info(
-                "lockdown on {host}: ruleset already live, no-op",
-                { host: args.host },
-              );
-              const stillArmed = record !== null && probe.armed;
-              return {
-                result: {
-                  host: args.host,
-                  ruleset_sha256,
-                  managed_sha256,
-                  revert_token: stillArmed ? record.token : null,
-                  expires_at: stillArmed ? record.expires_at : null,
-                  changed: false,
-                },
-              };
-            }
-          }
-          await assertNoActiveRevert(deps, t, args, record, args.host);
-          const token = deps.token();
-          const expires_at = new Date(
-            deps.now() + args.revert_after_s * 1000,
-          ).toISOString();
-          const steps = planFirewallChange({
-            token,
-            revertAfterS: args.revert_after_s,
-            sudo: args.sudo,
-            rulesText: ruleset,
-          });
-          await executePlan(deps, t, steps);
-          const revertHandle = await context.writeResource(
-            "revert",
-            revertName(args.host),
-            {
-              host: args.host,
-              token,
-              phase: "lockdown",
-              unit: `server-host-revert-${token}`,
-              expires_at,
-              armed_at: new Date(deps.now()).toISOString(),
-              ruleset_sha256,
-              managed_sha256,
-            },
-          );
-          const stateHandle = await writeFirewallState(
-            context,
-            stateName(args.host),
-            args.host,
-            stored,
-            { ruleset_sha256, managed_sha256 },
+            args,
             "lockdown",
+            rulesFrom({ ...args, allow_ssh_from_anywhere: false }),
             "management-only",
-            deps.now(),
           );
-          context.logger.info("lockdown on {host}: armed {token}", {
-            host: args.host,
-            token,
-          });
-          return {
-            dataHandles: [revertHandle, stateHandle],
-            result: {
-              host: args.host,
-              ruleset_sha256,
-              managed_sha256,
-              revert_token: token,
-              expires_at,
-            },
-          };
         },
       },
       commit: {
         description:
-          "Cancel the armed revert after confirming the host is still reachable. Probes that the timer is still active and the live ruleset still matches the armed revert, refuses when it does not, and treats a failed cancellation as fatal; only then is the revert recorded as committed.",
+          "DESTRUCTIVE. Removes automatic recovery. Cancel the armed revert after confirming the host is still reachable. Probes that the timer is still active and the live ruleset still matches the armed revert, refuses when it does not, and treats a failed cancellation as fatal; only then is the revert recorded as committed.",
         kind: "action" as const,
         arguments: CommitArgs,
         execute: async (
           args: z.infer<typeof CommitArgs>,
           context: Ctx,
         ) => {
-          const privateKey = await resolvePrivateKey(
-            deps,
-            context,
-            args.ssh_key_ref,
-          );
-          const t = target(args, privateKey);
-          const stored = await context.readResource(revertName(args.host)) as
+          const t = await openTarget(context, args);
+          let stored = await context.readResource(revertName(args.host)) as
             | Revert
             | null;
-          if (!stored) {
-            throw new HostConfigError(
-              `No armed revert is recorded for ${args.host}`,
-            );
+          if (!stored || !isOpen(stored)) {
+            // The record may be missing although the host is armed (a failure
+            // between arming and recording); the host's own marker is the truth.
+            const live = await probeState(deps, t, { sudo: args.sudo });
+            if (!live.current_token || !live.armed) {
+              throw new HostConfigError(
+                `No armed revert is recorded for ${args.host}`,
+              );
+            }
+            stored = {
+              host: args.host,
+              token: live.current_token,
+              phase: "firewall",
+              unit: unitName(live.current_token),
+              expires_at: live.current_expires_at!,
+              armed_at: live.observed_at,
+              ruleset_sha256: "",
+            };
           }
           if (
             args.revert_token !== undefined &&
@@ -875,21 +884,15 @@ export function createModel(overrides: Partial<HostDeps> = {}) {
           args: z.infer<typeof ProbeArgs>,
           context: Ctx,
         ) => {
-          const privateKey = await resolvePrivateKey(
-            deps,
-            context,
-            args.ssh_key_ref,
-          );
+          const t = await openTarget(context, args);
           const stored = await context.readResource(stateName(args.host)) as
             | HostState
             | null;
           const revert = await context.readResource(revertName(args.host)) as
             | Revert
             | null;
-          const active = revert && revert.committed_at === undefined
-            ? revert
-            : null;
-          const probe = await probeState(deps, target(args, privateKey), {
+          const active = isOpen(revert) ? revert : null;
+          const probe = await probeState(deps, t, {
             sudo: args.sudo,
             token: active?.token,
           });
@@ -932,21 +935,15 @@ export function createModel(overrides: Partial<HostDeps> = {}) {
           args: z.infer<typeof ProbeArgs>,
           context: Ctx,
         ) => {
-          const privateKey = await resolvePrivateKey(
-            deps,
-            context,
-            args.ssh_key_ref,
-          );
+          const t = await openTarget(context, args);
           const stored = await context.readResource(stateName(args.host)) as
             | HostState
             | null;
           const revert = await context.readResource(revertName(args.host)) as
             | Revert
             | null;
-          const active = revert && revert.committed_at === undefined
-            ? revert
-            : null;
-          const probe = await probeState(deps, target(args, privateKey), {
+          const active = isOpen(revert) ? revert : null;
+          const probe = await probeState(deps, t, {
             sudo: args.sudo,
             token: active?.token,
           });

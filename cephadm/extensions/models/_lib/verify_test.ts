@@ -3,10 +3,13 @@ import { PhaseError, TransportError } from "./errors.ts";
 import type { CommandResult, SshSession } from "./ssh.ts";
 import {
   crushFailureDomain,
+  nooutPredicate,
   persistVerdict,
   selectCrushRule,
   settle,
   verifyCsiUsers,
+  verifyHealth,
+  verifyHostNoout,
   verifyMgr,
   verifyMonQuorum,
   verifyOsd,
@@ -333,3 +336,189 @@ Deno.test(
     assertEquals(written.length, 2);
   },
 );
+
+Deno.test(
+  "health refuses missing, unknown and unnamed-warning states", // leak-allow(decision D38)
+  async () => {
+    const empty = vSession(() => ({ code: 0, stdout: "{}", stderr: "" }));
+    assertEquals(
+      (await verifyHealth(deps, empty, { wantOk: true })).actual,
+      null,
+    );
+    assertEquals(
+      (await verifyHealth(deps, empty, { wantOk: false })).actual,
+      null,
+    );
+
+    const unknown = vSession(() => ({
+      code: 0,
+      stdout: '{"status":"HEALTH_UNKNOWN","checks":{}}',
+      stderr: "",
+    }));
+    assertEquals(
+      (await verifyHealth(deps, unknown, { wantOk: true })).pass,
+      false,
+    );
+    assertEquals(
+      (await verifyHealth(deps, unknown, { wantOk: false })).actual,
+      null,
+    );
+
+    const unnamed = vSession(() => ({
+      code: 0,
+      stdout: '{"status":"HEALTH_WARN"}',
+      stderr: "",
+    }));
+    assertEquals(
+      (await verifyHealth(deps, unnamed, { wantOk: true })).pass,
+      false,
+    );
+
+    const contradiction = vSession(() => ({
+      code: 0,
+      stdout: '{"status":"HEALTH_WARN","checks":{"OSD_FLAGS":{}}}',
+      stderr: "",
+    }));
+    const verdict = await verifyHealth(deps, contradiction, {
+      wantOk: false,
+      allowedWarnings: ["OSD_FLAGS"],
+    });
+    assertEquals(verdict.pass, false);
+    assertEquals(verdict.actual, null);
+    assertEquals(String(verdict.detail.reason).includes("wantOk"), true);
+  },
+);
+
+Deno.test("health evaluates the status and the allowlist", async () => {
+  const ok = vSession(() => ({
+    code: 0,
+    stdout: '{"status":"health_ok","checks":{}}',
+    stderr: "",
+  }));
+  assertEquals((await verifyHealth(deps, ok, { wantOk: true })).pass, true);
+
+  const warn = vSession(() => ({
+    code: 0,
+    stdout:
+      '{"status":"HEALTH_WARN","checks":{"OSD_DOWN":{"summary":{"message":"1 osd down"}}}}',
+    stderr: "",
+  }));
+  const noAllow = await verifyHealth(deps, warn, { wantOk: true });
+  assertEquals(noAllow.pass, false);
+  assertEquals(noAllow.detail.activeChecks as string[], ["OSD_DOWN"]);
+
+  const allowed = vSession(() => ({
+    code: 0,
+    stdout:
+      '{"status":"HEALTH_WARN","checks":{"OSD_FLAGS":{"summary":{"message":"noout"}},"CEPHADM_FAILED_DAEMON":{"summary":{"message":"daemon"}}}}',
+    stderr: "",
+  }));
+  assertEquals(
+    (await verifyHealth(deps, allowed, {
+      wantOk: true,
+      allowedWarnings: ["OSD_FLAGS", "CEPHADM_FAILED_DAEMON"],
+    })).pass,
+    true,
+  );
+  const extra = vSession(() => ({
+    code: 0,
+    stdout:
+      '{"status":"HEALTH_WARN","checks":{"OSD_FLAGS":{},"PG_DEGRADED":{"summary":{"message":"degraded"}}}}',
+    stderr: "",
+  }));
+  const extraVerdict = await verifyHealth(deps, extra, {
+    wantOk: true,
+    allowedWarnings: ["OSD_FLAGS"],
+  });
+  assertEquals(extraVerdict.pass, false);
+  assertEquals(extraVerdict.detail.unallowedChecks, ["PG_DEGRADED"]);
+
+  const err = vSession(() => ({
+    code: 0,
+    stdout: '{"status":"HEALTH_ERR","checks":{"OSD_FLAGS":{}}}',
+    stderr: "",
+  }));
+  assertEquals(
+    (await verifyHealth(deps, err, {
+      wantOk: true,
+      allowedWarnings: ["OSD_FLAGS"],
+    })).pass,
+    false,
+  );
+  assertEquals((await verifyHealth(deps, err, { wantOk: false })).pass, true);
+});
+
+Deno.test(
+  "the host-noout predicate reads OSD_FLAGS as an unordered set", // leak-allow(decision D46)
+  () => {
+    const summary = {
+      checks: {
+        OSD_FLAGS: { summary: { message: "host host-a has flags noout" } },
+      },
+    };
+    assertEquals(nooutPredicate(summary, "host-a").set, true);
+    const detailOnly = {
+      checks: {
+        OSD_FLAGS: {
+          detail: [{ message: "host host-a has flags noout,noin" }],
+        },
+      },
+    };
+    assertEquals(nooutPredicate(detailOnly, "host-a").set, true);
+    const reordered = {
+      checks: {
+        OSD_FLAGS: { summary: { message: "host host-a has flags noin,noout" } },
+      },
+    };
+    assertEquals(nooutPredicate(reordered, "host-a").set, true);
+    const prefix = {
+      checks: {
+        OSD_FLAGS: { summary: { message: "host host-a1 has flags noout" } },
+      },
+    };
+    assertEquals(nooutPredicate(prefix, "host-a").set, false);
+    assertEquals(nooutPredicate({ checks: {} }, "host-a").set, false);
+  },
+);
+
+Deno.test("host-noout verifies the expectation in both directions", async () => {
+  const set = vSession(() => ({
+    code: 0,
+    stdout:
+      '{"checks":{"OSD_FLAGS":{"summary":{"message":"host host-a has flags noout"}}}}',
+    stderr: "",
+  }));
+  const pass = await verifyHostNoout(deps, set, {
+    hostName: "host-a",
+    expectSet: true,
+  });
+  assertEquals(pass.pass, true);
+  assertEquals(pass.subject, "host-a");
+  assertEquals(pass.detail.readFrom, "checks.OSD_FLAGS");
+  assertEquals(pass.detail.osdDumpConsulted, false);
+  assertEquals(
+    (await verifyHostNoout(deps, set, { hostName: "host-a", expectSet: false }))
+      .pass,
+    false,
+  );
+
+  const clear = vSession(() => ({
+    code: 0,
+    stdout: '{"checks":{}}',
+    stderr: "",
+  }));
+  assertEquals(
+    (await verifyHostNoout(deps, clear, {
+      hostName: "host-a",
+      expectSet: false,
+    })).pass,
+    true,
+  );
+  assertEquals(
+    (await verifyHostNoout(deps, clear, {
+      hostName: "host-a",
+      expectSet: true,
+    })).pass,
+    false,
+  );
+});

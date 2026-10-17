@@ -467,3 +467,164 @@ export async function verifyCsiUsers(
     detail: { missing, users },
   };
 }
+
+/** The host-subtree `noout` predicate result. */
+export interface NooutPredicate {
+  /** Whether the flag is set for the host. */
+  set: boolean;
+  /** The statement that asserted it, when one did. */
+  matched: string | null;
+  /** `OSD_FLAGS` summary messages. */
+  summaries: string[];
+  /** `OSD_FLAGS` detail messages. */
+  details: string[];
+}
+
+/**
+ * The shared host-subtree noout predicate. It reads only `checks.OSD_FLAGS`
+ * from `ceph health detail`; the cluster-wide flags in `osd dump` are never
+ * consulted.
+ */
+export function nooutPredicate(
+  healthDetail: unknown,
+  hostName: string,
+): NooutPredicate {
+  const checks = (healthDetail as { checks?: Record<string, unknown> }).checks;
+  const osdFlags = checks?.OSD_FLAGS as
+    | { summary?: { message?: unknown }; detail?: { message?: unknown }[] }
+    | undefined;
+  if (osdFlags === undefined) {
+    return { set: false, matched: null, summaries: [], details: [] };
+  }
+  const summaries: string[] = [];
+  if (typeof osdFlags.summary?.message === "string") {
+    summaries.push(osdFlags.summary.message);
+  }
+  const details: string[] = [];
+  for (const d of osdFlags.detail ?? []) {
+    if (typeof d.message === "string") details.push(d.message);
+  }
+  for (const statement of [...summaries, ...details]) {
+    const m = statement.match(/^host\s+(\S+)\s+has flags\s+(.+)$/i);
+    if (!m) continue;
+    if (m[1] !== hostName) continue;
+    const flags = m[2].split(",").map((f) => f.trim().toLowerCase());
+    if (flags.includes("noout")) {
+      return { set: true, matched: statement, summaries, details };
+    }
+  }
+  return { set: false, matched: null, summaries, details };
+}
+
+/** Arguments for the host-noout check. */
+export interface HostNooutArgs {
+  /** Ceph host whose subtree flag is checked. */
+  hostName: string;
+  /** Expected state of the flag. */
+  expectSet: boolean;
+}
+
+/** Checks a host-subtree noout against the caller's expectation. */
+export async function verifyHostNoout(
+  deps: PrepDeps,
+  session: SshSession,
+  args: HostNooutArgs,
+  log?: Logger,
+): Promise<VerifyOutcome> {
+  const detail = await read(deps, session, "health detail", "host-noout", log);
+  const predicate = nooutPredicate(detail, args.hostName);
+  return {
+    pass: predicate.set === args.expectSet,
+    expected: { hostName: args.hostName, nooutSet: args.expectSet },
+    actual: { hostName: args.hostName, nooutSet: predicate.set },
+    subject: args.hostName,
+    detail: {
+      osdFlagsSummary: predicate.summaries,
+      osdFlagsDetail: predicate.details,
+      matchedStatement: predicate.matched,
+      readFrom: "checks.OSD_FLAGS",
+      osdDumpConsulted: false,
+    },
+  };
+}
+
+/** Arguments for the health check. */
+export interface HealthArgs {
+  /** Direction: true asserts healthy, false asserts not healthy. */
+  wantOk: boolean;
+  /** Health check names treated as tolerated when wantOk is true. */
+  allowedWarnings?: string[] | null;
+}
+
+/** A trivial verdict for the health refusals. */
+function healthRefusal(
+  wantOk: boolean,
+  reason: string,
+  detail: Record<string, unknown>,
+): VerifyOutcome {
+  return {
+    pass: false,
+    expected: wantOk,
+    actual: null,
+    detail: { reason, ...detail },
+  };
+}
+
+/** Asserts cluster health in a stated direction with a warning allowlist. */
+export async function verifyHealth(
+  deps: PrepDeps,
+  session: SshSession,
+  args: HealthArgs,
+  log?: Logger,
+): Promise<VerifyOutcome> {
+  const allowed = (args.allowedWarnings ?? []).map((w) => w.toUpperCase());
+  const json = await read(deps, session, "health detail", "health", log) as {
+    status?: unknown;
+    checks?: Record<string, { summary?: { message?: unknown } }>;
+  };
+  const status = json.status;
+  if (typeof status !== "string" || status === "") {
+    return healthRefusal(args.wantOk, "status is missing or empty", {});
+  }
+  const upper = status.toUpperCase();
+  if (!["HEALTH_OK", "HEALTH_WARN", "HEALTH_ERR"].includes(upper)) {
+    return healthRefusal(args.wantOk, "unknown health status", { status });
+  }
+  const checks = json.checks ?? {};
+  const checkNames = Object.keys(checks);
+  if (upper === "HEALTH_WARN" && checkNames.length === 0) {
+    return healthRefusal(args.wantOk, "HEALTH_WARN with no named check", {
+      status: upper,
+    });
+  }
+  if (!args.wantOk && allowed.length > 0) {
+    return healthRefusal(
+      args.wantOk,
+      "wantOk false cannot be combined with an allowlist",
+      {
+        status: upper,
+        allowedWarnings: args.allowedWarnings ?? [],
+      },
+    );
+  }
+  const unallowedChecks = checkNames.filter((n) =>
+    !allowed.includes(n.toUpperCase())
+  );
+  const healthy = upper === "HEALTH_OK" ||
+    (upper === "HEALTH_WARN" && unallowedChecks.length === 0);
+  const messages: Record<string, unknown> = {};
+  for (const name of checkNames) {
+    messages[name] = checks[name]?.summary?.message ?? null;
+  }
+  return {
+    pass: healthy === args.wantOk,
+    expected: args.wantOk,
+    actual: healthy,
+    detail: {
+      status: upper,
+      activeChecks: checkNames,
+      unallowedChecks,
+      messages,
+    },
+  };
+}

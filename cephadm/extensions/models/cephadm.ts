@@ -80,6 +80,8 @@ import {
 import {
   persistVerdict,
   verifyCsiUsers,
+  verifyHealth,
+  verifyHostNoout,
   verifyMgr,
   verifyMonQuorum,
   verifyOsd,
@@ -480,6 +482,27 @@ const VerifyCsiUsersArgs = z.strictObject({
   ...VerifyCommon,
   expectedUserNames: z.array(CEPH_ID_SCHEMA).min(1).max(256).describe(
     "Bare entity names, without the client. prefix.",
+  ),
+});
+
+const VerifyHealthArgs = z.strictObject({
+  ...VerifyCommon,
+  wantOk: z.boolean().describe(
+    "true asserts healthy; false asserts not healthy.",
+  ),
+  allowedWarnings: z.array(z.string().regex(/^[A-Z0-9_]{1,64}$/)).max(64)
+    .nullish().describe(
+      "Health check names tolerated when wantOk is true.",
+    ),
+});
+
+const VerifyHostNooutArgs = z.strictObject({
+  ...VerifyCommon,
+  hostName: HOSTNAME_SCHEMA.describe(
+    "The Ceph host whose subtree flag is checked.",
+  ),
+  expectSet: z.boolean().describe(
+    "true: the flag must be set; false: it must be clear.",
   ),
 });
 
@@ -1604,6 +1627,86 @@ export function createCephadmModel(overrides: Partial<CephadmDeps> = {}) {
             host: args.host,
             phase: "csi-users",
             key: `cephVerifyCsiUsers-${args.host}`,
+            outcome,
+            throwOnFail: args.throwOnFail ?? true,
+          });
+          return { dataHandles: [handle] };
+        } finally {
+          await session.close();
+        }
+      },
+    },
+
+    cephVerifyHealth: {
+      description:
+        "READ-ONLY. Assert cluster health in a stated direction, naming the checks responsible and refusing a warning with no named check. Writes the verdict before throwing, then throws when it fails unless throwOnFail is false.",
+      arguments: VerifyHealthArgs,
+      execute: async (
+        args: z.infer<typeof VerifyHealthArgs>,
+        context: MethodContext,
+      ) => {
+        const session = await openSession(
+          deps,
+          toTarget({
+            host: args.host,
+            sshUser: args.sshUser,
+            port: args.port,
+            keyPath: args.keyPath,
+            privateKey: args.privateKey,
+            strictHostKeyChecking: args.strictHostKeyChecking,
+          }),
+          { multiplex: args.multiplex ?? false },
+        );
+        try {
+          const outcome = await verifyHealth(deps, session, {
+            wantOk: args.wantOk,
+            allowedWarnings: args.allowedWarnings,
+          }, context.logger);
+          const handle = await persistVerdict(context, deps, {
+            method: "cephVerifyHealth",
+            host: args.host,
+            phase: "health",
+            key: `cephVerifyHealth-${args.host}`,
+            outcome,
+            throwOnFail: args.throwOnFail ?? true,
+          });
+          return { dataHandles: [handle] };
+        } finally {
+          await session.close();
+        }
+      },
+    },
+
+    cephVerifyHostNoout: {
+      description:
+        "READ-ONLY. Check whether the host-subtree noout flag is set for one Ceph host, against an expectation the caller must state. Writes the verdict before throwing, then throws when it fails unless throwOnFail is false.",
+      arguments: VerifyHostNooutArgs,
+      execute: async (
+        args: z.infer<typeof VerifyHostNooutArgs>,
+        context: MethodContext,
+      ) => {
+        const session = await openSession(
+          deps,
+          toTarget({
+            host: args.host,
+            sshUser: args.sshUser,
+            port: args.port,
+            keyPath: args.keyPath,
+            privateKey: args.privateKey,
+            strictHostKeyChecking: args.strictHostKeyChecking,
+          }),
+          { multiplex: args.multiplex ?? false },
+        );
+        try {
+          const outcome = await verifyHostNoout(deps, session, {
+            hostName: args.hostName,
+            expectSet: args.expectSet,
+          }, context.logger);
+          const handle = await persistVerdict(context, deps, {
+            method: "cephVerifyHostNoout",
+            host: args.host,
+            phase: "host-noout",
+            key: `cephVerifyHostNoout-${args.host}-${args.hostName}`,
             outcome,
             throwOnFail: args.throwOnFail ?? true,
           });

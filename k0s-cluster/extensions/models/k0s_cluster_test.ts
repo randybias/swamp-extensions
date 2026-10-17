@@ -1290,7 +1290,10 @@ Deno.test("reset tolerates a stored record whose host is masked", async () => {
         k0s_version: "v1.31.2+k0s.0",
         binary_sha256: PAYLOAD_SHA,
         config_sha256: "c".repeat(64),
-        config_file_sha256: "d".repeat(64),
+        config_file_sha256: {
+          vault: "default",
+          key: "install-state-root~***~22-config_file_sha256",
+        },
         service: "k0scontroller",
         installed: true,
         adopted: false,
@@ -1300,6 +1303,78 @@ Deno.test("reset tolerates a stored record whose host is masked", async () => {
   });
   const out = await model.methods.reset.execute(args, context);
   assertEquals(out.result.reset, true);
+});
+
+Deno.test("upgrade refuses when a stale k0s.old exists", async () => {
+  const fake = makeDeps({
+    exec: upgradeRouter((argv) =>
+      argv[0] === "ls" && argv[2] === `${K0S_BINARY_PATH}.old`
+        ? { code: 0, stdout: `${K0S_BINARY_PATH}.old\n` }
+        : undefined
+    ),
+    fetch: () => Promise.resolve(PAYLOAD),
+  });
+  const model = createModel(fake.deps);
+  await assertRejects(
+    () =>
+      model.methods.upgrade.execute(upgradeArgs(), upgradeContext().context),
+    Error,
+    "already exists",
+  );
+});
+
+Deno.test("upgrade restores from the backup the host still has after an ssh drop", async () => {
+  const fake = makeDeps({
+    exec: upgradeRouter(),
+    fetch: () => Promise.resolve(PAYLOAD),
+  });
+  const inner = fake.deps.ssh.exec;
+  fake.deps.ssh.exec = (t, argv) =>
+    argv[0] === "mv" && argv[1] === `${K0S_BINARY_PATH}.new`
+      ? Promise.reject(new Error("ssh dropped"))
+      : inner(t, argv);
+  const model = createModel(fake.deps);
+  await assertRejects(
+    () =>
+      model.methods.upgrade.execute(upgradeArgs(), upgradeContext().context),
+    Error,
+    "restored the previous binary",
+  );
+});
+
+Deno.test("upgrade starts an untouched binary when the stop fails", async () => {
+  const fake = makeDeps({
+    exec: upgradeRouter((argv) =>
+      argv[0] === "systemctl" && argv[1] === "stop" ? { code: 1 } : undefined
+    ),
+    fetch: () => Promise.resolve(PAYLOAD),
+  });
+  const model = createModel(fake.deps);
+  await assertRejects(
+    () =>
+      model.methods.upgrade.execute(upgradeArgs(), upgradeContext().context),
+    Error,
+    "started on the unchanged binary",
+  );
+  assertEquals(
+    fake.execs.some((a) => a[0] === "systemctl" && a[1] === "restart"),
+    false,
+  );
+});
+
+Deno.test("upgrade releases the lock in finally", async () => {
+  const fake = makeDeps({
+    exec: upgradeRouter(),
+    fetch: () => Promise.resolve(PAYLOAD),
+  });
+  const model = createModel(fake.deps);
+  await model.methods.upgrade.execute(upgradeArgs(), upgradeContext().context);
+  assertEquals(
+    fake.execs.some((a) =>
+      a[0] === "rmdir" && a[1] === "/run/k0s-upgrade.lock"
+    ),
+    true,
+  );
 });
 
 Deno.test("reset refuses a confirm_host that does not match", async () => {
@@ -2636,9 +2711,25 @@ function upgradeRouter(
   ) => { code?: number; stdout?: string } | undefined = () => undefined,
 ) {
   let promoted = false;
+  let hasOld = false;
   return (argv: string[]) => {
     const override = overrides(argv);
     if (override) return override;
+    if (
+      argv[0] === "mv" && argv[1] === K0S_BINARY_PATH &&
+      argv[2] === `${K0S_BINARY_PATH}.old`
+    ) hasOld = true;
+    if (argv[0] === "mv" && argv[1] === `${K0S_BINARY_PATH}.old`) {
+      hasOld = false;
+    }
+    if (
+      argv[0] === "ls" && argv[1] === "-d" &&
+      argv[2] === `${K0S_BINARY_PATH}.old`
+    ) {
+      return hasOld
+        ? { code: 0, stdout: `${K0S_BINARY_PATH}.old\n` }
+        : { code: 2, stdout: "" };
+    }
     if (argv[0] === "uname") return { code: 0, stdout: "x86_64\n" };
     if (argv[0] === "sha256sum" && argv[1] === `${K0S_BINARY_PATH}.new`) {
       return { code: 0, stdout: `${PAYLOAD_SHA}  ${K0S_BINARY_PATH}.new\n` };
@@ -2711,6 +2802,69 @@ Deno.test("a keepalived VIP stores no hash over the secret-bearing config", asyn
     assertEquals(JSON.stringify(data).includes(secret), false);
     assertEquals("config_file_sha256" in data, false);
   }
+});
+
+Deno.test("drift sees an on-host config edit with CPLB set, without a secret-derived hash", async () => {
+  const secret = "abc12345";
+  const ifake = makeDeps({
+    exec: installRouter,
+    fetch: () => Promise.resolve(PAYLOAD),
+  });
+  const im = createModel(ifake.deps);
+  const ictx = createModelTestContext();
+  await im.methods.install.execute(
+    installArgs({
+      control_plane_load_balancing: {
+        virtual_ips: ["192.0.2.10/24"],
+        auth_pass: secret,
+      },
+    }),
+    ictx.context,
+  );
+  const state = ictx.getWrittenResources().find((r) => r.specName === "state")!
+    .data as Record<string, unknown>;
+  assertEquals(JSON.stringify(state).includes(secret), false);
+  assertEquals(state.has_helm_values, false);
+  const stored = state.config_sha256 as string;
+
+  const syncRouter = (configHash: string) => (argv: string[]) => {
+    if (argv[0] === "sh" && argv[1] === "-c") {
+      return { code: 0, stdout: `${configHash}  -\n` };
+    }
+    if (argv[0] === K0S_BINARY_PATH && argv[1] === "version") {
+      return { code: 0, stdout: `k0s ${VERSION}\n` };
+    }
+    if (argv[0] === "systemctl" && argv[1] === "is-active") {
+      return { code: 0, stdout: "active\n" };
+    }
+    if (argv[0] === "systemctl" && argv[1] === "cat") {
+      return { code: 0, stdout: "unit\n" };
+    }
+    return { code: 0, stdout: "" };
+  };
+  const sync = async (hash: string) => {
+    const model = createModel(
+      makeDeps({ exec: syncRouter(hash) }).deps,
+    );
+    const { context } = createModelTestContext({
+      storedResources: {
+        [targetId({ host: HOST, port: 22, user: "root" })]: state,
+      },
+    });
+    return await model.methods.sync.execute(
+      model.methods.sync.arguments.parse({ ssh: SSH }),
+      context,
+    );
+  };
+  assertEquals((await sync(stored)).result.in_sync, true);
+  const drifted = await sync("a".repeat(64));
+  assertEquals(drifted.result.in_sync, false);
+  assertEquals(
+    (drifted.result.diffs as string[]).some((d) =>
+      d.includes("config changed")
+    ),
+    true,
+  );
 });
 
 Deno.test("etcd_peer_address must be an IP and the join_token rules hold", () => {

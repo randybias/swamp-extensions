@@ -245,6 +245,9 @@ export function compareK0sVersion(a: string, b: string): number {
   return 0;
 }
 
+/** Fixed placeholder that replaces every secret value in a public render. */
+export const REDACTED_SECRET = "REDACTED";
+
 /** The major.minor of a k0s/Kubernetes version, for skew checks. */
 export function k8sMinor(version: string): number {
   const m = /^v?(\d+)\.(\d+)/.exec(version);

@@ -195,6 +195,10 @@ manifest where possible.
   unit is active; confirm the node is Ready with the new kubelet version from a
   controller afterwards. Upgrade HA controllers one at a time: the model locks
   one host, not the cluster.
+- A record written by 2026.10.17.2 whose `host` came from a vault or another
+  expression can stay unreadable (swamp-club lab 3585): the host is stored
+  masked and the record cannot be resolved on a later read. Recover by running
+  `install` again to adopt the host and write a fresh record.
 - Every caller-supplied value that reaches the remote shell is validated against
   an allowlist grammar and quoted as a single argv element; remote exit codes
   are returned as data, except a local `ssh` failure (exit 255), which is raised

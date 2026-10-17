@@ -3,6 +3,7 @@ import {
   classifyKubectl,
   clusterFingerprint16,
   type Deps,
+  FEATURE_GATE_RE,
   fetchVerifiedManifest,
   fieldManager,
   isDataVolumeSize,
@@ -10,11 +11,8 @@ import {
   isDnsLabel,
   isDnsSubdomain,
   isDowngrade,
-  isFeatureGate,
   isMemory,
   isMinorSkip,
-  isReleaseTag,
-  isSha256,
   kubectlJson,
   KubevirtError,
   manifestUrl,
@@ -22,6 +20,8 @@ import {
   operatorStateKey,
   parseVersion,
   pollUntil,
+  RELEASE_TAG_RE,
+  SHA256_RE,
   TargetShape,
   vmStateKey,
 } from "./k8s.ts";
@@ -39,20 +39,20 @@ const deps = (over: Partial<Deps> = {}): Deps => ({
 });
 
 Deno.test("grammars accept the documented shapes and refuse the rest", () => {
-  assertEquals(isReleaseTag("v1.2.3"), true);
-  assertEquals(isReleaseTag("1.2.3"), false);
-  assertEquals(isReleaseTag("v1.2"), false);
-  assertEquals(isSha256("0".repeat(64)), true);
-  assertEquals(isSha256("0".repeat(63)), false);
-  assertEquals(isSha256("A".repeat(64)), false);
+  assertEquals(RELEASE_TAG_RE.test("v1.2.3"), true);
+  assertEquals(RELEASE_TAG_RE.test("1.2.3"), false);
+  assertEquals(RELEASE_TAG_RE.test("v1.2"), false);
+  assertEquals(SHA256_RE.test("0".repeat(64)), true);
+  assertEquals(SHA256_RE.test("0".repeat(63)), false);
+  assertEquals(SHA256_RE.test("A".repeat(64)), false);
   assertEquals(isDnsLabel("vm-1"), true);
   assertEquals(isDnsLabel("-vm"), false);
   assertEquals(isDnsLabel("a".repeat(64)), false);
   assertEquals(isDnsSubdomain("a.b-c"), true);
   assertEquals(isDnsSubdomain("a..b"), false);
-  assertEquals(isFeatureGate("LiveMigration"), true);
-  assertEquals(isFeatureGate("liveMigration"), false);
-  assertEquals(isFeatureGate("A"), false);
+  assertEquals(FEATURE_GATE_RE.test("LiveMigration"), true);
+  assertEquals(FEATURE_GATE_RE.test("liveMigration"), false);
+  assertEquals(FEATURE_GATE_RE.test("A"), false);
   assertEquals(isMemory("64Mi"), true);
   assertEquals(isMemory("256Gi"), true);
   assertEquals(isMemory("63Mi"), false);

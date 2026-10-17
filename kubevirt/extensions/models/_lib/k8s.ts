@@ -450,29 +450,26 @@ export const timeoutField = (def: number) =>
     "Deadline in seconds for any wait.",
   );
 
-const RELEASE_TAG_RE = /^v\d{1,3}\.\d{1,3}\.\d{1,3}$/;
-const SHA256_RE = /^[0-9a-f]{64}$/;
+/** A `vMAJOR.MINOR.PATCH` KubeVirt or CDI release tag. */
+export const RELEASE_TAG_RE = /^v\d{1,3}\.\d{1,3}\.\d{1,3}$/;
+/** A lowercase 64-hex SHA-256. */
+export const SHA256_RE = /^[0-9a-f]{64}$/;
 const DNS_LABEL_RE = /^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?$/;
 const DNS_SUBDOMAIN_RE =
   /^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?(\.[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?)*$/;
-const FEATURE_GATE_RE = /^[A-Z][A-Za-z0-9]{1,63}$/;
+/** A KubeVirt feature-gate name. */
+export const FEATURE_GATE_RE = /^[A-Z][A-Za-z0-9]{1,63}$/;
 const MEMORY_RE = /^(\d{1,6})(Mi|Gi)$/;
 const SIZE_RE = /^(\d{1,4})(Mi|Gi)$/;
 const DIGEST_IMAGE_RE =
   /^[a-z0-9.-]+(:\d+)?(\/[a-z0-9._-]+)+@sha256:[0-9a-f]{64}$/;
 
-/** True for a `vMAJOR.MINOR.PATCH` KubeVirt or CDI release tag. */
-export const isReleaseTag = (s: string): boolean => RELEASE_TAG_RE.test(s);
-/** True for a lowercase 64-hex SHA-256. */
-export const isSha256 = (s: string): boolean => SHA256_RE.test(s);
 /** True for a DNS-1123 label (namespace or VM name). */
 export const isDnsLabel = (s: string): boolean =>
   s.length <= 63 && DNS_LABEL_RE.test(s);
 /** True for a DNS-1123 subdomain (Secret or StorageClass name). */
 export const isDnsSubdomain = (s: string): boolean =>
   s.length <= 253 && DNS_SUBDOMAIN_RE.test(s);
-/** True for a KubeVirt feature-gate name. */
-export const isFeatureGate = (s: string): boolean => FEATURE_GATE_RE.test(s);
 /** True for a memory quantity bounded to 64Mi..256Gi. */
 export function isMemory(s: string): boolean {
   const m = MEMORY_RE.exec(s);
@@ -573,11 +570,6 @@ export async function fetchVerifiedManifest(
     );
   }
   return res.body;
-}
-
-/** True when a value is a plain object. */
-export function isRecord(v: unknown): v is Record<string, unknown> {
-  return v !== null && typeof v === "object" && !Array.isArray(v);
 }
 
 /** One `status.conditions` entry, narrowed to the fields we read. */

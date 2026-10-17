@@ -21,6 +21,7 @@ import {
   conditionTrue,
   currentDeps,
   type Deps,
+  FEATURE_GATE_RE,
   fetchVerifiedManifest,
   fieldManager,
   isDowngrade,
@@ -33,6 +34,8 @@ import {
   POLL_INTERVAL_MS,
   pollUntil,
   projectConditions,
+  RELEASE_TAG_RE,
+  SHA256_RE,
   sha256Hex,
   TargetShape,
   timeoutField,
@@ -59,9 +62,6 @@ import {
 type Ctx = any;
 
 const HTTPS_URL_RE = /^https:\/\/[^\s?#@]+$/;
-const FEATURE_GATE_RE = /^[A-Z][A-Za-z0-9]{1,63}$/;
-const RELEASE_TAG_RE = /^v\d{1,3}\.\d{1,3}\.\d{1,3}$/;
-const SHA256_RE = /^[0-9a-f]{64}$/;
 
 /** True for an https URL with no userinfo or query (a mirror override). */
 export function isHttpsBase(u: string): boolean {

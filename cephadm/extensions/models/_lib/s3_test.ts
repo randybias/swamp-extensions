@@ -924,7 +924,7 @@ Deno.test("ensure: a stored-but-unenforced PAB detects the leak and deletes the 
   assertEquals(deletes.length, 2);
 });
 
-Deno.test("ensure: canned PutObject 500 is object-leak-probe, distinct and no delete", async () => {
+Deno.test("ensure: a canned PutObject 500 is object-leak-probe and the possibly stored object is removed", async () => {
   const { fetch, calls } = fakeFetch(
     ensureHandler({ pab: "full", cannedPut: 500 }),
   );
@@ -933,7 +933,47 @@ Deno.test("ensure: canned PutObject 500 is object-leak-probe, distinct and no de
     Error,
     "could not run",
   );
-  assertEquals(calls.some((c) => c.method === "DELETE"), false);
+  const deletes = calls.filter((c) => c.method === "DELETE");
+  assertEquals(deletes.length > 0, true);
+  assertEquals(deletes.every((c) => c.url.includes("-canned")), true);
+});
+
+Deno.test("ensure: an unanswered canned PutObject is cleaned up too, and a failed cleanup says so", async () => {
+  const base = ensureHandler({ pab: "full", deleteFail: true });
+  const { fetch, calls } = fakeFetch((req, p) =>
+    req.method === "PUT" && p.path.endsWith("-canned")
+      ? { fail: "unreachable" }
+      : base(req, p)
+  );
+  const error = await assertRejects(
+    () => bucketEnsure({ fetch, now: () => NOW }, ensureBase()),
+    Error,
+    "could not run",
+  );
+  assertEquals(error.message.includes("remove"), true);
+  assertEquals(calls.some((c) => c.method === "DELETE"), true);
+});
+
+Deno.test("ensure: a grant PutObject that went unanswered is removed, a refused one is not", async () => {
+  const unanswered = ensureHandler({ pab: "full" });
+  const a = fakeFetch((req, p) =>
+    req.method === "PUT" && p.path.endsWith("-grant")
+      ? { fail: "unreachable" }
+      : unanswered(req, p)
+  );
+  await bucketEnsure({ fetch: a.fetch, now: () => NOW }, ensureBase());
+  assertEquals(
+    a.calls.some((c) => c.method === "DELETE" && c.url.includes("-grant")),
+    true,
+  );
+  const refused = fakeFetch(ensureHandler({ pab: "full", grantPut: 403 }));
+  await bucketEnsure({ fetch: refused.fetch, now: () => NOW }, ensureBase());
+  assertEquals(
+    refused.calls.some((c) =>
+      c.method === "DELETE" && c.url.includes("-grant")
+    ),
+    false,
+  );
 });
 
 Deno.test("ensure: a refused cleanup DELETE rejects object-leak-cleanup naming the keys", async () => {

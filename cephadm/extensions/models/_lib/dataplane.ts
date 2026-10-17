@@ -1025,11 +1025,13 @@ export async function deleteFs(
     });
   }
 
-  await runMut(deps, session, "config set mon mon_allow_pool_delete true", {
-    phase: "cephDeleteFs.gate-on",
-  }, log);
   let removalError: Error | null = null;
   try {
+    // Inside the try so the gate is reset even when this call's outcome is
+    // unknown (a lost session after the command ran).
+    await runMut(deps, session, "config set mon mon_allow_pool_delete true", {
+      phase: "cephDeleteFs.gate-on",
+    }, log);
     const removal = await runCeph(
       deps,
       session,

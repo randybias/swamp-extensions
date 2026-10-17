@@ -844,6 +844,7 @@ const HostStateResultSchema = z.strictObject({
     lvm: z.boolean(),
     mdstat: z.boolean(),
   }),
+  sectionFailures: z.array(z.string()),
   capturedAt: z.string(),
 });
 
@@ -896,6 +897,7 @@ const HostTornDownResultSchema = z.strictObject({
     lvm: z.boolean(),
     mdstat: z.boolean(),
   }),
+  sectionFailures: z.array(z.string()),
   pass: z.boolean(),
   namedFsidGone: z.boolean(),
   findings: z.array(z.strictObject({ kind: z.string(), item: z.string() })),

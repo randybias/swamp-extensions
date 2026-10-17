@@ -479,7 +479,11 @@ export async function probeCephadmVersion(
  * config read from a here-document, never as an argument.
  */
 export function curlDownloadScript(url: string): string {
-  if (/[\x00-\x1f\x7f"\\]/.test(url)) {
+  const breaksConfig = [...url].some((c) => {
+    const code = c.charCodeAt(0);
+    return code < 0x20 || code === 0x7f || c === '"' || c === "\\";
+  });
+  if (breaksConfig) {
     fail("validate", "invalid cephadmUrl", { field: "cephadmUrl" });
   }
   return [

@@ -746,3 +746,51 @@ Deno.test("distribute-key records every host's outcome, then throws", async () =
   );
   assertEquals(getWrittenResources().length, 1);
 });
+
+Deno.test("host-state records carry sectionFailures in both strict schemas", () => {
+  const res = model.resources as unknown as Record<
+    string,
+    { schema: { safeParse: (v: unknown) => { success: boolean } } }
+  >;
+  const base = {
+    host: "192.0.2.10",
+    fsids: [],
+    cephUnits: [],
+    clusterUnits: [],
+    cephVolumeGroups: [],
+    cephLogicalVolumes: [],
+    mdArrays: [],
+    toolsSeen: { systemctl: true, lvm: true, mdstat: true },
+    capturedAt: "2026-10-17T00:00:00.000Z",
+  };
+  const torn = {
+    ...base,
+    fsid: "00000000-0000-0000-0000-000000000000",
+    pass: true,
+    namedFsidGone: true,
+    findings: [],
+  };
+  for (
+    const [name, record] of [
+      ["cephHostClusterStateResult", base],
+      ["cephHostTornDownResult", torn],
+    ] as const
+  ) {
+    const schema = res[name].schema;
+    assertEquals(
+      schema.safeParse({ ...record, sectionFailures: ["vgs"] }).success,
+      true,
+      name,
+    );
+    assertEquals(
+      schema.safeParse(record).success,
+      false,
+      `${name} requires it`,
+    );
+    assertEquals(
+      schema.safeParse({ ...record, sectionFailures: [], extra: 1 }).success,
+      false,
+      `${name} stays strict`,
+    );
+  }
+});

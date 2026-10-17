@@ -1644,10 +1644,16 @@ async function objectLeakProbe(
   const grantKey = `${stem}-grant`;
   const canned = await putProbeObject(ctx, cannedKey, {});
   if (canned.kind !== "answered" || canned.status !== 200) {
+    // An unanswered or failed PUT may still have stored the object, so the
+    // indeterminate path removes it too before it reports.
+    const removed = await cleanupProbeObject(ctx, cannedKey, "");
     fail(
       "object-leak-probe",
       "the object-leak probe could not run; no leak is claimed",
-      { status: statusOf(canned) },
+      {
+        status: statusOf(canned),
+        cleanup: removed ? "done" : `failed: remove ${cannedKey} by hand`,
+      },
     );
   }
   const cannedVersion = canned.headers["x-amz-version-id"] ?? "";
@@ -1670,6 +1676,15 @@ async function objectLeakProbe(
     storedGrant = true;
     grantVersion = grant.headers["x-amz-version-id"] ?? "";
     grantHeaderAnonymousStatus = await anonymousGet(ctx, grantKey);
+  }
+  // A grant PUT that was refused is settled, but one that went unanswered or
+  // failed server-side may have stored the object: treat it as stored so the
+  // cleanup below removes it.
+  if (
+    !storedGrant &&
+    (grant.kind !== "answered" || grant.status >= 500)
+  ) {
+    storedGrant = true;
   }
   // Cleanup always runs, by version id when one was returned.
   const leftBehind: string[] = [];

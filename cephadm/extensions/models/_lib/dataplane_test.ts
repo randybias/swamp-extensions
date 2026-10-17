@@ -632,3 +632,46 @@ Deno.test(
     );
   },
 );
+
+Deno.test("the pool-delete gate is reset even when turning it on fails", async () => {
+  let fsLs = 0;
+  const s = dpSession((body) => {
+    if (body.includes("fs ls")) {
+      fsLs++;
+      return {
+        code: 0,
+        stdout: fsLs === 1
+          ? '[{"name":"cephfs","metadata_pool":"cephfs.cephfs.meta","data_pools":["cephfs.cephfs.data"]}]'
+          : "[]",
+        stderr: "",
+      };
+    }
+    if (body.includes("osd pool ls")) {
+      return {
+        code: 0,
+        stdout: '["cephfs.cephfs.meta","cephfs.cephfs.data",".mgr"]',
+        stderr: "",
+      };
+    }
+    if (body.includes("orch ls")) {
+      return { code: 0, stdout: "No services reported", stderr: "" };
+    }
+    // The gate-on call fails after it may have run.
+    if (body.includes("mon_allow_pool_delete true")) {
+      return { code: 1, stdout: "", stderr: "session lost" };
+    }
+    return { code: 0, stdout: "", stderr: "" };
+  });
+  await assertRejects(() =>
+    deleteFs(deps, s.session, { fsName: "cephfs", confirmFsName: "cephfs" })
+  );
+  assertEquals(
+    s.bodies.some((b) => b.includes("mon_allow_pool_delete false")),
+    true,
+  );
+  assertEquals(
+    s.bodies.some((b) => b.includes("--yes-i-really-mean-it")),
+    false,
+    "the volume was never removed",
+  );
+});

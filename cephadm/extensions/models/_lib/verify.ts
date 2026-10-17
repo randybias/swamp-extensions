@@ -19,7 +19,7 @@ import {
   type PrepDeps,
   probeCephadmVersion,
 } from "./hostprep.ts";
-import { runCeph } from "./shell.ts";
+import { runCeph, runCephScript } from "./shell.ts";
 import { parseAuthEntities } from "./dataplane.ts";
 import { assertSshPublicKey, quote } from "./validate.ts";
 import { findNode, lsblkCommand, parseLsblk, subtreeMounts } from "./wipe.ts";
@@ -1664,4 +1664,323 @@ export async function verifyPool(
     },
   };
   return verdict;
+}
+
+// ---------------------------------------------------------------------------
+// cephVerifyRbdSmoke
+// ---------------------------------------------------------------------------
+
+/** A random UUID v4 from the injected randomness source. */
+export function randomUuid(random: () => number): string {
+  const bytes = Array.from(
+    { length: 16 },
+    () => Math.floor(random() * 256) & 0xff,
+  );
+  bytes[6] = (bytes[6] & 0x0f) | 0x40;
+  bytes[8] = (bytes[8] & 0x3f) | 0x80;
+  const hex = bytes.map((b) => b.toString(16).padStart(2, "0")).join("");
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${
+    hex.slice(16, 20)
+  }-${hex.slice(20)}`;
+}
+
+/**
+ * Creates, reads back and removes one tiny throwaway RBD image. This is the
+ * only verify method that writes anything; it never touches a pre-existing
+ * image.
+ */
+export async function verifyRbdSmoke(
+  deps: PrepDeps,
+  session: SshSession,
+  pool: string,
+  log?: Logger,
+): Promise<VerifyOutcome> {
+  const imageName = `cephadm-smoke-${randomUuid(deps.random)}`;
+  const target = `${pool}/${imageName}`;
+  const probe = await runCephScript(
+    deps,
+    session,
+    {
+      body: `rbd info ${quote(target)} --format json`,
+      phase: "rbd-smoke.probe",
+      allowNonZero: true,
+    },
+    log,
+  );
+  if (probe.result.code === 0) {
+    fail("rbd-smoke", "the throwaway image name already exists", { imageName });
+  }
+  let createAttempted = false;
+  let createError: Error | null = null;
+  let infoMatches = false;
+  let infoDetail: unknown = null;
+  try {
+    createAttempted = true;
+    const created = await runCephScript(
+      deps,
+      session,
+      {
+        body: `rbd create --size 1M ${quote(target)}`,
+        phase: "rbd-smoke.create",
+      },
+      log,
+    );
+    if (created.result.code !== 0) {
+      createError = new Error(
+        `cephadm[rbd-smoke]: rbd create exited ${created.result.code}`,
+      );
+    }
+  } catch (e) {
+    createError = e as Error;
+  }
+  if (createAttempted && createError === null) {
+    try {
+      const info = await runCephScript(
+        deps,
+        session,
+        {
+          body: `rbd info ${quote(target)} --format json`,
+          phase: "rbd-smoke.info",
+          allowNonZero: true,
+        },
+        log,
+      );
+      if (info.result.code !== 0) {
+        infoDetail = {
+          code: info.result.code,
+          stderr: info.result.stderr.slice(0, 200),
+        };
+      } else {
+        const parsed = parseCephJsonSafe(info.result.stdout);
+        infoDetail = parsed;
+        infoMatches = parsed !== null && parsed.name === imageName &&
+          parsed.size === 1048576;
+      }
+    } catch (e) {
+      createError = e as Error;
+    }
+  }
+  let cleanedUp = false;
+  let cleanupStderr = "";
+  if (createAttempted) {
+    try {
+      const rm = await runCephScript(
+        deps,
+        session,
+        {
+          body: `rbd rm ${quote(target)}`,
+          phase: "rbd-smoke.rm",
+          allowNonZero: true,
+        },
+        log,
+      );
+      cleanedUp = rm.result.code === 0;
+      cleanupStderr = rm.result.stderr.slice(0, 200);
+    } catch {
+      cleanedUp = false;
+    }
+  }
+  if (createError !== null) throw createError;
+  const created = createAttempted;
+  return {
+    pass: created && infoMatches && cleanedUp,
+    expected: { created: true, infoMatches: true, cleanedUp: true },
+    actual: { created, infoMatches, cleanedUp },
+    detail: { pool, imageName, info: infoDetail, cleanupStderr },
+  };
+}
+
+/** Parses JSON or returns null, never quoting the input. */
+function parseCephJsonSafe(
+  text: string,
+): { name?: unknown; size?: unknown } | null {
+  try {
+    const parsed = JSON.parse(text.trim());
+    return parsed !== null && typeof parsed === "object" ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// cephVerifyOsdClaimable
+// ---------------------------------------------------------------------------
+
+interface DeviceHost {
+  hostname: string;
+  devices: { deviceId: string; path: string; available: boolean }[] | null;
+}
+
+/** Parses `ceph orch device ls` host rows. */
+export function parseDeviceHosts(json: unknown): DeviceHost[] {
+  if (!Array.isArray(json)) return [];
+  return json.flatMap((raw) => {
+    if (raw === null || typeof raw !== "object") return [];
+    const e = raw as Record<string, unknown>;
+    const hostname = typeof e.hostname === "string" ? e.hostname : "";
+    let devices: DeviceHost["devices"] = null;
+    if (Array.isArray(e.devices)) {
+      devices = e.devices.flatMap((d) => {
+        if (d === null || typeof d !== "object") return [];
+        const dev = d as Record<string, unknown>;
+        return [{
+          deviceId: typeof dev.device_id === "string"
+            ? dev.device_id
+            : (typeof dev.deviceId === "string" ? dev.deviceId : ""),
+          path: typeof dev.path === "string" ? dev.path : "",
+          available: dev.available === true,
+        }];
+      });
+    }
+    return [{ hostname, devices }];
+  });
+}
+
+/** True when a device id names `serial` exactly or as a `_<serial>` suffix. */
+export function deviceIdMatches(deviceId: string, serial: string): boolean {
+  return deviceId === serial || deviceId.endsWith(`_${serial}`);
+}
+
+/** Arguments for the OSD-claimable pre-check. */
+export interface OsdClaimableArgs {
+  /** Fleet-wide mode. */
+  allAvailableDevices?: boolean | null;
+  /** Serials that must never be claimed. */
+  excludeDevices?: { serial: string }[] | null;
+  /** Selector target host. */
+  targetHost?: string | null;
+  /** Selector data devices. */
+  dataDevices?: { serial: string }[] | null;
+}
+
+/** Judges which disks cephadm would claim, before an OSD apply. */
+export async function verifyOsdClaimable(
+  deps: PrepDeps,
+  session: SshSession,
+  args: OsdClaimableArgs,
+  log?: Logger,
+): Promise<VerifyOutcome> {
+  const all = args.allAvailableDevices === true;
+  const dataDevices = (args.dataDevices ?? []).filter((d) => d.serial !== "");
+  const excludes = (args.excludeDevices ?? []).filter((d) => d.serial !== "");
+  const targetHost =
+    args.targetHost !== undefined && args.targetHost !== null &&
+      args.targetHost !== ""
+      ? args.targetHost
+      : null;
+  if (all && dataDevices.length > 0) {
+    fail("osd-claimable", "choose one mode", {});
+  }
+  if (!all && dataDevices.length === 0) {
+    fail("osd-claimable", "choose one mode", {});
+  }
+  if (all && targetHost !== null) {
+    fail("osd-claimable", "all-available must not name a targetHost", {});
+  }
+  if (!all && targetHost === null) {
+    fail("osd-claimable", "selector mode requires a targetHost", {});
+  }
+  if (all && excludes.length === 0) {
+    fail("osd-claimable", "all-available requires excludes", {});
+  }
+
+  const json = await read(
+    deps,
+    session,
+    "orch device ls",
+    "osd-claimable",
+    log,
+  );
+  const hosts = parseDeviceHosts(json);
+
+  if (all) {
+    const reasons: string[] = [];
+    const claimableExcluded: { host: string; serial: string; path: string }[] =
+      [];
+    const unidentified: { host: string; path: string }[] = [];
+    const malformedHosts: string[] = [];
+    const hostsWithoutDevices: string[] = [];
+    if (hosts.length === 0) reasons.push("the device listing has no hosts");
+    for (const h of hosts) {
+      if (h.devices === null) {
+        malformedHosts.push(h.hostname);
+        reasons.push(`${h.hostname} has no devices array`);
+        continue;
+      }
+      if (h.devices.length === 0) {
+        hostsWithoutDevices.push(h.hostname);
+        reasons.push(`${h.hostname} has not been inventoried`);
+        continue;
+      }
+      for (const d of h.devices) {
+        if (!d.available) continue;
+        if (d.deviceId === "") {
+          unidentified.push({ host: h.hostname, path: d.path });
+          reasons.push(`${h.hostname}:${d.path} has no device_id`);
+          continue;
+        }
+        for (const ex of excludes) {
+          if (deviceIdMatches(d.deviceId, ex.serial)) {
+            claimableExcluded.push({
+              host: h.hostname,
+              serial: ex.serial,
+              path: d.path,
+            });
+            reasons.push(
+              `${h.hostname} would claim ${d.path} (serial ${ex.serial})`,
+            );
+          }
+        }
+      }
+    }
+    return {
+      pass: reasons.length === 0,
+      expected: { claimableDevicesExclude: excludes.map((e) => e.serial) },
+      actual: {
+        claimableExcluded,
+        unidentified,
+        malformedHosts,
+        hostsWithoutDevices,
+      },
+      detail: {
+        mode: "all",
+        claimableExcluded,
+        unidentified,
+        malformedHosts,
+        hostsWithoutDevices,
+        reasons,
+      },
+    };
+  }
+
+  const host = hosts.find((h) => h.hostname === targetHost);
+  const reasons: string[] = [];
+  const matched: Record<string, number> = {};
+  if (!host) {
+    reasons.push(`target host ${targetHost} is not in the device listing`);
+    for (const d of dataDevices) matched[d.serial] = 0;
+  } else {
+    const devices = host.devices ?? [];
+    for (const d of dataDevices) {
+      matched[d.serial] = devices.filter((dev) =>
+        deviceIdMatches(dev.deviceId, d.serial)
+      ).length;
+      if (matched[d.serial] === 0) {
+        reasons.push(`serial ${d.serial} matched no device on ${targetHost}`);
+      }
+      if (matched[d.serial] > 1) {
+        reasons.push(
+          `serial ${d.serial} matched ${
+            matched[d.serial]
+          } devices on ${targetHost}`,
+        );
+      }
+    }
+  }
+  return {
+    pass: reasons.length === 0,
+    expected: { targetHost, eachSerialMatchedExactlyOnce: true },
+    actual: { targetKnown: host !== undefined, matched },
+    detail: { mode: "selector", targetHost, matched, reasons },
+  };
 }

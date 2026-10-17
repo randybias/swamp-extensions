@@ -4,6 +4,7 @@ import type { CommandResult, SshSession } from "./ssh.ts";
 import {
   capacityReport,
   crushFailureDomain,
+  deviceIdMatches,
   nooutPredicate,
   persistVerdict,
   poolTypeOf,
@@ -20,7 +21,9 @@ import {
   verifyMonPlacement,
   verifyMonQuorum,
   verifyOsd,
+  verifyOsdClaimable,
   verifyPool,
+  verifyRbdSmoke,
 } from "./verify.ts";
 
 const deps = {
@@ -29,10 +32,14 @@ const deps = {
   random: () => 0.5,
 };
 
-function vSession(route: (body: string) => CommandResult): SshSession {
+function vSession(
+  route: (body: string) => CommandResult,
+): SshSession & { bodies: string[] } {
   let dir = 0;
   let scriptBody = "";
+  const bodies: string[] = [];
   return {
+    bodies,
     target: { host: "192.0.2.10", user: "admin", strictHostKeyChecking: "yes" },
     controlPath: null,
     run: (opts) => {
@@ -49,6 +56,7 @@ function vSession(route: (body: string) => CommandResult): SshSession {
         return Promise.resolve({ code: 0, stdout: "", stderr: "" });
       }
       if (opts.command.startsWith("cephadm shell")) {
+        bodies.push(scriptBody);
         return Promise.resolve(route(scriptBody));
       }
       if (opts.command.startsWith("rm -rf")) {
@@ -1133,4 +1141,85 @@ Deno.test("pool check fails closed and reports the available pools", async () =>
     (verdict.detail.pool as { availablePools: string[] }).availablePools,
     ["other"],
   );
+});
+
+Deno.test("the RBD smoke test creates, reads back and removes one named image", async () => {
+  let infoCalls = 0;
+  const ok = vSession((body) => {
+    const name = body.match(/cephadm-smoke-[0-9a-f-]+/)?.[0] ?? "";
+    if (body.includes("rbd info")) {
+      infoCalls++;
+      // First info is the probe (not found); the second is the read-back.
+      return infoCalls === 1 ? { code: 1, stdout: "", stderr: "not found" } : {
+        code: 0,
+        stdout: JSON.stringify({ name, size: 1048576 }),
+        stderr: "",
+      };
+    }
+    if (body.includes("rbd create")) return { code: 0, stdout: "", stderr: "" };
+    if (body.includes("rbd rm")) return { code: 0, stdout: "", stderr: "" };
+    return { code: 1, stdout: "", stderr: "unrouted" };
+  });
+  const verdict = await verifyRbdSmoke(deps, ok, "rbd");
+  assertEquals(verdict.pass, true);
+  assertEquals((verdict.actual as { created: boolean }).created, true);
+
+  // Collision: the probe exits 0.
+  const collision = vSession((body) =>
+    body.includes("rbd info")
+      ? { code: 0, stdout: "{}", stderr: "" }
+      : { code: 0, stdout: "", stderr: "" }
+  );
+  await assertRejects(
+    () => verifyRbdSmoke(deps, collision, "rbd"),
+    PhaseError,
+    "already exists",
+  );
+  assertEquals(collision.bodies.some((b) => b.includes("rbd create")), false);
+});
+
+Deno.test("the OSD-claimable pre-check matches serials and modes", async () => {
+  const inventory = JSON.stringify([
+    {
+      hostname: "node1",
+      devices: [
+        { device_id: "ACME_Disk_S123", path: "/dev/sdb", available: true },
+        { device_id: "ACME_Disk_S999", path: "/dev/sdc", available: false },
+      ],
+    },
+  ]);
+  const s = vSession(() => ({ code: 0, stdout: inventory, stderr: "" }));
+  const fleet = await verifyOsdClaimable(deps, s, {
+    allAvailableDevices: true,
+    excludeDevices: [{ serial: "S123" }],
+  });
+  assertEquals(fleet.pass, false);
+  assertEquals(
+    (fleet.actual as { claimableExcluded: unknown[] }).claimableExcluded.length,
+    1,
+  );
+
+  const safe = await verifyOsdClaimable(deps, s, {
+    allAvailableDevices: true,
+    excludeDevices: [{ serial: "S999" }],
+  });
+  assertEquals(safe.pass, true);
+
+  const selector = await verifyOsdClaimable(deps, s, {
+    targetHost: "node1",
+    dataDevices: [{ serial: "S123" }],
+  });
+  assertEquals(selector.pass, true);
+  const unmatched = await verifyOsdClaimable(deps, s, {
+    targetHost: "node1",
+    dataDevices: [{ serial: "NOPE" }],
+  });
+  assertEquals(unmatched.pass, false);
+});
+
+Deno.test("device id matching is exact or an underscore suffix", () => {
+  assertEquals(deviceIdMatches("S123", "S123"), true);
+  assertEquals(deviceIdMatches("ACME_Disk_S123", "S123"), true);
+  assertEquals(deviceIdMatches("ACME_Disk_XS123", "S123"), false);
+  assertEquals(deviceIdMatches("ACME_Disk_S12", "S123"), false);
 });

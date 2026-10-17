@@ -92,7 +92,9 @@ import {
   verifyMonPlacement,
   verifyMonQuorum,
   verifyOsd,
+  verifyOsdClaimable,
   verifyPool,
+  verifyRbdSmoke,
 } from "./_lib/verify.ts";
 import { fail, TransportError } from "./_lib/errors.ts";
 import { wipeDiskToRaw, type WipeRecord } from "./_lib/wipe.ts";
@@ -514,6 +516,29 @@ const VerifyPoolArgs = z.strictObject({
   settleMs: z.number().int().min(0).nullish().describe("Settle budget in ms."),
   settlePollIntervalMs: z.number().int().min(1).nullish().describe(
     "Backoff ceiling in ms.",
+  ),
+});
+
+const VerifyRbdSmokeArgs = z.strictObject({
+  ...VerifyCommon,
+  pool: CEPH_ID_REF_SCHEMA.describe(
+    "Pool that has the rbd application enabled.",
+  ),
+});
+
+const VerifyOsdClaimableArgs = z.strictObject({
+  ...VerifyCommon,
+  allAvailableDevices: z.boolean().nullish().describe(
+    "Fleet-wide mode; needs excludeDevices.",
+  ),
+  excludeDevices: z.array(EXCLUDE_DEVICE_SCHEMA).max(256).nullish().describe(
+    "Serials that must never be claimed.",
+  ),
+  targetHost: OPTIONAL_HOST_SCHEMA.describe(
+    "Selector mode: the disk owner's name.",
+  ),
+  dataDevices: z.array(DATA_DEVICE_SCHEMA).max(128).nullish().describe(
+    "Selector mode: disks intended for OSDs.",
   ),
 });
 
@@ -2144,6 +2169,90 @@ export function createCephadmModel(overrides: Partial<CephadmDeps> = {}) {
             host: args.host,
             phase: "pool",
             key: `cephVerifyPool-${args.host}-${args.poolName}`,
+            outcome,
+            throwOnFail: args.throwOnFail ?? true,
+          });
+          return { dataHandles: [handle] };
+        } finally {
+          await session.close();
+        }
+      },
+    },
+
+    cephVerifyRbdSmoke: {
+      description:
+        "Create and remove one tiny throwaway RBD image (prefix cephadm-smoke-), reading it back to prove name and size; it is the only verify method that writes anything. A name collision is refused and never overwritten; the image is always removed once created.",
+      arguments: VerifyRbdSmokeArgs,
+      execute: async (
+        args: z.infer<typeof VerifyRbdSmokeArgs>,
+        context: MethodContext,
+      ) => {
+        const session = await openSession(
+          deps,
+          toTarget({
+            host: args.host,
+            sshUser: args.sshUser,
+            port: args.port,
+            keyPath: args.keyPath,
+            privateKey: args.privateKey,
+            strictHostKeyChecking: args.strictHostKeyChecking,
+          }),
+          { multiplex: args.multiplex ?? false },
+        );
+        try {
+          const outcome = await verifyRbdSmoke(
+            deps,
+            session,
+            args.pool,
+            context.logger,
+          );
+          const handle = await persistVerdict(context, deps, {
+            method: "cephVerifyRbdSmoke",
+            host: args.host,
+            phase: "rbd-smoke",
+            key: `cephVerifyRbdSmoke-${args.host}`,
+            outcome,
+            throwOnFail: args.throwOnFail ?? true,
+          });
+          return { dataHandles: [handle] };
+        } finally {
+          await session.close();
+        }
+      },
+    },
+
+    cephVerifyOsdClaimable: {
+      description:
+        "READ-ONLY. Pre-approval check that judges which disks cephadm would claim: fleet-wide available devices against an exclude list, or an explicit per-host selector. Applies nothing. Writes the verdict before throwing, then throws when it fails unless throwOnFail is false.",
+      arguments: VerifyOsdClaimableArgs,
+      execute: async (
+        args: z.infer<typeof VerifyOsdClaimableArgs>,
+        context: MethodContext,
+      ) => {
+        const session = await openSession(
+          deps,
+          toTarget({
+            host: args.host,
+            sshUser: args.sshUser,
+            port: args.port,
+            keyPath: args.keyPath,
+            privateKey: args.privateKey,
+            strictHostKeyChecking: args.strictHostKeyChecking,
+          }),
+          { multiplex: args.multiplex ?? false },
+        );
+        try {
+          const outcome = await verifyOsdClaimable(deps, session, {
+            allAvailableDevices: args.allAvailableDevices,
+            excludeDevices: args.excludeDevices,
+            targetHost: args.targetHost,
+            dataDevices: args.dataDevices,
+          }, context.logger);
+          const handle = await persistVerdict(context, deps, {
+            method: "cephVerifyOsdClaimable",
+            host: args.host,
+            phase: "osd-claimable",
+            key: `cephVerifyOsdClaimable-${args.host}`,
             outcome,
             throwOnFail: args.throwOnFail ?? true,
           });

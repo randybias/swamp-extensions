@@ -468,7 +468,7 @@ async function commitPin(
 export function createModel(deps: SshDeps = denoDeps): SshHostModel {
   return {
     type: "@randybias/ssh-host",
-    version: "2026.10.17.1",
+    version: "2026.10.17.2",
     description:
       "Run one argv vector, push bytes atomically, and wait for SSH host keys on any host. One generic definition with no host or credential in it; every method takes its target as arguments and stores evidence keyed by host, port and user.",
     globalArguments: z.strictObject({}),
@@ -650,5 +650,5 @@ export function createModel(deps: SshDeps = denoDeps): SshHostModel {
 export const model = {
   ...createModel(),
   type: "@randybias/ssh-host",
-  version: "2026.10.17.1",
+  version: "2026.10.17.2",
 } satisfies SshHostModel;

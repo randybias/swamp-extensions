@@ -47,10 +47,10 @@ fingerprint is the pinned `9C71D59C D4CE8BD2 966A7A3E AB6A3031 24019B64`, the
 repository is pinned at apt priority 100 so Knot DNS stays at the archive
 version while `knot-resolver6` (and its own library versions) come from CZ.NIC,
 and `kresctl`/`kresd` must be 6.x afterwards. The fingerprint was read from
-https://pkg.labs.nic.cz/gpg and could not be cross-checked against a second
-public source: confirm it against the vendor's installation page. The resolver
-service is left stopped and disabled until `apply_resolver` writes its
-configuration. The SSH key and any TSIG secret are read from a swamp vault.
+https://pkg.labs.nic.cz/gpg and confirmed against keys.openpgp.org and
+https://pkg.labs.nic.cz/doc. The resolver service is left stopped and disabled
+until `apply_resolver` writes its configuration. The SSH key and any TSIG secret
+are read from a swamp vault.
 
 ## Install
 

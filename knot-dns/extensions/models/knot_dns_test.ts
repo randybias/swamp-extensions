@@ -29,7 +29,7 @@ const ZONE_ARGS = {
 
 Deno.test("model is a plain object with the expected type and methods", () => {
   assertEquals(model.type, "@randybias/knot-dns");
-  assertEquals(model.version, "2026.10.17.3");
+  assertEquals(model.version, "2026.10.17.1");
   const methods = Object.keys(model.methods);
   assertEquals(
     methods.sort(),

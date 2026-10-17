@@ -28,10 +28,9 @@ const VENDOR_PREFS = "/etc/apt/preferences.d/cznic-labs-knot-resolver";
 
 /**
  * The primary-key fingerprint of the "CZ.NIC Labs Packaging" key, read from
- * https://pkg.labs.nic.cz/gpg on 2026-10-17, in gpg's grouped display form. It could not be
- * cross-checked against a second public source: confirm it against the
- * vendor's installation page before relying on it. A key whose fingerprint
- * differs is refused before it is trusted.
+ * https://pkg.labs.nic.cz/gpg on 2026-10-17, in gpg's grouped display form, and
+ * confirmed against keys.openpgp.org and https://pkg.labs.nic.cz/doc. A key
+ * whose fingerprint differs is refused before it is trusted.
  */
 const VENDOR_KEY_FINGERPRINT_GROUPED =
   "9C71 D59C D4CE 8BD2 966A 7A3E AB6A 3031 2401 9B64";
@@ -86,6 +85,9 @@ const RESOLVER_INSTALL = [
   // Leave the service stopped; apply_resolver enables and starts it with the
   // configuration it renders.
   "systemctl disable --now knot-resolver >/dev/null 2>&1 || true",
+  // The package's own start may have failed on that address; clear the
+  // failed state so the stopped service reads inactive.
+  "systemctl reset-failed knot-resolver >/dev/null 2>&1 || true",
 ];
 
 /** Fails unless the tools exist and are the major versions expected. */

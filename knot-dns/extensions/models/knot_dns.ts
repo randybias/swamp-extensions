@@ -287,7 +287,7 @@ async function observe(
 /** Model definition for `@randybias/knot-dns`. */
 export const model = {
   type: "@randybias/knot-dns",
-  version: "2026.10.17.3",
+  version: "2026.10.17.1",
   description:
     "Manage authoritative Knot DNS zones and a Knot Resolver 6 recursive resolver over SSH, validating every candidate with the vendor tools before it reaches the service.",
   globalArguments: z.strictObject({}),

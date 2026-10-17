@@ -56,6 +56,10 @@ export interface RevertContext {
   ownedFiles: string[];
   /** Parent interfaces whose MTU this change raises, with the pre-change value. */
   parentMtus: { name: string; mtu: number }[];
+  /** The interface that carried the management path before the change. */
+  managementInterface: string;
+  /** Its global addresses before the change, as CIDRs. */
+  managementAddrs: string[];
 }
 
 /** The marker written at arm time. */
@@ -95,18 +99,39 @@ function ownedList(ctx: RevertContext): string {
 
 /**
  * The post-restore checks, as a shell fragment that sets CHECK=pass only when
- * a default route exists AND the interface carrying it has a global address.
- * The restore and the operator's clear step judge the host by the same test.
+ * a default route leaves through the management interface AND that interface
+ * carries every address it had before the change. A default route or a global
+ * address elsewhere (a second NIC, an IPv6 SLAAC address) proves nothing about
+ * the management path, so neither counts. The restore and the operator's clear
+ * step judge the host by the same fragment.
  */
-export const POST_CHECKS = `CHECK=fail
-route="$(ip -j route show default 2>/dev/null | tr -d ' ' || true)"
-case "$route" in ""|"[]") ;; *)
-  dev="$(printf '%s' "$route" | sed -n 's/.*"dev":"\\([^"]*\\)".*/\\1/p' | head -n 1)"
-  if [ -n "$dev" ]; then
-    addrs="$(ip -j addr show dev "$dev" 2>/dev/null | tr -d ' ' || true)"
-    case "$addrs" in *'"scope":"global"'*) CHECK=pass ;; esac
-  fi ;;
+export function renderPostChecks(ctx: RevertContext): string {
+  assertIface(ctx.managementInterface, "management interface");
+  const ips = ctx.managementAddrs.map((c) => {
+    const ip = c.split("/")[0];
+    if (!/^[0-9A-Fa-f:.]+$/.test(ip)) {
+      throw new Error("invalid management address");
+    }
+    return ip.toLowerCase();
+  });
+  const family =
+    ips.some((ip) => ip.includes(":")) && !ips.some((ip) => !ip.includes(":"))
+      ? "-6"
+      : "-4";
+  const addrChecks = ips.length === 0
+    ? `case "$addrs" in *'"scope":"global"'*) ;; *) CHECK=fail ;; esac`
+    : ips.map((ip) =>
+      `case "$addrs" in *'"local":"${ip}"'*) ;; *) CHECK=fail ;; esac`
+    ).join("\n  ");
+  return `CHECK=fail
+MGMT=${shq(ctx.managementInterface)}
+route="$(ip -j ${family} route show default 2>/dev/null | tr -d ' ' || true)"
+case "$route" in *"\\"dev\\":\\"$MGMT\\""*)
+  CHECK=pass
+  addrs="$(ip -j addr show dev "$MGMT" 2>/dev/null | tr -d ' ' || true)"
+  ${addrChecks} ;;
 esac`;
+}
 
 /**
  * Renders the per-token restore script. It exits non-zero unless invoked with
@@ -149,7 +174,6 @@ write_result() {
   tmp="$MARKER.tmp"
   printf '{"token":"%s","result":"%s","fired_at":%s}\\n' "$TOKEN" "$RESULT" "$now" > "$tmp" 2>/dev/null && mv -f "$tmp" "$MARKER" || true
 }
-trap 'RESULT=fail; write_result' EXIT
 [ "\${1-}" = "$TOKEN" ] || { echo 'host-net: wrong token' >&2; exit 64; }
 exec 9>"${LOCK_PATH}"
 flock -w 30 9 || { echo 'host-net: lock busy' >&2; exit 75; }
@@ -157,9 +181,11 @@ cur=
 if [ -f "${CURRENT_PATH}" ]; then read cur _ < "${CURRENT_PATH}" || true; fi
 if [ "$cur" != "$TOKEN" ]; then
   rm -rf "$DIR"
-  trap - EXIT
   exit 0
 fi
+# Only a restore that is really running records an outcome: a refused call
+# (wrong token, busy lock, stale token) must never touch the marker.
+trap 'RESULT=fail; write_result' EXIT
 # 1. delete only the devices this change created (bridge before its ports).
 for dev in ${bridges} ${others}; do ip link delete dev "$dev" 2>/dev/null || true; done
 ${ovsDelete}
@@ -187,7 +213,7 @@ if [ "$applyrc" -ne 0 ]; then
   logger -t host-net "$msg" 2>/dev/null || true
 fi
 # 5. record the outcome; pass needs a default route and a management address.
-${POST_CHECKS}
+${renderPostChecks(ctx)}
 RESULT=$CHECK
 write_result
 if [ "$RESULT" = pass ]; then rm -f "${CURRENT_PATH}"; fi
@@ -277,6 +303,9 @@ for p in ${ownedList(ctx)}; do
   if [ -f "$p" ]; then cp -a "$p" "$SNAP/$b"; printf '%s\\tpresent\\n' "$p" >> "$DIR/owned.txt"; else printf '%s\\tabsent\\n' "$p" >> "$DIR/owned.txt"; fi
 done
 printf '%s\\n' '${marker}' > "$DIR/marker.json"
+cat > "$DIR/checks.sh" <<'HOST_NET_CHECKS'
+${renderPostChecks(ctx)}
+HOST_NET_CHECKS
 cat > ${shq(self)} <<'HOST_NET_RESTORE'
 ${renderRestoreScript(ctx)}HOST_NET_RESTORE
 chmod 700 ${shq(self)}
@@ -357,7 +386,9 @@ if [ ! -f "$dir/marker.json" ] || ! tr -d ' ' < "$dir/marker.json" | grep -q '"r
   exit 3
 fi
 unit="host-net-revert-$cur"
-${POST_CHECKS}
+# The checks recorded at arm time: the management interface and its addresses.
+[ -f "$dir/checks.sh" ] || { echo 'the recorded post-restore checks are missing' >&2; exit 5; }
+. "$dir/checks.sh"
 if [ "$CHECK" != pass ]; then
   echo 'the post-restore checks still fail; fix the host first' >&2
   exit 5

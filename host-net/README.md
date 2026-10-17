@@ -70,7 +70,9 @@ restore itself fails, the marker records `fail` and further applies are refused
 until an operator clears it — the model never reboots the host.
 
 The restore judges itself by two checks after it re-applies the network: a
-default route exists, and the interface carrying it has a global address. The
+default route leaves through the management interface, and that interface still
+carries every address it had before the change (recorded at arm time). A route
+or a global address on another NIC, or a link-local address, does not count. The
 exit status of `netplan apply` / `networkctl reconfigure` is only logged (to
 stderr and the journal as `host-net`), because a cloud-init netplan that matches
 an already-renamed NIC by MAC can exit non-zero on a host that is in fact
@@ -83,12 +85,20 @@ restored.
    `cat /var/lib/host-net/revert/*/marker.json` (look for `"result":"fail"`).
    Repair the network by hand if the checks above do not hold.
 2. Run the `clear_failed_revert` method with the same target arguments. It
-   refuses unless the host marker says `fail` and the two checks pass right now;
-   then it stops any leftover revert timer and removes the marker and revert
-   state, so the next `apply` is accepted. It never edits the network.
+   refuses unless the host marker says `fail` and the same checks (recorded at
+   arm time) pass right now; then it stops any leftover revert timer and removes
+   the marker and revert state, so the next `apply` is accepted. It never edits
+   the network.
 
-Without the method, the equivalent by hand is `rm -rf /var/lib/host-net` after
-step 1, which also discards the snapshots of every earlier revert.
+By hand, the equivalent is: take the lock (`flock /run/host-net.lock sh`), read
+the token in `/var/lib/host-net/current`, confirm that
+`/var/lib/host-net/revert/<token>/marker.json` says `"result":"fail"` and that
+the checks hold, then
+`systemctl stop host-net-revert-<token>.timer
+host-net-revert-<token>.service`,
+remove `/var/lib/host-net/current` and remove only
+`/var/lib/host-net/revert/<token>`. Never remove all of `/var/lib/host-net`:
+that also destroys an armed revert's snapshot and restore script.
 
 ## Dependencies
 

@@ -386,6 +386,9 @@ interface ArmInput {
   staleFiles: string[];
   /** Parent MTUs this change raises, with the pre-change value. */
   parentMtus: { name: string; mtu: number }[];
+  /** The management path before the change: its interface and global CIDRs. */
+  managementInterface: string;
+  managementAddrs: string[];
   /** The rendered config identity. */
   armedSha256: string;
   /** SHA-256 over the owned file contents only. */
@@ -405,6 +408,8 @@ function revertContext(token: string, input: ArmInput): RevertContext {
     // puts them back.
     ownedFiles: [...new Set([...input.ownedFiles, ...input.staleFiles])],
     parentMtus: input.parentMtus,
+    managementInterface: input.managementInterface,
+    managementAddrs: input.managementAddrs,
   };
 }
 
@@ -948,6 +953,8 @@ export function createModel(overrides: Partial<HostNetDeps> = {}) {
           staleDevices,
           staleFiles,
           parentMtus,
+          managementInterface: live.managementInterface,
+          managementAddrs: live.managementAddrs,
           armedSha256: render.sha256,
           contentSha256: desiredContentSha,
           operation: "apply",
@@ -1379,6 +1386,8 @@ export function createModel(overrides: Partial<HostNetDeps> = {}) {
           staleDevices: [],
           staleFiles: [],
           parentMtus: recordMtus,
+          managementInterface: live.managementInterface,
+          managementAddrs: live.managementAddrs,
           armedSha256: String(config?.configSha256 ?? ""),
           contentSha256: String(config?.contentSha256 ?? ""),
           operation: "remove",
@@ -1527,23 +1536,42 @@ export function createModel(overrides: Partial<HostNetDeps> = {}) {
           "-c",
           renderClearFailedScript(),
         ]);
-        if (res.exit_code !== 0) {
-          const why = res.stderr.trim() || `exit ${res.exit_code}`;
-          throw new HostNetConfigError(`nothing was cleared: ${why}`);
-        }
         const recorded = await context.readResource(
           `revert-${targetKey(args)}`,
         );
-        if (recorded !== null && typeof recorded.token === "string") {
+        const stamp = new Date(deps.now()).toISOString();
+        const write = async (token: string) => {
+          if (recorded === null || recorded.token !== token) return;
           await context.writeResource("revert", `revert-${targetKey(args)}`, {
             ...recorded,
             firedAt: typeof recorded.firedAt === "string"
               ? recorded.firedAt
-              : new Date(deps.now()).toISOString(),
+              : stamp,
             result: "fail",
-            clearedAt: new Date(deps.now()).toISOString(),
+            clearedAt: stamp,
           });
+        };
+        if (res.exit_code === 2) {
+          // A retry after the host clear succeeded but the reply or the record
+          // write was lost: the host has no marker and the record still says
+          // fail, so converge the record.
+          if (
+            recorded !== null && recorded.result === "fail" &&
+            typeof recorded.clearedAt !== "string" &&
+            typeof recorded.token === "string"
+          ) {
+            await write(recorded.token);
+            return {
+              result: { host: args.host, cleared: true, converged: true },
+            };
+          }
         }
+        if (res.exit_code !== 0) {
+          const why = res.stderr.trim() || `exit ${res.exit_code}`;
+          throw new HostNetConfigError(`nothing was cleared: ${why}`);
+        }
+        const cleared = /^cleared ([0-9a-f]{16})$/m.exec(res.stdout)?.[1];
+        if (cleared !== undefined) await write(cleared);
         return { result: { host: args.host, cleared: true } };
       },
     },

@@ -19,6 +19,8 @@ const CTX: RevertContext = {
   createdBridges: ["br0"],
   ownedFiles: ["/etc/netplan/90-host-net.yaml"],
   parentMtus: [{ name: "enp1s0", mtu: 1500 }],
+  managementInterface: "enp1s0",
+  managementAddrs: ["192.0.2.10/24"],
 };
 
 Deno.test("restore deletes only created devices (bridge first) and never flushes OVS", () => {
@@ -44,12 +46,18 @@ Deno.test("restore is token-guarded, fail-closed and never reboots", () => {
   assertEquals(script.includes("read cur _ <"), true);
   assertEquals(script.includes('rm -rf "$DIR"'), true);
   assertEquals(script.includes("trap 'RESULT=fail; write_result' EXIT"), true);
+  // The trap is installed only once the restore is really running.
+  const trap = script.indexOf("trap 'RESULT=fail");
+  assertEquals(trap > script.indexOf("exit 64"), true);
+  assertEquals(trap > script.indexOf("flock -w 30"), true);
+  assertEquals(trap > script.indexOf('if [ "$cur" != "$TOKEN" ]'), true);
   assertEquals(script.includes("write_result"), true);
   assertEquals(script.includes("systemctl reboot"), false);
   assertEquals(script.includes("shutdown -r"), false);
   // The default-route check must require a non-empty route.
-  assertEquals(script.includes('route="$(ip -j route show default'), true);
-  assertEquals(script.includes('case "$route" in ""|"[]")'), true);
+  assertEquals(script.includes('route="$(ip -j -4 route show default'), true);
+  assertEquals(script.includes('"dev\\":\\"$MGMT\\""'), true);
+  assertEquals(script.includes(`'"local":"192.0.2.10"'`), true);
   // The apply exit status is advisory: captured, logged, never fatal.
   assertEquals(script.includes("netplan apply || applyrc=$?"), true);
   assertEquals(script.includes("logger -t host-net"), true);

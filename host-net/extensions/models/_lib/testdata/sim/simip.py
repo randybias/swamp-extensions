@@ -18,10 +18,16 @@ def main():
         if s == "-d -j link": print(json.dumps(l)); return 0
         if s == "-j addr": print(json.dumps([{"ifname":"enp1s0","addr_info":[{"family":"inet","local":"192.0.2.10","prefixlen":24}]}])); return 0
         if a[:3] == ["-j", "addr", "show"]:
+            def info(ip, fam, scope): return [{"family": fam, "local": ip, "prefixlen": 24, "scope": scope}]
             if flag("no_addr"): print("[]"); return 0
-            print(json.dumps([{"ifname":a[4],"addr_info":[{"family":"inet","local":"192.0.2.10","prefixlen":24,"scope":"global"}]}])); return 0
-        if s == "-j route show default":
-            print("[]" if flag("no_route") else json.dumps([{"dst":"default","gateway":"192.0.2.1","dev":"enp1s0"}])); return 0
+            if flag("other_addr"): ai = info("203.0.113.9", "inet", "global")
+            elif flag("ll_only"): ai = info("2001:db8::1", "inet6", "link")
+            else: ai = info("192.0.2.10", "inet", "global")
+            print(json.dumps([{"ifname": a[4], "addr_info": ai}])); return 0
+        if s in ("-j route show default", "-j -4 route show default", "-j -6 route show default"):
+            if flag("no_route"): print("[]"); return 0
+            dev = "enp9s0" if flag("route_other_dev") else "enp1s0"
+            print(json.dumps([{"dst": "default", "gateway": "192.0.2.1", "dev": dev}])); return 0
         if a[:3] == ["-j", "route", "get"]: print(json.dumps([{"dev":"enp1s0"}])); return 0
         if a[:3] == ["link", "show", "dev"]:
             return 0 if any(x["ifname"] == a[3] for x in l) else 1

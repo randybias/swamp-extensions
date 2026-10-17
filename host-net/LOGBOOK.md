@@ -227,3 +227,10 @@ Every one of those tests fails on the previous round's code.
 - Sim tests: apply exits 1 with passing checks gives `pass` and clears the
   marker; failing checks give `fail`, block until cleared, and the clear refuses
   until the checks pass.
+- Round 6 review fixes: the post-restore checks now require a default route
+  through the management interface and every pre-change management address on it
+  (recorded at arm time in `checks.sh`, also used by `clear_failed_revert`); the
+  restore installs its EXIT trap only after the token, lock and superseded
+  checks, so a refused call never writes the marker; `clear_failed_revert`
+  updates only the record whose token it cleared and converges on a retry;
+  README gives the by-hand clear without a blanket `rm -rf`.

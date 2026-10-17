@@ -375,6 +375,7 @@ Deno.test("a restore whose post-checks fail records fail and blocks later applie
     assertEquals(w.store.get(`revert-${KEY}`)!.result, "fail");
     // Fail-closed: the host marker blocks the next apply.
     await Deno.remove(`${w.root}/state/no_route`);
+    await assertRejects(() => w.call("apply", net("netplan", [A, B])));
     // The clear refuses while the checks fail ...
     await Deno.writeTextFile(`${w.root}/state/no_addr`, "");
     await assertRejects(
@@ -408,6 +409,101 @@ Deno.test("clear_failed_revert refuses a marker that is not a failed restore", a
       Error,
       "not a failed restore",
     );
+  } finally {
+    await w.cleanup();
+  }
+});
+
+for (
+  const [flagName, why] of [
+    ["route_other_dev", "a default route through another NIC"],
+    ["other_addr", "a global address that is not the management address"],
+    ["ll_only", "a link-local address only"],
+  ] as const
+) {
+  Deno.test(`a restore with apply failing and ${why} is judged fail`, async () => {
+    if (!await simAvailable()) return;
+    const w = await world();
+    try {
+      const armed = await w.call("apply", net("netplan", [A]));
+      await Deno.writeTextFile(`${w.root}/state/apply_fails`, "");
+      await Deno.writeTextFile(`${w.root}/state/${flagName}`, "");
+      await assertRejects(
+        () => w.call("revert_now", { ...SSH, token: armed.revert_token }),
+        Error,
+        "restore reported fail",
+      );
+      assertEquals(w.store.get(`revert-${KEY}`)!.result, "fail");
+      // Clearing refuses while the management path is still wrong.
+      await assertRejects(
+        () => w.call("clear_failed_revert", { ...SSH }),
+        Error,
+        "post-restore checks",
+      );
+    } finally {
+      await w.cleanup();
+    }
+  });
+}
+
+Deno.test("restore.sh with a wrong token leaves an armed revert's marker alone", async () => {
+  if (!await simAvailable()) return;
+  const w = await world();
+  try {
+    const armed = await w.call("apply", net("netplan", [A]));
+    const dir = `${w.root}/var/lib/host-net/revert/${armed.revert_token}`;
+    const before = await Deno.readTextFile(`${dir}/marker.json`);
+    const out = await new Deno.Command("sh", {
+      args: [`${dir}/restore.sh`, "ffffffffffffffff"],
+      env: {
+        PATH: `${w.root}/bin:/usr/bin:/bin`,
+        SIMROOT: w.root,
+        SIMBIN: `${w.root}/bin`,
+      },
+      clearEnv: true,
+      stdout: "null",
+      stderr: "null",
+    }).output();
+    assertEquals(out.code, 64);
+    assertEquals(await Deno.readTextFile(`${dir}/marker.json`), before);
+  } finally {
+    await w.cleanup();
+  }
+});
+
+Deno.test("clear_failed_revert converges on a retry and only updates the matching record", async () => {
+  if (!await simAvailable()) return;
+  const w = await world();
+  try {
+    const armed = await w.call("apply", net("netplan", [A]));
+    await Deno.writeTextFile(`${w.root}/state/no_route`, "");
+    await assertRejects(() =>
+      w.call("revert_now", { ...SSH, token: armed.revert_token })
+    );
+    await Deno.remove(`${w.root}/state/no_route`);
+    // The host clear succeeds, but the record write is lost (simulated by
+    // restoring the failed record afterwards).
+    const failed = structuredClone(w.store.get(`revert-${KEY}`)!);
+    await w.call("clear_failed_revert", { ...SSH });
+    w.store.set(`revert-${KEY}`, failed);
+    // The retry finds no host marker (exit 2) and converges the record.
+    const again = await w.call("clear_failed_revert", { ...SSH });
+    assertEquals(again.cleared, true);
+    assertEquals(typeof w.store.get(`revert-${KEY}`)!.clearedAt, "string");
+    // With no host marker and a record that is not a failed one, there is
+    // nothing to converge: the clear refuses and the record is untouched.
+    const pending: Record<string, any> = {
+      ...w.store.get(`revert-${KEY}`)!,
+      result: "pending",
+    };
+    delete pending.clearedAt;
+    w.store.set(`revert-${KEY}`, pending);
+    await assertRejects(
+      () => w.call("clear_failed_revert", { ...SSH }),
+      Error,
+      "no revert marker",
+    );
+    assertEquals(w.store.get(`revert-${KEY}`)!.clearedAt, undefined);
   } finally {
     await w.cleanup();
   }

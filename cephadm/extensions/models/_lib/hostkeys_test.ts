@@ -27,10 +27,21 @@ Deno.test("hostKeysName keys a pin by host and port", () => {
   );
 });
 
-Deno.test("assertPinsApply accepts applicable pins and a bare key line", () => {
-  assertPinsApply([HOST_PORT, BARE], "192.0.2.10", 2222);
+Deno.test("assertPinsApply accepts an applicable pin", () => {
+  assertPinsApply([HOST_PORT], "192.0.2.10", 2222);
   assertPinsApply([HOST_22], "192.0.2.10", 22);
 });
+
+Deno.test(
+  "assertPinsApply refuses a bare key line: it would apply to every host",
+  () => {
+    assertThrows(
+      () => assertPinsApply([BARE], "192.0.2.10", 22),
+      LocalRefusalError,
+      "must name its host",
+    );
+  },
+);
 
 Deno.test("assertPinsApply refuses a non-applicable pin and a malformed line", () => {
   assertThrows(
@@ -126,14 +137,17 @@ Deno.test("resolvePins: an explicit pin wins over a stored one", () => {
   );
 });
 
-Deno.test("HostKeysSchema refuses a malformed host key line", () => {
-  assertEquals(
-    HostKeysSchema.safeParse({
-      host: "192.0.2.10",
-      port: 22,
-      host_keys: ["nope"],
-      learned_at: "2030-01-01T00:00:00Z",
-    }).success,
-    false,
-  );
+Deno.test("HostKeysSchema refuses a bare or malformed host key line", () => {
+  for (const keys of [["nope"], [BARE], [KEY]]) {
+    assertEquals(
+      HostKeysSchema.safeParse({
+        host: "192.0.2.10",
+        port: 22,
+        host_keys: keys,
+        learned_at: "2030-01-01T00:00:00Z",
+      }).success,
+      false,
+      keys.join(","),
+    );
+  }
 });

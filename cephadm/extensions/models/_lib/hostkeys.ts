@@ -32,18 +32,17 @@ export function hostKeysName(host: string, port: number): string {
   return `hostkeys-${host}-${port}`;
 }
 
-/** The host fields one ssh-keyscan line applies to, when it carries them. */
+/** The host fields one ssh-keyscan line applies to. */
 function hostFieldApplies(line: string, host: string, port: number): boolean {
   const fields = line.split(" ");
-  // Two fields is `type blob` with no host field: it applies everywhere.
-  if (fields.length === 2) return true;
   const wants = port === 22 ? [host, `[${host}]:22`] : [`[${host}]:${port}`];
   return fields[0].split(",").some((h) => wants.includes(h));
 }
 
 /**
- * Refuses a supplied pin that does not name this host and port. A pin with no
- * host field is understood to apply everywhere and is kept.
+ * Refuses a pin that does not name this host and port, and refuses a bare
+ * `type blob` line outright: in a multi-host model it would pin a key for every
+ * host, so host A's key could pass for host B.
  */
 export function assertPinsApply(
   hostKeys: string[],
@@ -51,6 +50,11 @@ export function assertPinsApply(
   port: number,
 ): void {
   for (const line of hostKeys) {
+    if (line.split(" ").length === 2) {
+      throw new LocalRefusalError(
+        `a pinned host key must name its host ([host]:port or host), not be a bare key line: "${line}"`,
+      );
+    }
     if (!isHostKeyLine(line)) {
       throw new LocalRefusalError(`not an ssh-keyscan line: ${line}`);
     }
@@ -84,10 +88,10 @@ export function resolvePins(opts: {
   stored?: HostKeys | null;
 }): PinDecision {
   const supplied = (opts.supplied ?? []).filter((k) => k !== "");
-  assertPinsApply(supplied, opts.host, opts.port);
   const hostKeys = supplied.length > 0
     ? supplied
     : (opts.stored?.host_keys ?? []);
+  assertPinsApply(hostKeys, opts.host, opts.port);
   if (opts.host_key_policy === "strict") {
     if (hostKeys.length === 0) {
       throw new LocalRefusalError(

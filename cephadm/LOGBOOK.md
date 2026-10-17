@@ -694,7 +694,9 @@ Schema: `host_key_policy` (strict|insecure_tofu) replaced
 model export carries a literal `upgrades` entry to 2026.10.17.3 mapping legacy
 yes -> strict (supply pins), no -> insecure_tofu. A new `hostkeys` resource
 persists learned pins per host:port via `_lib/hostkeys.ts` (`resolvePins`,
-`assertPinsApply`), unit-tested.
+`assertPinsApply`), unit-tested. Because cephadm is multi-host, every pinned
+line must name its host (`host` or `[host]:port`); a bare `type blob` line is
+refused so host A's key cannot pass for host B.
 
 Call sites that will move to the canonical
 `exec(argv, {stdin, timeout, truncation})`: **46 sites across 9 files**

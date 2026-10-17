@@ -111,7 +111,7 @@ export const SSH_FIELDS = {
       "an ssh-keyscan line (type blob or host type blob)",
     ),
   ).max(64).nullish().describe(
-    "ssh-keyscan-format host keys; required for strict, learned for insecure_tofu.",
+    "ssh-keyscan host keys, each naming its host (host type blob or [host]:port type blob); a bare key line is refused. Required for strict, learned for insecure_tofu.",
   ),
   multiplex: z.boolean().nullish().describe(
     "Reuse one authenticated SSH master per host; absent means false.",

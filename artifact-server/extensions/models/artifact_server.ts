@@ -28,7 +28,7 @@ import { objectMethods } from "./_lib/methods_objects.ts";
 import type { ArtifactServerModel } from "./_lib/types.ts";
 
 /** The artifact-server model: a plain object literal. */
-export const model: ArtifactServerModel = {
+export const model = {
   type: "@randybias/artifact-server",
   version: "2026.10.17.1",
   description:

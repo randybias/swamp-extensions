@@ -14,8 +14,11 @@ kea-dhcp:
 #              version may only be re-gated with exactly that hash
 artifact-server:
   channel: beta
-  ci: false
-  published: {}
+  ci: true
+  published:
+    2026.10.17.1: 198f765c88ce5f849cdb8403e1973628e605b347f292182f5ff68dd1e3966530
+  notes:
+    2026.10.17.1: 'First release, beta. Serve a directory of pinned artifacts over HTTP(S) from one host with nginx and manage it over SSH: render_config, install, get/sync and uninstall; upload, a host-side pinned fetch, publish_bundle, ref, unref and list; verify, plan_prune and prune. Objects are SHA-256 addressed (sha256/<hash>/<name>, bundles/<tree-hash>/) with a SHA256SUMS index, and verify re-hashes the bytes on the host. install never lets the package default site come up (a blocking policy-rc.d during apt-get), proves the config with nginx -t, enables and starts nginx, fails on any unexpected wildcard listener, and rolls every change back on any failure. Strict host-key pins only; secrets are vault references delivered over stdin. Live end to end on a throwaway Ubuntu 24.04 VPS over three rounds: 12 of 12 on the first build (two Highs found and fixed), 5 of 6 on the second (nginx left disabled, fixed), and 5 of 5 on this release including a real reboot, with no wildcard listener in 860 samples. Inline uploads are capped at 128 MiB because swamp holds the payload in memory; use fetch for larger files. Residuals are in the LOGBOOK: bundles/ itself as a symlink yields an empty prune plan rather than a refusal, purging nginx leaves the enable link install''s systemctl enable created, and the stored default-site flag can restore a default site the operator removed after a first uninstall.'
 
 azure-vm:
   channel: beta

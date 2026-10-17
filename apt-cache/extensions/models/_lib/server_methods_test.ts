@@ -12,20 +12,9 @@ import {
   assertThrows,
 } from "jsr:@std/assert@1.0.19";
 import { SshError } from "./ssh.ts";
-import {
-  renderBackendFiles,
-  renderServerFragment,
-  SECURITY_CONF_PATH,
-} from "./apt.ts";
-import { createModel, model, setDeps } from "../apt_cache.ts";
-import {
-  boxFake,
-  fakeApt,
-  has,
-  hasTok,
-  type Resp,
-  useFake,
-} from "./test_support.ts";
+import { renderBackendFiles, renderServerFragment } from "./apt.ts";
+import { createModel, model } from "../apt_cache.ts";
+import { fakeApt, has, hasTok, type Resp, useFake } from "./test_support.ts";
 import { ctx, SERVER, serverArgs, SSH } from "./model_test_support.ts";
 
 Deno.test("createModel returns the model", () => {
@@ -483,92 +472,6 @@ Deno.test("remove_server refuses a mismatched confirm_host", async () => {
   );
 });
 
-/** A responder for the host probes apply_server and remove_server need. */
-function serverResponder(command: string): Resp {
-  if (command.includes("is-active")) return { code: 0, stdout: "active\n" };
-  if (command.includes("-ltn")) {
-    return {
-      code: 0,
-      stdout:
-        "State Recv-Q Send-Q Local Address:Port Peer Address:Port\nLISTEN 0 4096 192.0.2.20:3142 0.0.0.0:*\n",
-    };
-  }
-  if (command.includes("dpkg-query")) {
-    return { code: 0, stdout: "install ok installed\n" };
-  }
-  return {};
-}
-
-const FRAGMENT = "/etc/apt-cacher-ng/zzzz-apt-cache.conf";
-const BACKENDS_DEBIAN = "/etc/apt-cacher-ng/backends_debian";
-const BACKUP_DEBIAN = `${BACKENDS_DEBIAN}.apt-cache.bak`;
-
-Deno.test("apply twice then remove deletes the model's files and restores the original", async () => {
-  const box = boxFake(
-    { [BACKENDS_DEBIAN]: "original debian mirror\n" },
-    serverResponder,
-  );
-  useFake(box.fake);
-  const c = ctx();
-  const args = model.methods.apply_server.arguments.parse({
-    ssh: SSH,
-    ...serverArgs({ listen: ["192.0.2.20"] }),
-  });
-  await model.methods.apply_server.execute(args, c.context);
-  await model.methods.apply_server.execute(args, c.context);
-  // The original was saved once, on the first apply; the second must not back
-  // up the model's own output.
-  assertEquals(
-    box.files.get(BACKUP_DEBIAN)?.content,
-    "original debian mirror\n",
-  );
-
-  const out = await model.methods.remove_server.execute(
-    model.methods.remove_server.arguments.parse({
-      ssh: SSH,
-      confirm_host: "192.0.2.20",
-      purge_cache_ack: true,
-    }),
-    c.context,
-  );
-  assertEquals(out.result.removed, true);
-  assertEquals(box.files.has(FRAGMENT), false, "fragment left behind");
-  assertEquals(
-    box.files.get(BACKENDS_DEBIAN)?.content,
-    "original debian mirror\n",
-    "original backend file not restored",
-  );
-  assertEquals(box.files.has(BACKUP_DEBIAN), false);
-});
-
-Deno.test("a later apply clears a dropped admin credential", async () => {
-  const box = boxFake({}, serverResponder);
-  useFake(box.fake);
-  setDeps({ resolveSecret: () => Promise.resolve("admin:s3cret") });
-  const c = ctx();
-  await model.methods.apply_server.execute(
-    model.methods.apply_server.arguments.parse({
-      ssh: SSH,
-      ...serverArgs({
-        listen: ["192.0.2.20"],
-        admin_auth_ref: { vault: "default", key: "ADMIN" },
-      }),
-    }),
-    c.context,
-  );
-  assertEquals(box.files.has(SECURITY_CONF_PATH), true);
-  await model.methods.apply_server.execute(
-    model.methods.apply_server.arguments.parse({
-      ssh: SSH,
-      ...serverArgs({ listen: ["192.0.2.20"] }),
-    }),
-    c.context,
-  );
-  // security.conf was absent before, so dropping the credential removes it
-  // instead of leaving the old admin credential in place forever.
-  assertEquals(box.files.has(SECURITY_CONF_PATH), false);
-});
-
 // --- sync -------------------------------------------------------------------
 
 Deno.test("sync reports a widened passthrough and a missing fragment", async () => {
@@ -656,7 +559,7 @@ Deno.test("stats reads the request log and fails closed on a bad log", async () 
     return { code: 0 };
   });
   useFake(corrupt);
-  await assertRejects(
+  const failure = await assertRejects(
     () =>
       model.methods.stats.execute(
         model.methods.stats.arguments.parse({ ssh: SSH, window: "today" }),
@@ -664,7 +567,8 @@ Deno.test("stats reads the request log and fails closed on a bad log", async () 
       ),
     Error,
     "corrupt",
-  );
+  ) as { code?: string };
+  assertEquals(failure.code, "log_corrupt");
 });
 
 // --- transport and parsing helpers ------------------------------------------

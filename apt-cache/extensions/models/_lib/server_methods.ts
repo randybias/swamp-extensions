@@ -8,7 +8,6 @@
 
 import { exec, sha256Hex, type SshTarget } from "./ssh.ts";
 import {
-  ACNG_CONF_DIR,
   APT_CACHER_LOG_PATH,
   AptConfigError,
   assertCacheDir,
@@ -33,7 +32,7 @@ import {
   type Ctx,
   deps,
   iso,
-  listManagedConfNames,
+  managedPaths,
   observationName,
   parseSsListen,
   passThroughPatternOf,
@@ -263,7 +262,7 @@ export async function applyServer(
     | ServerState
     | null;
   const priorManaged = prior?.managed_files ?? {};
-  const { managed, changed } = await writeServerFiles(
+  const written = await writeServerFiles(
     t,
     fragment,
     backendFiles,
@@ -271,20 +270,19 @@ export async function applyServer(
     context,
     priorManaged,
   );
-  // A path written by an earlier apply that this one does not write (a dropped
-  // backend key, or dropped admin_auth_ref) is restored or removed now, so its
-  // ownership digest does not linger in the record forever.
-  for (const [path, sha] of Object.entries(priorManaged)) {
-    if (path in managed) continue;
-    await removeOrRestoreManaged(deps, t, path, sha);
-  }
+  const dropped = await cleanupDroppedFiles(t, priorManaged, written.managed);
+  const managed = written.managed;
+  const changed = written.changed || dropped.changed;
+  // Anything apt-cacher-ng reads that changed (written or dropped) needs a
+  // restart: the daemon holds its configuration, and a restored security.conf
+  // would otherwise keep enforcing the old credential.
   if (changed) {
     requireOk(
       await exec(deps, t, ["systemctl", "restart", "apt-cacher-ng"]),
       "systemctl restart apt-cacher-ng",
     );
   }
-  await verifyApplied(t, args);
+  await verifyApplied(t, args, adminExpectation(args, dropped.adminCredential));
   const now = deps.now();
   const handle = await context.writeResource(
     "server",
@@ -326,51 +324,25 @@ async function writeServerFiles(
 ): Promise<{ managed: Record<string, string>; changed: boolean }> {
   const managed: Record<string, string> = {};
   let changed = false;
-  const record = (
-    path: string,
-    write: { sha256: string; changed: boolean },
-  ) => {
-    managed[path] = write.sha256;
-    changed = write.changed || changed;
-  };
-  record(
-    FRAGMENT_PATH,
-    await writeManagedFile(
+  const write = async (path: string, content: string, mode: string) => {
+    const result = await writeManagedFile(
       deps,
       t,
-      FRAGMENT_PATH,
-      fragment,
-      "0644",
-      priorManaged[FRAGMENT_PATH],
-    ),
-  );
-  for (const file of backendFiles) {
-    record(
-      file.path,
-      await writeManagedFile(
-        deps,
-        t,
-        file.path,
-        file.text,
-        "0644",
-        priorManaged[file.path],
-      ),
+      path,
+      content,
+      mode,
+      priorManaged[path],
     );
-  }
+    managed[path] = result.sha256;
+    changed = result.changed || changed;
+  };
+  await write(FRAGMENT_PATH, fragment, "0644");
+  for (const file of backendFiles) await write(file.path, file.text, "0644");
   if (args.admin_auth_ref) {
-    const body = renderSecurityConf(
-      await resolveKey(context, args.admin_auth_ref),
-    );
-    record(
+    await write(
       SECURITY_CONF_PATH,
-      await writeManagedFile(
-        deps,
-        t,
-        SECURITY_CONF_PATH,
-        body,
-        "0600",
-        priorManaged[SECURITY_CONF_PATH],
-      ),
+      renderSecurityConf(await resolveKey(context, args.admin_auth_ref)),
+      "0600",
     );
     requireOk(
       await exec(deps, t, [
@@ -384,10 +356,53 @@ async function writeServerFiles(
   return { managed, changed };
 }
 
+/** What happened to the admin credential file this apply stopped writing. */
+type AdminCredential = "kept" | "restored" | "removed" | "untouched";
+
+/**
+ * Restores or removes every managed path an earlier apply wrote that this one
+ * does not (a dropped backend key, or a dropped admin_auth_ref), so its
+ * ownership digest does not linger in the record. Only the fixed managed set is
+ * touched. `changed` is true when a file on disk changed, so the caller
+ * restarts the daemon.
+ */
+async function cleanupDroppedFiles(
+  t: SshTarget,
+  priorManaged: Record<string, string>,
+  managed: Record<string, string>,
+): Promise<{ changed: boolean; adminCredential: AdminCredential }> {
+  const allowed = managedPaths();
+  let changed = false;
+  let adminCredential: AdminCredential = "untouched";
+  for (const [path, sha] of Object.entries(priorManaged)) {
+    if (path in managed || !allowed.has(path)) continue;
+    const result = await removeOrRestoreManaged(deps, t, path, sha);
+    changed = changed || result !== "kept";
+    if (path === SECURITY_CONF_PATH) adminCredential = result;
+  }
+  return { changed, adminCredential };
+}
+
+/**
+ * Whether the live daemon must refuse or accept an unauthenticated
+ * administrative request after this apply. An apply that sets admin_auth_ref
+ * must enforce it; one that dropped it and deleted the file must not enforce
+ * the old credential any more. A restored file is the admin's own, so nothing
+ * is assumed about it.
+ */
+function adminExpectation(
+  args: ApplyServerArgs,
+  dropped: AdminCredential,
+): "enforced" | "open" | "unchecked" {
+  if (args.admin_auth_ref) return "enforced";
+  return dropped === "removed" ? "open" : "unchecked";
+}
+
 /** Verify the service is active, listening on every address, and answering. */
 async function verifyApplied(
   t: SshTarget,
   args: ApplyServerArgs,
+  admin: "enforced" | "open" | "unchecked",
 ): Promise<void> {
   const active = requireOk(
     await exec(deps, t, ["systemctl", "is-active", "apt-cacher-ng"]),
@@ -429,6 +444,46 @@ async function verifyApplied(
     throw new AptCacheError(
       "verify_failed",
       `the proxy did not answer on 127.0.0.1:${args.port}`,
+    );
+  }
+  if (admin !== "unchecked") await verifyAdminAuth(t, args.port, admin);
+}
+
+/**
+ * Asks the live daemon for a read-only administrative action without a
+ * credential: 401 proves AdminAuth is enforced, anything else proves it is
+ * not (the report page itself is not gated, an action URL is).
+ */
+async function verifyAdminAuth(
+  t: SshTarget,
+  port: number,
+  expected: "enforced" | "open",
+): Promise<void> {
+  const probe = requireOk(
+    await exec(deps, t, [
+      "curl",
+      "-s",
+      "-o",
+      "/dev/null",
+      "-w",
+      "%{http_code}",
+      "--max-time",
+      "15",
+      `http://127.0.0.1:${port}/acng-report.html?doCount=Count+Data`,
+    ]),
+    "curl admin probe",
+  ).stdout.trim();
+  const enforced = probe === "401";
+  if (expected === "enforced" && !enforced) {
+    throw new AptCacheError(
+      "verify_failed",
+      `the admin credential is not enforced by the running daemon (HTTP ${probe})`,
+    );
+  }
+  if (expected === "open" && enforced) {
+    throw new AptCacheError(
+      "verify_failed",
+      "the running daemon still enforces the dropped admin credential",
     );
   }
 }
@@ -545,13 +600,7 @@ async function removeManagedFiles(context: Ctx, t: SshTarget): Promise<void> {
     | ServerState
     | null;
   const recorded = record?.managed_files ?? {};
-  // Only ever touch the fixed managed set: a tampered record must not turn a
-  // resource field into an arbitrary remote path.
-  const paths = new Set([
-    FRAGMENT_PATH,
-    SECURITY_CONF_PATH,
-    ...listManagedConfNames().map((name) => `${ACNG_CONF_DIR}/${name}`),
-  ]);
+  const paths = managedPaths();
   for (const path of paths) {
     const result = await removeOrRestoreManaged(deps, t, path, recorded[path]);
     if (result === "kept") {

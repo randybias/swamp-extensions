@@ -283,3 +283,24 @@ uploads.
   Debian/Ubuntu host: install and adopt, apply with each policy, verify with
   `get`/`sync`/`stats`, point a second host at it and check a real package
   fetch, then `remove_server` with and without `purge_cache_ack`.
+
+## Round 5 (delta d256e1a review)
+
+- HIGH: dropping admin_auth_ref (or a backend key) restored/removed the file but
+  never restarted apt-cacher-ng, so the daemon kept enforcing the old
+  credential. A dropped path that changed on disk now triggers the restart, and
+  the apply verifies the live daemon: an unauthenticated read-only admin request
+  (`/acng-report.html?doCount=Count+Data`, measured against apt-cacher-ng 3.7.4:
+  401 with AdminAuth loaded, 200 without; the report page itself is not gated)
+  must be refused after setting admin_auth_ref and must not be refused after
+  dropping it and deleting the file. A restored admin file is not asserted on.
+- MEDIUM: one `managedPaths()` allowlist feeds both the dropped-path cleanup and
+  remove; a recorded path outside it is ignored.
+- MEDIUM: `writeManagedFile` backs up a pre-existing file even when its bytes
+  equal the new ones (remove gives it back instead of deleting it).
+- MEDIUM: one `write()` helper replaces three repeated writeManagedFile calls.
+- Tests: restart after dropping only admin_auth_ref or a backend key, a daemon
+  that never reloads fails the apply, tampered record paths, remoteSha failure
+  paths, unconfigure_client with a failing rm, log_corrupt code; the ownership
+  tests moved to `server_ownership_test.ts`; test_support dedupes agent replies,
+  upload bytes and response normalisation.

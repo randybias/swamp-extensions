@@ -350,3 +350,30 @@ Deno.test("unconfigure_client removes once then no-ops", async () => {
   );
   assertEquals(out2.result.removed, false);
 });
+
+Deno.test("unconfigure_client surfaces a failing rm instead of reporting success", async () => {
+  const SNIPPET = "/etc/apt/apt.conf.d/90apt-cache-proxy";
+  const fake = fakeApt((command) => {
+    if (command.includes("sha256sum")) {
+      return { code: 0, stdout: `${"a".repeat(64)}  ${SNIPPET}\n` };
+    }
+    if (command.includes("'cat'")) return { code: 0, stdout: "snippet\n" };
+    if (command.includes("'rm'")) {
+      return { code: 1, stderr: "rm: cannot remove: Read-only file system" };
+    }
+    return {};
+  });
+  useFake(fake);
+  const c = ctx();
+  await assertRejects(
+    () =>
+      model.methods.unconfigure_client.execute(
+        model.methods.unconfigure_client.arguments.parse({ ssh: SSH }),
+        c.context,
+      ),
+    Error,
+    "rm client snippet",
+  );
+  // Nothing is recorded as removed.
+  assertEquals(c.getWrittenResources().length, 0);
+});

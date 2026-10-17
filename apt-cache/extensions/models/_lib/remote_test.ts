@@ -1,13 +1,15 @@
-import { assertEquals } from "jsr:@std/assert@1.0.19";
+import { assertEquals, assertRejects } from "jsr:@std/assert@1.0.19";
 import { sha256Hex, type SshDeps, type SshTarget } from "./ssh.ts";
 import {
+  AptCacheError,
   backupPath,
   parseAptConfigDump,
   parseSsListen,
+  remoteSha,
   removeOrRestoreManaged,
   writeManagedFile,
 } from "./remote.ts";
-import { boxFake, TEST_NOW } from "./test_support.ts";
+import { boxFake, fakeApt, TEST_NOW } from "./test_support.ts";
 
 const T: SshTarget = {
   host: "192.0.2.20",
@@ -56,12 +58,22 @@ Deno.test("writeManagedFile adopts a pre-existing file and backs it up once", as
   assertEquals(box.files.get(BACKUP)?.content, "original\n");
 });
 
-Deno.test("writeManagedFile never backs up the model's own bytes", async () => {
-  // The file already holds exactly what we are about to write.
+Deno.test("writeManagedFile backs up a pre-existing file even when its bytes equal the new ones", async () => {
+  // Not the model's own: remove must give it back, not delete it.
   const same = boxFake({ [PATH]: "ours\n" });
   await writeManagedFile(depsOf(same.fake.run), T, PATH, "ours\n", "0644");
-  assertEquals(same.files.has(BACKUP), false);
-  // The file holds a prior generation this model wrote (recorded digest).
+  assertEquals(same.files.get(BACKUP)?.content, "ours\n");
+  const restored = await removeOrRestoreManaged(
+    depsOf(same.fake.run),
+    T,
+    PATH,
+    await sha("ours\n"),
+  );
+  assertEquals(restored, "restored");
+  assertEquals(same.files.get(PATH)?.content, "ours\n");
+});
+
+Deno.test("writeManagedFile never backs up a generation this model wrote (recorded digest)", async () => {
   const prior = boxFake({ [PATH]: "previous\n" });
   await writeManagedFile(
     depsOf(prior.fake.run),
@@ -72,6 +84,25 @@ Deno.test("writeManagedFile never backs up the model's own bytes", async () => {
     await sha("previous\n"),
   );
   assertEquals(prior.files.has(BACKUP), false);
+});
+
+Deno.test("remoteSha: a failing sha256sum on a present file is an error, an absent file is null", async () => {
+  const run = (code: number, testCode: number): SshDeps["run"] =>
+    fakeApt((command) => {
+      if (command.includes("sha256sum")) return { code, stderr: "boom" };
+      if (command.includes("'test'")) {
+        return { code: testCode, deliberate: true };
+      }
+      return {};
+    }).run;
+  // sha256sum fails and `test -e` says the file exists: not a missing file.
+  await assertRejects(
+    () => remoteSha(depsOf(run(1, 0)), T, PATH),
+    AptCacheError,
+    "could not hash",
+  );
+  // sha256sum fails and `test -e` says absent: null.
+  assertEquals(await remoteSha(depsOf(run(1, 1)), T, PATH), null);
 });
 
 Deno.test("removeOrRestoreManaged restores a backup when the bytes match", async () => {

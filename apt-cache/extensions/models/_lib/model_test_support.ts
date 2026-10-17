@@ -27,7 +27,7 @@ export const SERVER = {
   listen: ["192.0.2.20"],
   https_policy: "direct" as const,
   passthrough_hosts: [] as string[],
-  backends: { debian: ["http://deb.debian.org/debian/"] },
+  backends: { debian: ["http://deb.example.test/debian/"] },
   expire_days: 4,
   cache_dir: "/var/cache/apt-cacher-ng",
 };

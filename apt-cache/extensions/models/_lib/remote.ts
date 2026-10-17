@@ -18,6 +18,7 @@ import {
   upload,
 } from "./ssh.ts";
 import {
+  ACNG_CONF_DIR,
   assertCacheDir,
   CLIENT_SNIPPET_PATH,
   DETECT_PATH,
@@ -27,6 +28,7 @@ import {
   managedBackendName,
   parseCacheBytes,
   parseFsFree,
+  SECURITY_CONF_PATH,
 } from "./apt.ts";
 
 /** A typed model failure with a stable code. */
@@ -485,9 +487,11 @@ interface ManagedWrite {
 /**
  * Writes a managed file, saving pre-existing content to a sidecar once, and
  * returns the SHA-256 of the bytes written. A file that is absent, or whose
- * digest equals what this model last recorded for it (`priorSha`) or is about
- * to write, is not backed up: those bytes are the model's own, so a second
- * apply must not turn them into a "backup" that a later remove restores.
+ * digest equals what this model last recorded for it (`priorSha`), is not
+ * backed up: those bytes are the model's own, so a second apply must not turn
+ * them into a "backup" that a later remove restores. A pre-existing file with
+ * bytes identical to the new ones is still backed up, because remove must give
+ * it back rather than delete it.
  */
 export async function writeManagedFile(
   run: SshDeps,
@@ -499,7 +503,7 @@ export async function writeManagedFile(
 ): Promise<ManagedWrite> {
   const sha256 = await sha256Hex(new TextEncoder().encode(content));
   const current = await remoteSha(run, t, path);
-  const ours = current === null || current === sha256 || current === priorSha;
+  const ours = current === null || current === priorSha;
   const backup = backupPath(path);
   if (!ours && (await remoteSha(run, t, backup)) === null) {
     requireOk(
@@ -560,14 +564,21 @@ export async function removeCacheDir(
   requireOk(await exec(run, t, ["rm", "-rf", "--", dir]), "rm -rf cache");
 }
 
-/** The managed config filenames, including the built-in backend files. */
-export function listManagedConfNames(): string[] {
-  return [
-    FRAGMENT_PATH.split("/").pop() as string,
-    "backends_debian",
-    "backends_ubuntu",
-    ...DISTRO_KEYS.map((k) => managedBackendName(k)),
-  ];
+/**
+ * Every server path the model may write, back up or remove: the fragment, the
+ * admin credential file and the backend files (its own per-distro ones and the
+ * package's built-in debian/ubuntu ones). A recorded path outside this set is
+ * ignored, so a tampered record cannot turn a resource field into an arbitrary
+ * remote path.
+ */
+export function managedPaths(): Set<string> {
+  return new Set([
+    FRAGMENT_PATH,
+    SECURITY_CONF_PATH,
+    `${ACNG_CONF_DIR}/backends_debian`,
+    `${ACNG_CONF_DIR}/backends_ubuntu`,
+    ...DISTRO_KEYS.map((k) => `${ACNG_CONF_DIR}/${managedBackendName(k)}`),
+  ]);
 }
 
 /**

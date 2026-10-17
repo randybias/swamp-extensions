@@ -20,6 +20,12 @@ export interface Resp {
   stdout?: string;
   /** Standard error. */
   stderr?: string;
+  /**
+   * For a `test -e` probe: the answer is meant even when it is a plain success
+   * with no output. Without it a bare `{ code: 0 }` is a responder's catch-all
+   * and the probe agrees with the preceding digest probe instead.
+   */
+  deliberate?: boolean;
 }
 
 /** A responder keyed on the raw (quoted) remote command string. */
@@ -42,10 +48,35 @@ function parseUploadPath(command: string): string {
   return /^f='([^']+)'/m.exec(command)?.[1] ?? "";
 }
 
-/** The last single-quoted word of a quoted argv (paths never contain quotes). */
-function lastQuoted(command: string): string {
-  const matches = command.match(/'[^']*'/g);
-  return matches ? matches[matches.length - 1].slice(1, -1) : "";
+/** Every single-quoted word of a quoted argv (paths never contain quotes). */
+function argvOf(command: string): string[] {
+  return (command.match(/'[^']*'/g) ?? []).map((t) => t.slice(1, -1));
+}
+
+/** What a runner returns: all three fields present. */
+type CommandResultShape = { code: number; stdout: string; stderr: string };
+
+/** A fully populated result from a possibly partial responder answer. */
+function reply(r: Resp): CommandResultShape {
+  return { code: r.code ?? 0, stdout: r.stdout ?? "", stderr: r.stderr ?? "" };
+}
+
+const OK = reply({});
+
+/** The `ssh-agent` side of the transport: start (`-s`) or kill (`-k`). */
+function agentReply(args: string[]): CommandResultShape {
+  return args[0] === "-s"
+    ? reply({
+      stdout:
+        "SSH_AUTH_SOCK=/tmp/a.sock; export SSH_AUTH_SOCK;\nSSH_AGENT_PID=1; export SSH_AGENT_PID;\n",
+    })
+    : OK;
+}
+
+/** The bytes a fake upload received on stdin. */
+function stdinBytes(stdin: string | Uint8Array | undefined): Uint8Array {
+  if (stdin === undefined) return new Uint8Array();
+  return typeof stdin === "string" ? new TextEncoder().encode(stdin) : stdin;
 }
 
 async function sha256HexLocal(bytes: Uint8Array): Promise<string> {
@@ -69,18 +100,8 @@ export function fakeApt(respond: Respond): Fake {
   // per-path result so the follow-up `test -e` answers consistently.
   const shaExists = new Map<string, boolean>();
   const run: CommandRunner = async (cmd, args, options = {}) => {
-    if (cmd === "ssh-agent") {
-      return args[0] === "-s"
-        ? {
-          code: 0,
-          stdout:
-            "SSH_AUTH_SOCK=/tmp/a.sock; export SSH_AUTH_SOCK;\nSSH_AGENT_PID=1; export SSH_AGENT_PID;\n",
-          stderr: "",
-        }
-        : { code: 0, stdout: "", stderr: "" };
-    }
-    if (cmd === "ssh-add") return { code: 0, stdout: "", stderr: "" };
-    if (cmd !== "ssh") return { code: 0, stdout: "", stderr: "" };
+    if (cmd === "ssh-agent") return agentReply(args);
+    if (cmd !== "ssh") return OK;
     const command = args[args.length - 1];
     commands.push(command);
     // Record real `rm` invocations, not the upload script's own trap.
@@ -89,53 +110,32 @@ export function fakeApt(respond: Respond): Fake {
       if (match) removed.push(match[1]);
     }
     if (command.includes(".ssh-host-upload")) {
-      const bytes = options.stdin === undefined
-        ? new Uint8Array()
-        : typeof options.stdin === "string"
-        ? new TextEncoder().encode(options.stdin)
-        : options.stdin;
+      const bytes = stdinBytes(options.stdin);
       uploads.push({
         path: parseUploadPath(command),
         content: new TextDecoder().decode(bytes),
       });
-      const digest = await sha256HexLocal(bytes);
       const mode = /chmod '([0-7]{3,4})'/.exec(command)?.[1] ?? "0644";
-      return { code: 0, stdout: `${digest} ${mode}\n`, stderr: "" };
-    }
-    if (/^'sha256sum' /.test(command)) {
-      const r = respond(command);
-      shaExists.set(
-        lastQuoted(command),
-        (r.code ?? 0) === 0 && /[0-9a-f]{64}/i.test(r.stdout ?? ""),
-      );
-      return {
-        code: r.code ?? 0,
-        stdout: r.stdout ?? "",
-        stderr: r.stderr ?? "",
-      };
-    }
-    if (/^'test' '-e' /.test(command)) {
-      const r = respond(command);
-      const explicit = (r.code ?? 0) !== 0 || (r.stdout ?? "") !== "" ||
-        (r.stderr ?? "") !== "";
-      if (!explicit) {
-        const known = shaExists.get(lastQuoted(command));
-        if (known !== undefined) {
-          return { code: known ? 0 : 1, stdout: "", stderr: "" };
-        }
-      }
-      return {
-        code: r.code ?? 0,
-        stdout: r.stdout ?? "",
-        stderr: r.stderr ?? "",
-      };
+      return reply({ stdout: `${await sha256HexLocal(bytes)} ${mode}\n` });
     }
     const r = respond(command);
-    return {
-      code: r.code ?? 0,
-      stdout: r.stdout ?? "",
-      stderr: r.stderr ?? "",
-    };
+    const path = argvOf(command).at(-1) ?? "";
+    if (/^'sha256sum' /.test(command)) {
+      shaExists.set(
+        path,
+        (r.code ?? 0) === 0 && /[0-9a-f]{64}/i.test(r.stdout ?? ""),
+      );
+    }
+    if (/^'test' '-e' /.test(command)) {
+      // An explicit answer wins; otherwise agree with the digest probe.
+      const explicit = r.deliberate === true || (r.code ?? 0) !== 0 ||
+        (r.stdout ?? "") !== "" || (r.stderr ?? "") !== "";
+      const known = shaExists.get(path);
+      if (!explicit && known !== undefined) {
+        return reply({ code: known ? 0 : 1 });
+      }
+    }
+    return reply(r);
   };
   return { run, commands, uploads, removed };
 }
@@ -148,11 +148,6 @@ export function useFake(fake: Fake, now = TEST_NOW): void {
     sleep: () => Promise.resolve(),
     resolveSecret: () => Promise.resolve("PLACEHOLDER-KEY"),
   });
-}
-
-/** Every single-quoted word of a quoted argv (paths never contain quotes). */
-function argvOf(command: string): string[] {
-  return (command.match(/'[^']*'/g) ?? []).map((t) => t.slice(1, -1));
 }
 
 /** A fake target with an in-memory filesystem. */
@@ -180,37 +175,20 @@ export function boxFake(
   const commands: string[] = [];
   const uploads: { path: string; content: string }[] = [];
   const removed: string[] = [];
-  const ok = { code: 0, stdout: "", stderr: "" };
+  const ok = OK;
   const run: CommandRunner = async (cmd, args, options = {}) => {
-    if (cmd === "ssh-agent") {
-      return args[0] === "-s"
-        ? {
-          code: 0,
-          stdout:
-            "SSH_AUTH_SOCK=/tmp/a.sock; export SSH_AUTH_SOCK;\nSSH_AGENT_PID=1; export SSH_AGENT_PID;\n",
-          stderr: "",
-        }
-        : ok;
-    }
-    if (cmd === "ssh-add" || cmd !== "ssh") return ok;
+    if (cmd === "ssh-agent") return agentReply(args);
+    if (cmd !== "ssh") return ok;
     const command = args[args.length - 1];
     commands.push(command);
     if (command.includes(".ssh-host-upload")) {
       const path = parseUploadPath(command);
-      const bytes = options.stdin === undefined
-        ? new Uint8Array()
-        : typeof options.stdin === "string"
-        ? new TextEncoder().encode(options.stdin)
-        : options.stdin;
+      const bytes = stdinBytes(options.stdin);
       const content = new TextDecoder().decode(bytes);
       const mode = /chmod '([0-7]{3,4})'/.exec(command)?.[1] ?? "0644";
       files.set(path, { content, mode });
       uploads.push({ path, content });
-      return {
-        code: 0,
-        stdout: `${await sha256HexLocal(bytes)} ${mode}\n`,
-        stderr: "",
-      };
+      return reply({ stdout: `${await sha256HexLocal(bytes)} ${mode}\n` });
     }
     const argv = argvOf(command);
     const verb = argv[0];
@@ -267,14 +245,8 @@ export function boxFake(
         if (file) file.mode = argv[1];
         return ok;
       }
-      default: {
-        const r = respond(command);
-        return {
-          code: r.code ?? 0,
-          stdout: r.stdout ?? "",
-          stderr: r.stderr ?? "",
-        };
-      }
+      default:
+        return reply(respond(command));
     }
   };
   return { files, fake: { run, commands, uploads, removed } };

@@ -1,0 +1,88 @@
+{
+  "extension": "@randybias/redfish",
+  "version": "2026.10.17.1",
+  "reviewedAt": "2026-10-17T15:03:49Z",
+  "dimensions": [
+    {
+      "id": "credentials-secrets",
+      "verdict": "pass",
+      "note": "Username and password are vault-wired method inputs marked sensitive; they travel only in an Authorization or X-Auth-Token header, never in a URL, log, error, output or stored state (tested; live secret scan of 343 files: 0 hits). TLS is strict only: insecure_skip_verify and allow_insecure_credentials were removed after live showed Deno ignores the switch; ca_pem adds a trusted CA. Session discovery is anonymous (live header capture X2/X3). Residual MEDIUM (astra): a 5xx during session discovery counts as no SessionService, so auto falls back to Basic, still only over verified TLS; recorded in LOGBOOK."
+    },
+    {
+      "id": "logging-quality",
+      "verdict": "pass",
+      "note": "Each method logs once with structured placeholders (origin, system id, action, state); no credential, token, header value or body in log fields."
+    },
+    {
+      "id": "error-handling",
+      "verdict": "pass",
+      "note": "Typed RedfishError codes: unauthorized, not_found, unreachable, timeout, tls (classified from the fetch cause chain: untrusted CA, CA:TRUE leaf, expired, name mismatch), no_session_service, not_allowed and redfish_failed; messages are fixed text and never echo a body. Every request and body read has an abort deadline. Live T3, T6, A1, A2, U1, U2 and P7 confirm the typed errors."
+    },
+    {
+      "id": "testing-completeness",
+      "verdict": "pass",
+      "note": "64 unit tests with a fake fetch and DMTF-shaped synthetic fixtures (no socket): TLS policy, session discovery and logout, Basic fallback, task monitors (completed, 204/404, empty 500), restart transitions, stalled requests and DELETE, cross-origin links, allowable filtering and the plain-object method context. Live on sushy-tools 2.2.0 (emulator only, no real BMC): 21/23 PASS, 0 FAIL, B1/B3 BLOCKED by an emulator limitation where the model correctly refused."
+    },
+    {
+      "id": "idempotency-resilience",
+      "verdict": "pass",
+      "note": "power skips the Reset POST when already in the target state (live P2) and polls to a bounded deadline; restarts follow a task monitor or an observed transition and otherwise succeed with a warning. set_boot is a no-op when already set (live B2), sends If-Match when an ETag exists and reads the override back, refusing when the BMC did not apply it (live B1/B3)."
+    },
+    {
+      "id": "api-contracts",
+      "verdict": "pass",
+      "note": "DMTF Redfish service root, Systems collection, ComputerSystem, Reset action and Boot PATCH; @odata.id links are kept on the endpoint origin; requested ResetType is validated against the advertised AllowableValues, filtered to known values."
+    },
+    {
+      "id": "resource-management",
+      "verdict": "pass",
+      "note": "Each run uses one HttpClient closed in finally; a session is deleted in finally with min(30s, remaining deadline) and skipped with a warning on a cross-origin URI; bodies are capped at 1 MiB."
+    },
+    {
+      "id": "published-surface-hygiene",
+      "verdict": "pass",
+      "note": "Manifest has the @randybias/redfish name, Apache-2.0, additionalFiles README.md and LICENSE.txt; README documents strict TLS, ca_pem as an additional trusted CA, the CA:FALSE leaf requirement and auth_mode. No real host, IP or account in code, README or fixtures. Merge-prep fixed two description Lows (power description now three sentences; the TlsPolicy comment no longer says pinned)."
+    },
+    {
+      "id": "schema-strictness",
+      "verdict": "pass",
+      "note": "Strict zod objects; endpoint is an https origin only; tls_verify is the literal strict; auth_mode is an enum (auto, session, basic); action and boot target are enums; unknown inputs are rejected (live T4/T5)."
+    },
+    {
+      "id": "lifetime-gc",
+      "verdict": "pass",
+      "note": "One state resource, lifetime infinite, garbageCollection 10."
+    },
+    {
+      "id": "crud-completeness",
+      "verdict": "pass",
+      "note": "get and sync are READ-ONLY; power and set_boot are DESTRUCTIVE actions. A gone system is recorded as not_found by sync (live S4). There is nothing to create or delete on a BMC."
+    },
+    {
+      "id": "preflight-checks",
+      "verdict": "pass",
+      "note": "Before any mutation the model reads the system, checks AllowableValues and the current state, and refuses unknown or disallowed actions with no request sent (live P7)."
+    },
+    {
+      "id": "instance-names",
+      "verdict": "pass",
+      "note": "State is keyed by the canonical origin plus system id, so one definition serves any number of BMCs and systems without collisions."
+    },
+    {
+      "id": "data-access",
+      "verdict": "pass",
+      "note": "Stored state holds metadata only (power, boot override, health, allowable resets); no credential or token."
+    },
+    {
+      "id": "version-upgrades",
+      "verdict": "pass",
+      "note": "First release; no prior state shape to migrate."
+    }
+  ],
+  "panel": {
+    "codex-astra": "codex gpt-6-astra conformance seat over the lane/b2-redfish delta at 0e97c93 (from d6374a4): 0 Critical/High, 1 Medium (5xx during session discovery treated as no SessionService; open, recorded in LOGBOOK), 2 Low (power description length, pinned wording in the http.ts TlsPolicy comment), both fixed at merge-prep as doc-only changes.",
+    "codex-terra": "codex gpt-5.6-terra adversarial seat at 0e97c93: PASS, no justified defects. Earlier rounds 761b6df, e1ecad1, b3e629a and d6374a4 are dispositioned in LOGBOOK.",
+    "merge-prep": "Post-review change: the power method description and one JSDoc comment only; no behaviour change, 64 tests and gates 0 to 6 pass.",
+    "ocr-llm": "OCR sonnet5 and glm seats were not run in the final rounds"
+  }
+}

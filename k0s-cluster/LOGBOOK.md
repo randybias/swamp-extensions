@@ -344,3 +344,10 @@ the triage checks, no Critical/High. `_lib/ssh.ts` is the canonical blob
   a drift-detection hash, not a secret, and it is now stored in state. Any
   future sensitive resource field on this model must use a data name that cannot
   be masked, or persist the exact vault key at write time.
+
+- 2026-10-17 (17.3): after de-sensitising config_file_sha256, review noted it is
+  a hash of the REAL on-host k0s.yaml — which carries the plaintext keepalived
+  authPass when CPLB is set — so storing it (vaulted or not) lets the 8-char
+  authPass be brute-forced. The field is removed entirely; drift detection
+  relies on config_sha256, which is over the redacted render. A CPLB install
+  test asserts no written state contains the authPass or a config_file_sha256.

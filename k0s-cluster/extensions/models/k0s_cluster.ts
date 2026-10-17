@@ -365,9 +365,6 @@ const StateSchema = z.strictObject({
   k0s_version: z.string().nullable(),
   binary_sha256: z.string().nullable(),
   config_sha256: z.string().nullable(),
-  config_file_sha256: z.string().nullable().describe(
-    "Hash of the installed k0s.yaml, for drift detection. Not vaulted: a sensitive field here is keyed by the host-derived data name, which swamp masks when the host looks like an IP, so the key cannot be resolved on a later read.",
-  ),
   service: z.string().nullable(),
   installed: z.boolean(),
   adopted: z.boolean(),
@@ -461,9 +458,6 @@ const StatusSchema = z.strictObject({
   node: NodeViewSchema.nullable(),
   nodes: z.array(NodeViewSchema),
   system_pods: z.array(PodViewSchema),
-  config_file_sha256: z.string().nullable().describe(
-    "Hash of the installed k0s.yaml, for drift detection. Not vaulted: a sensitive field here is keyed by the host-derived data name, which swamp masks when the host looks like an IP, so the key cannot be resolved on a later read.",
-  ),
   stacks: z.array(z.string()),
   helm_releases: z.array(
     z.strictObject({
@@ -718,14 +712,6 @@ function publicRender(input: K0sConfigInput): string {
   });
 }
 
-async function remoteConfigSha(
-  deps: K0sDeps,
-  target: SshTarget,
-): Promise<string | null> {
-  const result = await deps.ssh.exec(target, ["sha256sum", K0S_CONFIG_PATH]);
-  return ok(result) ? parseSha256(result.stdout) : null;
-}
-
 async function remoteStacks(
   deps: K0sDeps,
   target: SshTarget,
@@ -924,7 +910,6 @@ async function readLive(
     node: nodes.find((node) => node.ready) ?? nodes[0] ?? null,
     nodes,
     system_pods: pods,
-    config_file_sha256: installed ? await remoteConfigSha(deps, target) : null,
     stacks: installed ? await remoteStacks(deps, target) : [],
     helm_releases: installed
       ? (await remoteHelmReleases(deps, target)).map((release) => ({
@@ -1173,7 +1158,6 @@ function buildK0sModel(deps: K0sDeps) {
           }
 
           const yaml = renderK0sConfig(renderInput(args));
-          const configFileSha = await sha256Hex(encoder.encode(yaml));
           const configSha = await sha256Hex(
             encoder.encode(publicRender(renderInput(args))),
           );
@@ -1279,7 +1263,6 @@ function buildK0sModel(deps: K0sDeps) {
                 k0s_version: args.k0s_version,
                 binary_sha256: args.k0s_binary_sha256.toLowerCase(),
                 config_sha256: configSha,
-                config_file_sha256: configFileSha,
                 service,
                 installed: true,
                 adopted,
@@ -1428,7 +1411,6 @@ function buildK0sModel(deps: K0sDeps) {
                 k0s_version: null,
                 binary_sha256: null,
                 config_sha256: null,
-                config_file_sha256: null,
                 service: newUnit ? service : null,
                 installed: false,
                 adopted: false,
@@ -1458,7 +1440,6 @@ function buildK0sModel(deps: K0sDeps) {
               k0s_version: args.k0s_version,
               binary_sha256: binarySha,
               config_sha256: configSha,
-              config_file_sha256: configFileSha,
               service,
               installed: true,
               adopted: false,
@@ -1730,7 +1711,6 @@ function buildK0sModel(deps: K0sDeps) {
                 k0s_version: to,
                 binary_sha256: binarySha,
                 config_sha256: stored.config_sha256,
-                config_file_sha256: stored.config_file_sha256,
                 service,
                 installed: true,
                 adopted: stored.adopted,
@@ -2180,7 +2160,6 @@ function buildK0sModel(deps: K0sDeps) {
             `${targetId(target)}~status`,
             status,
           );
-          const { config_file_sha256: configFile, ...publicStatus } = status;
           context.logger.info("Read k0s status for {host}: version {version}", {
             host: target.host,
             version: status.k0s_version ?? "not installed",
@@ -2188,8 +2167,8 @@ function buildK0sModel(deps: K0sDeps) {
           return {
             dataHandles: [...handles, handle],
             result: {
-              ...publicStatus,
-              config_present: configFile !== null,
+              ...status,
+              config_present: status.installed,
               kubeconfig_present: recorded !== null,
             },
           };
@@ -2225,9 +2204,10 @@ function buildK0sModel(deps: K0sDeps) {
                 }`,
               );
             }
-            if (stored.config_file_sha256 !== status.config_file_sha256) {
-              diffs.push("config changed on the host since it was recorded");
-            }
+            // The config hash is not persisted: over a secret-bearing
+            // k0s.yaml it would let the short keepalived authPass be
+            // brute-forced, and a sensitive field would be keyed by the
+            // host-derived data name that swamp masks.
           }
           const handle = await context.writeResource(
             "status",
@@ -2288,7 +2268,6 @@ function buildK0sModel(deps: K0sDeps) {
                 k0s_version: null,
                 binary_sha256: null,
                 config_sha256: null,
-                config_file_sha256: null,
                 service: null,
                 installed: false,
                 adopted: false,

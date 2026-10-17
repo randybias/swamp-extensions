@@ -1951,11 +1951,11 @@ Deno.test("sensitive digests are not returned by get, apply_manifests or render_
   assertEquals(JSON.stringify(applied.result).includes("sha256"), false);
   const rs = model.resources.manifests.schema.shape.files.element.shape;
   assertEquals(rs.sha256.meta()?.sensitive, true);
-  // config_file_sha256 is a drift hash, not vaulted: a sensitive field here
-  // would be keyed by the host-derived data name, which swamp masks.
+  // The config file hash is not persisted at all: over a secret-bearing
+  // k0s.yaml it would let the keepalived authPass be brute-forced, and a
+  // sensitive field would be keyed by the host-derived data name swamp masks.
   assertEquals(
-    model.resources.state.schema.shape.config_file_sha256.meta()?.sensitive ??
-      false,
+    "config_file_sha256" in model.resources.state.schema.shape,
     false,
   );
 });
@@ -2688,6 +2688,30 @@ function upgradeContext(overrides: Record<string, unknown> = {}) {
     },
   });
 }
+
+Deno.test("a keepalived VIP stores no hash over the secret-bearing config", async () => {
+  const secret = "abc12345";
+  const fake = makeDeps({
+    exec: installRouter,
+    fetch: () => Promise.resolve(PAYLOAD),
+  });
+  const model = createModel(fake.deps);
+  const { context, getWrittenResources } = createModelTestContext();
+  await model.methods.install.execute(
+    installArgs({
+      control_plane_load_balancing: {
+        virtual_ips: ["192.0.2.10/24"],
+        auth_pass: secret,
+      },
+    }),
+    context,
+  );
+  for (const row of getWrittenResources()) {
+    const data = row.data as Record<string, unknown>;
+    assertEquals(JSON.stringify(data).includes(secret), false);
+    assertEquals("config_file_sha256" in data, false);
+  }
+});
 
 Deno.test("etcd_peer_address must be an IP and the join_token rules hold", () => {
   const model = createModel(makeDeps().deps);

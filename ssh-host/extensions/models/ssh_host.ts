@@ -18,7 +18,9 @@ import {
   exec as sshExec,
   HOST_RE,
   type HostKeyPolicy,
+  keysForHost,
   MODE_RE,
+  parseHostKeys,
   REMOTE_PATH_RE,
   sha256Hex,
   SshConfigError,
@@ -343,6 +345,11 @@ interface RecordedKeys {
  * Applies host-key state. `strict` is used as given. `insecure_tofu` becomes
  * `strict` pinned to the keys recorded for this target on first use; with no
  * record it stays `insecure_tofu` for a genuine first connection.
+ *
+ * A caller-supplied `host_keys` set is never silently replaced: when a pin is
+ * already recorded, the supplied set must apply to this host/port and match the
+ * record exactly, or the run is refused. Silently substituting the record would
+ * turn a deliberately wrong pin into a successful connection.
  */
 async function pinnedTarget(
   context: MethodContext,
@@ -353,12 +360,36 @@ async function pinnedTarget(
   const stored = await context.readResource(
     `connection-${hostPortKey(args)}`,
   ) as RecordedKeys | null;
-  const keys = stored?.host_keys ?? [];
-  if (keys.length === 0) return target;
+  const recorded = stored?.host_keys ?? [];
+  if (recorded.length === 0) return target;
+
+  const supplied = args.host_keys ?? [];
+  if (supplied.length > 0) {
+    const applicable = keysForHost(
+      parseHostKeys(supplied.join("\n")),
+      args.host,
+      args.port,
+    );
+    if (applicable.length === 0) {
+      throw new SshConfigError(
+        `host_keys were supplied but none apply to ${args.host}:${args.port}`,
+      );
+    }
+    const suppliedSet = new Set(applicable.map((k) => `${k.type} ${k.key}`));
+    const recordedSet = new Set(recorded.map((k) => `${k.type} ${k.key}`));
+    const same = suppliedSet.size === recordedSet.size &&
+      [...suppliedSet].every((k) => recordedSet.has(k));
+    if (!same) {
+      throw new SshConfigError(
+        `the supplied host_keys for ${args.host}:${args.port} do not match the recorded pin; refusing to substitute the record`,
+      );
+    }
+  }
+
   return {
     ...target,
     host_key_policy: "strict",
-    host_keys: keys.map((k) => `${k.type} ${k.key}`),
+    host_keys: recorded.map((k) => `${k.type} ${k.key}`),
   };
 }
 

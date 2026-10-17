@@ -186,3 +186,15 @@ for this round.
   strictly against the shared pin. Per-user execution evidence keeps the user in
   its key (`exec-…-u<len>-<user>`, `upload-…`). A test pins as one user and
   proves a second user gets strict verification with no scan and no pin rewrite.
+
+## Live finding (cells X5b, X7b) — supplied pin silently replaced by record
+
+- HIGH: under `insecure_tofu` with a recorded pin, `pinnedTarget` overwrote the
+  caller's supplied `host_keys` with the record, so a wrong pin or a pin for
+  another host connected successfully instead of refusing. Now a supplied set
+  must apply to this host/port and match the record exactly; a mismatch or an
+  inapplicable set throws `SshConfigError`. Only when no `host_keys` are
+  supplied is the record used. Tests mirror X5b (wrong pin + record) and X7b
+  (other-host pin + record), and a matching pin proceeds strictly. Live was the
+  only thing that caught this; unit tests now cover it. The `_lib/ssh.ts`
+  vendored helper is unchanged by this fix.

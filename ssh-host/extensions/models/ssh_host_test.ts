@@ -710,6 +710,75 @@ Deno.test("a second user on a pinned host:port verifies against the shared pin",
   assertEquals(written.some((w) => w.specName === "connection"), false);
 });
 
+Deno.test("a supplied pin that disagrees with the record is refused (live X5b)", async () => {
+  const calls: Call[] = [];
+  const deps = fakeDeps(fakeRun(calls));
+  const m = createModel(deps);
+  const { context } = testContext({
+    [`connection-${HOSTPORT}`]: {
+      host_keys: [{ type: "ssh-ed25519", key: KEY }],
+    },
+  });
+  await assertRejects(
+    () =>
+      m.methods.exec.execute({
+        ...STRICT,
+        host_key_policy: "insecure_tofu",
+        host_keys: [`ssh-ed25519 QkJCQkJC`],
+        argv: ["true"],
+      }, context),
+    SshConfigError,
+    "do not match",
+  );
+  assertEquals(calls.some((c) => c.cmd === "ssh"), false);
+});
+
+Deno.test("a supplied pin for another host is refused, not substituted (live X7b)", async () => {
+  const calls: Call[] = [];
+  const deps = fakeDeps(fakeRun(calls));
+  const m = createModel(deps);
+  const { context } = testContext({
+    [`connection-${HOSTPORT}`]: {
+      host_keys: [{ type: "ssh-ed25519", key: KEY }],
+    },
+  });
+  await assertRejects(
+    () =>
+      m.methods.exec.execute({
+        ...STRICT,
+        host_key_policy: "insecure_tofu",
+        host_keys: [`other.example.com ssh-ed25519 ${KEY}`],
+        argv: ["true"],
+      }, context),
+    SshConfigError,
+    "none apply",
+  );
+  assertEquals(calls.some((c) => c.cmd === "ssh"), false);
+});
+
+Deno.test("a supplied pin that agrees with the record proceeds strictly", async () => {
+  const calls: Call[] = [];
+  const deps = fakeDeps(fakeRun(calls));
+  const m = createModel(deps);
+  const { context } = testContext({
+    [`connection-${HOSTPORT}`]: {
+      host_keys: [{ type: "ssh-ed25519", key: KEY }],
+    },
+  });
+  await m.methods.exec.execute({
+    ...STRICT,
+    host_key_policy: "insecure_tofu",
+    host_keys: [`ssh-ed25519 ${KEY}`],
+    argv: ["true"],
+  }, context);
+  assertEquals(
+    calls.find((c) => c.cmd === "ssh")?.args.includes(
+      "StrictHostKeyChecking=yes",
+    ),
+    true,
+  );
+});
+
 Deno.test("insecure_tofu refuses a changed key on a later run", async () => {
   const calls: Call[] = [];
   const deps = fakeDeps(fakeRun(calls, {

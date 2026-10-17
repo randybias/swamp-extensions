@@ -88,8 +88,8 @@ swamp CLI echoes method arguments, sensitive ones included, in `--json` output
   every later run and for every user on that host:port; a changed key is
   refused. Each line is `ssh-keyscan` format, either bare `type key` or with a
   host field naming this target (port 22 as `host`, otherwise `[host]:port`); a
-  supplied set that matches no host/port is refused, never silently downgraded
-  to trust-on-first-use.
+  supplied set that matches no host/port, or that disagrees with an
+  already-recorded pin, is refused, never silently downgraded or substituted.
 - `exec` takes a command and its arguments as an array. Each element is quoted
   as one literal word before it is sent, so `;`, `$()`, backticks and newlines
   inside an element can never become a second command. `argv` can still run a

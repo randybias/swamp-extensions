@@ -1,5 +1,6 @@
 import { assert, assertEquals, assertThrows } from "jsr:@std/assert@1.0.19";
 import {
+  canonicalIpv6,
   canonicalNameCompare,
   canonicalRecords,
   canonicalZoneFile,
@@ -14,6 +15,7 @@ import {
   noSignerOwned,
   ownerFqdn,
   quoteTxt,
+  RecordSchema,
   renderRdata,
   renderZoneConfig,
   renderZoneFile,
@@ -64,6 +66,11 @@ Deno.test("owner resolution and zone boundary", () => {
     "www.example.com.",
   );
   assertEquals(ownerFqdn("example.com.", "*"), "*.example.com.");
+  assertEquals(
+    ownerFqdn("example.com.", "_443._tcp.www"),
+    "_443._tcp.www.example.com.",
+  );
+  assertEquals(ownerFqdn("example.com.", "_dmarc"), "_dmarc.example.com.");
   assertThrows(() => ownerFqdn("example.com.", "www.other.test."));
   assertThrows(() => ownerFqdn("example.com.", "bad..name"));
 });
@@ -184,6 +191,62 @@ Deno.test("duplicate records collapse", () => {
     NS,
   ]);
   assertEquals(records.filter((r) => r.type === "A").length, 1);
+});
+
+Deno.test("domain-valued fields reject control characters and directives", () => {
+  const bad = [
+    {
+      name: "www",
+      type: "CNAME",
+      data: "www.example.com.\nevil.example.com. 60 IN A 192.0.2.66\n;",
+    },
+    { name: "www", type: "NS", data: "ns.$INCLUDE x" },
+    {
+      name: "@",
+      type: "MX",
+      data: { preference: 10, exchange: "a;b.example.com." },
+    },
+    {
+      name: "_sip._tcp",
+      type: "SRV",
+      data: { priority: 0, weight: 0, port: 5060, target: "t\tevil" },
+    },
+  ];
+  for (const r of bad) {
+    assertEquals(RecordSchema.safeParse(r).success, false, JSON.stringify(r));
+  }
+  assertEquals(
+    SoaSchema.safeParse({ ...SOA, primary_ns: "ns1;rm -rf /" }).success,
+    false,
+  );
+});
+
+Deno.test("IPv6 rdata is canonicalized for comparison", () => {
+  assertEquals(canonicalIpv6("2001:DB8:0:0::1"), "2001:db8::1");
+  assertEquals(canonicalIpv6("2001:db8::1"), "2001:db8::1");
+  assertEquals(
+    renderRdata(rec({ type: "AAAA", data: "2001:DB8:0:0::1" })),
+    "2001:db8::1",
+  );
+});
+
+Deno.test("config fragment is a valid top-level shape, not inline blocks", () => {
+  const fragment = renderZoneConfig({
+    apex: "example.com.",
+    file: "/var/lib/knot/zones/example.com.zone",
+    signed: true,
+    dnssec: { algorithm: "ecdsap256sha256", nsec3: false },
+    notifySecondaries: ["192.0.2.2@53"],
+    allowTransfer: ["192.0.2.3"],
+    tsigKeyNames: ["xfer"],
+  });
+  assert(fragment.startsWith("policy:"));
+  assert(fragment.includes("dnssec-policy: managed-example-com"));
+  assert(fragment.includes("remote:"));
+  assert(fragment.includes("acl:"));
+  assert(fragment.includes("notify: managed-example-com-notify"));
+  assert(!fragment.includes("disable-any"));
+  assert(!/^\s+notify:$/m.test(fragment));
 });
 
 Deno.test("golden plain zone file", () => {

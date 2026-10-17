@@ -1,5 +1,6 @@
 import { assertEquals } from "jsr:@std/assert@1.0.19";
-import { normalizeServedRdata, parseDsLines, parseZoneRead } from "./parse.ts";
+import { normalizeServedRdata } from "./zone.ts";
+import { parseDsLines, parseZoneRead } from "./parse.ts";
 
 Deno.test("parseZoneRead resolves owners and drops signer-owned types", () => {
   const text = [
@@ -14,6 +15,19 @@ Deno.test("parseZoneRead resolves owners and drops signer-owned types", () => {
     { name: "example.com.", type: "NS", data: "ns1.example.com." },
     { name: "www.example.com.", type: "A", data: "192.0.2.10" },
     { name: "*.example.com.", type: "TXT", data: '"wild"' },
+  ]);
+});
+
+Deno.test("parseZoneRead reads the real no-class format and normalizes IPv6", () => {
+  const text = [
+    "example.com. 3600 NS ns1.example.com.",
+    "www.example.com. 3600 AAAA 2001:DB8:0:0::1",
+    "[example.com.] sub.example.com. 3600 A 192.0.2.5",
+  ].join("\n");
+  assertEquals(parseZoneRead(text, "example.com."), [
+    { name: "example.com.", type: "NS", data: "ns1.example.com." },
+    { name: "www.example.com.", type: "AAAA", data: "2001:db8::1" },
+    { name: "sub.example.com.", type: "A", data: "192.0.2.5" },
   ]);
 });
 

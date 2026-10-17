@@ -160,7 +160,11 @@ Deno.test("render_resolver is deterministic and touches no host", async () => {
 });
 
 Deno.test("remove_zone refuses a recorded signed zone without an ack", async () => {
-  const name = await instanceName([ZONE_ARGS.ssh.host, "example.test."]);
+  const name = await instanceName([
+    "zone",
+    ZONE_ARGS.ssh.host,
+    "example.test.",
+  ]);
   const { context } = createModelTestContext({
     globalArgs: {},
     storedResources: {
@@ -188,4 +192,41 @@ Deno.test("remove_zone refuses a recorded signed zone without an ack", async () 
   ) as Error;
   assert(e.message.includes("dnssec_unsign_ack"));
   assertEquals(asked, [["ops", "ssh"]]);
+});
+
+Deno.test("apply_zone refuses to turn a recorded signed zone off without an ack", async () => {
+  const name = await instanceName([
+    "zone",
+    ZONE_ARGS.ssh.host,
+    "example.test.",
+  ]);
+  const { context } = createModelTestContext({
+    globalArgs: {},
+    storedResources: {
+      [name]: { dnssec: true, rendered_sha256: "placeholder" },
+    },
+  });
+  (context as { vaultService?: unknown }).vaultService = {
+    get: () => Promise.resolve("PLACEHOLDER-KEY"),
+    put: () => Promise.resolve(),
+  };
+  const e = await assertRejects(() =>
+    model.methods.apply_zone.execute(ZONE_ARGS as never, context)
+  ) as Error;
+  assert(e.message.includes("dnssec_unsign_ack"));
+});
+
+Deno.test("the zone schema rejects a newline smuggled in domain rdata", () => {
+  const schema = model.methods.render_zone.arguments;
+  assertEquals(
+    schema.safeParse({
+      ...ZONE_ARGS,
+      records: [{
+        name: "www",
+        type: "CNAME",
+        data: "ok.example.test.\nevil.example.test. 60 IN A 192.0.2.66\n;",
+      }],
+    }).success,
+    false,
+  );
 });

@@ -5,8 +5,10 @@
  * Every script is a single `sh -c` command whose text contains only fixed
  * paths and values that were validated by the schemas, so no untrusted text is
  * interpolated. A script prints `key=value` lines (and, where needed, a
- * delimited record dump) that the model parses; a non-zero exit and a stderr
- * marker map to a typed error.
+ * delimited record dump) that the model parses. On a reload error the previous
+ * files are restored before the script fails; on a verify mismatch the caller
+ * runs {@link restoreZoneScript} with the backup directory the apply script
+ * printed, so nothing new is left live.
  *
  * @module
  */
@@ -18,7 +20,6 @@ import { parseZoneRead } from "./parse.ts";
 export const KNOT_CONF = "/etc/knot/knot.conf";
 export const KNOT_CONF_DIR = "/etc/knot/knot.conf.d";
 export const ZONE_DIR = "/var/lib/knot/zones";
-export const TSIG_FRAGMENT = `${KNOT_CONF_DIR}/10-managed-tsig.conf`;
 export const INCLUDE_LINE = `include: ${KNOT_CONF_DIR}/*.conf`;
 
 /** Makes a filesystem-safe token from an apex. */
@@ -32,8 +33,10 @@ export function zonePaths(apex: string) {
   return {
     zoneFile: `${ZONE_DIR}/${token}.zone`,
     fragment: `${KNOT_CONF_DIR}/50-managed-${token}.conf`,
+    tsigFragment: `${KNOT_CONF_DIR}/10-managed-tsig-${token}.conf`,
     stagedZone: `${ZONE_DIR}/.${token}.zone.staged`,
     stagedFragment: `${KNOT_CONF_DIR}/.50-managed-${token}.conf.staged`,
+    stagedTsig: `${KNOT_CONF_DIR}/.10-managed-tsig-${token}.conf.staged`,
   };
 }
 
@@ -73,6 +76,7 @@ export function installScript(opts: { resolver: boolean }): string {
       "if ! command -v kresctl >/dev/null 2>&1; then",
       "  apt-get install -y -qq knot-resolver6 || apt-get install -y -qq knot-resolver",
       "fi",
+      "mkdir -p /etc/knot-resolver",
       "systemctl enable --now knot-resolver 2>/dev/null || true",
     );
   }
@@ -86,61 +90,102 @@ export function installScript(opts: { resolver: boolean }): string {
   return lines.join("\n");
 }
 
-/** Script that validates, swaps, reloads and dumps a zone under flock. */
+/** Grants the Knot user read access to a model-managed file. */
+const CHGRP =
+  'chown root:knot "$1" 2>/dev/null || chgrp knot "$1" 2>/dev/null || true';
+
+/**
+ * Script that validates, backs up, swaps, reloads and dumps one zone under
+ * flock. The backup directory is kept until the caller verifies the served
+ * records; it is printed as `backup=<dir>`.
+ */
 export function applyZoneScript(opts: {
   apex: string;
   signed: boolean;
+  hasTsig: boolean;
 }): string {
   const p = zonePaths(opts.apex);
   const dcheck = opts.signed ? " -d on" : "";
+  const inner = [
+    "set -eu",
+    `apex=${shq(opts.apex)}`,
+    `z=${shq(p.zoneFile)}; zst=${shq(p.stagedZone)}`,
+    `f=${shq(p.fragment)}; fst=${shq(p.stagedFragment)}`,
+    `t=${shq(p.tsigFragment)}; tst=${shq(p.stagedTsig)}`,
+    `zc=${shq(KNOT_CONF)}`,
+    `[ -f "$zc" ] || { echo INCLUDE_MISSING >&2; exit 3; }`,
+    `grep -qF ${
+      shq(INCLUDE_LINE)
+    } "$zc" || { echo INCLUDE_MISSING >&2; exit 3; }`,
+    `[ -f "$zst" ] || { echo STAGE_MISSING >&2; exit 3; }`,
+    `[ -f "$fst" ] || { echo STAGE_MISSING >&2; exit 3; }`,
+    `kzonecheck${dcheck} -o "$apex" "$zst" || { echo KZONECHECK_FAILED >&2; exit 4; }`,
+    "tmp=$(mktemp -d); trap 'rm -rf \"$tmp\"' EXIT",
+    'mkdir -p "$tmp/conf.d"',
+    `sed "s#${KNOT_CONF_DIR}/\\\\*\\\\.conf#$tmp/conf.d/*.conf#" "$zc" > "$tmp/knot.conf"`,
+    `for g in ${KNOT_CONF_DIR}/*.conf; do [ -e "$g" ] || continue; [ "$g" = "$f" ] && continue; [ "$g" = "$t" ] && continue; cp "$g" "$tmp/conf.d/"; done`,
+    'cp "$fst" "$tmp/conf.d/50-managed-zones.conf"',
+    `if [ -f "$tst" ]; then cp "$tst" "$tmp/conf.d/10-managed-tsig.conf"; fi`,
+    `knotc -c "$tmp/knot.conf" conf-check || { echo CONFCHECK_FAILED >&2; exit 4; }`,
+    "changed=yes",
+    `if [ -f "$z" ] && cmp -s "$z" "$zst" && [ -f "$f" ] && cmp -s "$f" "$fst"; then changed=no; fi`,
+    "b=$(mktemp -d)",
+    'cp -a "$z" "$b/z" 2>/dev/null || true',
+    'cp -a "$f" "$b/f" 2>/dev/null || true',
+    'cp -a "$t" "$b/t" 2>/dev/null || true',
+    'if [ "$changed" = yes ]; then',
+    '  mv "$zst" "$z"; mv "$fst" "$f"',
+    `  if [ -f "$tst" ]; then mv "$tst" "$t"; fi`,
+    `  for x in "$z" "$f"; do ${CHGRP}; done`,
+    `  [ -f "$t" ] && chown root:knot "$t" 2>/dev/null || true`,
+    '  if ! knotc -b reload || ! knotc -b zone-reload "$apex"; then',
+    '    [ -f "$b/z" ] && mv "$b/z" "$z" || rm -f "$z"',
+    '    [ -f "$b/f" ] && mv "$b/f" "$f" || rm -f "$f"',
+    '    [ -f "$b/t" ] && mv "$b/t" "$t" || rm -f "$t"',
+    "    knotc -b reload 2>/dev/null || true",
+    '    rm -rf "$b"; echo RELOAD_FAILED >&2; exit 5',
+    "  fi",
+    "fi",
+    'echo "backup=$b"',
+    'echo "changed=$changed"',
+    "serial=$(knotc zone-status \"$apex\" 2>/dev/null | sed -n 's/.*serial: *\\([0-9]*\\).*/\\1/p' | head -1)",
+    'echo "serial=${serial:-}"',
+    "echo ZONE_READ_BEGIN",
+    `knotc zone-read "$apex" 2>/dev/null || true`,
+    "echo ZONE_READ_END",
+  ].join("\n");
   return [
     "set -eu",
-    `flock -x /run/knot-dns.lock sh -c ${
-      shq(
-        [
-          "set -eu",
-          `apex=${shq(opts.apex)}`,
-          `z=${shq(p.zoneFile)}; zst=${shq(p.stagedZone)}`,
-          `f=${shq(p.fragment)}; fst=${shq(p.stagedFragment)}`,
-          `zc=${shq(KNOT_CONF)}`,
-          `[ -f "$zc" ] || { echo INCLUDE_MISSING >&2; exit 3; }`,
-          `grep -qF ${
-            shq(INCLUDE_LINE)
-          } "$zc" || { echo INCLUDE_MISSING >&2; exit 3; }`,
-          `[ -f "$zst" ] || { echo STAGE_MISSING >&2; exit 3; }`,
-          `[ -f "$fst" ] || { echo STAGE_MISSING >&2; exit 3; }`,
-          `kzonecheck${dcheck} -o "$apex" "$zst" || { echo KZONECHECK_FAILED >&2; exit 4; }`,
-          "tmp=$(mktemp -d); trap 'rm -rf \"$tmp\"' EXIT",
-          'mkdir -p "$tmp/conf.d"',
-          `sed "s#${KNOT_CONF_DIR}/\\*\\.conf#$tmp/conf.d/*.conf#" "$zc" > "$tmp/knot.conf"`,
-          `for g in ${KNOT_CONF_DIR}/*.conf; do [ -e "$g" ] || continue; [ "$g" = "$f" ] && continue; cp "$g" "$tmp/conf.d/"; done`,
-          'cp "$fst" "$tmp/conf.d/50-managed-zones.conf"',
-          `knotc -c "$tmp/knot.conf" conf-check || { echo CONFCHECK_FAILED >&2; exit 4; }`,
-          "changed=yes",
-          `if [ -f "$z" ] && cmp -s "$z" "$zst" && [ -f "$f" ] && cmp -s "$f" "$fst"; then changed=no; fi`,
-          'if [ "$changed" = yes ]; then',
-          "  b=$(mktemp -d)",
-          '  cp -a "$z" "$b/z" 2>/dev/null || true',
-          '  cp -a "$f" "$b/f" 2>/dev/null || true',
-          '  mv "$zst" "$z"; mv "$fst" "$f"',
-          '  if ! knotc reload || ! knotc zone-reload "$apex"; then',
-          '    [ -f "$b/z" ] && mv "$b/z" "$z" || rm -f "$z"',
-          '    [ -f "$b/f" ] && mv "$b/f" "$f" || rm -f "$f"',
-          "    knotc reload 2>/dev/null || true",
-          '    rm -rf "$b"; echo RELOAD_FAILED >&2; exit 5',
-          "  fi",
-          '  rm -rf "$b"',
-          "fi",
-          "serial=$(knotc zone-status \"$apex\" 2>/dev/null | sed -n 's/.*serial: *\\([0-9]*\\).*/\\1/p' | head -1)",
-          'echo "changed=$changed"',
-          'echo "serial=${serial:-}"',
-          "echo ZONE_READ_BEGIN",
-          `knotc zone-read "$apex" 2>/dev/null || true`,
-          "echo ZONE_READ_END",
-        ].join("\n"),
-      )
-    }`,
+    `flock -x /run/knot-dns.lock sh -c ${shq(inner)}`,
   ].join("\n");
+}
+
+/** Restores the files a failed apply kept in `backup`, then reloads. */
+export function restoreZoneScript(
+  opts: { apex: string; backup: string },
+): string {
+  const p = zonePaths(opts.apex);
+  const inner = [
+    "set -eu",
+    `b=${shq(opts.backup)}`,
+    `z=${shq(p.zoneFile)}; f=${shq(p.fragment)}; t=${shq(p.tsigFragment)}`,
+    `[ -d "$b" ] || { echo NO_BACKUP >&2; exit 3; }`,
+    'if [ -f "$b/z" ]; then mv "$b/z" "$z"; else rm -f "$z"; fi',
+    'if [ -f "$b/f" ]; then mv "$b/f" "$f"; else rm -f "$f"; fi',
+    'if [ -f "$b/t" ]; then mv "$b/t" "$t"; else rm -f "$t"; fi',
+    `for x in "$z" "$f"; do ${CHGRP}; done`,
+    "knotc -b reload 2>/dev/null || true",
+    'rm -rf "$b"',
+    "echo restored=yes",
+  ].join("\n");
+  return ["set -eu", `flock -x /run/knot-dns.lock sh -c ${shq(inner)}`].join(
+    "\n",
+  );
+}
+
+/** Removes a backup directory kept by a successful apply. */
+export function finalizeZoneScript(backup: string): string {
+  return `set -eu\nrm -rf ${shq(backup)}\necho discarded=yes`;
 }
 
 /** Script that removes one zone's file and fragment. */
@@ -151,12 +196,12 @@ export function removeZoneScript(opts: {
 }): string {
   const p = zonePaths(opts.apex);
   const purge = opts.purgeKeysAck
-    ? `keymgr ${shq(opts.apex)} ${shq("delete")} 2>/dev/null || true`
+    ? `knotc zone-purge ${shq(opts.apex)} 2>/dev/null || true`
     : "true";
   return [
     "set -eu",
     `apex=${shq(opts.apex)}`,
-    `z=${shq(p.zoneFile)}; f=${shq(p.fragment)}`,
+    `z=${shq(p.zoneFile)}; f=${shq(p.fragment)}; t=${shq(p.tsigFragment)}`,
     "present=no",
     '[ -f "$f" ] && present=yes',
     `if [ "$present" = no ]; then echo "removed=no"; exit 0; fi`,
@@ -167,10 +212,10 @@ export function removeZoneScript(opts: {
     } = 1 ]; then echo DNSSEC_UNSIGN_ACK_REQUIRED >&2; exit 6; fi`,
     "fi",
     'b=$(mktemp -d); cp -a "$z" "$b/z" 2>/dev/null || true; cp -a "$f" "$b/f"',
-    'rm -f "$z" "$f"',
-    "if ! knotc reload 2>/dev/null; then",
+    'rm -f "$z" "$f" "$t"',
+    "if ! knotc -b reload 2>/dev/null; then",
     '  cp -a "$b/z" "$z" 2>/dev/null || true; cp -a "$b/f" "$f"',
-    '  knotc reload 2>/dev/null || true; rm -rf "$b"; echo RELOAD_FAILED >&2; exit 5',
+    '  knotc -b reload 2>/dev/null || true; rm -rf "$b"; echo RELOAD_FAILED >&2; exit 5',
     "fi",
     'rm -rf "$b"',
     purge,
@@ -182,9 +227,19 @@ export function removeZoneScript(opts: {
 export function getDsScript(apex: string): string {
   return [
     "set -eu",
-    `echo DS_BEGIN`,
+    "echo DS_BEGIN",
     `keymgr ${shq(apex)} ds 2>/dev/null || true`,
     "echo DS_END",
+  ].join("\n");
+}
+
+/** Script that reports the DNSSEC key state of a zone. */
+export function keyStateScript(apex: string): string {
+  return [
+    "set -eu",
+    "echo KEY_BEGIN",
+    `keymgr ${shq(apex)} list 2>/dev/null || true`,
+    "echo KEY_END",
   ].join("\n");
 }
 
@@ -195,7 +250,7 @@ export function kskSubmittedScript(apex: string): string {
     `[ -f ${
       shq(zonePaths(apex).fragment)
     } ] || { echo ZONE_ABSENT >&2; exit 3; }`,
-    `knotc zone-ksk-submitted ${shq(apex)} >/dev/null`,
+    `knotc -b zone-ksk-submitted ${shq(apex)} >/dev/null`,
     "echo submitted=yes",
   ].join("\n");
 }
@@ -203,79 +258,57 @@ export function kskSubmittedScript(apex: string): string {
 /** Script that validates, swaps and reloads the resolver configuration. */
 export function applyResolverScript(opts: {
   liveYaml: string;
+  packageBackup: string;
   stagedYaml: string;
   testListen: string;
   testName: string;
 }): string {
-  return [
+  const inner = [
     "set -eu",
     `live=${shq(opts.liveYaml)}; st=${shq(opts.stagedYaml)}`,
-    `flock -x /run/knot-resolver.lock sh -c ${
-      shq(
-        [
-          "set -eu",
-          "changed=yes",
-          `live=${shq(opts.liveYaml)}; st=${shq(opts.stagedYaml)}`,
-          `[ -f "$st" ] || { echo STAGE_MISSING >&2; exit 3; }`,
-          `kresctl validate "$st" || { echo KRESCTL_FAILED >&2; exit 4; }`,
-          `if [ -f "$live" ] && cmp -s "$live" "$st"; then changed=no; fi`,
-          'if [ "$changed" = yes ]; then',
-          '  b=$(mktemp); cp -a "$live" "$b" 2>/dev/null || true',
-          '  mv "$st" "$live"',
-          "  if ! systemctl reload knot-resolver 2>/dev/null && ! systemctl restart knot-resolver 2>/dev/null; then",
-          '    [ -s "$b" ] && mv "$b" "$live" || rm -f "$live"',
-          '    systemctl restart knot-resolver 2>/dev/null || true; rm -f "$b"; echo RELOAD_FAILED >&2; exit 5',
-          "  fi",
-          '  rm -f "$b"',
-          "fi",
-          `kdig +time=3 +tries=1 @${shq(opts.testListen)} ${
-            shq(opts.testName)
-          } SOA >/dev/null 2>&1 || { echo TEST_QUERY_FAILED >&2; exit 7; }`,
-          'echo "changed=$changed"',
-        ].join("\n"),
-      )
-    }`,
+    `pkg=${shq(opts.packageBackup)}`,
+    `[ -f "$st" ] || { echo STAGE_MISSING >&2; exit 3; }`,
+    `kresctl validate "$st" || { echo KRESCTL_FAILED >&2; exit 4; }`,
+    `if [ -f "$live" ] && [ ! -f "$pkg" ]; then cp -a "$live" "$pkg"; fi`,
+    "changed=yes",
+    `if [ -f "$live" ] && cmp -s "$live" "$st"; then changed=no; fi`,
+    "b=$(mktemp)",
+    'cp -a "$live" "$b" 2>/dev/null || true',
+    'if [ "$changed" = yes ]; then',
+    '  mv "$st" "$live"',
+    "  if ! systemctl reload knot-resolver 2>/dev/null && ! systemctl restart knot-resolver 2>/dev/null; then",
+    '    [ -s "$b" ] && mv "$b" "$live" || rm -f "$live"',
+    '    systemctl restart knot-resolver 2>/dev/null || true; rm -f "$b"; echo RELOAD_FAILED >&2; exit 5',
+    "  fi",
+    "fi",
+    `if ! kdig +time=3 +tries=1 @${shq(opts.testListen)} ${
+      shq(opts.testName)
+    } SOA >/dev/null 2>&1; then`,
+    '  [ -s "$b" ] && mv "$b" "$live" || rm -f "$live"',
+    '  systemctl restart knot-resolver 2>/dev/null || true; rm -f "$b"; echo TEST_QUERY_FAILED >&2; exit 7',
+    "fi",
+    'rm -f "$b"',
+    'echo "changed=$changed"',
   ].join("\n");
-}
-
-/** Script that stops and disables the resolver. */
-export function removeResolverScript(): string {
   return [
     "set -eu",
-    "if ! command -v kresctl >/dev/null 2>&1 && [ ! -f /etc/knot-resolver/config.yaml ]; then echo 'removed=no'; exit 0; fi",
-    "systemctl disable --now knot-resolver 2>/dev/null || true",
-    "rm -f /etc/knot-resolver/config.yaml",
-    "echo 'removed=yes'",
+    `flock -x /run/knot-resolver.lock sh -c ${shq(inner)}`,
   ].join("\n");
 }
 
-/** Script that dumps every managed zone's served records and status under flock. */
-export function observeScript(apexes: string[]): string {
-  const blocks: string[] = [
+/** Script that stops the resolver and restores the package configuration. */
+export function removeResolverScript(opts: {
+  liveYaml: string;
+  packageBackup: string;
+}): string {
+  return [
     "set -eu",
-    "flock -x /run/knot-dns.lock sh -c " + shq(
-      [
-        "set -eu",
-        ...apexes.flatMap((apex) => [
-          `echo ${shq(`ZONE ${apex}`)}`,
-          `if [ -f ${shq(zonePaths(apex).fragment)} ]; then`,
-          `  serial=$(knotc zone-status ${
-            shq(apex)
-          } 2>/dev/null | sed -n 's/.*serial: *\\([0-9]*\\).*/\\1/p' | head -1)`,
-          `  sha=$(sha256sum ${
-            shq(zonePaths(apex).zoneFile)
-          } 2>/dev/null | awk '{print $1}')`,
-          `  echo "serial=\${serial:-}"`,
-          `  echo "file_sha=\${sha:-}"`,
-          `  echo ZONE_READ_BEGIN`,
-          `  knotc zone-read ${shq(apex)} 2>/dev/null || true`,
-          `  echo ZONE_READ_END`,
-          `else echo "missing=yes"; fi`,
-        ]),
-      ].join("\n"),
-    ),
-  ];
-  return blocks.join("\n");
+    `live=${shq(opts.liveYaml)}; pkg=${shq(opts.packageBackup)}`,
+    "if ! command -v kresctl >/dev/null 2>&1 && [ ! -f \"$live\" ]; then echo 'removed=no'; exit 0; fi",
+    "if ! systemctl disable --now knot-resolver 2>/dev/null; then echo STOP_FAILED >&2; exit 8; fi",
+    'if [ -f "$pkg" ]; then mv "$pkg" "$live"; else rm -f "$live"; fi',
+    "echo 'removed=yes'",
+  ].join("\n");
 }
 
 /** Script that lists the apex of every model-managed zone fragment. */
@@ -298,6 +331,36 @@ export function resolverObserveScript(): string {
     "echo RESOLVER_BEGIN",
     "cat /etc/knot-resolver/config.yaml 2>/dev/null || true",
     "echo RESOLVER_END",
+  ].join("\n");
+}
+
+/** Script that dumps every managed zone's served records and status under flock. */
+export function observeScript(apexes: string[]): string {
+  const inner = [
+    "set -eu",
+    ...apexes.flatMap((apex) => [
+      `echo ${shq(`ZONE ${apex}`)}`,
+      `if [ -f ${shq(zonePaths(apex).fragment)} ]; then`,
+      `  serial=$(knotc zone-status ${
+        shq(apex)
+      } 2>/dev/null | sed -n 's/.*serial: *\\([0-9]*\\).*/\\1/p' | head -1)`,
+      `  sha=$(sha256sum ${
+        shq(zonePaths(apex).zoneFile)
+      } 2>/dev/null | awk '{print $1}')`,
+      `  echo "serial=\${serial:-}"`,
+      `  echo "file_sha=\${sha:-}"`,
+      `  echo KEY_BEGIN`,
+      `  keymgr ${shq(apex)} list 2>/dev/null || true`,
+      `  echo KEY_END`,
+      `  echo ZONE_READ_BEGIN`,
+      `  knotc zone-read ${shq(apex)} 2>/dev/null || true`,
+      `  echo ZONE_READ_END`,
+      `else echo "missing=yes"; fi`,
+    ]),
+  ].join("\n");
+  return [
+    "set -eu",
+    `flock -x /run/knot-dns.lock sh -c ${shq(inner)}`,
   ].join("\n");
 }
 

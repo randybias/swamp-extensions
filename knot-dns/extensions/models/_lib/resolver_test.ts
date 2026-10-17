@@ -61,7 +61,7 @@ Deno.test("golden resolver config.yaml", () => {
       "listen:",
       '  - "127.0.0.1@53"',
       "cache:",
-      "  size: 256MB",
+      "  size-max: 256MB",
       "forward:",
       '  - subtree: "internal.example."',
       "    servers:",
@@ -69,18 +69,19 @@ Deno.test("golden resolver config.yaml", () => {
       '  - subtree: "."',
       "    servers:",
       '      - "203.0.113.53"',
-      "    transport: tls",
-      '    tls_hostname: "dns.example"',
-      "    dnssec: true",
+      "    options:",
+      "      transport: tls",
+      '      tls_hostname: "dns.example"',
+      "      dnssec: true",
       "view:",
-      '  - address: "127.0.0.0/8"',
-      "    action: allow",
-      '  - address: "2001:db8::/32"',
-      "    action: allow",
-      '  - address: "0.0.0.0/0"',
-      "    action: deny",
-      '  - address: "::/0"',
-      "    action: deny",
+      "  - subnets:",
+      '      - "127.0.0.0/8"',
+      '      - "2001:db8::/32"',
+      "    answer: allow",
+      "  - subnets:",
+      '      - "0.0.0.0/0"',
+      '      - "::/0"',
+      "    answer: deny",
       "",
     ].join("\n"),
   );
@@ -90,10 +91,10 @@ Deno.test("resolver YAML escapes scalar content", () => {
   const input = ResolverSchema.parse({
     listen: ["127.0.0.1@53"],
     forwards: [{
-      subtree: 'a"b',
+      subtree: "example.test.",
       servers: ["192.0.2.1"],
     }],
   });
   const yaml = renderResolverYaml(input);
-  assert(yaml.includes('"a\\"b"'));
+  assert(yaml.includes('subtree: "example.test."'));
 });

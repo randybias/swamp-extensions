@@ -10,6 +10,7 @@ import {
   removeResolverScript,
   removeZoneScript,
   resolverObserveScript,
+  restoreZoneScript,
   shq,
   zonePaths,
 } from "./scripts.ts";
@@ -31,7 +32,10 @@ async function shSyntax(script: string): Promise<number> {
 
 const SCRIPTS: [string, string][] = [
   ["install", installScript({ resolver: true })],
-  ["apply_zone", applyZoneScript({ apex: "example.com.", signed: true })],
+  [
+    "apply_zone",
+    applyZoneScript({ apex: "example.com.", signed: true, hasTsig: true }),
+  ],
   [
     "remove_zone",
     removeZoneScript({
@@ -47,12 +51,19 @@ const SCRIPTS: [string, string][] = [
     "apply_resolver",
     applyResolverScript({
       liveYaml: "/etc/knot-resolver/config.yaml",
+      packageBackup: "/etc/knot-resolver/config.yaml.package",
       stagedYaml: "/etc/knot-resolver/.config.yaml.staged",
       testListen: "127.0.0.1",
       testName: ".",
     }),
   ],
-  ["remove_resolver", removeResolverScript()],
+  [
+    "remove_resolver",
+    removeResolverScript({
+      liveYaml: "/etc/knot-resolver/config.yaml",
+      packageBackup: "/etc/knot-resolver/config.yaml.package",
+    }),
+  ],
   ["observe_resolver", resolverObserveScript()],
 ];
 
@@ -70,7 +81,11 @@ Deno.test("zone paths and quoting are stable", () => {
 });
 
 Deno.test("apply script validates before swapping and rolls back on reload failure", () => {
-  const script = applyZoneScript({ apex: "example.com.", signed: false });
+  const script = applyZoneScript({
+    apex: "example.com.",
+    signed: false,
+    hasTsig: false,
+  });
   assert(script.includes("kzonecheck"));
   assert(script.includes("knotc -c"));
   assert(script.includes("conf-check"));
@@ -93,12 +108,13 @@ Deno.test("remove script refuses a signed zone without an ack", () => {
     unsigned: true,
   });
   assert(acked.includes("[ 0 = 1 ]"));
-  assert(acked.includes("keymgr"));
+  assert(acked.includes("zone-purge"));
 });
 
 Deno.test("resolver apply script validates with kresctl before swapping", () => {
   const script = applyResolverScript({
     liveYaml: "/etc/knot-resolver/config.yaml",
+    packageBackup: "/etc/knot-resolver/config.yaml.package",
     stagedYaml: "/etc/knot-resolver/.config.yaml.staged",
     testListen: "127.0.0.1",
     testName: ".",
@@ -108,6 +124,40 @@ Deno.test("resolver apply script validates with kresctl before swapping", () => 
     script.indexOf("kresctl validate") < script.indexOf('mv "$st" "$live"'),
   );
   assert(script.includes("TEST_QUERY_FAILED"));
+});
+
+Deno.test("apply script blocks on reload and keeps the backup", () => {
+  const script = applyZoneScript({
+    apex: "example.com.",
+    signed: true,
+    hasTsig: true,
+  });
+  assert(script.includes("knotc -b reload"));
+  assert(script.includes("knotc -b zone-reload"));
+  assert(script.includes("backup=$b"));
+  assert(script.includes("chown root:knot"));
+  assert(script.includes("10-managed-tsig"));
+});
+
+Deno.test("restore script restores every file and reloads", () => {
+  const s = restoreZoneScript({ apex: "example.com.", backup: "/tmp/b" });
+  assert(s.includes("NO_BACKUP"));
+  assert(s.includes("knotc -b reload"));
+  assert(s.includes("flock -x /run/knot-dns.lock"));
+});
+
+Deno.test("resolver apply tests the query before discarding the backup", () => {
+  const script = applyResolverScript({
+    liveYaml: "/etc/knot-resolver/config.yaml",
+    packageBackup: "/etc/knot-resolver/config.yaml.package",
+    stagedYaml: "/etc/knot-resolver/.config.yaml.staged",
+    testListen: "127.0.0.1",
+    testName: ".",
+  });
+  assert(script.includes("kresctl validate"));
+  assert(script.includes("TEST_QUERY_FAILED"));
+  assert(script.includes('mv "$b" "$live"'));
+  assert(script.indexOf("kdig") < script.indexOf("TEST_QUERY_FAILED"));
 });
 
 Deno.test("parseKeyValues reads simple output", () => {

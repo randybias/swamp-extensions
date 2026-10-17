@@ -83,3 +83,50 @@ states one; the rest take the simplest safe option or a documented deviation.
 - get / sync: blocked
 - remove_zone / again; remove_resolver: blocked
 - injection literal: blocked
+
+## Review round 1 (HEAD 8ae8a5a) dispositions
+
+Validated by the lead in a container against real knot 3.3.4 / 3.6.1 and
+knot-resolver6 6.5.0.
+
+- HIGH zone-file injection: every domain-valued field (`CNAME`/`NS`/`PTR` data,
+  `MX` exchange, `SRV` target, `ns[]`, `soa.primary_ns`/`contact`) now enforces
+  the `FqdnSchema` grammar, so a newline, `$INCLUDE` or `;` payload is refused
+  by the schema. Tests cover all three.
+- HIGH conf-check: the fragment now renders top-level `policy:`/`remote:`/
+  `acl:` sections with apex-derived ids and references them from the `zone:`
+  entry; inline blocks and `disable-any` are gone; `ksk-lifetime`/`zsk-lifetime`
+  are rendered. (`parent_ds_check` has no Knot policy key, so it stays
+  accepted-but-unrendered.)
+- HIGH kresctl: `cache: size-max`, forward options under `options:`, and `view:`
+  `subnets`/`answer`. Real `kresctl validate` is still the authority (not
+  installed here).
+- HIGH zone-read: `parseZoneRead` reads the real `owner ttl TYPE rdata` form
+  (optional `[apex.]` prefix, optional `IN`), and IPv6 is compressed on both
+  sides, so an `AAAA` declaration matches the served form.
+- HIGH rollback: the apply script keeps the backup until the served-record
+  verify passes; on a mismatch the model restores it. `knotc -b` blocks on
+  reload. The resolver script tests the query before discarding its backup.
+- HIGH ownership/TSIG: managed files are `chown root:knot`; the TSIG fragment is
+  per-zone now (`10-managed-tsig-<apex>.conf`), staged and swapped under flock,
+  and included in backup/restore, so applying one zone no longer clobbers
+  another's keys. (Deviation: the spec says one key file.)
+- HIGH dnssec-off: `apply_zone` refuses a recorded signed zone turned `off`
+  without `dnssec_unsign_ack`; the delete-algorithm path is not implemented in
+  v1, so `remove_zone` (with ack) is the supported way to retire signing.
+- HIGH remove_resolver: requires a recorded applied resolver or `remove_ack`,
+  fails if the service cannot be stopped, and restores the package
+  `config.yaml`.
+- MEDIUM names: resources are suffixed (`zone`/`render`/`ds`/`resolver`/
+  `observation`), so `get_ds` no longer overwrites zone state and `render_zone`
+  no longer overwrites applied state.
+- MEDIUM listen: wildcard needs `listen_any_ack`, the auth and resolver listen
+  sets must be disjoint, a port-53 precheck refuses a foreign listener, and the
+  authoritative listen is rendered as a host-global fragment.
+- MEDIUM service owners: a leading underscore is allowed on any owner label
+  (`_sip._tcp`, `_443._tcp.www`, `_dmarc`).
+- MEDIUM get/sync: they now diff served vs the recorded declaration
+  (added/removed), report DNSSEC key states, and only persist after both probes
+  succeed.
+- `purge_keys_ack` now runs `knotc zone-purge` for the journal; KASP key
+  deletion is left to `keymgr` and is a residual.

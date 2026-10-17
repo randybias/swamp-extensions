@@ -53,6 +53,54 @@ export function isFqdn(s: string): boolean {
   return !name.split(".").some((l) => !isLabel(l));
 }
 
+/** A fully-qualified domain name, A-labels only, no control characters. */
+export const FqdnSchema = z.string().min(1).max(253).refine(
+  isFqdn,
+  "not a fully-qualified domain name",
+);
+
+/**
+ * Compresses one IPv6 literal to RFC 5952 form (lowercase, longest zero run as
+ * `::`), so a declaration and a tool read-back compare equal.
+ */
+export function canonicalIpv6(s: string): string {
+  if (!isIpv6(s)) return s;
+  const [head, tail] = s.includes("::")
+    ? [s.slice(0, s.indexOf("::")), s.slice(s.indexOf("::") + 2)]
+    : [s, undefined];
+  const groups = head === "" ? [] : head.split(":");
+  const tailGroups = tail === undefined || tail === "" ? [] : tail.split(":");
+  const full = [
+    ...groups.map((g) => parseInt(g, 16)),
+    ...(tail !== undefined
+      ? new Array(Math.max(0, 8 - groups.length - tailGroups.length)).fill(0)
+      : []),
+    ...tailGroups.map((g) => parseInt(g, 16)),
+  ];
+  // Find the longest run of two or more zeros.
+  let bestStart = -1;
+  let bestLen = 0;
+  let runStart = -1;
+  for (let i = 0; i <= full.length; i++) {
+    if (full[i] === 0) {
+      if (runStart === -1) runStart = i;
+    } else if (runStart !== -1) {
+      const len = i - runStart;
+      if (len > bestLen) {
+        bestLen = len;
+        bestStart = runStart;
+      }
+      runStart = -1;
+    }
+  }
+  if (bestLen < 2) return full.map((g) => g.toString(16)).join(":");
+  const left = full.slice(0, bestStart).map((g) => g.toString(16)).join(":");
+  const right = full.slice(bestStart + bestLen).map((g) => g.toString(16)).join(
+    ":",
+  );
+  return `${left}::${right}`;
+}
+
 /**
  * Resolves an owner (`@`, a relative name, a `*` wildcard, or an in-zone FQDN)
  * to an absolute owner inside `apex`, or throws when it is outside the zone.
@@ -66,7 +114,9 @@ export function ownerFqdn(apex: string, name: string): string {
   const labels = raw.split(".");
   labels.forEach((l, i) => {
     if (i === 0 && l === "*") return;
-    if (i === 0 && isServiceLabel(l)) return;
+    // A leading underscore is allowed on any label (service owners such as
+    // `_sip._tcp`, `_443._tcp.www` and `_dmarc`).
+    if (isServiceLabel(l)) return;
     if (!isLabel(l)) throw new Error("invalid owner label");
   });
   let fqdn: string;
@@ -131,7 +181,7 @@ const CnameRecord = z.object({
   name: Owner,
   ttl: Ttl.optional(),
   type: z.literal("CNAME"),
-  data: z.string().min(1).max(253),
+  data: FqdnSchema,
 });
 const MxRecord = z.object({
   name: Owner,
@@ -139,7 +189,7 @@ const MxRecord = z.object({
   type: z.literal("MX"),
   data: z.object({
     preference: z.number().int().min(0).max(65535),
-    exchange: z.string().min(1).max(253),
+    exchange: FqdnSchema,
   }),
 });
 const TxtRecord = z.object({
@@ -156,7 +206,7 @@ const SrvRecord = z.object({
     priority: z.number().int().min(0).max(65535),
     weight: z.number().int().min(0).max(65535),
     port: z.number().int().min(0).max(65535),
-    target: z.string().min(1).max(253),
+    target: FqdnSchema,
   }),
 });
 const CaaRecord = z.object({
@@ -176,7 +226,7 @@ const NsRecord = z.object({
   name: Owner,
   ttl: Ttl.optional(),
   type: z.literal("NS"),
-  data: z.string().min(1).max(253),
+  data: FqdnSchema,
 });
 const DsRecord = z.object({
   name: Owner,
@@ -193,7 +243,7 @@ const PtrRecord = z.object({
   name: Owner,
   ttl: Ttl.optional(),
   type: z.literal("PTR"),
-  data: z.string().min(1).max(253),
+  data: FqdnSchema,
 });
 const SshfpRecord = z.object({
   name: Owner,
@@ -297,8 +347,8 @@ export const DnssecSchema = z.strictObject({
 
 /** SOA fields; the serial is Knot's. */
 export const SoaSchema = z.strictObject({
-  primary_ns: z.string().min(1).max(253),
-  contact: z.string().min(1).max(253).describe(
+  primary_ns: FqdnSchema,
+  contact: FqdnSchema.describe(
     "RNAME form, e.g. hostmaster.example.com.",
   ),
   refresh: z.number().int().min(1).max(2147483647),
@@ -331,8 +381,9 @@ export function targetOf(r: ZoneRecord): string | undefined {
 export function renderRdata(r: ZoneRecord): string {
   switch (r.type) {
     case "A":
-    case "AAAA":
       return r.data;
+    case "AAAA":
+      return canonicalIpv6(r.data);
     case "CNAME":
     case "NS":
     case "PTR":
@@ -354,6 +405,24 @@ export function renderRdata(r: ZoneRecord): string {
     case "TLSA":
       return `${r.data.usage} ${r.data.selector} ${r.data.matching_type} ${r.data.certificate.toUpperCase()}`;
   }
+}
+
+/**
+ * Normalizes one rdata string for comparison, so a formatting difference
+ * (case, trailing dot, IPv6 compression, whitespace) is not mistaken for
+ * drift.
+ */
+export function normalizeServedRdata(type: string, data: string): string {
+  const t = type.toUpperCase();
+  const d = data.trim().replace(/\s+/g, " ");
+  if (t === "DS" || t === "SSHFP" || t === "TLSA") return d.toUpperCase();
+  if (t === "TXT" || t === "CAA") return d;
+  if (t === "A") return d;
+  if (t === "AAAA") return canonicalIpv6(d);
+  return d.split(" ").map((part) => {
+    if (/^[0-9]+$/.test(part) || part.startsWith('"')) return part;
+    return `${stripDot(part)}.`;
+  }).join(" ");
 }
 
 /** Quotes and escapes one character string for a zone file. */
@@ -502,48 +571,63 @@ export interface ZoneConfigInput {
   tsigKeyNames: string[];
 }
 
-/** Renders one `zone:` entry for `50-managed-zones.conf`. */
+/**
+ * Renders the top-level `policy:`/`remote:`/`acl:` sections and the `zone:`
+ * entry for one managed zone. Notify and ACL targets must be top-level
+ * sections referenced by id (inline blocks are rejected by `knotc
+ * conf-check`), and `disable-any` is not a valid item on vendor Knot.
+ */
 export function renderZoneConfig(input: ZoneConfigInput): string {
   const zone = normalizeApex(input.apex);
-  const lines = [
-    "zone:",
-    `  - domain: ${zone}`,
-    `    file: ${JSON.stringify(input.file)}`,
-    "    zonefile-sync: -1",
-    "    zonefile-load: difference-no-serial",
-    "    journal-content: all",
-    "    serial-policy: unixtime",
-    `    dnssec-signing: ${input.signed ? "on" : "off"}`,
-  ];
+  const base = `managed-${stripDot(zone).replace(/[^A-Za-z0-9-]/g, "-")}`;
+  const lines: string[] = [];
   if (input.signed) {
-    lines.push(
-      `    dnssec-policy: ${input.dnssec.algorithm}${
-        input.dnssec.nsec3 ? "-nsec3" : ""
-      }`,
-    );
+    lines.push("policy:");
+    lines.push(`  - id: ${base}`);
+    lines.push(`    algorithm: ${input.dnssec.algorithm}`);
+    lines.push(`    nsec3: ${input.dnssec.nsec3 ? "on" : "off"}`);
+    if (input.dnssec.ksk_lifetime) {
+      lines.push(`    ksk-lifetime: ${input.dnssec.ksk_lifetime}`);
+    }
+    if (input.dnssec.zsk_lifetime) {
+      lines.push(`    zsk-lifetime: ${input.dnssec.zsk_lifetime}`);
+    }
   }
+  const wantsTransfer = input.allowTransfer.length > 0 ||
+    input.tsigKeyNames.length > 0;
   if (input.notifySecondaries.length > 0) {
-    lines.push("    notify:");
+    lines.push("remote:");
+    lines.push(`  - id: ${base}-notify`);
     for (const addr of input.notifySecondaries) {
-      lines.push(`      - address: ${JSON.stringify(addr)}`);
+      lines.push(`    address: ${JSON.stringify(addr)}`);
     }
   }
-  if (input.allowTransfer.length > 0) {
-    lines.push("    acl:");
-    lines.push("      - id: transfer");
-    lines.push("        address:");
-    lines.push("          - action: transfer");
+  if (wantsTransfer) {
+    lines.push("acl:");
+    lines.push(`  - id: ${base}-transfer`);
     for (const addr of input.allowTransfer) {
-      lines.push(`            - ${JSON.stringify(addr)}`);
+      lines.push(`    address: ${JSON.stringify(addr)}`);
     }
-    lines.push("        key: null");
+    lines.push("    action: transfer");
+    if (input.tsigKeyNames.length === 1) {
+      lines.push(`    key: ${input.tsigKeyNames[0]}`);
+    } else {
+      lines.push(`    key: ${input.tsigKeyNames.length > 1}`);
+    }
   }
-  if (input.tsigKeyNames.length > 0) {
-    lines.push("    acl:");
-    lines.push("      - id: transfer");
-    lines.push("        key: true");
+  lines.push("zone:");
+  lines.push(`  - domain: ${zone}`);
+  lines.push(`    file: ${JSON.stringify(input.file)}`);
+  lines.push("    zonefile-sync: -1");
+  lines.push("    zonefile-load: difference-no-serial");
+  lines.push("    journal-content: all");
+  lines.push("    serial-policy: unixtime");
+  lines.push(`    dnssec-signing: ${input.signed ? "on" : "off"}`);
+  if (input.signed) lines.push(`    dnssec-policy: ${base}`);
+  if (input.notifySecondaries.length > 0) {
+    lines.push(`    notify: ${base}-notify`);
   }
-  lines.push("    disable-any: true");
+  if (wantsTransfer) lines.push(`    acl: ${base}-transfer`);
   return `${lines.join("\n")}\n`;
 }
 
@@ -582,7 +666,7 @@ export function declaredTuples(
   return canonicalRecords(apex, soa, records).map((r) => ({
     name: r.name,
     type: r.type,
-    data: renderRdata(r),
+    data: normalizeServedRdata(r.type, renderRdata(r)),
   }));
 }
 

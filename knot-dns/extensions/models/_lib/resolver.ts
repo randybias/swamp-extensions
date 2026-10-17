@@ -10,7 +10,12 @@
  */
 
 import { z } from "npm:zod@4.3.6";
-import { isIpv4, isIpv6 } from "./zone.ts";
+import { FqdnSchema, isIpv4, isIpv6 } from "./zone.ts";
+
+const ServerAddress = z.string().min(1).max(64).refine(
+  (s) => isIpv4(s) || isIpv6(s),
+  "an upstream server must be an IP address",
+);
 
 /** One `ADDR[@port]` listen address. */
 export const ListenAddressSchema = z.string().min(1).max(64).refine(
@@ -41,10 +46,10 @@ export const CidrSchema = z.string().min(1).max(64).refine(
 
 /** One forwarding rule. */
 export const ForwardSchema = z.strictObject({
-  subtree: z.string().min(1).max(253),
-  servers: z.array(z.string().min(1).max(64)).min(1).max(16),
+  subtree: z.union([z.literal("."), FqdnSchema]),
+  servers: z.array(ServerAddress).min(1).max(16),
   transport: z.enum(["udp", "tls"]).default("udp"),
-  tls_hostname: z.string().min(1).max(253).optional(),
+  tls_hostname: FqdnSchema.optional(),
   authoritative: z.boolean().default(false),
   dnssec: z.boolean().default(false),
 }).refine(
@@ -96,33 +101,34 @@ export function renderResolverYaml(input: ResolverInput): string {
     lines.push(`  - ${yamlString(addr)}`);
   }
   lines.push("cache:");
-  lines.push(`  size: ${input.cache_size_mb}MB`);
+  lines.push(`  size-max: ${input.cache_size_mb}MB`);
   if (input.forwards.length > 0) {
     lines.push("forward:");
     for (const f of input.forwards) {
       lines.push(`  - subtree: ${yamlString(f.subtree)}`);
       lines.push("    servers:");
       for (const s of f.servers) lines.push(`      - ${yamlString(s)}`);
-      if (f.transport === "tls") {
-        lines.push("    transport: tls");
-        if (f.tls_hostname) {
-          lines.push(`    tls_hostname: ${yamlString(f.tls_hostname)}`);
-        }
+      const options: string[] = [];
+      if (f.transport === "tls") options.push("      transport: tls");
+      if (f.tls_hostname) {
+        options.push(`      tls_hostname: ${yamlString(f.tls_hostname)}`);
       }
-      if (f.authoritative) lines.push("    authoritative: true");
-      if (f.dnssec) lines.push("    dnssec: true");
+      if (f.authoritative) options.push("      authoritative: true");
+      if (f.dnssec) options.push("      dnssec: true");
+      if (options.length > 0) {
+        lines.push("    options:");
+        lines.push(...options);
+      }
     }
   }
-  const allow = input.allow_query_from ??
-    ["127.0.0.0/8", "::1/128"];
+  const allow = input.allow_query_from ?? ["127.0.0.0/8", "::1/128"];
   lines.push("view:");
-  for (const cidr of allow) {
-    lines.push(`  - address: ${yamlString(cidr)}`);
-    lines.push("    action: allow");
-  }
-  lines.push('  - address: "0.0.0.0/0"');
-  lines.push("    action: deny");
-  lines.push('  - address: "::/0"');
-  lines.push("    action: deny");
+  lines.push("  - subnets:");
+  for (const cidr of allow) lines.push(`      - ${yamlString(cidr)}`);
+  lines.push("    answer: allow");
+  lines.push("  - subnets:");
+  lines.push('      - "0.0.0.0/0"');
+  lines.push('      - "::/0"');
+  lines.push("    answer: deny");
   return `${lines.join("\n")}\n`;
 }

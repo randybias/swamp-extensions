@@ -647,4 +647,8 @@ export function createModel(deps: SshDeps = denoDeps): SshHostModel {
 }
 
 /** Production model: the factory with no overrides. */
-export const model: SshHostModel = createModel();
+export const model = {
+  ...createModel(),
+  type: "@randybias/ssh-host",
+  version: "2026.10.17.1",
+} satisfies SshHostModel;

@@ -1223,3 +1223,21 @@ Deno.test("device id matching is exact or an underscore suffix", () => {
   assertEquals(deviceIdMatches("ACME_Disk_XS123", "S123"), false);
   assertEquals(deviceIdMatches("ACME_Disk_S12", "S123"), false);
 });
+
+Deno.test(
+  "a malformed auth ls read never echoes keys in the error", // leak-allow(decision D48)
+  async () => {
+    const s2 = vSession((body) =>
+      body.includes("auth ls")
+        ? { code: 0, stdout: "garbage SECRETKEY material", stderr: "" }
+        : { code: 0, stdout: "[]", stderr: "" }
+    );
+    try {
+      await verifyCsiUsers(deps, s2, ["csi-rbd"]);
+      throw new Error("should throw");
+    } catch (e) {
+      assertEquals((e as Error).message.includes("SECRETKEY"), false);
+      assertEquals(e instanceof PhaseError, true);
+    }
+  },
+);

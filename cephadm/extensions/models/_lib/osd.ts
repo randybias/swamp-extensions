@@ -263,8 +263,8 @@ export function osdSpecYaml(
     `    - ${targetHost}`,
     "spec:",
     "  data_devices:",
-    "  paths:",
-    ...paths.map((p) => `    - ${p}`),
+    "    paths:",
+    ...paths.map((p) => `      - ${p}`),
     "",
   ].join("\n");
 }

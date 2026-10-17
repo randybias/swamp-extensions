@@ -1,5 +1,5 @@
 import { assertEquals, assertRejects } from "jsr:@std/assert@1.0.19";
-import { PhaseError } from "./errors.ts";
+import { PhaseError, RemoteExitError } from "./errors.ts";
 import { listByIdCommand } from "./resolve.ts";
 import type { CommandResult, RunOptions, SshSession } from "./ssh.ts";
 import {
@@ -47,7 +47,11 @@ function adminSession(
       }
       if (opts.command.startsWith("cephadm shell")) {
         bodies.push(scriptBody);
-        return Promise.resolve(route(scriptBody, opts.command));
+        const r = route(scriptBody, opts.command);
+        if (r.code !== 0 && !opts.allowNonZero) {
+          throw new RemoteExitError(r.code, r.stdout, r.stderr, "test");
+        }
+        return Promise.resolve(r);
       }
       if (opts.command.startsWith("rm -rf")) {
         return Promise.resolve({ code: 0, stdout: "", stderr: "" });
@@ -218,7 +222,13 @@ Deno.test(
     assertEquals(yaml.includes("service_type: osd"), true);
     assertEquals(yaml.includes("service_id: by-serial-node1"), true);
     assertEquals(yaml.includes("    - node1"), true);
-    assertEquals(yaml.includes("spec:\n  data_devices:\n  paths:"), true);
+    // paths must nest under data_devices, not sit beside it.
+    assertEquals(
+      yaml.includes(
+        "spec:\n  data_devices:\n    paths:\n      - /dev/disk/by-id/nvme-X_SN0001",
+      ),
+      true,
+    );
     assertEquals(yaml.includes("/dev/disk/by-id/nvme-X_SN0001"), true);
     assertEquals(yaml.includes("*"), false);
     const body = osdApplyBody(yaml);
@@ -388,3 +398,41 @@ Deno.test("a leftover service is force-removed before the apply", async () => {
   const rmAt = admin.bodies.findIndex((b) => b.includes("orch rm"));
   assertEquals(applyAt >= 0 && applyAt < rmAt, true);
 });
+
+Deno.test(
+  "a failed OSD apply does not remove the stale service", // leak-allow(decision D21)
+  async () => {
+    let removed = false;
+    const admin = adminSession((body) => {
+      if (body.includes("orch ls --service_type osd")) {
+        return {
+          code: 0,
+          stdout:
+            '[{"service_name":"osd.by-serial-node1-old","placement":{"hosts":["node1"]}}]',
+          stderr: "",
+        };
+      }
+      if (body.includes("--export")) {
+        return { code: 1, stdout: "", stderr: "no spec" };
+      }
+      if (body.includes("orch apply -i")) {
+        return { code: 1, stdout: "", stderr: "apply failed" };
+      }
+      if (body.includes("orch rm")) {
+        removed = true;
+        return { code: 0, stdout: "", stderr: "" };
+      }
+      return { code: 0, stdout: "[]", stderr: "" };
+    });
+    await assertRejects(
+      () =>
+        applyOsd(deps, admin.session, targetSession(), {
+          targetHost: "node1",
+          dataDevices: [{ serial: "SN0001" }],
+        }),
+      PhaseError,
+      "OSD apply failed",
+    );
+    assertEquals(removed, false);
+  },
+);

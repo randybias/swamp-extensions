@@ -2,6 +2,91 @@
 
 Not packaged. Notes for whoever maintains this extension.
 
+---
+
+## HANDOFF: RGW S3 plane (clean room)
+
+**What remains.** The four S3-plane methods only:
+
+| Method                          | Spec                                     |
+| ------------------------------- | ---------------------------------------- |
+| `cephRgwBucketInspect`          | `docs/specs/cephadm/07-rgw.md` section 4 |
+| `cephRgwBucketEnsure`           | `07-rgw.md` section 5                    |
+| `cephRgwBucketPolicyEnsure`     | `07-rgw.md` section 6                    |
+| `cephRgwBucketVersioningEnsure` | `07-rgw.md` section 7                    |
+
+The cross-cutting rules are all of `07-rgw.md` section 1: §1.1 two access
+planes, §1.2 secret-redaction contract, §1.4 effect-not-acceptance, §1.5
+validation inside execute, §1.6 common S3 arguments, §1.7 S3 transport outcome
+classes, §1.8 bucket presence classification, §1.9 Public Access Block, §1.10
+error phases, §1.11 resource records, §1.12 probe objects. Where a group rule or
+an overview decision disagrees, the overview decision wins. Do not read the old
+ceph repo or any summary of it.
+
+**Module and file layout.** Add one module
+`cephadm/extensions/models/_lib/s3.ts` plus a sibling `s3_test.ts`, and wire the
+four methods and their resource specs into `extensions/models/cephadm.ts` (which
+already declares every other resource and method). Put the SigV4 signer, the XML
+reader, the endpoint / bucket / credential grammars, the presence classifier and
+the PAB helpers in `s3.ts`. Keep the model file thin: it opens a session-free
+call, calls the module, writes one record with `capturedAt`, and returns a data
+handle. The four S3 methods do NOT open an SSH session and are NOT in the
+`ssh-installed` pre-flight check's `appliesTo` list; add a `S3_METHODS` set to
+the model factory and compute
+`sshMethods = Object.keys(methods).filter(m => !S3_METHODS.has(m))`.
+
+**Dependency seam.** `07-rgw.md` and `00-overview.md` require a single
+injectable HTTP fetch for the S3 methods only. Re-add it to the model's
+`CephadmDeps` as `fetch: FetchFn` (see how the transport seams `spawn`, `now`,
+`sleep`, `random` are declared and overridden) and pass it into `s3.ts`. Every
+request opens a fresh connection: no keep-alive reuse. Pin the HTTP and XML
+dependencies with exact `npm:`/`jsr:` versions in each file's import and in
+`cephadm/deno.json`/`deno.lock`; no bare specifiers. Use a real, pinned XML
+parser that handles default and prefixed namespaces and entity decoding — do not
+hand-roll one. The four methods and their tests must inject a fake fetch so no
+socket is opened.
+
+**Reuse from this repo (all in `_lib/`):**
+
+- `errors.ts` — `fail(phase, message, detail)` produces `cephadm[<phase>]:`
+  messages with JSON/raw detail rendering; `TransportError` is the typed
+  transport error. Use the phase tags from `07-rgw.md` §1.10.
+- `validate.ts` — `quote()` for POSIX single-quoting and the grammar helpers;
+  `truncate()` for error excerpts. Add the S3 endpoint/bucket/credential
+  grammars here or in `s3.ts`, but validate every caller value and re-validate
+  inside execute (§1.5), with zero transport calls on failure.
+- `rgw.ts` — `redactSecrets(text, secrets?)` is the redactor required by §1.2;
+  `parseUserView`, `classifyUserInfo` and `budgetInventory` show the established
+  secret-free parsing style. `s3.ts` results must never contain a field named
+  `secret` or `secretKey` (§1.2, D49), and headers, URLs and signatures are
+  never recorded or logged.
+- `hostprep.ts` / `verify.ts` — the wait/`settle` helpers and the
+  `persistVerdict` pattern if a polled re-read is needed; S3 writes are verified
+  by re-reading, not by status codes (§1.4, §1.9).
+
+**Conventions established here.**
+
+- Strict `z.strictObject` schemas; every record schema declares every field it
+  writes; secret fields carry `.meta({ sensitive: true })`.
+- A failing method writes no record; a success record is never written for a
+  pub-lic/leaking/lifted bucket.
+- Stable, non-timestamped instance keys exactly as `07-rgw.md` §1.11 lists them;
+  `capturedAt` carries freshness.
+- Every mutating method is `kind: "action" as const` (the S3 methods are all
+  mutating, so all four need it).
+- The redactor runs before any truncation and covers JSON fields, flags and
+  literal secret values.
+
+**Test helpers to reuse.** The `_test.ts` files build a scripted `SshSession`
+(or, for S3, a scripted `fetch`) and assert the exact command/request text. For
+S3, assert: SigV4 `Authorization` shape, `x-amz-content-sha256`, path-style
+`<origin>/<bucket>`, a fresh fetch per request, the presence classifier table
+(§1.8), the three transport outcome classes (§1.7), PAB read/write, the probe
+prefix `.cephadm-pab-probe/` (§1.12), and that no record, log or error contains
+a secret. Fixtures are synthetic only (RFC 5737 addresses, `.test` names).
+
+---
+
 - 2026-10-17: initial scaffold and the transport + host-preparation milestone
   (D1-D9, D13-D18, D37, D55-D57, D66-D68). One model type, empty
   `globalArguments`, factory with overridable dependencies (spawner, clock,

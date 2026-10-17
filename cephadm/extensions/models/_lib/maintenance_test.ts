@@ -9,6 +9,7 @@ import {
   cephadmResidue,
   classifyCheckHost,
   classifyFsid,
+  enterMaintenance,
   floorPollBudget,
   HOST_MARKERS,
   hostOsdIds,
@@ -345,3 +346,52 @@ Deno.test("noout-clear refuses an unknown host, a maintenance host and down OSDs
     "in maintenance",
   );
 });
+
+Deno.test(
+  "a failed LVM section is not read as a clean host", // leak-allow(decision D13)
+  () => {
+    const stdout =
+      observation({ systemctl: true, lvm: true, vgs: ["ceph-abc"] }) +
+      "\n" + "#__cephadm_status_vgs__1";
+    const state = parseHostState("h", stdout);
+    assertEquals(state.sectionFailures.includes("vgs"), true);
+    assertThrows(() => lvmResidue(state), PhaseError, "not observed");
+  },
+);
+
+Deno.test(
+  "maintenance enter reads real OSD counts, not zeros", // leak-allow(decision D45)
+  async () => {
+    const hosts = JSON.stringify([{
+      hostname: "node1",
+      status: "maintenance",
+    }]);
+    const health = JSON.stringify({
+      checks: {
+        OSD_FLAGS: { summary: { message: "host node1 has flags noout" } },
+      },
+    });
+    const osd = JSON.stringify({ num_up_osds: 0, num_in_osds: 3, num_osds: 3 });
+    const s = mSession((body) => {
+      if (body.includes("orch host ls")) {
+        return { code: 0, stdout: hosts, stderr: "" };
+      }
+      if (body.includes("health detail")) {
+        return { code: 0, stdout: health, stderr: "" };
+      }
+      if (body.includes("osd stat")) {
+        return { code: 0, stdout: osd, stderr: "" };
+      }
+      return { code: 0, stdout: "[]", stderr: "" };
+    });
+    const record = await enterMaintenance(deps, s, {
+      host: "192.0.2.10",
+      hostName: "node1",
+      osdCount: 3,
+    });
+    assertEquals(record.numUpOsds, 0);
+    assertEquals(record.numInOsds, 3);
+    assertEquals(record.didIssueCommand, false);
+    assertEquals(record.hostOsdsDown, true);
+  },
+);

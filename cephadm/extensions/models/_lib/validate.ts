@@ -143,7 +143,10 @@ export function isHttpUrl(raw: string): boolean {
 
 /** Removes any userinfo from a URL for safe display in an error or log. */
 export function redactUrl(raw: string): string {
-  return raw.replace(/^([A-Za-z][A-Za-z0-9+.-]*:\/\/)[^@/\s]*@/, "$1");
+  // Drop userinfo, then any query or fragment, which can carry credentials.
+  return raw
+    .replace(/^([A-Za-z][A-Za-z0-9+.-]*:\/\/)[^@/\s]*@/, "$1")
+    .replace(/^([A-Za-z][A-Za-z0-9+.-]*:\/\/\S*?)[?#].*$/, "$1");
 }
 
 /** LVM volume-group name: letters, digits, plus, underscore, dot, hyphen; no leading hyphen. */

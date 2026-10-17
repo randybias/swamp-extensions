@@ -670,6 +670,7 @@ Deno.test("verifyPackageSource records first, then throws, when throwOnFail is u
 });
 
 Deno.test("every mutating method is declared an action", () => {
+  // M, M!, D and W methods, and no read-only method.
   const mutating = [
     "cephHostPrep",
     "wipeDiskToRaw",
@@ -685,8 +686,60 @@ Deno.test("every mutating method is declared an action", () => {
     "cephCreateCsiUser",
     "cephDeleteFs",
     "cephRemoveOsds",
+    "cephVerifyRbdSmoke",
+    "cephRgwUserEnsure",
+    "cephHostMaintenanceEnter",
+    "cephHostMaintenanceExit",
+    "cephHostNooutClear",
+    "cephOsdActivate",
+    "cephDisableOrchestration",
+    "cephRmCluster",
+  ];
+  const readOnly = [
+    "cephGetConnBundle",
+    "cephVerifyHealth",
+    "cephVerifyMonQuorum",
+    "cephVerifyPool",
+    "cephCapacityReport",
+    "cephRgwBucketInventory",
+    "cephHostMaintenanceState",
+    "cephVerifyHostTornDown",
   ];
   const methods = model.methods as unknown as Record<string, { kind?: string }>;
   for (const name of mutating) assertEquals(methods[name].kind, "action", name);
-  assertEquals(methods.cephGetConnBundle.kind, undefined);
+  for (const name of readOnly) {
+    assertEquals(methods[name].kind, undefined, name);
+  }
+});
+
+Deno.test("distribute-key records every host's outcome, then throws", async () => {
+  const key =
+    "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIExampleExampleExampleExampleExample";
+  const spawn = routeSpawner((command) => {
+    if (command.includes("mkdir -p")) {
+      return { code: 0, stdout: "", stderr: "" };
+    }
+    if (command.startsWith("grep -Fqx")) {
+      return { code: 1, stdout: "", stderr: "" };
+    }
+    if (command.startsWith("cat >>")) {
+      return { code: 1, stdout: "", stderr: "denied" };
+    }
+    return { code: 1, stdout: "", stderr: "unrouted" };
+  });
+  const m = createCephadmModel({ spawn, now: () => 0 });
+  const { context, getWrittenResources } = createModelTestContext({
+    globalArgs: GLOBALS,
+  });
+  await assertRejects(
+    () =>
+      m.methods.cephDistributeKey.execute({
+        ...SSH_NULLS,
+        cephPubKey: key,
+        hosts: [{ host: "192.0.2.10", port: 22 }],
+      }, context),
+    Error,
+    "not present",
+  );
+  assertEquals(getWrittenResources().length, 1);
 });

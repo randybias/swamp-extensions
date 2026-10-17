@@ -188,7 +188,9 @@ export async function runCephScript(
       command: shellRunCommand(dir, scriptPath),
       sudo: true,
       budgetMs,
-      allowNonZero: opts.allowNonZero ?? true,
+      // Fail closed by default: a ceph mutation that exits non-zero must
+      // throw. Callers that tolerate a non-zero exit pass true and check code.
+      allowNonZero: opts.allowNonZero ?? false,
       phase: opts.phase,
       resend: opts.resend ?? "dropped",
     });

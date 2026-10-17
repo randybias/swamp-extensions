@@ -52,7 +52,7 @@ Prepare one host, with the key kept in a vault:
 
 ```bash
 swamp behavior run cephadm cephHostPrep --input host=node1.example.com \
-  --input sshUser=admin --input port=22 \
+  --input sshUser=admin --input port=22 --input strictHostKeyChecking=yes \
   --input 'privateKey=${{ vault.get("default", "NODE1_KEY") }}' \
   --input 'packages:json=["chrony","lvm2","podman"]' \
   --input cephadmUrl=https://download.example.com/ceph/19.2.1/el9/noarch/cephadm \

@@ -102,23 +102,33 @@ export const HOST_SECTIONS: (keyof typeof HOST_MARKERS)[] = [
 ];
 
 /** The privileged host-observation script, sent over one connection. */
+/** Prefix of a per-section exit-status marker. */
+export const STATUS_PREFIX = "#__cephadm_status_";
+
 export function hostObservationScript(): string {
   const m = HOST_MARKERS;
+  // Each section emits its command's exit status; a failed vgs/lvs/systemctl
+  // section must never read as a clean host.
+  const sec = (key: keyof typeof HOST_MARKERS, cmd: string): string[] => [
+    `echo '${m[key]}'`,
+    `${cmd} 2>/dev/null`,
+    `echo '${STATUS_PREFIX}${key}__'$?`,
+  ];
   return [
     `if command -v systemctl >/dev/null 2>&1; then echo '${m.systemctl}'; fi`,
     `if command -v vgs >/dev/null 2>&1 && command -v lvs >/dev/null 2>&1; then echo '${m.lvm}'; fi`,
-    `echo '${m.fsid}'`,
-    "ls -1 /var/lib/ceph 2>/dev/null || true",
-    `echo '${m.units}'`,
-    "systemctl list-units --all --plain --no-legend --no-pager 'ceph*' 2>/dev/null || true",
-    `echo '${m.unitFiles}'`,
-    "systemctl list-unit-files --no-legend --no-pager 'ceph*' 2>/dev/null || true",
-    `echo '${m.vgs}'`,
-    "vgs --noheadings -o vg_name 2>/dev/null || true",
-    `echo '${m.lvs}'`,
-    "lvs --noheadings -o vg_name,lv_name --separator / 2>/dev/null || true",
-    `echo '${m.mdstat}'`,
-    "cat /proc/mdstat 2>/dev/null || true",
+    ...sec("fsid", "ls -1 /var/lib/ceph"),
+    ...sec(
+      "units",
+      "systemctl list-units --all --plain --no-legend --no-pager 'ceph*'",
+    ),
+    ...sec(
+      "unitFiles",
+      "systemctl list-unit-files --no-legend --no-pager 'ceph*'",
+    ),
+    ...sec("vgs", "vgs --noheadings -o vg_name"),
+    ...sec("lvs", "lvs --noheadings -o vg_name,lv_name --separator /"),
+    ...sec("mdstat", "cat /proc/mdstat"),
     "exit 0",
   ].join("\n");
 }
@@ -141,6 +151,8 @@ export interface HostState {
   mdArrays: string[];
   /** Which tools were observed. */
   toolsSeen: { systemctl: boolean; lvm: boolean; mdstat: boolean };
+  /** Sections whose command exited non-zero. */
+  sectionFailures: string[];
 }
 
 const UUID_RE =
@@ -203,6 +215,11 @@ export function parseHostState(host: string, stdout: string): HostState {
     ]),
   ]
     .sort();
+  const sectionFailures: string[] = [];
+  for (const line of stdout.split("\n")) {
+    const m = line.trim().match(/^#__cephadm_status_([A-Za-z]+)__(\d+)$/);
+    if (m && Number(m[2]) !== 0) sectionFailures.push(m[1]);
+  }
   return {
     host,
     fsids: sections.fsid.filter((f) => UUID_RE.test(f)).sort(),
@@ -225,6 +242,7 @@ export function parseHostState(host: string, stdout: string): HostState {
       lvm: stdout.split("\n").some((l) => l.trim() === HOST_MARKERS.lvm),
       mdstat: sections.mdstat.length > 0,
     },
+    sectionFailures,
   };
 }
 
@@ -268,6 +286,15 @@ export function cephadmResidue(
       host: state.host,
     });
   }
+  if (
+    state.sectionFailures.includes("units") ||
+    state.sectionFailures.includes("unitFiles")
+  ) {
+    fail(phase, "host state not observed (systemctl read failed)", {
+      host: state.host,
+      sections: state.sectionFailures,
+    });
+  }
   return [
     ...state.fsids.map((item) => ({ kind: "fsid", item })),
     ...state.clusterUnits.map((item) => ({ kind: "unit", item })),
@@ -282,6 +309,15 @@ export function lvmResidue(
   if (!state.toolsSeen.lvm) {
     fail(phase, "host state not observed (LVM tools absent)", {
       host: state.host,
+    });
+  }
+  if (
+    state.sectionFailures.includes("vgs") ||
+    state.sectionFailures.includes("lvs")
+  ) {
+    fail(phase, "host state not observed (LVM read failed)", {
+      host: state.host,
+      sections: state.sectionFailures,
     });
   }
   return [
@@ -363,13 +399,19 @@ async function readOsdStat(
     "osd stat",
     { json: true, phase },
     log,
-  ) as {
+  );
+  const j = r.json as {
     num_up_osds?: unknown;
     num_in_osds?: unknown;
     num_osds?: unknown;
-  };
-  const n = (v: unknown) => typeof v === "number" ? v : 0;
-  return { up: n(r.num_up_osds), in: n(r.num_in_osds), numOsds: n(r.num_osds) };
+  } | null;
+  if (
+    j === null || typeof j.num_up_osds !== "number" ||
+    typeof j.num_in_osds !== "number" || typeof j.num_osds !== "number"
+  ) {
+    fail(phase, "osd stat did not report numeric counts", {});
+  }
+  return { up: j.num_up_osds, in: j.num_in_osds, numOsds: j.num_osds };
 }
 
 /** Reads `health detail` for the noout predicate. */
@@ -1119,6 +1161,9 @@ export async function rmCluster(
       cephadmStateAbsent: true,
       lvmResidue: lvmResidue(before).map((r) => r.item),
       fsidsBefore: before.fsids,
+      fsidsAfter: before.fsids,
+      clusterUnitsBefore: before.clusterUnits,
+      cephVolumeGroupsBefore: before.cephVolumeGroups,
       mdArraysAfter: before.mdArrays,
       capturedAt: new Date(deps.now()).toISOString(),
     };

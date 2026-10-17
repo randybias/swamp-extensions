@@ -166,8 +166,15 @@ async function read(
   args: string,
   phase: string,
   log?: Logger,
+  redact = false,
 ): Promise<unknown> {
-  const r = await runCeph(deps, session, args, { json: true, phase }, log);
+  const r = await runCeph(
+    deps,
+    session,
+    args,
+    { json: true, phase, redactStdout: redact },
+    log,
+  );
   if (r.result.code !== 0) {
     fail(phase, `command failed: ceph ${args}`, {
       code: r.result.code,
@@ -460,7 +467,8 @@ export async function verifyCsiUsers(
   expectedUserNames: string[],
   log?: Logger,
 ): Promise<VerifyOutcome> {
-  const json = await read(deps, session, "auth ls", "csi-users", log);
+  // auth ls output carries keys; never let a parse error echo it.
+  const json = await read(deps, session, "auth ls", "csi-users", log, true);
   const entities = parseAuthEntities(json);
   const found = new Map(entities.map((e) => [e.entity, e.caps]));
   const expected = expectedUserNames.map((n) => `client.${n}`);

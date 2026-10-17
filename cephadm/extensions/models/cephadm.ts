@@ -1386,17 +1386,8 @@ export function createCephadmModel(overrides: Partial<CephadmDeps> = {}) {
           }
         }
         const failed = outcomes.filter((o) => !o.verified);
-        if (failed.length > 0) {
-          throw new PhaseError(
-            "cephDistributeKey",
-            `the key is not present on ${failed.length} of ${outcomes.length} hosts`,
-            {
-              failures: failed.map((o) =>
-                `${o.host}:${o.port} (${o.reason ?? "unverified"})`
-              ),
-            },
-          );
-        }
+        // Persist the per-host outcomes even when some host failed, so the
+        // evidence is not lost, then throw.
         const handle = await context.writeResource(
           "cephDistributeKeyResult",
           distributeRecordKey(args.hosts),
@@ -1411,6 +1402,17 @@ export function createCephadmModel(overrides: Partial<CephadmDeps> = {}) {
             capturedAt: new Date(deps.now()).toISOString(),
           },
         );
+        if (failed.length > 0) {
+          throw new PhaseError(
+            "cephDistributeKey",
+            `the key is not present on ${failed.length} of ${outcomes.length} hosts`,
+            {
+              failures: failed.map((o) =>
+                `${o.host}:${o.port} (${o.reason ?? "unverified"})`
+              ),
+            },
+          );
+        }
         return { dataHandles: [handle] };
       },
     },
@@ -2512,6 +2514,7 @@ export function createCephadmModel(overrides: Partial<CephadmDeps> = {}) {
     },
 
     cephVerifyRbdSmoke: {
+      kind: "action" as const,
       description:
         "Create and remove one tiny throwaway RBD image (prefix cephadm-smoke-), reading it back to prove name and size; it is the only verify method that writes anything. A name collision is refused and never overwritten; the image is always removed once created.",
       arguments: VerifyRbdSmokeArgs,

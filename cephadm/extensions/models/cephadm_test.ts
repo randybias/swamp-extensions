@@ -1,6 +1,6 @@
 import { assertEquals, assertRejects } from "jsr:@std/assert@1.0.19";
 import { createModelTestContext } from "jsr:@swamp-club/swamp-testing@0.20261014.55";
-import { createCephadmModel, model, VERSION } from "./cephadm.ts";
+import { createCephadmModel, model, S3_METHODS, VERSION } from "./cephadm.ts";
 import { busyProbeScript } from "./_lib/hostprep.ts";
 import type { Spawner } from "./_lib/ssh.ts";
 
@@ -79,6 +79,7 @@ Deno.test(
       { arguments: { shape: Record<string, unknown> } }
     >;
     for (const [name, method] of Object.entries(shapes)) {
+      if (S3_METHODS.has(name)) continue;
       const fields = Object.keys(method.arguments.shape);
       for (
         const field of [
@@ -105,7 +106,9 @@ Deno.test(
     >;
     assertEquals(checks["ssh-installed"].labels.includes("live"), true);
     const methodNames = new Set(Object.keys(model.methods));
-    const ssh = methodNames;
+    const ssh = new Set(
+      [...methodNames].filter((name) => !S3_METHODS.has(name)),
+    );
     assertEquals(new Set(checks["ssh-installed"].appliesTo), ssh);
   },
 );

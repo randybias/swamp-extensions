@@ -304,3 +304,58 @@ a secret. Fixtures are synthetic only (RFC 5737 addresses, `.test` names).
   approval, and requires every mutating step to sit behind an approval on its
   step-dependency path. Deleting an approval now fails the test.
 - add-host limit recorded in the README: only hostname presence is proven.
+
+- 2026-10-17: group 07 RGW S3 plane complete (lane/d4-cephs3, rebased onto d6
+  head 6807776). New module `extensions/models/_lib/s3.ts` + sibling
+  `s3_test.ts`, wired into `cephadm.ts`. The four methods are
+  `cephRgwBucketInspect` (READ-ONLY), `cephRgwBucketEnsure`,
+  `cephRgwBucketPolicyEnsure` and `cephRgwBucketVersioningEnsure` (each
+  `kind: action`). All four take the common S3 arguments and open no SSH
+  session: a new injectable `fetch: FetchFn` seam (used by these methods only)
+  carries every request on a fresh connection, and `S3_METHODS` excludes them
+  from the `ssh-installed` applies-to list. The XML reader is pinned
+  `jsr:@std/xml@0.2.0` (namespaces and entities); SigV4 (service `s3`) and MD5
+  (for the mandated `Content-MD5`) are implemented locally.
+- NOTE: the S3 handoff text said all four methods are mutating and need
+  `kind: "action"`. `00-overview.md` row 47 and `07-rgw.md` §4 both classify
+  `cephRgwBucketInspect` as READ-ONLY (it sends only HEAD/GET), so it is left
+  without `kind`, matching the other read-only methods. Flagged for the lead.
+- Behaviour: presence is the shared HEAD classifier with the ListBuckets
+  tie-break; only an explicit not-found counts as absence. `cephRgwBucketEnsure`
+  creates with `<region>:<placementTarget>` and `x-amz-acl: private`, converges
+  the ACL and the four Public Access Block flags (with `Content-MD5`), then runs
+  the signed-control/unsigned-anonymous list probe and the object-leak probe
+  under the fixed `.cephadm-pab-probe/` prefix; "the probe could not run" and "a
+  leak was detected" are distinct phases, and every stored probe object is
+  deleted (by `versionId` when returned) before the leak is judged.
+  `cephRgwBucketPolicyEnsure` refuses public and self-locking policies before
+  any request, writes the document verbatim, proves it with a canonical
+  read-back and the anonymous probe, lifts and restores `BlockPublicPolicy`, and
+  rolls back on failure. `cephRgwBucketVersioningEnsure` converges the
+  three-state versioning and warns when Enabled makes conditional writes unsafe.
+- Security: the owner's `accessKey`/`secretKey` are sensitive arguments, used
+  only to sign; no request URL, header or signature reaches a record, log or
+  error; request transport detail is URL-stripped and truncated. 49 new unit
+  tests (274 total) inject a scripted `fetch`, so no socket is opened; gates 0-6
+  pass offline.
+- 2026-10-17: S3-plane review round 2 (delta vs 6807776). Fixes:
+  - HIGH: the object-leak public-read step was a second PutObject; it is now
+    `PUT ?acl` with `x-amz-acl: public-read` (empty body), so a versioned bucket
+    gains no extra version. Cleanup now lists object versions under each probe
+    key (`GET ?versions&prefix=`) and deletes every version by `versionId`,
+    falling back to the PutObject version id when the listing is unreadable, so
+    a retried or versioned probe cannot leave a public version.
+  - MEDIUM: a failed PAB lift now best-effort restores the original block and
+    says in the error whether it was restored.
+  - MEDIUM: a non-answered policy PUT is treated as indeterminate: the policy is
+    re-read, the rollback runs if it changed (or the re-read fails), and
+    RESTORED is reported only after a canonical read-back confirms it.
+  - MEDIUM: cephRgwBucketEnsure and cephRgwBucketPolicyEnsure now lead with
+    `DESTRUCTIVE.` and name what is replaced.
+  - MEDIUM: the fetch seam caps the response body at 1 MiB and throws a URL-free
+    transport error past the cap.
+  - LOW: added the AWS published examplebucket SigV4 known-answer tests (GET
+    Object and List Objects).
+  - LEAD RULING: self-lockout detection now also refuses a Deny on
+    `aws:SecureTransport` whose condition matches both true and false (it
+    applies on every request and would lock the owner out).

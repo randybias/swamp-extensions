@@ -3,6 +3,14 @@ import { PhaseError } from "./errors.ts";
 import { listByIdCommand } from "./resolve.ts";
 import type { CommandResult, RunOptions, SshSession } from "./ssh.ts";
 import {
+  BLKID_COMMAND,
+  FINDMNT_COMMAND,
+  LINKS_COMMAND,
+  LSBLK_COMMAND,
+  PVS_COMMAND,
+  ZPOOL_COMMAND,
+} from "./protected_devices.ts";
+import {
   arrayBasename,
   editMdConfig,
   ensureArrayLine,
@@ -28,9 +36,101 @@ const RAW_TREE = JSON.stringify({
   ],
 });
 
+type Answer = CommandResult | ((command: string) => CommandResult);
+
+/** Overrides for the boot-guard probes; keys are the probe names below. */
+type Probes = Record<string, Answer>;
+
+const done = (stdout: string, code = 0, stderr = ""): CommandResult => ({
+  code,
+  stdout,
+  stderr,
+});
+
+/** A rich lsblk row builder for the guard's probe (synthetic names only). */
+function guardRow(
+  name: string,
+  type: string,
+  extra: Record<string, unknown> = {},
+  children?: unknown[],
+): Record<string, unknown> {
+  return {
+    name,
+    path: type === "lvm" || type === "crypt"
+      ? `/dev/mapper/${name}`
+      : `/dev/${name}`,
+    pkname: null,
+    type,
+    fstype: null,
+    uuid: null,
+    partuuid: null,
+    label: null,
+    mountpoints: [null],
+    ...extra,
+    ...(children ? { children } : {}),
+  };
+}
+
+const guardLsblk = (...rows: unknown[]): CommandResult =>
+  done(JSON.stringify({ blockdevices: rows }));
+
+/** Root on sda1; the candidate nvme0n1 is raw. */
+const HEALTHY: Probes = {
+  lsblk: guardLsblk(
+    guardRow("sda", "disk", {}, [
+      guardRow("sda1", "part", { fstype: "ext4", mountpoints: ["/"] }),
+    ]),
+    guardRow("nvme0n1", "disk"),
+  ),
+  findmnt: done(
+    JSON.stringify({
+      filesystems: [{ target: "/", source: "/dev/sda1", fstype: "ext4" }],
+    }),
+  ),
+  fstab: done("/dev/sda1 / ext4 defaults 0 1\n"),
+  swaps: done("Filename\tType\tSize\tUsed\tPriority\n"),
+  mdstat: done("", 1, "cat: /proc/mdstat: No such file or directory"),
+  links: done(""),
+  blkid: done("", 127),
+  zpool: done("", 127),
+  pvs: done("", 127),
+};
+
+const NO_SUPERBLOCK = done("", 1, "mdadm: No md superblock detected\n");
+
+/** Answers the guard's probes, or returns undefined for any other command. */
+function probeAnswer(
+  command: string,
+  over: Probes,
+): CommandResult | undefined {
+  const names: [string, string][] = [
+    [LSBLK_COMMAND, "lsblk"],
+    [FINDMNT_COMMAND, "findmnt"],
+    ["cat -- '/etc/fstab'", "fstab"],
+    ["cat -- '/proc/swaps'", "swaps"],
+    ["cat -- '/proc/mdstat'", "mdstat"],
+    [LINKS_COMMAND, "links"],
+    [BLKID_COMMAND, "blkid"],
+    [ZPOOL_COMMAND, "zpool"],
+    [PVS_COMMAND, "pvs"],
+  ];
+  const hit = names.find(([c]) => c === command);
+  if (hit) {
+    const answer = over[hit[1]] ?? HEALTHY[hit[1]];
+    return typeof answer === "function" ? answer(command) : answer;
+  }
+  const examine = /^mdadm --examine -- '(.+)'$/.exec(command);
+  if (examine) {
+    const answer = over[`examine:${examine[1]}`] ?? NO_SUPERBLOCK;
+    return typeof answer === "function" ? answer(command) : answer;
+  }
+  return undefined;
+}
+
 function fakeSession(
   route: (opts: RunOptions) => CommandResult,
   host = "192.0.2.10",
+  probes: Probes = {},
 ): { session: SshSession; calls: RunOptions[] } {
   const calls: RunOptions[] = [];
   const session: SshSession = {
@@ -38,10 +138,8 @@ function fakeSession(
     controlPath: null,
     run: (opts) => {
       calls.push(opts);
-      // No boot filesystem is mounted in these fixtures.
-      if (opts.command.startsWith("findmnt")) {
-        return Promise.resolve({ code: 1, stdout: "", stderr: "" });
-      }
+      const probe = probeAnswer(opts.command, probes);
+      if (probe) return Promise.resolve(probe);
       if (
         opts.command.startsWith("mdadm --detail ") &&
         !opts.command.includes("--scan")
@@ -156,6 +254,7 @@ Deno.test(
 function routedSession(
   route: (opts: RunOptions) => CommandResult | undefined,
   host = "192.0.2.10",
+  probes: Probes = {},
 ): { session: SshSession; calls: RunOptions[] } {
   const calls: RunOptions[] = [];
   const session: SshSession = {
@@ -163,6 +262,8 @@ function routedSession(
     controlPath: null,
     run: (opts) => {
       calls.push(opts);
+      const probe = probeAnswer(opts.command, probes);
+      if (probe) return Promise.resolve(probe);
       const r = route(opts);
       if (!r) throw new Error(`unexpected ${opts.command}`);
       return Promise.resolve(r);
@@ -174,123 +275,6 @@ function routedSession(
 
 const NO_DESTRUCTIVE =
   /wipefs|vgremove|vgchange|lvremove|pvremove|mdadm --stop|zero-superblock|sgdisk/;
-
-Deno.test(
-  "a disk behind an active root array is refused before any mutation", // leak-allow(decision D3)
-  async () => {
-    const tree = JSON.stringify({
-      blockdevices: [
-        {
-          name: "md0",
-          path: "/dev/md0",
-          type: "raid1",
-          fstype: "ext4",
-          mountpoint: "/",
-          children: [{
-            name: "nvme0n1",
-            path: "/dev/nvme0n1",
-            type: "disk",
-            fstype: null,
-          }],
-        },
-      ],
-    });
-    const { session, calls } = routedSession((opts) => {
-      if (opts.command === listByIdCommand()) {
-        return { code: 0, stdout: "nvme-SN0001\n", stderr: "" };
-      }
-      if (
-        opts.command === "readlink -f '/dev/disk/by-id/nvme-SN0001' | sort -u"
-      ) {
-        return { code: 0, stdout: "/dev/nvme0n1\n", stderr: "" };
-      }
-      if (opts.command === lsblkCommand()) {
-        return { code: 0, stdout: tree, stderr: "" };
-      }
-      if (opts.command === "findmnt -rno SOURCE,TARGET") {
-        return { code: 0, stdout: "/dev/md0 /\n", stderr: "" };
-      }
-      if (opts.command.startsWith("findmnt --fstab")) {
-        return { code: 1, stdout: "", stderr: "" };
-      }
-      if (opts.command.startsWith("readlink -f '/dev/md0'")) {
-        return { code: 0, stdout: "/dev/md0\n", stderr: "" };
-      }
-      if (opts.command.startsWith("mdadm --detail ")) {
-        return {
-          code: 0,
-          stdout:
-            "     0       8       16        0      active sync   /dev/nvme0n1\n",
-          stderr: "",
-        };
-      }
-      return undefined;
-    });
-    await assertRejects(
-      () =>
-        wipeDiskToRaw({ ...deps, session }, {
-          dataDevices: [{ serial: "SN0001" }],
-          excludeDevices: [],
-        }),
-      PhaseError,
-      "boot-protected",
-    );
-    assertEquals(calls.some((c) => NO_DESTRUCTIVE.test(c.command)), false);
-  },
-);
-
-Deno.test(
-  "a member of an inactive boot array named by fstab is refused", // leak-allow(decision D3)
-  async () => {
-    const { session, calls } = routedSession((opts) => {
-      if (opts.command === listByIdCommand()) {
-        return { code: 0, stdout: "nvme-SN0001\n", stderr: "" };
-      }
-      if (
-        opts.command === "readlink -f '/dev/disk/by-id/nvme-SN0001' | sort -u"
-      ) {
-        return { code: 0, stdout: "/dev/nvme0n1\n", stderr: "" };
-      }
-      if (opts.command === lsblkCommand()) {
-        return { code: 0, stdout: RAW_TREE, stderr: "" };
-      }
-      if (opts.command === "findmnt -rno SOURCE,TARGET") {
-        return { code: 1, stdout: "", stderr: "" };
-      }
-      if (opts.command.startsWith("findmnt --fstab")) {
-        return {
-          code: 0,
-          stdout: "/dev/md0 /boot ext4 defaults 0 0\n",
-          stderr: "",
-        };
-      }
-      if (opts.command.startsWith("readlink -f '/dev/md0'")) {
-        return { code: 0, stdout: "/dev/md0\n", stderr: "" };
-      }
-      if (opts.command.startsWith("mdadm --detail ")) {
-        return { code: 0, stdout: "", stderr: "" };
-      }
-      if (opts.command.startsWith("mdadm --examine")) {
-        return {
-          code: 0,
-          stdout: "ARRAY /dev/md0 metadata=1.2 name=host:0 UUID=abc\n",
-          stderr: "",
-        };
-      }
-      return undefined;
-    });
-    await assertRejects(
-      () =>
-        wipeDiskToRaw({ ...deps, session }, {
-          dataDevices: [{ serial: "SN0001" }],
-          excludeDevices: [],
-        }),
-      PhaseError,
-      "boot-protected",
-    );
-    assertEquals(calls.some((c) => NO_DESTRUCTIVE.test(c.command)), false);
-  },
-);
 
 /** Routes listing, readlink and one lsblk read for a single disk. */
 function diskRouter(opts: RunOptions, lsblk: string): CommandResult {
@@ -460,145 +444,332 @@ Deno.test("an already-raw disk completes the teardown idempotently", async () =>
   );
 });
 
-Deno.test(
-  "root on a plain md array protects every member disk", // leak-allow(decision D3)
-  async () => {
-    const tree = JSON.stringify({
-      blockdevices: [
-        {
-          name: "sda",
-          path: "/dev/sda",
-          type: "disk",
-          fstype: null,
-          children: [{
-            name: "md0",
-            path: "/dev/md0",
-            type: "raid1",
-            fstype: null,
-            children: [{
-              name: "md0p1",
-              path: "/dev/md0p1",
-              type: "part",
-              fstype: "ext4",
-              mountpoint: "/",
-            }],
-          }],
-        },
-        {
-          name: "sdb",
-          path: "/dev/sdb",
-          type: "disk",
-          fstype: null,
-          children: [{
-            name: "md0",
-            path: "/dev/md0",
-            type: "raid1",
-            fstype: null,
-          }],
-        },
-      ],
-    });
-    const { session, calls } = routedSession((opts) => {
-      if (opts.command === listByIdCommand()) {
-        return { code: 0, stdout: "sdb-SN0001\n", stderr: "" };
-      }
-      if (opts.command.startsWith("readlink -f '/dev/disk/by-id/")) {
-        return { code: 0, stdout: "/dev/sdb\n", stderr: "" };
-      }
-      if (opts.command === lsblkCommand()) {
-        return { code: 0, stdout: tree, stderr: "" };
-      }
-      if (opts.command === "findmnt -rno SOURCE,TARGET") {
-        return { code: 0, stdout: "/dev/md0p1 /\n", stderr: "" };
-      }
-      if (opts.command.startsWith("findmnt --fstab")) {
-        return { code: 1, stdout: "", stderr: "" };
-      }
-      if (opts.command.startsWith("readlink -f '/dev/md0p1'")) {
-        return { code: 0, stdout: "/dev/md0p1\n", stderr: "" };
-      }
-      return undefined;
-    });
-    await assertRejects(
-      () =>
-        wipeDiskToRaw({ ...deps, session }, {
-          dataDevices: [{ serial: "SN0001" }],
-          excludeDevices: [],
-        }),
-      PhaseError,
-      "boot-protected",
-    );
-    assertEquals(calls.some((c) => NO_DESTRUCTIVE.test(c.command)), false);
-  },
-);
+/** Routes serial discovery and the gate-3 lsblk for one raw NVMe disk. */
+function discover(
+  opts: RunOptions,
+  tree: string = RAW_TREE,
+): CommandResult | undefined {
+  if (opts.command === listByIdCommand()) return done("nvme-SN0001\n");
+  if (opts.command.startsWith("readlink")) return done("/dev/nvme0n1\n");
+  if (opts.command === lsblkCommand()) return done(tree);
+  if (opts.command.startsWith("mdadm --examine --scan")) return done("");
+  if (opts.command.startsWith("pvs ")) return done("");
+  return undefined;
+}
 
-Deno.test(
-  "root on LVM over md protects the md device and its members", // leak-allow(decision D3)
-  async () => {
-    const tree = JSON.stringify({
-      blockdevices: [
-        {
-          name: "sda",
-          path: "/dev/sda",
-          type: "disk",
-          fstype: null,
-          children: [{
-            name: "md0",
-            path: "/dev/md0",
-            type: "raid1",
-            fstype: null,
-            children: [{
-              name: "dm-0",
-              path: "/dev/dm-0",
-              type: "lvm",
-              fstype: "ext4",
-            }],
-          }],
-        },
-        {
-          name: "sdb",
-          path: "/dev/sdb",
-          type: "disk",
-          fstype: null,
-          children: [{
-            name: "md0",
-            path: "/dev/md0",
-            type: "raid1",
-            fstype: null,
-          }],
-        },
-      ],
-    });
-    const { session, calls } = routedSession((opts) => {
-      if (opts.command === listByIdCommand()) {
-        return { code: 0, stdout: "sdb-SN0001\n", stderr: "" };
-      }
-      if (opts.command.startsWith("readlink -f '/dev/disk/by-id/")) {
-        return { code: 0, stdout: "/dev/sdb\n", stderr: "" };
-      }
-      if (opts.command === lsblkCommand()) {
-        return { code: 0, stdout: tree, stderr: "" };
-      }
-      if (opts.command === "findmnt -rno SOURCE,TARGET") {
-        return { code: 0, stdout: "/dev/mapper/vg-root /\n", stderr: "" };
-      }
-      if (opts.command.startsWith("findmnt --fstab")) {
-        return { code: 1, stdout: "", stderr: "" };
-      }
-      if (opts.command.startsWith("readlink -f '/dev/mapper/vg-root'")) {
-        return { code: 0, stdout: "/dev/dm-0\n", stderr: "" };
-      }
-      return undefined;
-    });
-    await assertRejects(
-      () =>
-        wipeDiskToRaw({ ...deps, session }, {
-          dataDevices: [{ serial: "SN0001" }],
-          excludeDevices: [],
+/** A disk that still carries a filesystem signature, so it is not already raw. */
+const DIRTY_TREE = JSON.stringify({
+  blockdevices: [{
+    name: "nvme0n1",
+    path: "/dev/nvme0n1",
+    mountpoint: null,
+    type: "disk",
+    fstype: "xfs",
+  }],
+});
+
+const ARRAY_UUID = "7a0d6e3f:11112222:33334444:55556666";
+const examineOut = (uuid = ARRAY_UUID) =>
+  done(`/dev/x:\n     Array UUID : ${uuid}\n`);
+
+/** Root on md0, whose members are sda1 and the candidate disk's partition. */
+function rootArrayProbes(): Probes {
+  const md = (children?: unknown[]) =>
+    guardRow("md0", "raid1", { fstype: "ext4", mountpoints: ["/"] }, children);
+  const member = (name: string) =>
+    guardRow(name, "part", {
+      fstype: "linux_raid_member",
+      uuid: ARRAY_UUID.replaceAll(":", "-"),
+    }, [md()]);
+  return {
+    lsblk: guardLsblk(
+      guardRow("sda", "disk", {}, [member("sda1")]),
+      guardRow("nvme0n1", "disk", {}, [member("nvme0n1p1")]),
+    ),
+    findmnt: done(
+      JSON.stringify({
+        filesystems: [{ target: "/", source: "/dev/md0", fstype: "ext4" }],
+      }),
+    ),
+    fstab: done("/dev/md0 / ext4 defaults 0 1\n"),
+    mdstat: done("md0 : active raid1 nvme0n1p1[1] sda1[0]\n"),
+    "examine:/dev/sda1": examineOut(),
+    "examine:/dev/nvme0n1p1": examineOut(),
+  };
+}
+
+async function refusedWith(
+  probes: Probes,
+  phase: string,
+  route: (opts: RunOptions) => CommandResult | undefined = discover,
+): Promise<RunOptions[]> {
+  const { session, calls } = routedSession(route, "192.0.2.10", probes);
+  await assertRejects(
+    () =>
+      wipeDiskToRaw({ ...deps, session }, {
+        dataDevices: [{ serial: "SN0001" }],
+        excludeDevices: [],
+      }),
+    PhaseError,
+    phase,
+  );
+  assertEquals(calls.some((c) => NO_DESTRUCTIVE.test(c.command)), false);
+  assertEquals(
+    calls.some((c) => c.command.startsWith("cp ")),
+    false,
+    "no backup or other host change happened",
+  );
+  return calls;
+}
+
+Deno.test("a disk under the active root array is refused before any mutation", async () => {
+  await refusedWith(rootArrayProbes(), "wipe.boot-protected");
+});
+
+Deno.test("a member of an inactive array named by fstab is refused", async () => {
+  await refusedWith({
+    lsblk: guardLsblk(
+      guardRow("sda", "disk", {}, [
+        guardRow("sda1", "part", { fstype: "ext4", mountpoints: ["/"] }),
+      ]),
+      guardRow("nvme0n1", "disk", {}, [
+        guardRow("nvme0n1p1", "part", {
+          fstype: "linux_raid_member",
+          uuid: ARRAY_UUID.replaceAll(":", "-"),
         }),
-      PhaseError,
-      "boot-protected",
-    );
-    assertEquals(calls.some((c) => NO_DESTRUCTIVE.test(c.command)), false);
-  },
-);
+      ]),
+    ),
+    fstab: done(
+      "/dev/sda1 / ext4 defaults 0 1\n/dev/md0 /data ext4 nofail 0 2\n",
+    ),
+    mdstat: done("md0 : inactive nvme0n1p1[1](S)\n"),
+    "examine:/dev/nvme0n1p1": examineOut(),
+  }, "wipe.boot-protected");
+});
+
+Deno.test("a dropped-out member of the root array is refused by array UUID", async () => {
+  const probes = rootArrayProbes();
+  // The candidate's partition is no longer in mdstat or under md0.
+  probes.mdstat = done("md0 : active raid1 sda1[0]\n");
+  probes.lsblk = guardLsblk(
+    guardRow("sda", "disk", {}, [
+      guardRow("sda1", "part", {
+        fstype: "linux_raid_member",
+        uuid: ARRAY_UUID.replaceAll(":", "-"),
+      }, [guardRow("md0", "raid1", { fstype: "ext4", mountpoints: ["/"] })]),
+    ]),
+    guardRow("nvme0n1", "disk", {}, [
+      guardRow("nvme0n1p1", "part", { fstype: "linux_raid_member" }),
+    ]),
+  );
+  await refusedWith(probes, "wipe.boot-protected");
+});
+
+Deno.test("a PV of the root volume group is refused", async () => {
+  await refusedWith({
+    lsblk: guardLsblk(
+      guardRow("sda", "disk", {}, [
+        guardRow("sda1", "part", { fstype: "LVM2_member" }, [
+          guardRow("vg0-root", "lvm", { fstype: "ext4", mountpoints: ["/"] }),
+        ]),
+      ]),
+      guardRow("nvme0n1", "disk", { fstype: "LVM2_member" }),
+    ),
+    findmnt: done(
+      JSON.stringify({
+        filesystems: [{
+          target: "/",
+          source: "/dev/mapper/vg0-root",
+          fstype: "ext4",
+        }],
+      }),
+    ),
+    fstab: done("/dev/mapper/vg0-root / ext4 defaults 0 1\n"),
+    links: done("/dev/mapper/vg0-root /dev/dm-0\n"),
+    pvs: done("  /dev/sda1  vg0\n  /dev/nvme0n1  vg0\n"),
+  }, "wipe.boot-protected");
+});
+
+Deno.test("a ZFS root pool vdev reached through by-id is refused", async () => {
+  await refusedWith({
+    lsblk: guardLsblk(
+      guardRow("nvme0n1", "disk", {}, [
+        guardRow("nvme0n1p3", "part", { fstype: "zfs_member", label: "rpool" }),
+      ]),
+    ),
+    findmnt: done(
+      JSON.stringify({
+        filesystems: [{
+          target: "/",
+          source: "rpool/ROOT/debian",
+          fstype: "zfs",
+        }],
+      }),
+    ),
+    fstab: done(""),
+    links: done("/dev/disk/by-id/nvme-EXAMPLE-part3 /dev/nvme0n1p3\n"),
+    zpool: done(
+      "  pool: rpool\nconfig:\n\n\tNAME  STATE\n\trpool  ONLINE\n\t  /dev/disk/by-id/nvme-EXAMPLE-part3  ONLINE\n\nerrors: none\n",
+    ),
+  }, "wipe.boot-protected");
+});
+
+Deno.test("every probe failure refuses as boot-unverifiable before any mutation", async () => {
+  const failures: [string, Probes][] = [
+    ["findmnt", { findmnt: done("", 1, "findmnt: failed") }],
+    ["lsblk", { lsblk: done("", 1) }],
+    ["fstab", { fstab: done("", 1, "cat: Input/output error") }],
+    ["swaps", { swaps: done("", 1, "cat: Input/output error") }],
+    ["links", { links: done("", 1) }],
+  ];
+  for (const [name, probes] of failures) {
+    await refusedWith(probes, "wipe.boot-unverifiable");
+    void name;
+  }
+  // mdadm and zpool errors matter when they guard something protected.
+  const raid = rootArrayProbes();
+  raid["examine:/dev/sda1"] = done("mdadm: error", 2);
+  await refusedWith(raid, "wipe.boot-unverifiable");
+  await refusedWith({
+    lsblk: guardLsblk(guardRow("nvme0n1", "disk")),
+    findmnt: done(
+      JSON.stringify({
+        filesystems: [{ target: "/", source: "rpool/ROOT/x", fstype: "zfs" }],
+      }),
+    ),
+    fstab: done(""),
+    zpool: done("", 1, "zpool: cannot open"),
+  }, "wipe.boot-unverifiable");
+});
+
+Deno.test("sudo is used for the probes that need root", async () => {
+  const { session, calls } = routedSession(discover, "192.0.2.10", {});
+  await wipeDiskToRaw({ ...deps, session }, {
+    dataDevices: [{ serial: "SN0001" }],
+    excludeDevices: [],
+    dryRun: true,
+  });
+  for (
+    const cmd of [LSBLK_COMMAND, BLKID_COMMAND, ZPOOL_COMMAND, PVS_COMMAND]
+  ) {
+    assertEquals(calls.find((c) => c.command === cmd)?.sudo, true, cmd);
+  }
+});
+
+Deno.test("the set is re-read and re-judged before the first change, and only grows", async () => {
+  let reads = 0;
+  let lsblkReads = 0;
+  const probes: Probes = {
+    fstab: done(""),
+    findmnt: () => {
+      reads++;
+      // The second read finds the candidate's own partition mounted as root.
+      return reads === 1 ? HEALTHY.findmnt as CommandResult : done(
+        JSON.stringify({
+          filesystems: [{
+            target: "/",
+            source: "/dev/nvme0n1p1",
+            fstype: "ext4",
+          }],
+        }),
+      );
+    },
+    lsblk: () =>
+      ++lsblkReads <= 1 ? HEALTHY.lsblk as CommandResult : guardLsblk(
+        guardRow("sda", "disk"),
+        guardRow("nvme0n1", "disk", {}, [
+          guardRow("nvme0n1p1", "part", { fstype: "ext4", mountpoints: ["/"] }),
+        ]),
+      ),
+  };
+  await refusedWith(
+    probes,
+    "wipe.boot-protected",
+    (o) => discover(o, DIRTY_TREE),
+  );
+  assertEquals(reads, 2);
+});
+
+Deno.test("a healthy host passes both reads and the wipe proceeds", async () => {
+  const { session, calls } = routedSession((opts) => {
+    const base = discover(opts, DIRTY_TREE);
+    if (base) return base;
+    if (opts.command === "test -e /etc/mdadm/mdadm.conf") return done("", 1);
+    if (opts.command.startsWith("mdadm --detail --scan")) return done("");
+    if (opts.command === "cat /etc/fstab") {
+      return done("/dev/sda1 / ext4 defaults 0 1\n");
+    }
+    if (
+      /^(mdadm --zero-superblock|wipefs -a|sgdisk|partprobe)/.test(opts.command)
+    ) {
+      return done("");
+    }
+    return undefined;
+  });
+  const record = await wipeDiskToRaw({ ...deps, session }, {
+    dataDevices: [{ serial: "SN0001" }],
+    excludeDevices: [],
+  });
+  assertEquals(record.dryRun, false);
+  // Two reads of the root mount table: the gate and the re-validation.
+  assertEquals(calls.filter((c) => c.command === FINDMNT_COMMAND).length, 2);
+});
+
+Deno.test("a udev-less host (empty lsblk type columns, no blkid) refuses before any mutation", async () => {
+  await refusedWith({
+    lsblk: guardLsblk(
+      guardRow("sda", "disk", {}, [
+        guardRow("sda1", "part", { mountpoints: ["/"] }),
+      ]),
+      guardRow("nvme0n1", "disk"),
+    ),
+    blkid: done("", 127),
+  }, "wipe.boot-unverifiable");
+});
+
+Deno.test("mdadm's not-a-member answer is read from stderr", async () => {
+  // The default NO_SUPERBLOCK fixture puts the text on stderr like real mdadm;
+  // a host where only stdout carries it would be refused as unverifiable.
+  await refusedWith({
+    "examine:/dev/nvme0n1": done(
+      "",
+      1,
+      "mdadm: cannot open /dev/nvme0n1: Permission denied\n",
+    ),
+  }, "wipe.boot-unverifiable");
+});
+
+Deno.test("a failed mdadm --examine before --stop refuses and nothing is stopped", async () => {
+  let examines = 0;
+  const probes: Probes = {
+    // Reads 1 and 2 are the two guard passes; read 3 is the belt check.
+    "examine:/dev/nvme0n1": () => {
+      examines++;
+      return examines <= 2 ? NO_SUPERBLOCK : done("", 2, "mdadm: error\n");
+    },
+  };
+  const { session, calls } = routedSession(
+    (opts) => {
+      if (opts.command.startsWith("mdadm --examine --scan")) {
+        return done("ARRAY /dev/md9 metadata=1.2 name=host:9 UUID=abc\n");
+      }
+      if (opts.command === "test -e /etc/mdadm/mdadm.conf") return done("", 1);
+      if (opts.command.startsWith("mdadm --detail --scan")) return done("");
+      if (opts.command === "cat /etc/fstab") return done("");
+      return discover(opts, DIRTY_TREE);
+    },
+    "192.0.2.10",
+    probes,
+  );
+  await assertRejects(
+    () =>
+      wipeDiskToRaw({ ...deps, session }, {
+        dataDevices: [{ serial: "SN0001" }],
+        excludeDevices: [],
+      }),
+    PhaseError,
+    "wipe.boot-unverifiable",
+  );
+  assertEquals(examines, 3);
+  assertEquals(calls.some((c) => c.command.startsWith("mdadm --stop")), false);
+});

@@ -20,6 +20,22 @@ import { isSudoRefusal } from "./ssh.ts";
 import { assertMdArrayPath, assertVgName, quote } from "./validate.ts";
 import { type ResolvedDevice, resolveSerial } from "./resolve.ts";
 import type { PrepDeps } from "./hostprep.ts";
+import {
+  assess,
+  BLKID_COMMAND,
+  type CommandProbe,
+  examineTargets,
+  type FileProbe,
+  FINDMNT_COMMAND,
+  LINKS_COMMAND,
+  LSBLK_COMMAND,
+  mdExamineCommand,
+  parseExamineUuid,
+  type ProbeInputs,
+  type ProtectedSet,
+  PVS_COMMAND,
+  ZPOOL_COMMAND,
+} from "./protected_devices.ts";
 
 /** One disk selected by serial. */
 export interface DataDevice {
@@ -226,123 +242,95 @@ export function editMdConfig(
   return joined.endsWith("\n") ? joined : `${joined}\n`;
 }
 
-/** The languages of protection a disk can have. */
-export interface ProtectedSet {
-  /** Canonical device paths that must not be touched. */
-  devices: Set<string>;
-  /** md array paths that back the root or boot filesystem. */
-  arrays: Set<string>;
-}
-
-/** True for a mount target that is the root or part of the boot tree. */
-function isBootTarget(target: string): boolean {
-  return target === "/" || target === "/boot" || target === "/boot/efi" ||
-    target.startsWith("/boot/");
-}
-
-/** Finds a node whose path or kernel name is one of `candidates`. */
-export function findNodeByAny(
-  nodes: LsblkNode[],
-  candidates: Set<string>,
-): LsblkNode | null {
-  for (const node of nodes) {
-    if (
-      (node.path && candidates.has(node.path)) ||
-      (node.name && candidates.has(node.name))
-    ) {
-      return node;
+/**
+ * Reads every probe the protected-device module judges, all as data: a non-zero
+ * exit is returned, never thrown, so the module can refuse on it. A file counts
+ * as absent only when the read says it does not exist.
+ */
+async function collectProbes(
+  session: SshSession,
+  candidates: string[],
+): Promise<ProbeInputs> {
+  const command = async (cmd: string, sudo: boolean): Promise<CommandProbe> => {
+    const r = sudo
+      ? await root(session, cmd, { allowNonZero: true })
+      : await session.run({ command: cmd, allowNonZero: true });
+    return { code: r.code, stdout: r.stdout, stderr: r.stderr };
+  };
+  const readFile = async (path: string): Promise<FileProbe> => {
+    const r = await session.run({
+      command: `cat -- ${quote(path)}`,
+      allowNonZero: true,
+    });
+    if (r.code === 0) return { state: "ok", text: r.stdout };
+    if (r.code === 1 && /No such file or directory/i.test(r.stderr)) {
+      return { state: "absent" };
     }
-    const found = node.children
-      ? findNodeByAny(node.children, candidates)
-      : null;
-    if (found) return found;
+    return { state: "error", detail: `exit ${r.code}` };
+  };
+  // Everything that reads device contents runs as root: unprivileged, lsblk
+  // and blkid come back with empty type and UUID columns on a host without
+  // udev, and the guard must never read that as "unrelated".
+  const lsblk = await command(LSBLK_COMMAND, true);
+  const links = await command(LINKS_COMMAND, false);
+  const blkid = await command(BLKID_COMMAND, true);
+  const mdstat = await readFile("/proc/mdstat");
+  const mdExamine: Record<string, CommandProbe> = {};
+  for (
+    const path of examineTargets(
+      { lsblk, links, blkid, mdstat },
+      candidates,
+    )
+  ) {
+    mdExamine[path] = await command(mdExamineCommand(path), true);
   }
-  return null;
+  return {
+    lsblk,
+    findmnt: await command(FINDMNT_COMMAND, false),
+    fstab: await readFile("/etc/fstab"),
+    swaps: await readFile("/proc/swaps"),
+    mdstat,
+    links,
+    blkid,
+    zpool: await command(ZPOOL_COMMAND, true),
+    pvs: await command(PVS_COMMAND, true),
+    mdExamine,
+  };
 }
 
 /**
- * Builds the protected-device set from the mounted and configured root/boot
- * filesystems. It walks the whole storage dependency graph in both directions
- * from each source, so a root on LVM over md protects the md device and every
- * physical member behind it, and a root on a plain partition protects the
- * whole disk. md devices anywhere in the graph are recorded so an inactive
- * array is still caught by serial membership. Runs before any mutation and is
- * not recomputed from a later tree.
+ * Judges the selected devices against the host's protected set, throwing the
+ * wipe's typed error on any refusal. `previous` is the set already established,
+ * so a re-read can only grow it.
  */
-export async function detectProtectedSet(
+async function guardBootAndRoot(
   session: SshSession,
-  tree: LsblkNode[],
+  devices: string[],
+  serials: Map<string, string>,
+  previous?: ProtectedSet,
 ): Promise<ProtectedSet> {
-  const devices = new Set<string>();
-  const arrays = new Set<string>();
-
-  // Undirected adjacency keyed by path; duplicate md nodes under each member
-  // merge because the key is the path.
-  const adjacency = new Map<string, Set<string>>();
-  const edge = (a: string, b: string): void => {
-    if (!adjacency.has(a)) adjacency.set(a, new Set());
-    if (!adjacency.has(b)) adjacency.set(b, new Set());
-    adjacency.get(a)!.add(b);
-    adjacency.get(b)!.add(a);
+  const result = assess(
+    await collectProbes(session, devices),
+    devices,
+    previous,
+  );
+  if (result.ok) return result.set;
+  const { refusal } = result;
+  const detail = {
+    host: session.target.host,
+    ...refusal.detail,
+    ...(typeof refusal.detail.device === "string" &&
+        serials.has(refusal.detail.device)
+      ? { serial: serials.get(refusal.detail.device) }
+      : {}),
   };
-  const index = (node: LsblkNode): void => {
-    for (const child of node.children ?? []) {
-      if (node.path && child.path) edge(node.path, child.path);
-      index(child);
-    }
-  };
-  for (const node of tree) index(node);
-
-  const protectComponent = (seed: string): void => {
-    const queue = [seed];
-    const seen = new Set([seed]);
-    while (queue.length > 0) {
-      const path = queue.shift()!;
-      devices.add(path);
-      if (path.startsWith("/dev/md")) arrays.add(path);
-      for (const neighbour of adjacency.get(path) ?? []) {
-        if (!seen.has(neighbour)) {
-          seen.add(neighbour);
-          queue.push(neighbour);
-        }
-      }
-    }
-  };
-
-  const addSource = async (source: string): Promise<void> => {
-    if (!source.startsWith("/dev/")) return;
-    const resolved = (
-      await session.run({
-        command: `readlink -f ${quote(source)}`,
-        allowNonZero: true,
-      })
-    ).stdout.trim();
-    const device = resolved || source;
-    const candidates = new Set(
-      [
-        source,
-        device,
-        source.split("/").at(-1) ?? "",
-        device.split("/").at(-1) ?? "",
-      ]
-        .filter((c) => c !== ""),
-    );
-    const node = findNodeByAny(tree, candidates);
-    protectComponent(node?.path ?? device);
-  };
-
-  const readMounts = async (command: string): Promise<void> => {
-    const r = await session.run({ command, allowNonZero: true });
-    for (const line of r.stdout.split("\n")) {
-      const [source, target] = line.trim().split(/\s+/);
-      if (!source || !target) continue;
-      if (isBootTarget(target)) await addSource(source);
-    }
-  };
-  // Actual mounts, then the configured ones (which catch an inactive array).
-  await readMounts("findmnt -rno SOURCE,TARGET");
-  await readMounts("findmnt --fstab -rno SOURCE,TARGET --evaluate");
-  return { devices, arrays };
+  fail(
+    refusal.code === "protected"
+      ? "wipe.boot-protected"
+      : "wipe.boot-unverifiable",
+    refusal.message,
+    detail,
+  );
 }
 
 /** A full wipe run's dependencies. */
@@ -396,6 +384,45 @@ async function examineArray(
     allowNonZero: true,
   });
   return firstArrayPath(r.stdout);
+}
+
+/**
+ * Refuses to stop an array that backs the system. Compared by array UUID, not
+ * by name: `mdadm --examine --scan` prints `/dev/md/<name>` where lsblk shows
+ * `/dev/mdN`.
+ */
+async function assertArrayNotProtected(
+  session: SshSession,
+  protectedSet: ProtectedSet,
+  device: string,
+  arrayPath: string,
+  what: string,
+): Promise<void> {
+  const host = session.target.host;
+  if (protectedSet.devices[arrayPath] !== undefined) {
+    fail("wipe.boot-protected", what, { host, array: arrayPath });
+  }
+  const r = await root(session, mdExamineCommand(device), {
+    allowNonZero: true,
+  });
+  if (r.code !== 0) {
+    fail(
+      "wipe.boot-unverifiable",
+      "the array about to be stopped could not be examined",
+      { host, array: arrayPath, exit: r.code },
+    );
+  }
+  const uuid = parseExamineUuid(r.stdout);
+  if (!uuid) {
+    fail(
+      "wipe.boot-unverifiable",
+      "the array about to be stopped cannot be identified",
+      { host, array: arrayPath },
+    );
+  }
+  if (protectedSet.arrayUuids.includes(uuid)) {
+    fail("wipe.boot-protected", what, { host, array: arrayPath });
+  }
 }
 
 /** A read-only poll of `/proc/mdstat` until an array's line disappears. */
@@ -527,36 +554,22 @@ export async function wipeDiskToRaw(
     }
   }
 
-  // Gate 3b: never eat the boot or root array, even when it is unmounted and
-  // inactive. Built once, before anything destructive.
-  const protectedSet = await detectProtectedSet(session, tree);
+  // Gate 3b: never touch anything that backs the root or boot filesystems,
+  // fstab, swap or an md/LVM/ZFS stack under them, even when it is unmounted,
+  // inactive or degraded. Built once, before anything destructive, and failing
+  // closed on any probe problem.
+  const serialOf = new Map<string, string>();
   for (const d of args.dataDevices) {
-    const device = resolved.get(d.serial)!;
-    if (protectedSet.devices.has(device.device)) {
-      fail(
-        "wipe.boot-protected",
-        "the disk backs the root or boot filesystem",
-        {
-          host,
-          serial: d.serial,
-          device: device.device,
-        },
-      );
-    }
-    const array = await examineArray(session, device.device);
-    if (array !== null && protectedSet.arrays.has(array)) {
-      fail(
-        "wipe.boot-protected",
-        "the disk is a member of an array that backs root or boot",
-        {
-          host,
-          serial: d.serial,
-          device: device.device,
-          array,
-        },
-      );
-    }
+    serialOf.set(resolved.get(d.serial)!.device, d.serial);
   }
+  const candidatePaths = args.dataDevices.map((d) =>
+    resolved.get(d.serial)!.device
+  );
+  let protectedSet = await guardBootAndRoot(
+    session,
+    candidatePaths,
+    serialOf,
+  );
 
   // Gate 4: a data device aliasing an excluded disk.
   for (const d of args.dataDevices) {
@@ -625,6 +638,15 @@ export async function wipeDiskToRaw(
       initramfsRebuilt: false,
     };
   }
+
+  // Re-read and re-judge immediately before the first command that changes the host;
+  // the set can only grow.
+  protectedSet = await guardBootAndRoot(
+    session,
+    candidatePaths,
+    serialOf,
+    protectedSet,
+  );
 
   // Step 0: recovery capture and one stable, idempotent backup.
   log?.info("wipe phase recovery-capture", { host });
@@ -734,6 +756,13 @@ export async function wipeDiskToRaw(
     const arrayPath = await examineArray(session, device.device);
     if (!arrayPath || stoppedArrays.includes(arrayPath)) continue;
     assertMdArrayPath("array", arrayPath);
+    await assertArrayNotProtected(
+      session,
+      protectedSet,
+      device.device,
+      arrayPath,
+      "an array about to be stopped backs the root or boot filesystem",
+    );
     await root(session, `mdadm --stop -- ${quote(arrayPath)}`, {
       allowNonZero: true,
     });
@@ -799,6 +828,13 @@ export async function wipeDiskToRaw(
       const rebuilt = await examineArray(session, device.device);
       if (rebuilt) {
         assertMdArrayPath("array", rebuilt);
+        await assertArrayNotProtected(
+          session,
+          protectedSet,
+          device.device,
+          rebuilt,
+          "an array about to be re-stopped backs the root or boot filesystem",
+        );
         await root(session, `mdadm --stop -- ${quote(rebuilt)}`, {
           allowNonZero: true,
         });

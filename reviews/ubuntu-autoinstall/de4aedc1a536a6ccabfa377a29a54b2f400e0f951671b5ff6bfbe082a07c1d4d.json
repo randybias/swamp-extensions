@@ -1,0 +1,90 @@
+{
+  "extension": "@randybias/ubuntu-autoinstall",
+  "version": "2026.10.17.1",
+  "reviewedAt": "2026-10-17T18:10:00Z",
+  "dimensions": [
+    {
+      "id": "credentials-secrets",
+      "verdict": "pass",
+      "note": "identity.password_hash is a sensitive vault reference that must be a real crypt(3) hash ($1$, $2a/b/y$, $5$, $6$ with optional rounds=, $y$); a plaintext is refused at the schema (live 6, 6b). A plaintext password, chpasswd, plain_text_passwd or *_private SSH key anywhere in first_boot_user_data is refused by the secret walk. A LUKS passphrase is refused (autoinstall serves it in plaintext). render returns only hashes and the command line; the seed bytes go to the seed_files resource whose fields are sensitive (live: stored in the vault, 0 hash occurrences in console or results). SSH uses the canonical ssh.ts (blob fe0139f0) with the key as a vault reference; strict host keys only, no insecure_tofu."
+    },
+    {
+      "id": "logging-quality",
+      "verdict": "pass",
+      "note": "publish_http, unpublish, get and sync each log the host and outcome once; no seed content, hash or key in log fields."
+    },
+    {
+      "id": "error-handling",
+      "verdict": "pass",
+      "note": "Typed AutoinstallError codes (invalid_input, validation, transport, layout, not_found, conflict). Remote existence uses stat and its stderr, so a permission error is a transport failure rather than absence (publish_test.ts). Residual LOW: absence is detected from English stderr, so a non-C remote locale fails closed as transport."
+    },
+    {
+      "id": "testing-completeness",
+      "verdict": "pass",
+      "note": "104 offline tests (2 gated: the ubuntu:24.04 container test running cloud-init schema and netplan generate, and the dev-only subiquity cross-check, both green manually): byte goldens per storage profile x network through the full validation pipeline, a YAML 1.1 trap corpus, crypt-format near-misses, seed URL injection, unpublish A/B cross-delete, unique resource names per run, transport failure leaves no state. Live on <bm1>: 11/11 on 61147ba, including a real unattended install of the sha-verified 24.04.5 live-server ISO in a KVM guest (lvm profile), reboot and SSH verification. CIDATA path not live-tested."
+    },
+    {
+      "id": "idempotency-resilience",
+      "verdict": "pass",
+      "note": "publish_http checks every bundle file and the ref and is a no-op when they match; ref convergence counts as a change. unpublish removes the ref before the bundle and is a clean no-op when absent (live 5b). Residual MEDIUM: unpublish without a ref treats a bundle with no meta-data as absent."
+    },
+    {
+      "id": "api-contracts",
+      "verdict": "pass",
+      "note": "Subiquity autoinstall v1 (structural checks written from the public reference; the AGPL-3.0 subiquity schema is not shipped, only fetched by a dev test), cloud-init 26.1 cloud-config schema vendored (Apache-2.0/GPL-3.0) and compiled with pinned ajv/ajv-draft-04/ajv-formats, netplan v2 subset, curtin storage. NoCloud seed (user-data, meta-data, vendor-data) in artifact-server's bundles/refs/SHA256SUMS layout; .layout-version mismatch refused."
+    },
+    {
+      "id": "resource-management",
+      "verdict": "pass",
+      "note": "One ssh call per remote step through the canonical transport; uploads go on stdin; no temp files left locally. first_boot_user_data is bounded to 64 KiB."
+    },
+    {
+      "id": "published-surface-hygiene",
+      "verdict": "pass",
+      "note": "Manifest @randybias/ubuntu-autoinstall 2026.10.17.1, one model type, Apache-2.0, additionalFiles README.md and LICENSE.txt (LOGBOOK not packaged); LICENSE.txt records the vendored cloud-init schema source and license. Leak scan, gitleaks and fixture guard pass; fixtures use RFC 5737 addresses; LOGBOOK receipts redact the host as <bm1>. Main carries one squash commit; the lane history with the AGPL file is not merged or pushed."
+    },
+    {
+      "id": "schema-strictness",
+      "verdict": "pass",
+      "note": "Every argument is a strictObject with grammars: hostname, user name, crypt hash, OpenSSH key (type allowlist, RSA >= 3072), device and mount paths, curtin ids, package names, a bounded netplan subset, printable argv late-commands (a shell string only with late_commands_shell_ack), a seed URL allowlist ending in '/', strict-only host keys. The rendered user-data is re-parsed with a YAML 1.1 loader and deep-compared (parser-differential guard); #cloud-config is required and a jinja header refused."
+    },
+    {
+      "id": "lifetime-gc",
+      "verdict": "pass",
+      "note": "render 30d/10, seed_files 30d/5, seed infinite/10."
+    },
+    {
+      "id": "crud-completeness",
+      "verdict": "pass",
+      "note": "render, validate and cmdline are pure; publish_http and unpublish are actions; get and sync observe and persist the seed resource. No method tombstones the definition."
+    },
+    {
+      "id": "preflight-checks",
+      "verdict": "pass",
+      "note": "Arguments and the rendered seed are fully validated before any SSH; the layout marker is checked before writing; unpublish refuses a tree_sha256 that differs from the ref and, with no ref, deletes only a bundle whose meta-data records the same hostname."
+    },
+    {
+      "id": "instance-names",
+      "verdict": "pass",
+      "note": "render writes <hostname>-<tree12>-render and -files (distinct per kind; found live); seed is keyed by hostname, a RFC 1123 label, so no '/', '..' or NUL can occur."
+    },
+    {
+      "id": "data-access",
+      "verdict": "pass",
+      "note": "Inputs arrive as method arguments; the model reads only the remote seed root it manages."
+    },
+    {
+      "id": "version-upgrades",
+      "verdict": "pass",
+      "note": "First publish: no prior stored attributes, so no upgrade entries are needed."
+    }
+  ],
+  "panel": {
+    "codex-astra": "conformance seat, rounds r1 (113270c), r2 (6410b5b), r3 (e13edd7): r1 3 High and r2 1 High fixed; r3 CLEAN after triage (its root secret-walk High refuted: validateUserDataObject refuses every top-level key but autoinstall). Its missing-meta-data MEDIUM is a LOGBOOK residual.",
+    "codex-terra": "adversarial seat, same rounds: r3 CLEAN after triage; its seed_files High refuted (the resource is sensitive and vault-backed by design, for the CIDATA workflow); its stat-probe and size-bound MEDIUMs were fixed in fc6e664.",
+    "tightness-astra": "r3 COULD-BE-TIGHTER (~265 lines): the goldens dedup was done in fc6e664; the duplicated unpublish test arguments are LOW and left. Merge-prep quality pass removed a redundant check in isCryptHash.",
+    "merge-prep": "Self-review of e13edd7..61147ba (fc6e664 polish, 61147ba live fixes) against TRIAGE 4b-4h: no Critical/High. ssh.ts is the canonical blob fe0139f0. No hash on argv (4h); strict-only host keys (4g); render validated after YAML 1.1 re-parse (4c). Squash-merged as one commit; AGPL schema unreachable from main.",
+    "live-e2e": "<bm1>, KVM guest via virt-install kernel/initrd boot, seed through publish_http: 11/11 on 61147ba with no patches, bundled in a fresh repo without the lock. An earlier patched pass on fc6e664 found the two live fixes. CIDATA not live-tested.",
+    "ocr-llm": "advisory adversarial-glm seat timed out in round 3; not blocking"
+  }
+}

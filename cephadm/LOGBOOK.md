@@ -586,3 +586,103 @@ scripted SSH and fetch, no socket) cover every path offline.
   `.meta({ sensitive: true })` sits on each field's own line (the quality
   scanner is line-based); the RGW user record's `accessKey` is now
   sensitive-marked beside `key`. No other behaviour change; 486 tests pass.
+
+## 2026-10-17 live e2e: wipe guard (2026.10.17.2 candidate)
+
+Scope: `wipeDiskToRaw` only, on one bare-metal host `<bm1>` (Ubuntu 24.04),
+strict host-key pins, SSH key by vault reference, extension installed from a git
+archive of the head named in each table. Substitutions, stated plainly:
+
+- The test disks were RAM-backed `scsi_debug` disks (`sdc` serial 16000, `sdd`
+  serial 18000, 64 MB each, created with `modprobe scsi_debug` for this test;
+  sector 0 written with `dd` per cell). The host's only two real disks both hold
+  the root md RAID1 and BIOS-boot partitions, so no real data disk was free.
+- The OS disks were exercised with `dryRun: true` only (the gates run in full;
+  nothing destructive can happen).
+- The workflow catalog was exercised only in scratch repos against a fake
+  cluster (approval gate reached and rejected; re-gate and failed-gate paths),
+  never against a real Ceph cluster.
+- Every cluster cell is still `blocked`: a cephadm cluster needs three or more
+  hosts with free whole disks (see the 2026.10.17.1 blocked table above; it
+  stands unchanged apart from `wipeDiskToRaw`).
+
+Receipt = first 16 hex of the sha256 of the console output with timestamps
+stripped. Host addresses and OS-disk serials are redacted.
+
+Run 1, lane/cephadm-int a05a5b8 (guard r9): 5/6 pass plus one finding.
+
+| Cell                                                        | Result                | Receipt          |
+| ----------------------------------------------------------- | --------------------- | ---------------- |
+| 1 root disk `sda` (dryRun) refused (`wipe.in-use`, `/`)     | PASS                  | 003241134519ffa1 |
+| 5 other OS disk `sdb` (md member + BIOS boot, dryRun)       | PASS                  | e0272a6b13c47308 |
+| 2a data disk, zeroed sector 0, dryRun: plan only, untouched | PASS                  | ad1ce83ea8023fe4 |
+| 2b data disk, zeroed sector 0 + ext4: wiped                 | PASS                  | 64de9c88d82cd167 |
+| 3a GRUB-style sector 0 (55aa + code): `wipe.boot-partition` | PASS                  | c610919c58b89c6e |
+| 3b same disk, ack for its own serial: wiped                 | FINDING: reported raw | cdedd0045796592f |
+| 4 ack for disk 18000 does not cover disk 16000              | PASS                  | 229364a6ba4bdb84 |
+
+Finding 3b: with the ack, the run returned `alreadyRaw: true` and wrote nothing;
+sector 0 still held 55aa and wipefs still listed a dos signature, so a
+partitionless disk with boot code was reported raw. Fixed in ecce7c6
+(`alreadyRaw` now requires a zero sector 0 with no table signature and an empty
+wipefs, and the wipe zeroes sector 0 after `sgdisk --zap-all`).
+
+Run 2, lane/cephadm-int b2b99c6 (guard r9 + ecce7c6), with
+`scsi_debug per_host_store=1` so the two disks are independent (an earlier pass
+on a shared backing store was discarded): 7/7 pass.
+
+| Cell                                                       | Result | Receipt          |
+| ---------------------------------------------------------- | ------ | ---------------- |
+| 1 root disk `sda` (dryRun) refused (`wipe.in-use`, `/`)    | PASS   | 003241134519ffa1 |
+| 5 other OS disk `sdb` (md member + BIOS boot, dryRun)      | PASS   | e0272a6b13c47308 |
+| 2 zeroed raw disk: `alreadyRaw: true`, nothing written     | PASS   | 622a149ca68bebce |
+| 2b zeroed sector 0 + ext4: wiped, blkid and wipefs empty   | PASS   | a3647382fecb395d |
+| 3a GRUB-style sector 0: `wipe.boot-partition`, untouched   | PASS   | c610919c58b89c6e |
+| 3b same disk, ack for its own serial: wiped, sector 0 zero | PASS   | f791dd9ede22db60 |
+| 4 ack for disk 18000 does not cover disk 16000, untouched  | PASS   | 229364a6ba4bdb84 |
+
+The guard and wipe code at this release are those of b2b99c6
+(`_lib/protected_devices.ts` blob 62743884, `_lib/wipe.ts` identical); the
+catalog fixes after it (a59e5b3, 64cfc1f, c3b928e) do not touch either file.
+
+## Review ledger: 2026.10.17.2 merge prep
+
+- Guard round 9 (8729580) signed off: no Critical/High; 35/35 reviewer probes;
+  both seats rc=0.
+- Wipe ecce7c6 CLEAN. Refuted HIGH (terra) "`dd bs=512 count=1` fails with
+  EINVAL on a 4Kn disk after wipefs/sgdisk": the write is buffered (no
+  `oflag=direct`), so the kernel does the read-modify-write of the logical
+  sector; EINVAL applies only to O_DIRECT.
+- Catalog A chosen over B (catalog compare); catalog fixes a59e5b3 and round 2
+  64cfc1f CLEAN after c3b928e (cephDeleteFs requires a non-negative integer
+  client count; the seats' only High on 64cfc1f).
+- Known residuals (none block beta):
+  - MEDIUM: on an EFI host where `efibootmgr` is missing or fails, a
+    non-ESP-typed, unmounted EFI boot partition is not protected by the guard.
+  - MEDIUM (convergence debt): cephadm keeps its own SSH helper (`_lib/ssh.ts`,
+    ControlMaster multiplexing) instead of the canonical ssh-host transport.
+    Related: the per-key nonce map keeps every distinct inline private key in
+    memory for the life of the process (terra).
+  - MEDIUM (platform, swamp lab 3583): `workflow resume --input` can reuse gate
+    results or skip them. Mitigated by a post-approval re-gate in every
+    destructive workflow plus in-method preconditions in every destructive
+    method (guard, health, in-use, ok-to-stop, fsid checks).
+  - MEDIUM (test tightness, terra/astra): catalog_test checks that the direct
+    edges to approval and gate asserts exist but not that each is
+    `succeeded`-only, and does not tie each post-approval re-gate to the
+    pre-gate it repeats; gates are collected per job, not per approval phase.
+  - LOW L-9a: the guard tests do not pin "a LUN-serial ack does not lift
+    multipath boot code" or md/LVM/crypt over whole disks (mutants R8, R9
+    survive the lane suite; caught by reviewer probes).
+  - LOW L-9b: a dm device on a partition of a disk with boot code is refused and
+    cannot be acknowledged (over-refusal, fail-closed).
+  - LOW: `subtree()` is recomputed per boot disk in `protected_devices.ts`.
+  - LOW (r8 carry-overs): BootOrder spacing, the sudo-refusal message, a
+    zero-calls assertion, L-7a (a multipath LUN with boot code cannot be acked).
+  - LOW: the wipe dry-run test's no-write matcher omits the new sector-0 `dd`.
+  - LOW: the joint ok-to-stop rejection test would also pass with a check of
+    only one OSD.
+  - LOW: `minItems: 1` is missing on the dataDevices, excludeDevices and hosts
+    workflow inputs.
+  - LOW (from 2026.10.17.1): probe-cleanup fallback on a versioned bucket,
+    `stackOf` duplication, `cephadmUrl` accepts http.

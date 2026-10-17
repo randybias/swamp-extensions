@@ -1,6 +1,6 @@
 manifestVersion: 1
 name: "@randybias/cephadm"
-version: "2026.10.17.1"
+version: "2026.10.17.2"
 description: "Install and operate a standalone Ceph cluster managed by cephadm on Debian-family Linux hosts reached over SSH. One model type drives host preparation, disk wiping, bootstrap, daemon placement, pools, CephFS, RGW users and buckets, maintenance and teardown."
 license: Apache-2.0
 repository: https://github.com/randybias/swamp-extensions

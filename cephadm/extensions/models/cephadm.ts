@@ -128,7 +128,7 @@ import { fail, TransportError } from "./_lib/errors.ts";
 import { wipeDiskToRaw, type WipeRecord } from "./_lib/wipe.ts";
 
 /** Model type version; must equal the manifest version. */
-export const VERSION = "2026.10.17.1";
+export const VERSION = "2026.10.17.2";
 
 /**
  * The S3-plane methods: they open no SSH session, so they are excluded from
@@ -3284,13 +3284,19 @@ export function createCephadmModel(overrides: Partial<CephadmDeps> = {}) {
   return {
     type: "@randybias/cephadm",
     // The consistency gate requires this literal; VERSION mirrors it.
-    version: "2026.10.17.1",
+    version: "2026.10.17.2",
     description:
       "Install and operate a standalone Ceph cluster managed by cephadm on Debian-family hosts reached over SSH. One model type serves any number of hosts and clusters; every method takes its own target.",
     upgrades: [
       {
-        toVersion: VERSION,
+        toVersion: "2026.10.17.1",
         description: "First published version; no schema changes",
+        upgradeAttributes: (old: Record<string, unknown>) => old,
+      },
+      {
+        toVersion: VERSION,
+        description:
+          "Workflow catalog safety fixes and wipe-guard fixes; no schema changes",
         upgradeAttributes: (old: Record<string, unknown>) => old,
       },
     ],
@@ -3544,7 +3550,7 @@ export function createCephadmModel(overrides: Partial<CephadmDeps> = {}) {
 export const model = {
   ...createCephadmModel(),
   type: "@randybias/cephadm",
-  version: "2026.10.17.1",
+  version: "2026.10.17.2",
 } satisfies ReturnType<typeof createCephadmModel>;
 
 /** Outcome of the package-source check. */

@@ -2,9 +2,11 @@ import { assertEquals, assertRejects } from "jsr:@std/assert@1.0.19";
 import { PhaseError, TransportError } from "./errors.ts";
 import type { CommandResult, SshSession } from "./ssh.ts";
 import {
+  capacityReport,
   crushFailureDomain,
   nooutPredicate,
   persistVerdict,
+  poolTypeOf,
   selectCrushRule,
   settle,
   verifyCsiUsers,
@@ -14,6 +16,8 @@ import {
   verifyHostPrep,
   verifyKeyDistributed,
   verifyMgr,
+  verifyMgrPlacement,
+  verifyMonPlacement,
   verifyMonQuorum,
   verifyOsd,
 } from "./verify.ts";
@@ -716,4 +720,272 @@ Deno.test("key distribution reports present, absent, unreadable and unreachable"
   });
   assertEquals(unreachable.unreachable.length, 1);
   assertEquals(unreachable.outcome.detail.unreachableOn as string[], ["x"]);
+});
+
+Deno.test("pool type mapping is explicit, never guessed", () => {
+  assertEquals(poolTypeOf(1), "replicated");
+  assertEquals(poolTypeOf(3), "erasure");
+  assertEquals(poolTypeOf(2), "unknown");
+  assertEquals(poolTypeOf(undefined), "unknown");
+  assertEquals(poolTypeOf("3"), "unknown");
+});
+
+Deno.test(
+  "capacity joins both reads, computes margins and flags at-risk EC pools", // leak-allow(decision D35)
+  async () => {
+    const df = JSON.stringify({
+      stats: {
+        total_bytes: 100,
+        total_avail_bytes: 50,
+        total_used_bytes: 50,
+        total_used_raw_ratio: 0.5,
+        num_osds: 3,
+      },
+      pools: [
+        {
+          name: "rep",
+          id: 1,
+          stats: {
+            stored: 10,
+            bytes_used: 10,
+            percent_used: 0.1,
+            max_avail: 40,
+            objects: 5,
+          },
+        },
+        {
+          name: "ec",
+          id: 2,
+          stats: {
+            stored: 20,
+            bytes_used: 20,
+            percent_used: 0.2,
+            max_avail: 30,
+            objects: 7,
+          },
+        },
+      ],
+    });
+    const detail = JSON.stringify([
+      {
+        pool_name: "rep",
+        pool: 1,
+        type: 1,
+        size: 3,
+        min_size: 2,
+        pg_num: 32,
+        erasure_code_profile: "",
+      },
+      {
+        pool_name: "ec",
+        pool: 2,
+        type: 3,
+        size: 5,
+        min_size: 4,
+        pg_num: 128,
+        erasure_code_profile: "ec_k3_m2_host",
+      },
+    ]);
+    const s = vSession((body) =>
+      body.includes("osd pool ls detail")
+        ? { code: 0, stdout: detail, stderr: "" }
+        : { code: 0, stdout: df, stderr: "" }
+    );
+    const report = await capacityReport(deps, s);
+    assertEquals(report.poolCount, 2);
+    assertEquals(report.partialCount, 0);
+    const ec = report.pools.find((p) => p.name === "ec")!;
+    assertEquals(ec.poolType, "erasure");
+    assertEquals([
+      ec.size,
+      ec.minSize,
+      ec.minSizeMargin,
+      ec.pgNum,
+      ec.ecProfile,
+    ], [5, 4, 1, 128, "ec_k3_m2_host"]);
+    assertEquals(ec.storedBytes, 20);
+    const rep = report.pools.find((p) => p.name === "rep")!;
+    assertEquals([rep.size, rep.minSize, rep.minSizeMargin, rep.ecProfile], [
+      3,
+      2,
+      1,
+      null,
+    ]);
+    assertEquals(report.atRiskPools, ["ec"]);
+    assertEquals(report.unjudgedPools, []);
+    assertEquals(report.cluster.numOsds, 3);
+  },
+);
+
+Deno.test("capacity marks partial pools and unjudged EC pools", async () => {
+  const df = JSON.stringify({
+    stats: {},
+    pools: [{ name: "extra", id: 9, stats: { stored: 1 } }],
+  });
+  const detail = JSON.stringify([
+    {
+      pool_name: "ec",
+      pool: 2,
+      type: 3,
+      size: 6,
+      pg_num: 64,
+      erasure_code_profile: "ec_k3_m2_host",
+    },
+  ]);
+  const s = vSession((body) =>
+    body.includes("osd pool ls detail")
+      ? { code: 0, stdout: detail, stderr: "" }
+      : { code: 0, stdout: df, stderr: "" }
+  );
+  const report = await capacityReport(deps, s);
+  assertEquals(report.poolCount, 2);
+  assertEquals(report.partialCount, 2);
+  const extra = report.pools.find((p) => p.name === "extra")!;
+  assertEquals(extra.partial, true);
+  assertEquals(extra.size, null);
+  assertEquals(extra.storedBytes, 1);
+  // EC with no min_size -> unjudged, never silently omitted.
+  assertEquals(report.atRiskPools, []);
+  assertEquals(report.unjudgedPools, ["ec"]);
+  assertEquals(report.cluster.totalBytes, null);
+});
+
+Deno.test("capacity throws on a cluster with no pools", async () => {
+  const s = vSession((body) =>
+    body.includes("osd pool ls detail")
+      ? { code: 0, stdout: "[]", stderr: "" }
+      : { code: 0, stdout: '{"stats":{},"pools":[]}', stderr: "" }
+  );
+  await assertRejects(() => capacityReport(deps, s), PhaseError, "no pools");
+});
+
+Deno.test(
+  "mon placement judges quorum, mapping and majority over monmap entries", // leak-allow(decision D42)
+  async () => {
+    const mk = (quorum: string, ps: string, hosts: string) =>
+      vSession((body) => {
+        if (body.includes("quorum_status")) {
+          return { code: 0, stdout: quorum, stderr: "" };
+        }
+        if (body.includes("orch ps")) {
+          return { code: 0, stdout: ps, stderr: "" };
+        }
+        if (body.includes("orch host ls")) {
+          return { code: 0, stdout: hosts, stderr: "" };
+        }
+        return { code: 0, stdout: "[]", stderr: "" };
+      });
+    const quorum =
+      '{"monmap":{"mons":[{"name":"a"},{"name":"b"},{"name":"c"},{"name":"d"},{"name":"e"}]},"quorum_names":["a","b","c","d","e"]}';
+    const ps = JSON.stringify(
+      ["a", "b", "c", "d", "e"].map((h) => ({
+        daemon_type: "mon",
+        daemon_id: h,
+        hostname: h,
+      })),
+    );
+    const hosts = JSON.stringify(
+      ["a", "b", "c", "d", "e"].map((h) => ({ hostname: h, status: "" })),
+    );
+    assertEquals(
+      (await verifyMonPlacement(deps, mk(quorum, ps, hosts), [
+        "a",
+        "b",
+        "c",
+        "d",
+        "e",
+      ])).pass,
+      true,
+    );
+    const shrunk = await verifyMonPlacement(deps, mk(quorum, ps, hosts), [
+      "a",
+      "b",
+    ]);
+    assertEquals(shrunk.pass, false);
+    assertEquals(
+      (shrunk.actual as { majorityKept: boolean }).majorityKept,
+      false,
+    );
+    const unknown = await verifyMonPlacement(deps, mk(quorum, ps, hosts), [
+      "a",
+      "b",
+      "c",
+      "d",
+      "e",
+      "z",
+    ]);
+    assertEquals(unknown.detail.unknownPlacementHosts as string[], ["z"]);
+  },
+);
+
+Deno.test("mon placement fails closed on an unmapped or out-of-quorum mon", async () => {
+  const quorum =
+    '{"monmap":{"mons":[{"name":"mon1"},{"name":"node-a"}]},"quorum_names":["mon1","node-a"]}';
+  const ps = JSON.stringify([{
+    daemon_type: "mon",
+    daemon_id: "mon1",
+    hostname: "node-x",
+  }]);
+  const hosts = JSON.stringify([{ hostname: "node-x", status: "" }, {
+    hostname: "node-a",
+    status: "",
+  }]);
+  const s = vSession((body) =>
+    body.includes("quorum_status")
+      ? { code: 0, stdout: quorum, stderr: "" }
+      : body.includes("orch ps")
+      ? { code: 0, stdout: ps, stderr: "" }
+      : { code: 0, stdout: hosts, stderr: "" }
+  );
+  const verdict = await verifyMonPlacement(deps, s, ["node-x", "node-a"]);
+  assertEquals(verdict.pass, false);
+  assertEquals(verdict.detail.unmappedMons as string[], ["node-a"]);
+});
+
+Deno.test("mgr placement reports a collision with an active MDS", async () => {
+  const mgr = '{"active_name":"mgr1"}';
+  const fs =
+    '{"filesystems":[{"mdsmap":{"fs_name":"cephfs","info":{"0":{"name":"mds1","state":"up:active"},"1":{"name":"mds2","state":"up:standby-replay"}}}}]}';
+  const ps = JSON.stringify([
+    { daemon_type: "mgr", daemon_id: "mgr1", hostname: "node-mgr" },
+    { daemon_type: "mds", daemon_id: "mds1", hostname: "node-mds" },
+    { daemon_type: "mds", daemon_id: "mds2", hostname: "node-standby" },
+  ]);
+  const hosts = JSON.stringify(
+    ["node-mgr", "node-mds", "node-standby"].map((h) => ({
+      hostname: h,
+      status: "",
+    })),
+  );
+  const mk = () =>
+    vSession((body) => {
+      if (body.includes("mgr dump")) {
+        return { code: 0, stdout: mgr, stderr: "" };
+      }
+      if (body.includes("fs dump")) return { code: 0, stdout: fs, stderr: "" };
+      if (body.includes("orch ps")) return { code: 0, stdout: ps, stderr: "" };
+      return { code: 0, stdout: hosts, stderr: "" };
+    });
+  const collision = await verifyMgrPlacement(deps, mk(), ["node-mds"]);
+  assertEquals(collision.pass, false);
+  assertEquals(
+    (collision.actual as { besideActiveMds: string[] }).besideActiveMds,
+    ["node-mds"],
+  );
+  // Naming only the standby-replay host passes; no filesystems passes.
+  assertEquals(
+    (await verifyMgrPlacement(deps, mk(), ["node-standby"])).pass,
+    true,
+  );
+  const none = vSession((body) => {
+    if (body.includes("mgr dump")) {
+      return { code: 0, stdout: '{"active_name":"mgr1"}', stderr: "" };
+    }
+    if (body.includes("fs dump")) {
+      return { code: 0, stdout: '{"filesystems":[]}', stderr: "" };
+    }
+    if (body.includes("orch ps")) return { code: 0, stdout: ps, stderr: "" };
+    return { code: 0, stdout: hosts, stderr: "" };
+  });
+  assertEquals((await verifyMgrPlacement(deps, none, ["node-mgr"])).pass, true);
 });

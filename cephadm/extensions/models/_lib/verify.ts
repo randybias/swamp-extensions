@@ -921,3 +921,443 @@ export async function verifyKeyDistributed(
     unreachable,
   };
 }
+
+// ---------------------------------------------------------------------------
+// cephCapacityReport
+// ---------------------------------------------------------------------------
+
+/** One pool's capacity and durability margin. */
+export interface CapacityPool {
+  /** Pool name. */
+  name: string;
+  /** Pool id. */
+  id: number | null;
+  /** `replicated`, `erasure` or `unknown`. */
+  poolType: string;
+  /** Replica count or k+m. */
+  size: number | null;
+  /** Durability floor. */
+  minSize: number | null;
+  /** size - minSize, or null. */
+  minSizeMargin: number | null;
+  /** Placement groups. */
+  pgNum: number | null;
+  /** EC profile name, or null. */
+  ecProfile: string | null;
+  /** Bytes stored. */
+  storedBytes: number | null;
+  /** Bytes used. */
+  usedBytes: number | null;
+  /** Percent used. */
+  percentUsed: number | null;
+  /** Maximum available bytes. */
+  maxAvailBytes: number | null;
+  /** Object count. */
+  objects: number | null;
+  /** True unless the pool appeared in both reads. */
+  partial: boolean;
+}
+
+/** The capacity report's data. */
+export interface CapacityReport {
+  /** Cluster totals. */
+  cluster: {
+    /** Total bytes. */
+    totalBytes: number | null;
+    /** Available bytes. */
+    availBytes: number | null;
+    /** Used bytes. */
+    usedBytes: number | null;
+    /** Raw used ratio. */
+    rawUsedRatio: number | null;
+    /** OSD count. */
+    numOsds: number | null;
+  };
+  /** Per-pool rows, sorted by name. */
+  pools: CapacityPool[];
+  /** Number of pools. */
+  poolCount: number;
+  /** Pools seen in only one read. */
+  partialCount: number;
+  /** EC pools whose min_size margin is <= 1. */
+  atRiskPools: string[];
+  /** EC pools whose margin could not be judged. */
+  unjudgedPools: string[];
+}
+
+/** A finite number, or null. */
+function num(v: unknown): number | null {
+  return typeof v === "number" && Number.isFinite(v) ? v : null;
+}
+
+/** Maps a Ceph pool type number to a name. */
+export function poolTypeOf(v: unknown): string {
+  if (v === 1) return "replicated";
+  if (v === 3) return "erasure";
+  return "unknown";
+}
+
+/** Builds the capacity report from the two reads. */
+export async function capacityReport(
+  deps: PrepDeps,
+  session: SshSession,
+  log?: Logger,
+): Promise<CapacityReport> {
+  const df = await read(deps, session, "df", "capacity", log) as {
+    stats?: Record<string, unknown>;
+    pools?: { name?: unknown; id?: unknown; stats?: Record<string, unknown> }[];
+  };
+  let detail = await read(deps, session, "osd pool ls detail", "capacity", log);
+  if (!Array.isArray(detail)) detail = [];
+  const detailPools = (detail as Record<string, unknown>[]).filter((p) =>
+    typeof p.pool_name === "string" && p.pool_name !== ""
+  );
+  const dfPools = (Array.isArray(df.pools) ? df.pools : []).filter((p) =>
+    typeof p.name === "string" && p.name !== ""
+  );
+  const names = new Set<string>();
+  for (const p of detailPools) names.add(p.pool_name as string);
+  for (const p of dfPools) names.add(p.name as string);
+  const sorted = [...names].sort();
+
+  const pools: CapacityPool[] = sorted.map((name) => {
+    const d = detailPools.find((p) => p.pool_name === name);
+    const f = dfPools.find((p) => p.name === name);
+    const size = d ? num(d.size) : null;
+    const minSize = d ? num(d.min_size) : null;
+    const ecProfile = d && typeof d.erasure_code_profile === "string" &&
+        d.erasure_code_profile !== ""
+      ? d.erasure_code_profile
+      : null;
+    const stats = f?.stats ?? {};
+    return {
+      name,
+      id: d ? num(d.pool) : (f ? num(f.id) : null),
+      poolType: d ? poolTypeOf(d.type) : "unknown",
+      size,
+      minSize,
+      minSizeMargin: size !== null && minSize !== null ? size - minSize : null,
+      pgNum: d ? num(d.pg_num) : null,
+      ecProfile,
+      storedBytes: num(stats.stored),
+      usedBytes: num(stats.bytes_used),
+      percentUsed: num(stats.percent_used),
+      maxAvailBytes: num(stats.max_avail),
+      objects: num(stats.objects),
+      partial: !(d !== undefined && f !== undefined),
+    };
+  });
+
+  if (pools.length === 0) {
+    fail("capacity", "the cluster reports no pools", { poolCount: 0 });
+  }
+
+  const atRiskPools = pools
+    .filter((p) =>
+      p.poolType === "erasure" && p.minSizeMargin !== null &&
+      p.minSizeMargin <= 1
+    )
+    .map((p) => p.name);
+  const unjudgedPools = pools
+    .filter((p) => p.poolType === "erasure" && p.minSizeMargin === null)
+    .map((p) => p.name);
+  const stats = df.stats ?? {};
+  const report: CapacityReport = {
+    cluster: {
+      totalBytes: num(stats.total_bytes),
+      availBytes: num(stats.total_avail_bytes),
+      usedBytes: num(stats.total_used_bytes),
+      rawUsedRatio: num(stats.total_used_raw_ratio),
+      numOsds: num(stats.num_osds),
+    },
+    pools,
+    poolCount: pools.length,
+    partialCount: pools.filter((p) => p.partial).length,
+    atRiskPools,
+    unjudgedPools,
+  };
+  log?.info("Capacity report: {pools} pools, {osds} OSDs, {atRisk} at risk", {
+    pools: report.poolCount,
+    osds: report.cluster.numOsds ?? "unknown",
+    atRisk: report.atRiskPools.length + report.unjudgedPools.length,
+  });
+  return report;
+}
+
+// ---------------------------------------------------------------------------
+// Placement pre-checks
+// ---------------------------------------------------------------------------
+
+interface OrchPsRow {
+  daemonType: string;
+  daemonId: string;
+  hostname: string;
+}
+
+/** Parses `ceph orch ps` rows. */
+export function parseOrchPs(json: unknown): OrchPsRow[] {
+  if (!Array.isArray(json)) return [];
+  return json.flatMap((raw) => {
+    if (raw === null || typeof raw !== "object") return [];
+    const e = raw as Record<string, unknown>;
+    const daemonType = typeof e.daemon_type === "string" ? e.daemon_type : "";
+    const daemonId = typeof e.daemon_id === "string" ? e.daemon_id : "";
+    const hostname = typeof e.hostname === "string" ? e.hostname : "";
+    return daemonType === "" || daemonId === ""
+      ? []
+      : [{ daemonType, daemonId, hostname }];
+  });
+}
+
+/** Parses `ceph orch host ls` into hostname -> status. */
+export function parseHostStatus(json: unknown): Map<string, string> {
+  const out = new Map<string, string>();
+  if (!Array.isArray(json)) return out;
+  for (const raw of json) {
+    if (raw === null || typeof raw !== "object") continue;
+    const e = raw as Record<string, unknown>;
+    if (typeof e.hostname === "string") {
+      out.set(e.hostname, typeof e.status === "string" ? e.status : "");
+    }
+  }
+  return out;
+}
+
+/** Judges a proposed mon placement against live quorum. */
+export async function verifyMonPlacement(
+  deps: PrepDeps,
+  session: SshSession,
+  placement: string[],
+  log?: Logger,
+): Promise<VerifyOutcome> {
+  const quorum = await read(
+    deps,
+    session,
+    "quorum_status",
+    "mon-placement",
+    log,
+  ) as {
+    monmap?: { mons?: { name?: string }[] };
+    quorum_names?: string[];
+  };
+  const ps = parseOrchPs(
+    await read(deps, session, "orch ps", "mon-placement", log),
+  );
+  const hostStatus = parseHostStatus(
+    await read(deps, session, "orch host ls", "mon-placement", log),
+  );
+  const monNames = (quorum.monmap?.mons ?? []).flatMap((m) =>
+    typeof m.name === "string" ? [m.name] : []
+  );
+  const quorumNames = (quorum.quorum_names ?? []).filter((n): n is string =>
+    typeof n === "string"
+  );
+  const requestSet = new Set(placement);
+  const monRows = ps.filter((r) => r.daemonType === "mon");
+  const hostByName = new Map(monRows.map((r) => [r.daemonId, r.hostname]));
+  const orchOnlyMons = monRows.filter((r) => !monNames.includes(r.daemonId))
+    .map((r) => r.daemonId);
+  const outOfQuorum = monNames.filter((n) => !quorumNames.includes(n));
+  const monHosts = monNames.map((name) => ({
+    name,
+    host: hostByName.get(name) ?? null,
+  }));
+  const unmappedMons = monHosts.filter((m) => m.host === null).map((m) =>
+    m.name
+  );
+  const currentHosts = [
+    ...new Set(monHosts.flatMap((m) => m.host === null ? [] : [m.host])),
+  ];
+  const retainedHosts = placement.filter((h) => currentHosts.includes(h));
+  const removedHosts = currentHosts.filter((h) => !requestSet.has(h));
+  const addedHosts = placement.filter((h) => !currentHosts.includes(h));
+  const retainedMons = monHosts.filter((m) =>
+    m.host !== null && quorumNames.includes(m.name) && requestSet.has(m.host)
+  );
+  const majorityKept = monNames.length > 0 &&
+    2 * retainedMons.length > monNames.length;
+  const unknownPlacementHosts = placement.filter((h) => !hostStatus.has(h));
+  const unavailableAddedHosts = addedHosts.filter((h) =>
+    (hostStatus.get(h) ?? "") !== ""
+  );
+  const reasons: string[] = [];
+  if (monNames.length === 0) reasons.push("the monmap lists no mons");
+  if (outOfQuorum.length > 0) {
+    reasons.push(`mons out of quorum: ${outOfQuorum.join(", ")}`);
+  }
+  if (unmappedMons.length > 0) {
+    reasons.push(`mons with no orch ps row: ${unmappedMons.join(", ")}`);
+  }
+  if (unknownPlacementHosts.length > 0) {
+    reasons.push(
+      `placement hosts unknown to orch host ls: ${
+        unknownPlacementHosts.join(", ")
+      }`,
+    );
+  }
+  if (unavailableAddedHosts.length > 0) {
+    reasons.push(
+      `added hosts not deployable: ${unavailableAddedHosts.join(", ")}`,
+    );
+  }
+  if (!majorityKept && monNames.length > 0) {
+    reasons.push(
+      `the placement keeps ${retainedMons.length} of ${monNames.length} mons, not a strict majority`,
+    );
+  }
+  return {
+    pass: reasons.length === 0,
+    expected: {
+      monmapNonEmpty: true,
+      allInQuorum: true,
+      allMonsMapped: true,
+      hostsKnown: true,
+      addedHostsDeployable: true,
+      majorityKept: true,
+    },
+    actual: {
+      monmapNonEmpty: monNames.length > 0,
+      allInQuorum: outOfQuorum.length === 0,
+      allMonsMapped: unmappedMons.length === 0,
+      hostsKnown: unknownPlacementHosts.length === 0,
+      addedHostsDeployable: unavailableAddedHosts.length === 0,
+      majorityKept,
+      retainedHosts,
+      removedHosts,
+      addedHosts,
+    },
+    detail: {
+      monNames,
+      quorumNames,
+      outOfQuorum,
+      monHosts,
+      unmappedMons,
+      orchOnlyMons,
+      placement,
+      retainedHosts,
+      removedHosts,
+      addedHosts,
+      retainedMons: retainedMons.map((m) => m.name),
+      unknownPlacementHosts,
+      unavailableAddedHosts,
+      majorityKept,
+      monmapEmpty: monNames.length === 0,
+      reasons,
+    },
+  };
+}
+
+/** Judges a proposed mgr placement, reporting a collision with an active MDS. */
+export async function verifyMgrPlacement(
+  deps: PrepDeps,
+  session: SshSession,
+  placement: string[],
+  log?: Logger,
+): Promise<VerifyOutcome> {
+  const mgr = await read(deps, session, "mgr dump", "mgr-placement", log) as {
+    active_name?: unknown;
+  };
+  const fsDump = await read(deps, session, "fs dump", "mgr-placement", log) as {
+    filesystems?: {
+      mdsmap?: { info?: Record<string, { name?: unknown; state?: unknown }> };
+    }[];
+  };
+  const ps = parseOrchPs(
+    await read(deps, session, "orch ps", "mgr-placement", log),
+  );
+  const hostStatus = parseHostStatus(
+    await read(deps, session, "orch host ls", "mgr-placement", log),
+  );
+  const activeName =
+    typeof mgr.active_name === "string" && mgr.active_name !== ""
+      ? mgr.active_name
+      : null;
+  const activeMgrHost = activeName === null
+    ? null
+    : ps.find((r) => r.daemonType === "mgr" && r.daemonId === activeName)
+      ?.hostname ?? null;
+  const mdsHostById = new Map(
+    ps.filter((r) => r.daemonType === "mds").map((
+      r,
+    ) => [r.daemonId, r.hostname]),
+  );
+  const activeMds: { fsName: string; name: string; host: string | null }[] = [];
+  const unmappedMds: string[] = [];
+  const fsWithoutActiveMds: string[] = [];
+  for (const fs of fsDump.filesystems ?? []) {
+    const info = fs.mdsmap?.info ?? {};
+    let found = false;
+    for (const entry of Object.values(info)) {
+      const state = typeof entry.state === "string"
+        ? entry.state.toLowerCase()
+        : "";
+      const name = typeof entry.name === "string" ? entry.name : "";
+      if (state === "up:active") {
+        found = true;
+        const host = mdsHostById.get(name) ?? null;
+        if (host === null) unmappedMds.push(name);
+        activeMds.push({
+          fsName: fsDump.filesystems?.indexOf(fs) === undefined ? "" : "",
+          name,
+          host,
+        });
+      }
+    }
+    if (!found) fsWithoutActiveMds.push("");
+  }
+  const unknownPlacementHosts = placement.filter((h) => !hostStatus.has(h));
+  const besideActiveMds = placement.filter((h) =>
+    activeMds.some((m) => m.host === h)
+  );
+  const reasons: string[] = [];
+  if (activeName === null) reasons.push("no active mgr");
+  if (unknownPlacementHosts.length > 0) {
+    reasons.push(
+      `placement hosts unknown: ${unknownPlacementHosts.join(", ")}`,
+    );
+  }
+  if (unmappedMds.length > 0) {
+    reasons.push(`active MDS with no host: ${unmappedMds.join(", ")}`);
+  }
+  if (besideActiveMds.length > 0) {
+    reasons.push(
+      `placement hosts run an active MDS: ${besideActiveMds.join(", ")}`,
+    );
+  }
+  if (fsWithoutActiveMds.length > 0) {
+    reasons.push(
+      `${fsWithoutActiveMds.length} filesystem(s) with no up:active MDS`,
+    );
+  }
+  return {
+    pass: reasons.length === 0,
+    expected: {
+      activeMgrPresent: true,
+      hostsKnown: true,
+      activeMdsMapped: true,
+      placementClearOfActiveMds: true,
+      everyFsHasActiveMds: true,
+    },
+    actual: {
+      activeMgr: activeName === null
+        ? null
+        : { name: activeName, host: activeMgrHost },
+      unknownPlacementHosts,
+      unmappedMds,
+      besideActiveMds,
+      fsWithoutActiveMds,
+      activeMds,
+    },
+    detail: {
+      activeMgr: activeName === null
+        ? null
+        : { name: activeName, host: activeMgrHost },
+      activeMds,
+      unknownPlacementHosts,
+      unmappedMds,
+      besideActiveMds,
+      fsWithoutActiveMds,
+      reasons,
+    },
+  };
+}

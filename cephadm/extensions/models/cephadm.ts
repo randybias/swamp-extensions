@@ -78,6 +78,7 @@ import {
   removeOsds,
 } from "./_lib/dataplane.ts";
 import {
+  capacityReport,
   persistVerdict,
   verifyCsiUsers,
   verifyDisksRaw,
@@ -86,6 +87,8 @@ import {
   verifyHostPrep,
   verifyKeyDistributed,
   verifyMgr,
+  verifyMgrPlacement,
+  verifyMonPlacement,
   verifyMonQuorum,
   verifyOsd,
 } from "./_lib/verify.ts";
@@ -481,6 +484,13 @@ const VerifyOsdArgs = z.strictObject({
   ),
 });
 
+const VerifyPlacementArgs = z.strictObject({
+  ...VerifyCommon,
+  placement: PLACEMENT_SCHEMA.describe(
+    "Proposed host list to judge; applies nothing.",
+  ),
+});
+
 const VerifyCsiUsersArgs = z.strictObject({
   ...VerifyCommon,
   expectedUserNames: z.array(CEPH_ID_SCHEMA).min(1).max(256).describe(
@@ -539,6 +549,40 @@ const VerifyKeyDistributedArgs = z.strictObject({
     "Hosts the key was distributed to.",
   ),
   cephPubKey: SSH_PUBKEY_SCHEMA.describe("The public key to look for."),
+});
+
+const CapacityPoolSchema = z.strictObject({
+  name: z.string(),
+  id: z.number().nullable(),
+  poolType: z.string(),
+  size: z.number().nullable(),
+  minSize: z.number().nullable(),
+  minSizeMargin: z.number().nullable(),
+  pgNum: z.number().nullable(),
+  ecProfile: z.string().nullable(),
+  storedBytes: z.number().nullable(),
+  usedBytes: z.number().nullable(),
+  percentUsed: z.number().nullable(),
+  maxAvailBytes: z.number().nullable(),
+  objects: z.number().nullable(),
+  partial: z.boolean(),
+});
+
+const CapacityReportSchema = z.strictObject({
+  host: z.string(),
+  cluster: z.strictObject({
+    totalBytes: z.number().nullable(),
+    availBytes: z.number().nullable(),
+    usedBytes: z.number().nullable(),
+    rawUsedRatio: z.number().nullable(),
+    numOsds: z.number().nullable(),
+  }),
+  pools: z.array(CapacityPoolSchema),
+  poolCount: z.number(),
+  partialCount: z.number(),
+  atRiskPools: z.array(z.string()),
+  unjudgedPools: z.array(z.string()),
+  observedAt: z.string(),
 });
 
 const PoolResultSchema = z.strictObject({
@@ -1909,6 +1953,128 @@ export function createCephadmModel(overrides: Partial<CephadmDeps> = {}) {
         return { dataHandles: [handle] };
       },
     },
+
+    cephCapacityReport: {
+      description:
+        "READ-ONLY. Report cluster and per-pool capacity with the durability margin. atRiskPools lists erasure-coded pools whose min_size margin is at most 1; unjudgedPools lists erasure-coded pools whose margin could not be read.",
+      arguments: ReadHostArgs,
+      execute: async (
+        args: z.infer<typeof ReadHostArgs>,
+        context: MethodContext,
+      ) => {
+        const session = await openSession(
+          deps,
+          toTarget({
+            host: args.host,
+            sshUser: args.sshUser,
+            port: args.port,
+            keyPath: args.keyPath,
+            privateKey: args.privateKey,
+            strictHostKeyChecking: args.strictHostKeyChecking,
+          }),
+          { multiplex: args.multiplex ?? false },
+        );
+        try {
+          const report = await capacityReport(deps, session, context.logger);
+          const handle = await context.writeResource(
+            "cephCapacityReport",
+            `cephCapacityReport-${args.host}`,
+            {
+              host: args.host,
+              ...report,
+              observedAt: new Date(deps.now()).toISOString(),
+            },
+          );
+          return { dataHandles: [handle] };
+        } finally {
+          await session.close();
+        }
+      },
+    },
+
+    cephVerifyMonPlacement: {
+      description:
+        "READ-ONLY. Pre-approval check that judges a proposed mon host list against live quorum, the monmap and orchestrator mappings; applies nothing. Writes the verdict before throwing, then throws when it fails unless throwOnFail is false.",
+      arguments: VerifyPlacementArgs,
+      execute: async (
+        args: z.infer<typeof VerifyPlacementArgs>,
+        context: MethodContext,
+      ) => {
+        const session = await openSession(
+          deps,
+          toTarget({
+            host: args.host,
+            sshUser: args.sshUser,
+            port: args.port,
+            keyPath: args.keyPath,
+            privateKey: args.privateKey,
+            strictHostKeyChecking: args.strictHostKeyChecking,
+          }),
+          { multiplex: args.multiplex ?? false },
+        );
+        try {
+          const outcome = await verifyMonPlacement(
+            deps,
+            session,
+            args.placement,
+            context.logger,
+          );
+          const handle = await persistVerdict(context, deps, {
+            method: "cephVerifyMonPlacement",
+            host: args.host,
+            phase: "mon-placement",
+            key: `cephVerifyMonPlacement-${args.host}`,
+            outcome,
+            throwOnFail: args.throwOnFail ?? true,
+          });
+          return { dataHandles: [handle] };
+        } finally {
+          await session.close();
+        }
+      },
+    },
+
+    cephVerifyMgrPlacement: {
+      description:
+        "READ-ONLY. Pre-approval check that judges a proposed mgr host list without applying it, reporting a mgr placed on the host of an active MDS. Writes the verdict before throwing, then throws when it fails unless throwOnFail is false.",
+      arguments: VerifyPlacementArgs,
+      execute: async (
+        args: z.infer<typeof VerifyPlacementArgs>,
+        context: MethodContext,
+      ) => {
+        const session = await openSession(
+          deps,
+          toTarget({
+            host: args.host,
+            sshUser: args.sshUser,
+            port: args.port,
+            keyPath: args.keyPath,
+            privateKey: args.privateKey,
+            strictHostKeyChecking: args.strictHostKeyChecking,
+          }),
+          { multiplex: args.multiplex ?? false },
+        );
+        try {
+          const outcome = await verifyMgrPlacement(
+            deps,
+            session,
+            args.placement,
+            context.logger,
+          );
+          const handle = await persistVerdict(context, deps, {
+            method: "cephVerifyMgrPlacement",
+            host: args.host,
+            phase: "mgr-placement",
+            key: `cephVerifyMgrPlacement-${args.host}`,
+            outcome,
+            throwOnFail: args.throwOnFail ?? true,
+          });
+          return { dataHandles: [handle] };
+        } finally {
+          await session.close();
+        }
+      },
+    },
   };
 
   const sshMethods = Object.keys(methods);
@@ -1989,6 +2155,12 @@ export function createCephadmModel(overrides: Partial<CephadmDeps> = {}) {
         description: "OSD service application evidence",
         schema: ApplyOsdResultSchema,
         lifetime: "infinite" as const,
+        garbageCollection: 10,
+      },
+      cephCapacityReport: {
+        description: "Cluster and per-pool capacity with the durability margin",
+        schema: CapacityReportSchema,
+        lifetime: "7d" as const,
         garbageCollection: 10,
       },
       poolResult: {

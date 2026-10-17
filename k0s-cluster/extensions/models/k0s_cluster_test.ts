@@ -136,6 +136,16 @@ function primary<T extends { specName: string }>(rows: T[], all?: true) {
   return all ? kept : kept[0];
 }
 
+/** What `systemctl show -p ExecStart --value k0scontroller` prints. */
+const showController = (withWorker: boolean) => ({
+  code: 0,
+  stdout: `{ path=/usr/local/bin/k0s ; argv[]=/usr/local/bin/k0s controller${
+    withWorker ? " --enable-worker" : ""
+  } --config=/etc/k0s/k0s.yaml ; }\n`,
+});
+const isShow = (argv: string[]) =>
+  argv[0] === "systemctl" && argv[1] === "show";
+
 const ABSENT = { code: 1, stderr: "Unit could not be found." };
 
 const installed = { value: false };
@@ -157,6 +167,7 @@ function adoptRouter(
   presentUnit = "k0scontroller",
 ): (argv: string[]) => { code?: number; stdout?: string } {
   return (argv) => {
+    if (isShow(argv)) return showController(true);
     if (argv[0] === "systemctl" && argv[1] === "cat") {
       return argv[2] === presentUnit ? { code: 0 } : ABSENT;
     }
@@ -1035,6 +1046,7 @@ Deno.test("allow_role_change stops and resets the old role before installing", a
 Deno.test("a failed k0s stop during force_reinstall is not ignored", async () => {
   const fake = makeDeps({
     exec: (argv) => {
+      if (isShow(argv)) return showController(true);
       if (argv[0] === "systemctl" && argv[1] === "cat") {
         return argv[2] === "k0scontroller" ? { code: 0 } : ABSENT;
       }
@@ -1612,6 +1624,7 @@ Deno.test("an installed but stopped unit is started, not reinstalled over", asyn
   let started = false;
   const fake = makeDeps({
     exec: (argv) => {
+      if (isShow(argv)) return showController(true);
       if (argv[0] === "systemctl" && argv[1] === "cat") {
         return argv[2] === "k0scontroller" ? { code: 0 } : ABSENT;
       }
@@ -1661,4 +1674,120 @@ Deno.test("a failed restart puts the previous k0s.yaml back", async () => {
   const last = fake.uploads.at(-1)!;
   assertEquals(new TextDecoder().decode(last.content), "previous: config\n");
   assertEquals(last.mode, "0600");
+});
+
+/** A host whose k0scontroller unit was installed with or without a worker. */
+function controllerHost(withWorker: boolean) {
+  return (argv: string[]) => {
+    if (isShow(argv)) return showController(withWorker);
+    if (argv[0] === "systemctl" && argv[1] === "cat") {
+      return argv[2] === "k0scontroller" ? { code: 0 } : ABSENT;
+    }
+    if (argv[0] === "systemctl" && argv[1] === "is-active") {
+      return { code: argv[2] === "k0scontroller" ? 0 : 3 };
+    }
+    if (argv[0] === "uname") return { code: 0, stdout: "x86_64\n" };
+    return undefined;
+  };
+}
+
+Deno.test("single and controller are different roles on the shared unit", async () => {
+  for (
+    const [role, installedWithWorker] of [
+      ["single", false],
+      ["controller", true],
+    ] as const
+  ) {
+    const fake = makeDeps({
+      exec: controllerHost(installedWithWorker),
+      fetch: () => Promise.resolve(PAYLOAD),
+    });
+    const model = createModel(fake.deps);
+    const { context, getWrittenResources } = createModelTestContext();
+    await assertRejects(
+      () => model.methods.install.execute(installArgs({ role }), context),
+      Error,
+      "confirm_role_change",
+    );
+    assertEquals(fake.fetches.length, 0);
+    assertEquals(fake.uploads.length, 0);
+    assertEquals(
+      fake.execs.some((argv) => argv[1] === "stop" || argv[1] === "reset"),
+      false,
+    );
+    assertEquals(primary(getWrittenResources(), true).length, 0);
+  }
+});
+
+Deno.test("a confirmed single/controller change resets and reinstalls in the new mode", async () => {
+  for (
+    const [role, installedWithWorker, expected] of [
+      ["single", false, ["install", "controller", "--enable-worker"]],
+      ["controller", true, ["install", "controller"]],
+    ] as const
+  ) {
+    let reinstalled = false;
+    const fake = makeDeps({
+      exec: (argv) => {
+        if (argv[1] === "install") reinstalled = true;
+        if (argv[0] === "systemctl" && argv[1] === "enable") {
+          reinstalled = true;
+        }
+        if (reinstalled && argv[0] === "systemctl") {
+          if (argv[1] === "is-active") return { code: 0 };
+        }
+        return controllerHost(installedWithWorker)(argv);
+      },
+      fetch: () => Promise.resolve(PAYLOAD),
+    });
+    const model = createModel(fake.deps);
+    const { context, getWrittenResources } = createModelTestContext();
+    await model.methods.install.execute(
+      installArgs({ role, confirm_role_change: HOST }),
+      context,
+    );
+    const verbs = fake.execs.map((argv) => argv.slice(0, 2).join(" "));
+    const at = (verb: string) => verbs.indexOf(`${K0S_BINARY_PATH} ${verb}`);
+    assertEquals(fake.fetches.length, 1);
+    assertEquals(at("stop") >= 0 && at("stop") < at("reset"), true);
+    assertEquals(at("reset") < at("install"), true);
+    assertEquals(
+      fake.execs.find((argv) => argv[1] === "install"),
+      [K0S_BINARY_PATH, ...expected],
+    );
+    assertEquals(
+      (primary(getWrittenResources()).data as { role: string }).role,
+      role,
+    );
+  }
+});
+
+Deno.test("a matching single/controller mode is adopted without a change", async () => {
+  for (
+    const [role, installedWithWorker] of [
+      ["single", true],
+      ["controller", false],
+    ] as const
+  ) {
+    const configSha = await sha256Hex(
+      encoder.encode(renderK0sConfig({ ...CLUSTER, helm: [] })),
+    );
+    const base = adoptRouter(configSha);
+    const fake = makeDeps({
+      exec: (argv) =>
+        isShow(argv) ? showController(installedWithWorker) : base(argv),
+      uploadChanged: () => false,
+    });
+    const model = createModel(fake.deps);
+    const { context } = createModelTestContext();
+    const out = await model.methods.install.execute(
+      installArgs({ role }),
+      context,
+    );
+    assertEquals(out.result.role, role);
+    assertEquals(
+      fake.execs.some((argv) => argv[1] === "stop" || argv[1] === "reset"),
+      false,
+    );
+  }
 });

@@ -681,6 +681,30 @@ async function unitExists(
 }
 
 /**
+ * Whether the installed k0scontroller unit runs a worker too (`k0s install
+ * controller --enable-worker`), read from the unit's own command line.
+ */
+async function controllerRunsWorker(
+  deps: K0sDeps,
+  target: SshTarget,
+): Promise<boolean> {
+  const shown = await deps.ssh.exec(target, [
+    "systemctl",
+    "show",
+    "-p",
+    "ExecStart",
+    "--value",
+    "k0scontroller",
+  ]);
+  if (!ok(shown) || !/\bcontroller\b/.test(shown.stdout)) {
+    throw new Error(
+      `could not read how k0scontroller is installed on ${target.host}`,
+    );
+  }
+  return /--enable-worker\b/.test(shown.stdout);
+}
+
+/**
  * Uploads k0s.yaml and, when it changed, restarts the unit and waits for it to
  * be healthy. If the restart fails, the previous file is put back and the unit
  * restarted again on a best-effort basis, so a bad config does not stay on the
@@ -910,6 +934,8 @@ function buildK0sModel(deps: K0sDeps) {
           // re-applied as a worker must not get a second, competing role.
           const otherInstalled = await unitExists(deps, target, otherService);
           let migrating = false;
+          // The role unit that a migration stops and resets.
+          let replaced = otherService;
           if (otherInstalled) {
             if (
               args.confirm_role_change?.toLowerCase() !== target.host
@@ -936,11 +962,30 @@ function buildK0sModel(deps: K0sDeps) {
           );
           // A unit that exists but is stopped is adopted and started, not
           // reinstalled over: `k0s install` would fail on it.
-          const unitPresent = !migrating &&
+          let unitPresent = !migrating &&
             await unitExists(deps, target, service);
-          const alreadyActive = unitPresent && ok(
+          let alreadyActive = unitPresent && ok(
             await deps.ssh.exec(target, ["systemctl", "is-active", service]),
           );
+          // `single` and `controller` share one unit, so a unit that exists
+          // may still have been installed in the other mode. That is a role
+          // change like any other.
+          if (unitPresent && service === "k0scontroller") {
+            const hasWorker = await controllerRunsWorker(deps, target);
+            if (hasWorker !== (args.role === "single")) {
+              if (args.confirm_role_change?.toLowerCase() !== target.host) {
+                throw new Error(
+                  `${target.host} has k0scontroller installed ${
+                    hasWorker ? "with" : "without"
+                  } a worker; refusing to install it as ${args.role}. Set confirm_role_change to ${target.host} to replace it (IRREVERSIBLE: this resets the existing role).`,
+                );
+              }
+              migrating = true;
+              replaced = service;
+              unitPresent = false;
+              alreadyActive = false;
+            }
+          }
           const result = {
             host: target.host,
             k0s_version: args.k0s_version,
@@ -1054,7 +1099,7 @@ function buildK0sModel(deps: K0sDeps) {
               await deps.ssh.exec(target, [
                 "systemctl",
                 "is-active",
-                otherService,
+                replaced,
               ]),
             );
             if (otherActive) {
@@ -1165,7 +1210,7 @@ function buildK0sModel(deps: K0sDeps) {
             throw new Error(
               `${
                 (error as Error).message
-              }; the previous ${otherService} role had already been reset and could not be restored. ${
+              }; the previous ${replaced} role had already been reset and could not be restored. ${
                 newUnit
                   ? `The new ${service} unit exists but did not come up`
                   : "No k0s role is installed"

@@ -152,3 +152,8 @@ Low findings fixed as noted.
   previous k0s.yaml back, IPv6 CIDRs are parsed strictly, and remote-bound
   strings have length caps. Residual: manifest stacks are not applied
   atomically. Transport resynced to ssh.ts cb61c4ad.
+- 2026-10-17: `single` and `controller` share the k0scontroller unit, so the
+  unit's own `ExecStart` is read (`--enable-worker` or not) and a mismatch with
+  the requested role is treated as a role change: refused without
+  `confirm_role_change`, reset and reinstalled with it. The ExecStart format
+  from `systemctl show --value` is unverified until a live run.

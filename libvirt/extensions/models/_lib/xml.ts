@@ -10,12 +10,14 @@
 import {
   assertArch,
   assertDiskBus,
+  assertDiskFormat,
   assertDiskPath,
   assertDnsName,
   assertIfname,
   assertIpv4,
   assertMac,
   assertName,
+  DISK_FORMATS,
   NETWORK_MODES,
 } from "./validate.ts";
 
@@ -44,7 +46,7 @@ export interface DomainDiskSpec {
   /** Absolute path of the backing file or ISO. */
   path: string;
   /** qemu driver format, e.g. `qcow2` or `raw`. */
-  format: string;
+  format: (typeof DISK_FORMATS)[number];
   /** Target device name, e.g. `vda` or `sda`. */
   target: string;
   /** Bus, e.g. `virtio` or `sata`. */
@@ -175,6 +177,7 @@ export function renderDomainXml(spec: DomainSpec): string {
     assertDiskPath(disk.path);
     assertName(disk.target, "disk target");
     assertDiskBus(disk.bus);
+    assertDiskFormat(disk.format);
     // `type='file'` with the resolved path, never `type='volume'`: on a stock
     // Ubuntu host virt-aa-helper grants AppArmor access to an explicit file but
     // not to a volume reference, so qemu gets Permission denied.

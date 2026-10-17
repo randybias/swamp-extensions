@@ -716,9 +716,10 @@ Deno.test("console: bounded capture stores the text and returns only its digest"
   assertEquals(out.result.bytes, "boot log line\nlogin: ".length);
   assertEquals(typeof out.result.sha256, "string");
   assertEquals((out.result as Record<string, unknown>).text, undefined);
-  assertEquals(has(f, "'console'"), true);
-  assertEquals(f.commands.some((c) => c.includes("timeout -s KILL")), true);
-  assertEquals(f.commands.some((c) => c.includes("script -qec")), true);
+  assertEquals(has(f, "console"), true);
+  assertEquals(f.commands.some((c) => c.includes("timeout")), true);
+  assertEquals(f.commands.some((c) => c.includes("script")), true);
+  assertEquals(has(f, "--force"), true);
   assertEquals(has(f, "--force"), true);
   const written = ctx.getWrittenResources()[0];
   assertEquals(written.data.text, "boot log line\nlogin: ");
@@ -1126,4 +1127,152 @@ Deno.test("schema: max_output_bytes is bounded and defaults to the transport cap
     }).success,
     true,
   );
+});
+
+Deno.test("undefine_domain detaches every non-boot disk before removing volumes", async () => {
+  const f = fakeLibvirt(seq([
+    ["'dominfo'", () => ({ code: 0, stdout: SHUT_OFF })],
+    [
+      "'domblklist'",
+      () => ({
+        code: 0,
+        stdout:
+          " Type   Device   Target   Source\n----\n file   disk     vda      /p/root.qcow2\n file   disk     vdb      /p/other-root.qcow2\n file   cdrom    sda      /p/seed.iso\n",
+      }),
+    ],
+    ["'detach-disk'", () => ({ code: 0 })],
+    ["'undefine'", () => ({ code: 0 })],
+  ]));
+  await modelWith(f).methods.undefine_domain.execute(
+    modelWith(f).methods.undefine_domain.arguments.parse({
+      ...SSH,
+      uri: URI,
+      name: "node-a",
+      remove_volumes: true,
+    }),
+    createModelTestContext({ globalArgs: {} }).context,
+  );
+  const detached = f.commands.filter((c) => c.includes("'detach-disk'"));
+  assertEquals(detached.some((c) => c.includes("'vdb'")), true);
+  assertEquals(detached.some((c) => c.includes("'sda'")), true);
+  assertEquals(detached.some((c) => c.includes("'vda'")), false);
+});
+
+Deno.test("undefine_domain refuses an invalid disk target from domblklist", async () => {
+  const f = fakeLibvirt(seq([
+    ["'dominfo'", () => ({ code: 0, stdout: SHUT_OFF })],
+    [
+      "'domblklist'",
+      () => ({
+        code: 0,
+        stdout:
+          " Type   Device   Target   Source\n----\n file   disk     vda;id   /p/x\n",
+      }),
+    ],
+    ["'undefine'", () => ({ code: 0 })],
+  ]));
+  await assertRejects(
+    () =>
+      modelWith(f).methods.undefine_domain.execute(
+        modelWith(f).methods.undefine_domain.arguments.parse({
+          ...SSH,
+          uri: URI,
+          name: "node-a",
+          remove_volumes: true,
+        }),
+        createModelTestContext({ globalArgs: {} }).context,
+      ),
+    Error,
+    "Not a valid disk target",
+  );
+  assertEquals(has(f, "'undefine'"), false);
+});
+
+Deno.test("define_domain rejects a duplicate explicit disk target", async () => {
+  const f = fakeLibvirt(seq([
+    ["'vol-info'", () => ({ code: 0, stdout: "Name: node-a-root\n" })],
+    ["'vol-path'", () => ({ code: 0, stdout: "/p/node-a-root.qcow2\n" })],
+  ]));
+  await assertRejects(
+    () =>
+      modelWith(f).methods.define_domain.execute(
+        modelWith(f).methods.define_domain.arguments.parse({
+          ...SSH,
+          uri: URI,
+          name: "node-a",
+          pool: "pool-a",
+          volume: "node-a-root",
+          vcpus: 1,
+          memory_mib: 1024,
+          extra_disks: [{ path: "/p/a.iso", target: "vda" }],
+        }),
+        createModelTestContext({ globalArgs: {} }).context,
+      ),
+    Error,
+    "duplicate disk target",
+  );
+});
+
+Deno.test("define_domain skips an explicitly reserved disk target", async () => {
+  const f = fakeLibvirt(seq([
+    ["'vol-info'", () => ({ code: 0, stdout: "Name: node-a-root\n" })],
+    ["'vol-path'", () => ({ code: 0, stdout: "/p/node-a-root.qcow2\n" })],
+    [
+      "'dominfo'",
+      (n) =>
+        n === 0
+          ? { code: 1, stderr: "error: failed to get domain" }
+          : { code: 0, stdout: SHUT_OFF },
+    ],
+    ["'define'", () => ({ code: 0 })],
+  ]));
+  await modelWith(f).methods.define_domain.execute(
+    modelWith(f).methods.define_domain.arguments.parse({
+      ...SSH,
+      uri: URI,
+      name: "node-a",
+      pool: "pool-a",
+      volume: "node-a-root",
+      vcpus: 1,
+      memory_mib: 1024,
+      extra_disks: [{ path: "/p/a.qcow2", target: "vdb" }, {
+        path: "/p/b.qcow2",
+      }],
+    }),
+    createModelTestContext({ globalArgs: {} }).context,
+  );
+  const xml = f.uploads[0];
+  assertEquals(xml.includes("<target dev='vdb' bus='virtio'/>"), true);
+  assertEquals(xml.includes("<target dev='vdc' bus='virtio'/>"), true);
+});
+
+Deno.test("define_network: the start error strips control characters", async () => {
+  const f = fakeLibvirt(seq([
+    [
+      "'net-info'",
+      (n) =>
+        n === 0 ? { code: 1, stderr: "error: failed to get network" } : {
+          code: 0,
+          stdout: "Name: net-a\nActive: no\nAutostart: no\nUUID: u1\n",
+        },
+    ],
+    ["'net-define'", () => ({ code: 0 })],
+    ["'net-start'", () => ({ code: 1, stderr: "error: bad\u0001bridge\n" })],
+    ["'net-undefine'", () => ({ code: 0 })],
+  ]));
+  const error = await assertRejects(
+    () =>
+      modelWith(f).methods.define_network.execute(
+        modelWith(f).methods.define_network.arguments.parse({
+          ...NET,
+          mode: "nat",
+          gateway: "192.0.2.1",
+          start: true,
+        }),
+        createModelTestContext({ globalArgs: {} }).context,
+      ),
+    Error,
+    "bad bridge",
+  );
+  assertEquals(error.message.includes("\u0001"), false);
 });

@@ -431,6 +431,16 @@ function diskLetter(index: number): string {
   return String.fromCharCode(97 + index);
 }
 
+/** Last few lines of a virsh error with control characters removed. */
+function sanitizeVirshDetail(text: string): string {
+  let flattened = "";
+  for (const ch of text) {
+    const code = ch.codePointAt(0) ?? 0;
+    flattened += code < 0x20 || code === 0x7f ? " " : ch;
+  }
+  return flattened.replace(/\s+/g, " ").trim().slice(0, 400);
+}
+
 const BENIGN = {
   start: [/already (active|running)/i, /domain is already running/i],
   shutdown: [/already shut ?off/i, /domain is not running/i, /not running/i],
@@ -687,9 +697,9 @@ export function createModel(overrides: Partial<LibvirtDeps> = {}) {
             if (start.exit_code !== 0 && !isBenign(start, BENIGN.netStart)) {
               // Surface the virsh cause, and roll back a network this call
               // created so it does not linger defined-but-inactive.
-              const detail = `${start.stderr || start.stdout}`.trim().split(
-                "\n",
-              ).slice(-3).join(" ").slice(0, 400);
+              const detail = sanitizeVirshDetail(
+                start.stderr || start.stdout,
+              );
               if (createdHere) {
                 await virshTry(deps, t, args.uri, ["net-undefine", args.name]);
               }
@@ -870,7 +880,10 @@ export function createModel(overrides: Partial<LibvirtDeps> = {}) {
               "--",
               args.target_volume,
             ]);
-            format = parseVolumeFormat(dump.stdout) || "qcow2";
+            const parsedFormat = parseVolumeFormat(dump.stdout);
+            format = /^[a-z0-9]{1,16}$/.test(parsedFormat)
+              ? parsedFormat
+              : "unknown";
           }
           const handle = await context.writeResource(
             "volume_state",
@@ -944,15 +957,31 @@ export function createModel(overrides: Partial<LibvirtDeps> = {}) {
             device: "disk",
             readonly: false,
           }];
+          const usedTargets = new Set<string>(["vda"]);
           let virtioIndex = 1;
           let sdIndex = 0;
           for (const extra of args.extra_disks) {
             const device = extra.device;
             const bus = extra.bus ?? (device === "cdrom" ? "sata" : "virtio");
-            const target = extra.target ??
-              (bus === "virtio"
-                ? `vd${diskLetter(virtioIndex++)}`
-                : `sd${diskLetter(sdIndex++)}`);
+            let target: string;
+            if (extra.target !== undefined) {
+              assertName(extra.target, "disk target");
+              if (usedTargets.has(extra.target)) {
+                throw new LibvirtError(
+                  `duplicate disk target ${extra.target}`,
+                );
+              }
+              target = extra.target;
+            } else if (bus === "virtio") {
+              while (usedTargets.has(`vd${diskLetter(virtioIndex)}`)) {
+                virtioIndex++;
+              }
+              target = `vd${diskLetter(virtioIndex++)}`;
+            } else {
+              while (usedTargets.has(`sd${diskLetter(sdIndex)}`)) sdIndex++;
+              target = `sd${diskLetter(sdIndex++)}`;
+            }
+            usedTargets.add(target);
             disks.push({
               path: extra.path,
               format: extra.format ?? (device === "cdrom" ? "raw" : "qcow2"),
@@ -1108,7 +1137,10 @@ export function createModel(overrides: Partial<LibvirtDeps> = {}) {
               await domainInfo(deps, t, args.uri, args.name),
             );
             while (!isOffState(state) && deps.now() < deadline) {
-              await deps.sleep(args.poll_interval_s * 1000);
+              const remaining = deadline - deps.now();
+              await deps.sleep(
+                Math.min(args.poll_interval_s * 1000, remaining),
+              );
               state = domainState(
                 await domainInfo(deps, t, args.uri, args.name),
               );
@@ -1255,15 +1287,18 @@ export function createModel(overrides: Partial<LibvirtDeps> = {}) {
             }
           }
           if (args.remove_volumes && !args.remove_attached_media) {
-            // Detach read-only media (e.g. a seed ISO this extension did not
-            // create) so `--remove-all-storage` cannot delete it.
+            // Detach every disk except the primary boot disk (target vda) so
+            // `--remove-all-storage` cannot delete an extra disk, including a
+            // read-only root image this extension did not create.
             const blk = await virsh(deps, t, args.uri, [
               "domblklist",
               args.name,
               "--details",
             ]);
             for (const entry of parseBlkListDetails(blk.stdout)) {
-              if (entry.device !== "cdrom") continue;
+              if (entry.target === "vda") continue;
+              if (entry.source === "" || entry.source === "-") continue;
+              assertName(entry.target, "disk target");
               const detach = await virshTry(deps, t, args.uri, [
                 "detach-disk",
                 args.name,

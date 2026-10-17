@@ -111,14 +111,26 @@ export function consoleArgv(
   if (devname !== undefined) args.push("--devname", devname);
   // `virsh console` has no --timeout option and needs a controlling TTY, so
   // wrap it: `script` allocates a pty and `timeout -s KILL` is the real bound.
-  // The wrapper runs in an outer shell that survives the killed child: without
-  // it, GNU timeout kills the session process, ssh exits 255, and the canonical
-  // transport (correctly) reports a transport failure, discarding the bytes
-  // captured so far. Here 137 (SIGKILL) and 124 (timeout) become exit 0.
+  // `inner` is a multi-word quoted command; quote it again so `script -qec`
+  // receives exactly one argument (pasting it raw makes script see many args
+  // and fail with "unexpected number of arguments"). The whole bounded command
+  // is built by quoteArgv, so no word is pasted raw into the shell text. The
+  // outer `sh -c` survives the killed child: 137 (SIGKILL), 124 (timeout) and a
+  // normal 0 all exit 0, so a timed-out capture keeps the bytes read so far
+  // instead of becoming an ssh exit 255.
   const inner = quoteArgv(virshArgv(uri, args));
+  const cmd = quoteArgv([
+    "timeout",
+    "-s",
+    "KILL",
+    String(timeoutS),
+    "script",
+    "-qec",
+    inner,
+    "/dev/null",
+  ]);
   const script =
-    `timeout -s KILL ${timeoutS} script -qec ${inner} /dev/null; rc=$?; ` +
-    `[ $rc -eq 137 ] || [ $rc -eq 124 ]; exit $?`;
+    `${cmd}; rc=$?; case $rc in 0|124|137) exit 0;; *) exit $rc;; esac`;
   return ["sh", "-c", script];
 }
 

@@ -343,3 +343,24 @@ Deno.test("state helpers: running, paused and off", () => {
   assertEquals(isOffState("crashed"), true);
   assertEquals(isOffState("running"), false);
 });
+
+Deno.test("domain xml: an unaccepted disk format is refused", () => {
+  assertThrows(
+    () =>
+      renderDomainXml({
+        name: "node-a",
+        vcpus: 1,
+        memoryMib: 1024,
+        arch: "x86_64",
+        disks: [{
+          path: "/p/root.qcow2",
+          format: "vmdk" as unknown as "qcow2",
+          target: "vda",
+          bus: "virtio",
+          device: "disk",
+          readonly: false,
+        }],
+      }),
+    LibvirtConfigError,
+  );
+});

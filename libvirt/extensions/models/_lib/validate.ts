@@ -155,3 +155,14 @@ export function assertDiskBus(bus: string): void {
     );
   }
 }
+
+/** Throws unless `format` is an accepted disk format. */
+export function assertDiskFormat(format: string): void {
+  if (!(DISK_FORMATS as readonly string[]).includes(format)) {
+    throw new LibvirtConfigError(
+      `Not an accepted disk format: ${format} (expected one of ${
+        DISK_FORMATS.join(", ")
+      })`,
+    );
+  }
+}

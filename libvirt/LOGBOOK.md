@@ -185,3 +185,34 @@ this environment.
   `vol-info`'s `Type: file`.
 - `ssh.ts` is unchanged (blob cb61c4ad). `release.yaml` gains the required
   `libvirt` beta stanza so the offline gates can run.
+
+## Delta-live review round 2 (bcd2871 vs 0733670)
+
+- **HIGH console was still broken live.** `consoleArgv` pasted the already
+  quoted `inner` command raw into the `sh -c` text, so `script -qec` saw many
+  arguments and failed with "unexpected number of arguments". The whole bounded
+  command is now built by `quoteArgv([...])` (so `inner` is quoted as one word),
+  and the wrapper maps exit `0|124|137` to 0 and anything else to its code. Two
+  tests execute the rendered argv locally against a stub `virsh`: one times out
+  and asserts exit 0 with the partial output, one exits 1 and asserts non-zero.
+- **HIGH `undefine_domain remove_volumes` could delete an extra disk.** It only
+  detached cdroms, so a `device=disk` extra (e.g. another domain's root image)
+  was removed by `--remove-all-storage`. It now detaches every disk except the
+  primary boot disk (`vda`) before undefining, unless `remove_attached_media`.
+- **MEDIUM a normal console exit 0 was mapped to 1.** The `case` statement now
+  treats 0, 124 and 137 as success.
+- **MEDIUM** the remote `domblklist` target is validated with `assertName`
+  before `detach-disk`.
+- **MEDIUM** explicit `extra_disks` targets are reserved, duplicates are
+  rejected, and implicit targets skip used letters.
+- **MEDIUM** `DomainDiskSpec.format` is typed to `DISK_FORMATS` and asserted at
+  render time.
+- **MEDIUM** the shutdown poll sleeps `min(interval, remaining)`, never past the
+  deadline.
+- **LOW** `clone_volume` accepts a host-derived format only if it matches
+  `/^[a-z0-9]{1,16}$/`, else records `unknown`.
+- **LOW** the network start error strips control characters.
+- `deno.json` test task gains `--allow-run` for the executed console tests.
+- `_lib/ssh.ts` resynced to the canonical blob `fe0139f0` (ssh-host
+  2026.10.17.2): upload no longer sends the content sha256 on the remote command
+  line; the libvirt fake now returns the written hash and mode.

@@ -1853,7 +1853,13 @@ Deno.test("a vault write failure or missing vault service fails without the valu
   // deno-lint-ignore no-explicit-any
   (failing.context as any).vaultService = {
     put: (_v: string, _k: string, value: string) =>
-      Promise.reject(new Error(`no such vault, value was ${value}`)),
+      Promise.reject(
+        new Error(
+          `backend rejected ${
+            value.split("\n")[0]
+          } client-key-data: FAKE-KEY-DATA`,
+        ),
+      ),
   };
   const error = await assertRejects(
     () => model.methods.kubeconfig.execute(args, failing.context),
@@ -1861,6 +1867,12 @@ Deno.test("a vault write failure or missing vault service fails without the valu
     "could not write the kubeconfig to vault cluster",
   );
   assertEquals(error.message.includes("FAKE-KEY-DATA"), false);
+  assertEquals(error.message.includes("client-key-data"), false);
+  assertEquals(error.message.includes("apiVersion"), false);
+  assertEquals(
+    error.message,
+    "could not write the kubeconfig to vault cluster key kc",
+  );
   assertEquals(primary(failing.getWrittenResources(), true).length, 0);
 });
 
@@ -1881,4 +1893,40 @@ Deno.test("store_in_vault rejects malformed vault names and keys", () => {
       })
     );
   }
+});
+
+Deno.test("a failed first-time restart removes the unverified k0s.yaml", async () => {
+  const fake = makeDeps({
+    exec: (argv) => {
+      if (argv[0] === "cat") return { code: 1 };
+      if (argv[0] === "systemctl" && argv[1] === "restart") return { code: 1 };
+      return undefined;
+    },
+  });
+  const model = createModel(fake.deps);
+  const { context } = createModelTestContext();
+  await assertRejects(
+    () =>
+      model.methods.apply_helm.execute(
+        model.methods.apply_helm.arguments.parse({
+          ssh: SSH,
+          ...CLUSTER,
+          helm: [{
+            chart: "example/nginx",
+            repo: "https://charts.example.com",
+            version: "1.2.3",
+            namespace: "default",
+          }],
+        }),
+        context,
+      ),
+    Error,
+    "the new k0s.yaml was removed",
+  );
+  assertEquals(
+    fake.execs.some((argv) =>
+      argv[0] === "rm" && argv.includes(K0S_CONFIG_PATH)
+    ),
+    true,
+  );
 });

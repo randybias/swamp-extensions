@@ -406,11 +406,6 @@ function iso(ms: number): string {
   return new Date(ms).toISOString();
 }
 
-/** Removes a secret from text that is about to become an error message. */
-function scrubSecret(text: string, secret: string): string {
-  return secret.length >= 3 ? text.split(secret).join("[redacted]") : text;
-}
-
 /** SSH settings as parsed from a method's arguments. */
 type SshArgs = z.infer<typeof SSH>;
 
@@ -748,7 +743,15 @@ async function applyConfig(
     await restartAndVerify(deps, target, service);
   } catch (error) {
     let note = "the previous k0s.yaml could not be restored";
-    if (previous !== null) {
+    if (previous === null) {
+      // There was no config before: do not leave the unverified one behind.
+      try {
+        await deps.ssh.exec(target, ["rm", "-f", K0S_CONFIG_PATH]);
+        note = "the new k0s.yaml was removed";
+      } catch {
+        note = "the new k0s.yaml could not be removed";
+      }
+    } else {
       try {
         await deps.ssh.upload(target, {
           path: K0S_CONFIG_PATH,
@@ -1367,11 +1370,11 @@ function buildK0sModel(deps: K0sDeps) {
                 vault.key,
                 kubeconfig,
               );
-            } catch (error) {
+            } catch {
+              // The backend's own text is never reflected: it may quote any
+              // fragment of the value. Vault and key names are validated.
               throw new Error(
-                `could not write the kubeconfig to vault ${vault.vault}: ${
-                  scrubSecret((error as Error).message, kubeconfig)
-                }`,
+                `could not write the kubeconfig to vault ${vault.vault} key ${vault.key}`,
               );
             }
           }

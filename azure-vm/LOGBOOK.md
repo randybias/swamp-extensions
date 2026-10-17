@@ -68,8 +68,8 @@ promoting to stable. Unit/contract tests (scripted fetch) cover every path.
 
 ## Prior art
 
-Registry search on stable and beta (`swamp extension search`, whole-word
-matches in the package name or description) for `azure-vm` and `azure`.
+Registry search on stable and beta (`swamp extension search`, whole-word matches
+in the package name or description) for `azure-vm` and `azure`.
 
 - azure-vm: no hits.
 - azure:
@@ -77,14 +77,14 @@ matches in the package name or description) for `azure-vm` and `azure`.
     `azure-vm` type has list, get, sync, create, delete, start, stop,
     deallocate, restart, resize and runCommand. It relies on the ambient
     `az login` session (no vault-wired service principal), passes the admin
-    password on argv in create, and has no adopt or converge semantics.
-    OVERLAP, justified: this extension uses the ARM REST API with a service
-    principal from a vault, no `az` dependency, and create/adopt converge.
+    password on argv in create, and has no adopt or converge semantics. OVERLAP,
+    justified: this extension uses the ARM REST API with a service principal
+    from a vault, no `az` dependency, and create/adopt converge.
   - `@nedbellavance/azure-ssh-key` (stable): Azure sshPublicKeys resources
     through the az CLI; a related resource, not compute. NONE (adjacent).
   - `@rkcoleman/azure-containers` (stable), `@rkcoleman/azure-app-service`
-    (stable): Container Apps and App Service over the az CLI; different
-    resource families. NONE.
+    (stable): Container Apps and App Service over the az CLI; different resource
+    families. NONE.
   - `@swamp/azure-kv` (stable): the Key Vault secret backend; a source this
     extension can read from, not compute. NONE.
   - `@webframp/azure-blob-datastore` (stable),
@@ -92,8 +92,8 @@ matches in the package name or description) for `azure-vm` and `azure`.
     Blob Storage. NONE.
   - `@webframp/azure/openai-usage` (stable), `@webframp/ai-usage` (stable),
     `@webframp/ai-research-mapper` (stable), `@webframp/cost-projection`
-    (stable), `@twonines/cloud-cost-focus` (stable): usage and cost
-    reporting; read-only. NONE.
+    (stable), `@twonines/cloud-cost-focus` (stable): usage and cost reporting;
+    read-only. NONE.
   - `@dougschaefer/ms-graph` (stable), `@dougschaefer/purview` (stable):
     Microsoft Graph and Purview; not Azure compute. NONE.
   - `@randybias/azure-nsg` (beta): ours; the sibling network security group

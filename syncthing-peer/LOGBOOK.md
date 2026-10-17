@@ -213,13 +213,13 @@ user) and the vault emptied afterwards.
 
 Prior art terms: syncthing
 
-Registry search on stable and beta (`swamp extension search`, whole-word
-matches in the package name or description). The package name's segment
-`peer` is a plain English word (it matched only a test harness that peers
-containers), so the term is the product. This extends the "Registry
-evaluation (before building)" section above.
+Registry search on stable and beta (`swamp extension search`, whole-word matches
+in the package name or description). The package name's segment `peer` is a
+plain English word (it matched only a test harness that peers containers), so
+the term is the product. This extends the "Registry evaluation (before
+building)" section above.
 
 - syncthing: no hits on either channel.
 
-Verdict: NONE. No package manages Syncthing devices or shared folders;
-nothing to file upstream.
+Verdict: NONE. No package manages Syncthing devices or shared folders; nothing
+to file upstream.

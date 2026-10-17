@@ -191,33 +191,31 @@ unless noted, for a later release:
 
 Prior art terms: kubernetes, k8s, secret
 
-Registry search on stable and beta (`swamp extension search`, whole-word
-matches in the package name or description). `kubernetes` is added to the
-package name's own segments because the first-party toolkit does not use the
-abbreviation in its name or description.
+Registry search on stable and beta (`swamp extension search`, whole-word matches
+in the package name or description). `kubernetes` is added to the package name's
+own segments because the first-party toolkit does not use the abbreviation in
+its name or description.
 
 - kubernetes:
-  - `@swamp/kubernetes` (stable): the first-party toolkit; its `secret` type
-    has list, get, create, update and delete through the Kubernetes client
-    API with `data` marked sensitive. `get` returns the decoded values into
-    stored data; create and update are separate calls (create fails when the
-    Secret exists), so there is no idempotent ensure or sync; the kubeconfig
-    comes from a context or path, not a validated vault reference. OVERLAP,
-    justified: values here reach kubectl only on stdin and are never
-    returned, sync is idempotent, and the kubeconfig is validated
-    default-deny.
-  - `@john/k8s` (stable): the same code base as the first-party toolkit at
-    an earlier revision (15 types, 13 workflows), with the same `secret`
-    semantics. OVERLAP, justified for the same reasons.
+  - `@swamp/kubernetes` (stable): the first-party toolkit; its `secret` type has
+    list, get, create, update and delete through the Kubernetes client API with
+    `data` marked sensitive. `get` returns the decoded values into stored data;
+    create and update are separate calls (create fails when the Secret exists),
+    so there is no idempotent ensure or sync; the kubeconfig comes from a
+    context or path, not a validated vault reference. OVERLAP, justified: values
+    here reach kubectl only on stdin and are never returned, sync is idempotent,
+    and the kubeconfig is validated default-deny.
+  - `@john/k8s` (stable): the same code base as the first-party toolkit at an
+    earlier revision (15 types, 13 workflows), with the same `secret` semantics.
+    OVERLAP, justified for the same reasons.
   - `@bixu/k8s/exec` (stable): exec into pods; no Secret management. NONE.
-  - `@twonines/k8s-fleet` (stable): read-only health across kubeconfig
-    contexts. NONE.
+  - `@twonines/k8s-fleet` (stable): read-only health across kubeconfig contexts.
+    NONE.
   - `@rjeschmi/helm-chart` (stable): Helm install, upgrade and uninstall;
     Secrets only as a side effect of a chart. NONE.
-  - `@sntxrr/scaleway-kapsule` (stable): managed cluster lifecycle through
-    the Scaleway API; no in-cluster objects. NONE.
-  - `@shelson/k3s` (stable): installs k3s on a host; no Secret management.
-    NONE.
+  - `@sntxrr/scaleway-kapsule` (stable): managed cluster lifecycle through the
+    Scaleway API; no in-cluster objects. NONE.
+  - `@shelson/k3s` (stable): installs k3s on a host; no Secret management. NONE.
   - `@webframp/aws/pricing` (stable), `@svendowideit/sudo` (stable): word
     matches only. NONE.
   - `@randybias/k0s-cluster` (beta), `@randybias/kubevirt` (beta): ours; a
@@ -239,10 +237,9 @@ abbreviation in its name or description.
   - `@mgreten/notification-outbox` (stable), `@sntxrr/scaleway-object-storage`
     (stable), `@kneel/super-productivity` (beta), `@kneel/jlcpcb` (beta),
     `@svendowideit/test-factory` (beta): word matches only. NONE.
-  - `@randybias/secret-file` (beta), `@randybias/server-stack` (beta): ours;
-    the host-file counterpart and the stack that composes this extension.
-    Not prior art.
+  - `@randybias/secret-file` (beta), `@randybias/server-stack` (beta): ours; the
+    host-file counterpart and the stack that composes this extension. Not prior
+    art.
 
-Verdict: OVERLAP, justified. Worth filing upstream: an idempotent `ensure`
-or sync method and a metadata-only `get` for `@swamp/kubernetes`'s `secret`
-type.
+Verdict: OVERLAP, justified. Worth filing upstream: an idempotent `ensure` or
+sync method and a metadata-only `get` for `@swamp/kubernetes`'s `secret` type.

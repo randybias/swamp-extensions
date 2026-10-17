@@ -351,11 +351,11 @@ Earlier heads (superseded; each finding was fixed by the next head):
 
 Prior art terms: netplan, bridge, vlan, mtu, ovs
 
-Registry search on stable and beta (`swamp extension search`, whole-word
-matches in the package name or description). The package name's own segments
-(`host`, `net`) are plain English words that match dozens of unrelated
-packages, so the terms name what this extension writes: Netplan configuration
-for a Linux or OVS bridge, a VLAN plane and jumbo MTU under an armed revert.
+Registry search on stable and beta (`swamp extension search`, whole-word matches
+in the package name or description). The package name's own segments (`host`,
+`net`) are plain English words that match dozens of unrelated packages, so the
+terms name what this extension writes: Netplan configuration for a Linux or OVS
+bridge, a VLAN plane and jumbo MTU under an armed revert.
 
 - netplan:
   - `@mccormick/migrate` (stable): host-to-host VM disk migration; the word
@@ -363,16 +363,16 @@ for a Linux or OVS bridge, a VLAN plane and jumbo MTU under an armed revert.
 - bridge:
   - `@keeb/mikrotik-routeros` (stable): bridge and interface objects on a
     MikroTik router over its REST API; not a Linux host and no Netplan. NONE.
-  - `@jpisgeek/video-pipeline` (stable), `@atalanta/external-reviewer`
-    (stable), `@maphew/bd` (stable), `@kneel/super-productivity` (beta):
-    "bridge" in the software-integration sense; word matches only. NONE.
+  - `@jpisgeek/video-pipeline` (stable), `@atalanta/external-reviewer` (stable),
+    `@maphew/bd` (stable), `@kneel/super-productivity` (beta): "bridge" in the
+    software-integration sense; word matches only. NONE.
 - vlan:
   - `@shrug/freeradius` (stable): a RADIUS server that can assign VLANs; it
     configures no host interface. NONE.
-  - `@shrug/freeipa/group` (stable): FreeIPA group management; word match
-    only. NONE.
-  - `@dougschaefer/cisco-ios-switch` (stable): VLANs on a Cisco switch over
-    its CLI; a network appliance, not a Linux host. NONE.
+  - `@shrug/freeipa/group` (stable): FreeIPA group management; word match only.
+    NONE.
+  - `@dougschaefer/cisco-ios-switch` (stable): VLANs on a Cisco switch over its
+    CLI; a network appliance, not a Linux host. NONE.
 - mtu: no hits.
 - ovs: no hits.
 

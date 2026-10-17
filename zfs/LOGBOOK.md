@@ -353,26 +353,25 @@ reasons were fixed in the same round.
 
 ## Prior art
 
-Registry search on stable and beta (`swamp extension search`, whole-word
-matches in the package name or description) for `zfs`. This extends the
-"Evaluation (before building)" section above with the full hit list.
+Registry search on stable and beta (`swamp extension search`, whole-word matches
+in the package name or description) for `zfs`. This extends the "Evaluation
+(before building)" section above with the full hit list.
 
 - `@josephholsten/zfs` (stable): pool sync, scrub and trim; dataset create,
-  destroy and set; snapshot create, destroy and prune, over SSH with an
-  optional known_hosts. No pool creation, no zvols, clones or rollback, and
-  no device-refusal guard. OVERLAP, justified: the pool lifecycle, zvols and
-  the boot-disk guard are the reason this extension exists.
+  destroy and set; snapshot create, destroy and prune, over SSH with an optional
+  known_hosts. No pool creation, no zvols, clones or rollback, and no
+  device-refusal guard. OVERLAP, justified: the pool lifecycle, zvols and the
+  boot-disk guard are the reason this extension exists.
 - `@bixu/zfs` (stable): local only (no SSH); import and export, health sync,
   snapshot, prune, scrub and trim. OVERLAP, justified: no remote host and no
   pool or dataset creation.
-- `@mccormick/helios` (stable): manages an illumos/Helios host, including
-  its ZFS, over SSH; illumos only. NONE (adjacent).
+- `@mccormick/helios` (stable): manages an illumos/Helios host, including its
+  ZFS, over SSH; illumos only. NONE (adjacent).
 - `@magistr/cozystack-linstor` (stable): creates ZFS-backed Linstor storage
-  pools inside Cozystack through its own API; not a host-level ZFS manager.
-  NONE (adjacent).
-- `@mccormick/truenas` (stable): read-only VM inventory on TrueNAS SCALE
-  through its JSON-RPC API; ZFS appears in the description only. NONE.
+  pools inside Cozystack through its own API; not a host-level ZFS manager. NONE
+  (adjacent).
+- `@mccormick/truenas` (stable): read-only VM inventory on TrueNAS SCALE through
+  its JSON-RPC API; ZFS appears in the description only. NONE.
 
 Verdict: OVERLAP, justified. Worth filing upstream (low priority): zvols,
-clones, rollback and a device guard on pool creation for
-`@josephholsten/zfs`.
+clones, rollback and a device guard on pool creation for `@josephholsten/zfs`.

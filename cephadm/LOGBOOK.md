@@ -370,3 +370,118 @@ a secret. Fixtures are synthetic only (RFC 5737 addresses, `.test` names).
   protected volume group needs a pvs row. Accepted limits: external fs
   journal/log devices and `resume=` (the kernel's exclusive open refuses a write
   to a mounted, swapped or claimed device).
+
+## 2026-10-17 live e2e: blocked
+
+Reason: a real cephadm cluster needs at least three hosts with free whole disks;
+the one bare-metal test box has root RAID1 members on both disks. Every cell
+below is `blocked`, not skipped; run them against a throwaway three-host cluster
+with spare whole disks before promoting to stable. Unit/contract tests (486,
+scripted SSH and fetch, no socket) cover every path offline.
+
+| Cell                                                                                       | Result  |
+| ------------------------------------------------------------------------------------------ | ------- |
+| 1 method `cephHostPrep`                                                                    | blocked |
+| 2 method `cephVerifyPackageSource`                                                         | blocked |
+| 3 method `wipeDiskToRaw`                                                                   | blocked |
+| 4 method `cephBootstrap`                                                                   | blocked |
+| 5 method `cephDistributeKey`                                                               | blocked |
+| 6 method `cephHostAdd`                                                                     | blocked |
+| 7 method `cephApplyMon`                                                                    | blocked |
+| 8 method `cephApplyMgr`                                                                    | blocked |
+| 9 method `cephApplyMds`                                                                    | blocked |
+| 10 method `cephApplyOsd`                                                                   | blocked |
+| 11 method `cephCreatePool`                                                                 | blocked |
+| 12 method `cephCreateFs`                                                                   | blocked |
+| 13 method `cephCreateCsiUser`                                                              | blocked |
+| 14 method `cephGetConnBundle`                                                              | blocked |
+| 15 method `cephFetchCsiKey`                                                                | blocked |
+| 16 method `cephDeleteFs`                                                                   | blocked |
+| 17 method `cephRemoveOsds`                                                                 | blocked |
+| 18 method `cephVerifyMonQuorum`                                                            | blocked |
+| 19 method `cephVerifyMgr`                                                                  | blocked |
+| 20 method `cephVerifyOsd`                                                                  | blocked |
+| 21 method `cephVerifyCsiUsers`                                                             | blocked |
+| 22 method `cephVerifyHealth`                                                               | blocked |
+| 23 method `cephVerifyHostNoout`                                                            | blocked |
+| 24 method `cephVerifyHostPrep`                                                             | blocked |
+| 25 method `cephVerifyDisksRaw`                                                             | blocked |
+| 26 method `cephVerifyKeyDistributed`                                                       | blocked |
+| 27 method `cephCapacityReport`                                                             | blocked |
+| 28 method `cephVerifyMonPlacement`                                                         | blocked |
+| 29 method `cephVerifyMgrPlacement`                                                         | blocked |
+| 30 method `cephVerifyPool`                                                                 | blocked |
+| 31 method `cephVerifyRbdSmoke`                                                             | blocked |
+| 32 method `cephVerifyOsdClaimable`                                                         | blocked |
+| 33 method `cephHostMaintenanceEnter`                                                       | blocked |
+| 34 method `cephHostMaintenanceExit`                                                        | blocked |
+| 35 method `cephHostMaintenanceState`                                                       | blocked |
+| 36 method `cephOsdOkToStop`                                                                | blocked |
+| 37 method `cephCephadmCheckHost`                                                           | blocked |
+| 38 method `cephHostNooutClear`                                                             | blocked |
+| 39 method `cephOsdActivate`                                                                | blocked |
+| 40 method `cephHostClusterState`                                                           | blocked |
+| 41 method `cephVerifyClusterFsid`                                                          | blocked |
+| 42 method `cephDisableOrchestration`                                                       | blocked |
+| 43 method `cephRmCluster`                                                                  | blocked |
+| 44 method `cephVerifyHostTornDown`                                                         | blocked |
+| 45 method `cephRgwBucketInventory`                                                         | blocked |
+| 46 method `cephRgwUserEnsure`                                                              | blocked |
+| 47 method `cephRgwBucketInspect`                                                           | blocked |
+| 48 method `cephRgwBucketEnsure`                                                            | blocked |
+| 49 method `cephRgwBucketPolicyEnsure`                                                      | blocked |
+| 50 method `cephRgwBucketVersioningEnsure`                                                  | blocked |
+| 51 workflow `cephadm-add-host` end to end                                                  | blocked |
+| 52 workflow `cephadm-apply-mds` end to end                                                 | blocked |
+| 53 workflow `cephadm-apply-mgr` end to end                                                 | blocked |
+| 54 workflow `cephadm-apply-mon` end to end                                                 | blocked |
+| 55 workflow `cephadm-apply-osds` end to end                                                | blocked |
+| 56 workflow `cephadm-bootstrap-cluster` end to end                                         | blocked |
+| 57 workflow `cephadm-create-csi-user` end to end                                           | blocked |
+| 58 workflow `cephadm-create-fs` end to end                                                 | blocked |
+| 59 workflow `cephadm-create-pool` end to end                                               | blocked |
+| 60 workflow `cephadm-delete-fs` end to end                                                 | blocked |
+| 61 workflow `cephadm-distribute-key` end to end                                            | blocked |
+| 62 workflow `cephadm-fetch-csi-key` end to end                                             | blocked |
+| 63 workflow `cephadm-get-conn-bundle` end to end                                           | blocked |
+| 64 workflow `cephadm-inventory-rgw-buckets` end to end                                     | blocked |
+| 65 workflow `cephadm-prep-host` end to end                                                 | blocked |
+| 66 workflow `cephadm-remove-osds` end to end                                               | blocked |
+| 67 workflow `cephadm-verify-health` end to end                                             | blocked |
+| 68 workflow `cephadm-verify-host-prep` end to end                                          | blocked |
+| 69 workflow `cephadm-verify-mgr` end to end                                                | blocked |
+| 70 workflow `cephadm-verify-mon-quorum` end to end                                         | blocked |
+| 71 workflow `cephadm-verify-osds` end to end                                               | blocked |
+| 72 workflow `cephadm-wipe-disks` end to end                                                | blocked |
+| 73 wipeDiskToRaw refuses a root RAID1 member (protected device)                            | blocked |
+| 74 wipeDiskToRaw refuses when lsblk and blkid disagree                                     | blocked |
+| 75 cephRgwBucketEnsure object-leak probe leaves no probe version behind (versioned bucket) | blocked |
+| 76 cephRgwBucketPolicyEnsure rollback restores the prior policy on failure                 | blocked |
+| 77 cephRmCluster refuses a host whose fsid differs from the named one                      | blocked |
+
+## Review ledger: final verify and merge prep
+
+- Integrated tree reviewed CLEAN at 7f931c2. Delta triage 7f931c2..95517dc
+  (README regeneration, six integrated-review Mediums, the final shared wipe
+  guard: `_lib/protected_devices.ts` blob 2a2592a4, `_lib/wipe.ts` identical to
+  lane/b2-cephwipe at 8798f32), codex astra + terra seats both rc=0:
+  - Refuted HIGH (terra) `_lib/s3.ts` probe cleanup "creates a delete marker
+    when the PUT version id is lost": `cleanupProbeObject` lists every Version
+    and DeleteMarker for the exact probe key and deletes each by id; the
+    empty-id delete is only the fallback when the listing is unreadable.
+  - Refuted MEDIUM (terra) `blkidUsable` "refuses blank disks": bare `blkid`
+    reports every signature on the host, including the root filesystem, so it
+    exits 0 on any booted host; an exit-2 answer refuses fail-closed by design
+    (guard signed off at round 5).
+  - Mitigated MEDIUM (astra) `curlDownloadScript` character denylist:
+    `assertHttpUrl` validates the URL first in `ensureCephadm`.
+- Known residuals for the next version: LOW the probe-cleanup fallback (version
+  listing unreadable after an indeterminate PUT) reports success after a plain
+  DELETE that on a versioned bucket only adds a delete marker; LOW `stackOf` in
+  `_lib/protected_devices.ts` duplicates the `closure` traversal; LOW
+  `cephadmUrl` accepts http as well as https (by spec).
+- Merge prep (gate 7): plain model export so the registry catalogs the model
+  type; the S3 credential grammar moved to one shared constant so
+  `.meta({ sensitive: true })` sits on each field's own line (the quality
+  scanner is line-based); the RGW user record's `accessKey` is now
+  sensitive-marked beside `key`. No other behaviour change; 486 tests pass.

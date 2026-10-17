@@ -244,8 +244,13 @@ const InstallArgs = z.strictObject({
     .describe(
       "Bearer token for a private release mirror, sent as an Authorization header; wire with a vault.get(...) expression.",
     ),
-  role: z.enum(["single", "controller", "worker"]).default("single").describe(
-    "single installs a controller that also runs a worker; worker joins an existing cluster with join_token.",
+  role: z.enum(["single", "controller", "controller_worker", "worker"]).default(
+    "single",
+  ).describe(
+    "single installs a controller that also runs a worker with no control-plane taint; controller_worker installs a controller with --enable-worker (tainted unless no_taints); controller is control-plane only; worker joins an existing cluster with join_token.",
+  ),
+  no_taints: z.boolean().default(false).describe(
+    "For role controller_worker, also pass --no-taints so workloads schedule on it; ignored for other roles and off keeps the previous behaviour.",
   ),
   join_token: z.string().max(16384).meta({ sensitive: true }).nullish()
     .describe(
@@ -326,7 +331,9 @@ const StateSchema = z.strictObject({
   host: z.string(),
   port: z.number().int(),
   user: z.string(),
-  role: z.enum(["single", "controller", "worker"]).nullable(),
+  role: z
+    .enum(["single", "controller", "controller_worker", "worker"])
+    .nullable(),
   k0s_version: z.string().nullable(),
   binary_sha256: z.string().nullable(),
   config_sha256: z.string().nullable(),
@@ -1157,9 +1164,11 @@ function buildK0sModel(deps: K0sDeps) {
           // change like any other.
           if (unitPresent && service === "k0scontroller") {
             const mode = await controllerMode(deps, target);
-            const wanted: ControllerMode = args.role === "single"
-              ? "single"
-              : "controller";
+            const wanted: ControllerMode = args.role === "controller"
+              ? "controller"
+              : args.role === "controller_worker" && !args.no_taints
+              ? "controller+worker"
+              : "single";
             if (mode !== wanted) {
               if (args.confirm_role_change?.toLowerCase() !== target.host) {
                 throw new Error(
@@ -1351,7 +1360,7 @@ function buildK0sModel(deps: K0sDeps) {
 
             const installed = await deps.ssh.exec(target, [
               K0S_BINARY_PATH,
-              ...installArgs(args.role, args.force_reinstall),
+              ...installArgs(args.role, args.no_taints, args.force_reinstall),
             ]);
             if (!ok(installed)) {
               throw new Error(

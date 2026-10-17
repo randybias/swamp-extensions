@@ -514,3 +514,30 @@ Deno.test("HA config inputs render only when set, leaving the base byte-identica
   const ext = renderK0sConfig({ ...BASE, external_address: "192.0.2.10" });
   assertEquals(ext.includes('externalAddress: "192.0.2.10"'), true);
 });
+
+Deno.test("installArgs: controller_worker enables a worker and honors no_taints", () => {
+  assertEquals(installArgs("controller_worker"), [
+    "install",
+    "controller",
+    "--enable-worker",
+  ]);
+  assertEquals(installArgs("controller_worker", true), [
+    "install",
+    "controller",
+    "--enable-worker",
+    "--no-taints",
+  ]);
+  assertEquals(installArgs("single"), [
+    "install",
+    "controller",
+    "--enable-worker",
+    "--no-taints",
+  ]);
+  assertEquals(installArgs("controller"), ["install", "controller"]);
+  assertEquals(installArgs("controller_worker", false, true), [
+    "install",
+    "controller",
+    "--enable-worker",
+    "--force",
+  ]);
+});

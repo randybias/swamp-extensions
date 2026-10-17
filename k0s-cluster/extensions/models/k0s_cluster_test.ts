@@ -1274,6 +1274,26 @@ Deno.test("reset refuses a confirm_host that does not match", async () => {
   );
 });
 
+Deno.test("install accepts role controller_worker and no_taints", () => {
+  const model = createModel(makeDeps().deps);
+  assertEquals(
+    model.methods.install.arguments.safeParse(
+      installArgs({ role: "controller_worker", no_taints: true }),
+    ).success,
+    true,
+  );
+  assertEquals(
+    model.methods.install.arguments.safeParse({
+      ssh: SSH,
+      k0s_version: VERSION,
+      k0s_binary_sha256: PAYLOAD_SHA,
+      ...CLUSTER,
+      role: "bogus",
+    }).success,
+    false,
+  );
+});
+
 Deno.test("the grammar rejects injection on every remote-bound input", () => {
   const model = createModel(makeDeps().deps);
   const bad = [

@@ -28,7 +28,7 @@ export const K0S_VERSION_RE = /^v?\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?$/;
 /** A 64-character hex digest. */
 export const SHA256_RE = /^[0-9a-f]{64}$/i;
 /** A cluster role the host may be installed as. */
-export type K0sRole = "single" | "controller" | "worker";
+export type K0sRole = "single" | "controller" | "controller_worker" | "worker";
 
 /** A host's CPU architecture as k0s names it in a release artifact. */
 export type K0sArch = "amd64" | "arm64";
@@ -236,9 +236,20 @@ export async function verifyBinary(
  * ever scheduled. (`--single` would also do it but switches the datastore to
  * kine, overriding the `storage_type` input, so the two explicit flags are used.)
  */
-export function installArgs(role: K0sRole, force = false): string[] {
+export function installArgs(
+  role: K0sRole,
+  noTaints = false,
+  force = false,
+): string[] {
   const base = role === "single"
     ? ["install", "controller", "--enable-worker", "--no-taints"]
+    : role === "controller_worker"
+    ? [
+      "install",
+      "controller",
+      "--enable-worker",
+      ...(noTaints ? ["--no-taints"] : []),
+    ]
     : role === "controller"
     ? ["install", "controller"]
     : ["install", "worker", "--token-file", K0S_WORKER_TOKEN_PATH];

@@ -30,8 +30,11 @@ ssh-host:
 
 cephadm:
   channel: beta
-  ci: false
-  published: {}
+  ci: true
+  published:
+    2026.10.17.1: cb3f5404e00b2797a65dfae6694cc9a03f2d474c734ae3f2640bf5e09f50254e
+  notes:
+    2026.10.17.1: 'First release, beta. Install and operate a standalone Ceph cluster managed by cephadm on Linux hosts over SSH: host preparation, disk wiping behind a fail-closed boot and root device guard, bootstrap, daemon placement, pools, CephFS, client entities, RGW users and buckets (S3 plane signed with SigV4), maintenance, teardown and read-only verification, with 22 workflows. Live testing needs three or more hosts with free whole disks and was not possible in this release; every live cell is recorded as blocked, so it stays on beta.'
 
 cherry-servers:
   channel: beta
@@ -45,5 +48,8 @@ cherry-servers:
 
 wireguard-mesh:
   channel: beta
-  ci: false
-  published: {}
+  ci: true
+  published:
+    2026.10.17.4: f74daacaa223888d33da7a3018ca6d2beb22520f2d04f1e44a50913882eb7957
+  notes:
+    2026.10.17.4: 'First release, beta. Render one node''s WireGuard config from mesh inputs (peers allowlist, relay exclusion) and push it over SSH under a strict or persisted trust-on-first-use host-key policy. Every apply arms a host-side rollback before any live change, confirms over a fresh management connection, and disarms only its own generation under a host lock; Address or routed AllowedIPs changes recreate the interface. Live end to end on two throwaway VPS: 19 of 21 cells pass, 0 fail; a delete that severs its own management path and that delete''s rollback firing were not exercised, so it stays on beta.'

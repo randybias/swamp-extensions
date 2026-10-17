@@ -2,10 +2,12 @@
  * Mutating layout operations: atomic `SHA256SUMS` regeneration, refs and
  * object removal.
  *
- * `SHA256SUMS` is rebuilt under `flock(1)` from the blob files actually
- * present, written to a same-directory temp file and renamed into place, so a
- * reader never sees a partial index. No content digest is ever placed on a
- * command line.
+ * The shell for each operation is built by an exported pure function so tests
+ * can run it through a real `sh`. `SHA256SUMS` is rebuilt under `flock(1)` from
+ * the blob paths present and renamed into place, so a reader never sees a
+ * partial index. The recorded hash is the content address in the path, not a
+ * re-read of the bytes: verification happens when bytes are written and again
+ * in `verify`. No content digest is placed on a command line.
  *
  * @module
  */
@@ -14,30 +16,96 @@ import { posixQuote, type SshDeps, SshError, type SshTarget } from "./ssh.ts";
 import { BLOB_DIR, LOCK_FILE, REFS_DIR, SHA256SUMS_FILE } from "./layout.ts";
 import { execSudo, probeFile, runScript } from "./remote.ts";
 
-/** Rebuilds `SHA256SUMS` from the blobs present, under an exclusive lock. */
-export async function regenerateSha256Sums(
-  deps: SshDeps,
-  target: SshTarget,
-  root: string,
-): Promise<void> {
+const BLOB_REL_RE = /^([0-9a-f]{64})\/([A-Za-z0-9][A-Za-z0-9._-]{0,127})$/;
+
+/** The `SHA256SUMS` rebuild script: records each blob's path hash. */
+export function regenerateSumsScript(root: string): string {
   const r = posixQuote(root);
-  const script = [
-    `set -e`,
+  return [
+    `set -eu`,
     `r=${r}`,
     `[ -d "$r/${BLOB_DIR}" ] || mkdir -p "$r/${BLOB_DIR}"`,
     `exec 9>"$r/${LOCK_FILE}"`,
     `flock 9`,
     `tmp="$r/.${SHA256SUMS_FILE}.tmp.$$"`,
     `trap 'rm -f "$tmp"' EXIT`,
-    `find "$r/${BLOB_DIR}" -type f 2>/dev/null | LC_ALL=C sort | while IFS= read -r f; do`,
+    `find "$r/${BLOB_DIR}" -type f ! -name '.*' 2>/dev/null | LC_ALL=C sort | while IFS= read -r f; do`,
     `  rel="\${f#"$r/"}"`,
-    `  h=$( { sha256sum "$f" 2>/dev/null || shasum -a 256 "$f" 2>/dev/null; } | awk '{print $1}' )`,
+    `  h="\${rel#${BLOB_DIR}/}"; h="\${h%%/*}"`,
+    `  [ "\${#h}" -eq 64 ] || continue`,
     `  printf '%s  %s\\n' "$h" "$rel"`,
     `done > "$tmp"`,
     `mv -T "$tmp" "$r/${SHA256SUMS_FILE}"`,
     `trap - EXIT`,
   ].join("\n");
-  const result = await runScript(deps, target, script);
+}
+
+/** The `setRef` script: writes a ref file atomically next to its siblings. */
+export function setRefScript(
+  root: string,
+  name: string,
+  kind: "blob" | "bundle",
+  hash: string,
+): string {
+  const r = posixQuote(root);
+  const refPath = posixQuote(`${root}/${REFS_DIR}/${name}`);
+  return [
+    `set -eu`,
+    `r=${r}`,
+    `mkdir -p "$r/${REFS_DIR}"`,
+    `tmp="$r/${REFS_DIR}/.${name}.tmp.$$"`,
+    `trap 'rm -f "$tmp"' EXIT`,
+    `printf '%s  %s\\n' ${posixQuote(kind)} ${posixQuote(hash)} > "$tmp"`,
+    `mv -T "$tmp" ${refPath}`,
+    `trap - EXIT`,
+  ].join("\n");
+}
+
+/** The `unsetRef` script. */
+export function unsetRefScript(root: string, name: string): string {
+  return `rm -f ${posixQuote(`${root}/${REFS_DIR}/${name}`)}`;
+}
+
+/**
+ * The object removal script. It refuses a symlinked `sha256/`, `bundles/` or
+ * `<hex>` directory before removing anything, so a planted link cannot redirect
+ * `rm` outside the root. Each path must be a blob or bundle relative path.
+ */
+export function removeObjectsScript(root: string, paths: string[]): string {
+  const r = posixQuote(root);
+  const list = paths.map(posixQuote).join(" ");
+  return [
+    `set -eu`,
+    `r=${r}`,
+    `cd "$r"`,
+    `for d in "$r/${BLOB_DIR}" "$r/bundles"; do`,
+    `  [ -L "$d" ] && { echo "refusing symlinked $d" >&2; exit 3; }`,
+    `done`,
+    `for p in ${list}; do`,
+    `  case "$p" in`,
+    `    ${BLOB_DIR}/*/*) h="\${p#${BLOB_DIR}/}"; h="\${h%%/*}"; d="$r/${BLOB_DIR}/$h";;`,
+    `    bundles/*) d="$r/bundles/\${p#bundles/}";;`,
+    `    *) echo "unexpected path $p" >&2; exit 3;;`,
+    `  esac`,
+    `  [ -L "$d" ] && { echo "refusing symlinked $d" >&2; exit 3; }`,
+    `done`,
+    `rm -rf -- ${list}`,
+  ].join("\n");
+}
+
+/** Returns whether a relative path is an accepted blob or bundle path. */
+export function isSafeObjectPath(path: string): boolean {
+  if (/^bundles\/[0-9a-f]{64}$/.test(path)) return true;
+  return BLOB_REL_RE.test(path.replace(/^sha256\//, ""));
+}
+
+/** Rebuilds `SHA256SUMS` from the blobs present, under an exclusive lock. */
+export async function regenerateSha256Sums(
+  deps: SshDeps,
+  target: SshTarget,
+  root: string,
+): Promise<void> {
+  const result = await runScript(deps, target, regenerateSumsScript(root));
   if (result.exit_code !== 0) {
     throw new SshError(
       `could not regenerate SHA256SUMS (exit ${result.exit_code})`,
@@ -45,7 +113,7 @@ export async function regenerateSha256Sums(
   }
 }
 
-/** Writes a ref file atomically. */
+/** Writes a ref file atomically, refusing to write through a symlink. */
 export async function setRef(
   deps: SshDeps,
   target: SshTarget,
@@ -54,23 +122,16 @@ export async function setRef(
   kind: "blob" | "bundle",
   hash: string,
 ): Promise<void> {
-  const r = posixQuote(root);
   const refPath = `${root}/${REFS_DIR}/${name}`;
   const probe = await probeFile(deps, target, refPath);
   if (probe.state === "symlink") {
     throw new SshError(`${refPath} is a symlink; refusing to write through it`);
   }
-  const script = [
-    `set -e`,
-    `r=${r}`,
-    `mkdir -p "$r/${REFS_DIR}"`,
-    `tmp="$r/${REFS_DIR}/.${name}.tmp.$$"`,
-    `trap 'rm -f "$tmp"' EXIT`,
-    `printf '%s  %s\\n' ${posixQuote(kind)} ${posixQuote(hash)} > "$tmp"`,
-    `mv -T "$tmp" "$r/${REFS_DIR}/${posixQuote(name)}"`,
-    `trap - EXIT`,
-  ].join("\n");
-  const result = await runScript(deps, target, script);
+  const result = await runScript(
+    deps,
+    target,
+    setRefScript(root, name, kind, hash),
+  );
   if (result.exit_code !== 0) {
     throw new SshError(`could not write ref ${name}`);
   }
@@ -91,18 +152,14 @@ export async function unsetRef(
       `${refPath} is a symlink; refusing to remove through it`,
     );
   }
-  const result = await runScript(
-    deps,
-    target,
-    `rm -f ${posixQuote(refPath)}`,
-  );
+  const result = await runScript(deps, target, unsetRefScript(root, name));
   if (result.exit_code !== 0) {
     throw new SshError(`could not remove ref ${name}`);
   }
   return true;
 }
 
-/** Removes object paths (relative to `<root>`) that were validated by a plan. */
+/** Removes object paths (relative to `<root>`) validated by a plan. */
 export async function removeObjects(
   deps: SshDeps,
   target: SshTarget,
@@ -110,11 +167,15 @@ export async function removeObjects(
   paths: string[],
 ): Promise<void> {
   if (paths.length === 0) return;
-  const quoted = paths.map(posixQuote).join(" ");
+  for (const path of paths) {
+    if (!isSafeObjectPath(path)) {
+      throw new SshError(`refusing to remove unexpected path ${path}`);
+    }
+  }
   const result = await runScript(
     deps,
     target,
-    `cd ${posixQuote(root)} && rm -rf -- ${quoted}`,
+    removeObjectsScript(root, paths),
   );
   if (result.exit_code !== 0) {
     throw new SshError("could not remove the planned objects");

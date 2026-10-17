@@ -178,9 +178,29 @@ Deno.test("basic auth over plain HTTP must be acknowledged at run time", async (
 
 Deno.test("root refuses /, relative and dot-dot paths", () => {
   const args = createModel().methods.list.arguments;
-  for (const root of ["/", "/srv/../etc", "srv/artifacts", "/srv/./x"]) {
+  for (
+    const root of [
+      "/",
+      "/srv/../etc",
+      "srv/artifacts",
+      "/srv/./x",
+      "/etc",
+      "/usr",
+      "/home",
+      "/srv",
+      "/tmp",
+      "/opt",
+      "/var",
+    ]
+  ) {
     assertEquals(args.safeParse({ ssh: SSH, root }).success, false, root);
   }
+  // A two-segment path under a system directory is allowed by the grammar; the
+  // install/uninstall sentinel is what protects it at run time.
+  assertEquals(
+    args.safeParse({ ssh: SSH, root: "/srv/artifacts" }).success,
+    true,
+  );
 });
 
 Deno.test("fetch.url must be https with no userinfo, quote or semicolon", () => {
@@ -539,7 +559,11 @@ Deno.test("uninstall is a clean no-op when the site is absent", async () => {
   const m = createModel(host.deps);
   const { context } = createModelTestContext({});
   const result = await m.methods.uninstall.execute(base(), context);
-  assertEquals(result.result, { removed: false, data_removed: false });
+  assertEquals(result.result, {
+    removed: false,
+    credentials_removed: 0,
+    data_removed: false,
+  });
 });
 
 Deno.test("uninstall removes the site and, when asked, the data root", async () => {
@@ -553,11 +577,155 @@ Deno.test("uninstall removes the site and, when asked, the data root", async () 
     base({ remove_data: true }),
     context,
   );
-  assertEquals(result.result, { removed: true, data_removed: true });
+  assertEquals(result.result, {
+    removed: true,
+    credentials_removed: 0,
+    data_removed: true,
+  });
   assertEquals(host.files.has(NGINX_SITE_PATH), false);
   assertEquals(host.symlinks.has(NGINX_ENABLED_PATH), false);
   assertEquals(
     [...host.files.keys()].some((p) => p.startsWith(`${ROOT}/`)),
     false,
   );
+});
+
+Deno.test("install refuses a populated root that holds no sentinel", async () => {
+  const host = makeFakeRemote();
+  host.setFile(`${ROOT}/not-ours.conf`, "x\n", "644", "user", "user");
+  const m = createModel(host.deps);
+  const { context } = createModelTestContext({});
+  await assertRejects(
+    () =>
+      m.methods.install.execute(
+        base({ ...SITE_ARGS, tls: { mode: "none", plaintext_ack: true } }),
+        context,
+      ),
+    Error,
+    "sentinel",
+  );
+  // Nothing was written and no symlink was left behind.
+  assertEquals(host.files.has(NGINX_SITE_PATH), false);
+  assertEquals(host.symlinks.has(NGINX_ENABLED_PATH), false);
+});
+
+Deno.test("install rollback removes the enabled link and the site on a first install", async () => {
+  const host = makeFakeRemote();
+  host.failNginxTest = true;
+  const m = createModel(host.deps);
+  const { context } = createModelTestContext({});
+  await assertRejects(
+    () =>
+      m.methods.install.execute(
+        base({ ...SITE_ARGS, tls: { mode: "none", plaintext_ack: true } }),
+        context,
+      ),
+    Error,
+    "rolled back",
+  );
+  // No dangling sites-enabled link, no site file, and no reload.
+  assertEquals(host.symlinks.has(NGINX_ENABLED_PATH), false);
+  assertEquals(host.files.has(NGINX_SITE_PATH), false);
+  assertEquals(
+    host.commands.some((c) => c.includes("argv:systemctl reload")),
+    false,
+  );
+});
+
+Deno.test("fetch is idempotent when the pinned object is already present", async () => {
+  const host = makeFakeRemote();
+  let downloads = 0;
+  host.curl = () => {
+    downloads++;
+    return "payload";
+  };
+  const hash = await sha256Hex("payload");
+  host.setFile(
+    `${ROOT}/sha256/${hash}/p.bin`,
+    "payload",
+    "644",
+    "user",
+    "user",
+  );
+  const m = createModel(host.deps);
+  const { context } = createModelTestContext({});
+  const result = await m.methods.fetch.execute(
+    base({
+      url: "https://up.example.test/p.bin",
+      filename: "p.bin",
+      sha256: hash,
+    }),
+    context,
+  );
+  assertEquals((result.result as { changed: boolean }).changed, false);
+  assertEquals(downloads, 0);
+  assertEquals(
+    host.commands.some((c) => c.includes("curl -fsS")),
+    false,
+  );
+});
+
+Deno.test("publish_bundle refuses duplicate file names", async () => {
+  const host = makeFakeRemote();
+  const m = createModel(host.deps);
+  const { context } = createModelTestContext({});
+  await assertRejects(
+    () =>
+      m.methods.publish_bundle.execute(
+        base({
+          files: [{ name: "a", content: "one" }, { name: "a", content: "two" }],
+        }),
+        context,
+      ),
+    Error,
+    "unique",
+  );
+});
+
+Deno.test("prune refuses a symlinked hash directory and deletes nothing", async () => {
+  const host = makeFakeRemote();
+  const orphan = await sha256Hex("orphan\n");
+  host.setFile(
+    `${ROOT}/sha256/${orphan}/data`,
+    "orphan\n",
+    "644",
+    "user",
+    "user",
+  );
+  // The hash directory is a symlink pointing outside the root.
+  host.symlinks.add(`${ROOT}/sha256/${orphan}`);
+  const m = createModel(host.deps);
+  const { context } = createModelTestContext({});
+  const plan = (await m.methods.plan_prune.execute(base(), context)).result as {
+    planSha256: string;
+  };
+  await assertRejects(
+    () =>
+      m.methods.prune.execute(base({ plan_sha256: plan.planSha256 }), context),
+    Error,
+  );
+  assertEquals(host.files.has(`${ROOT}/sha256/${orphan}/data`), true);
+});
+
+Deno.test("list drops an object whose name contains a newline", async () => {
+  const host = makeFakeRemote();
+  const good = await sha256Hex("good\n");
+  host.setFile(
+    `${ROOT}/sha256/${good}/good.txt`,
+    "good\n",
+    "644",
+    "user",
+    "user",
+  );
+  host.setFile(
+    `${ROOT}/sha256/${good}/bad\nname`,
+    "bad\n",
+    "644",
+    "user",
+    "user",
+  );
+  const m = createModel(host.deps);
+  const { context } = createModelTestContext({});
+  const result = await m.methods.list.execute(base(), context);
+  assertEquals((result.result as { blobs: number }).blobs, 1);
 });

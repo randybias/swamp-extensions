@@ -30,20 +30,41 @@ addresses and `.test` names only.
    basic-auth hashes and the TLS key are sensitive method inputs written to
    root-only files. No secret is placed on a command line, in state, or in a
    log.
-5. **Config rollback** — `install` reads the previous site file before writing
-   the new one. If `nginx -t` fails, it restores the previous file and throws
-   without reloading, so the running config is never replaced by a broken one.
-6. **Prune safety** — `plan_prune` persists a plan whose hash covers the sorted
-   object paths; `prune` recomputes the plan with the same `keep` list and
-   refuses when the hash differs, so a change since planning deletes nothing.
-7. **`fetch` transport** — restricted to `https` with no userinfo and no shell
-   metacharacters in the URL. The download lands in a hidden temp file and is
-   moved into place only after the host-reported hash matches the pin.
-8. **Read-only methods persist** — `render_config`, `list`, `verify`, `get`,
-   `sync` and `plan_prune` each persist their observation as a resource.
-9. **In-method preconditions** — every destructive method re-checks its own
-   safety preconditions at run time, so a workflow resume with overridden inputs
-   cannot bypass a workflow gate.
+5. **Config rollback** — `install` snapshots the site file, the enabled link,
+   the default site, the TLS files and the htpasswd before changing anything. If
+   `nginx -t` fails it restores every one of them, removes a first-install
+   enabled link so no dangling symlink can break a host-wide `nginx -t`, and
+   re-runs `nginx -t` before throwing. It never reloads a broken config.
+6. **Served-root policy** — `root` requires at least two segments and may not be
+   a bare system directory. `install` refuses a populated root with no regular
+   `.layout-version` sentinel, and `uninstall` removes a root only when it is a
+   real directory holding that sentinel.
+7. **`SHA256SUMS` semantics** — a line records the content address in the path
+   (`sha256/<hex>/<name>`), not a re-read of the bytes; dotfiles are skipped. It
+   is rebuilt under `flock` and renamed into place. `verify` re-hashes the bytes
+   and reports a mismatch against either the path hash or the recorded value.
+8. **Object path grammar** — paths read from the host must match
+   `sha256/<64-hex>/<name>` or `bundles/<64-hex>`. `prune` refuses to remove
+   through a symlinked `sha256/`, `bundles/` or hash directory, and the shell
+   refuses any path that fails the grammar.
+9. **Bundles** — duplicate file names are refused, and files are staged in a
+   hidden dot-directory and renamed into place, so the tree hash always matches
+   what is served.
+10. **`fetch` transport** — `https` only, no userinfo or shell metacharacters,
+    `-L` with at most five redirects, a `curl --max-filesize` and a
+    post-download size check. A present object with the pinned hash is not
+    downloaded again.
+11. **Nginx realm and locations** — the basic-auth realm is restricted to
+    `[A-Za-z0-9 ._-]`; the `sha256/` and `bundles/` locations no longer use `^~`
+    and nest a dotfile `deny` so in-flight temp files are never served.
+12. **Read-only methods persist** — `render_config`, `list`, `verify`, `get`,
+    `sync` and `plan_prune` each persist their observation as a resource.
+13. **In-method preconditions** — every destructive method re-checks its own
+    safety preconditions at run time, so a workflow resume with overridden
+    inputs cannot bypass a workflow gate.
+14. **Plain model literal** — `model` is a plain object literal (not a computed
+    spread) so tooling can catalogue it; `createModel(deps)` remains a thin
+    compatibility wrapper that sets the transport for tests.
 
 ## Open spec questions resolved by the simplest safe option
 

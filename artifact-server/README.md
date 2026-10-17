@@ -50,19 +50,34 @@ persist an `artifact` resource.
 Every destructive method enforces its own preconditions in the method, so a
 workflow resume with overridden inputs cannot skip a gate:
 
-- `install` reads the previous site file first; a failed `nginx -t` restores it
-  and never reloads. The generated config disables autoindex and symlink
-  following and denies dotfiles and `refs/`.
+- The served `root` must have at least two segments and may not be a bare system
+  directory. `install` refuses a populated root that holds no regular
+  `.layout-version` sentinel, and `uninstall` only removes a root that is a real
+  directory holding that sentinel.
+- `install` snapshots the site file, the enabled link, the default site, the TLS
+  files and the htpasswd before it changes anything. A failed `nginx -t`
+  restores all of them, removes a first-install enabled link, and never reloads;
+  it then re-runs `nginx -t` to prove the restored config is clean.
+- The generated config disables autoindex and symlink following and denies
+  dotfiles at the root and inside `sha256/` and `bundles/`, so in-flight upload
+  temp files are never served.
+- Object paths read back from the host must match `sha256/<64-hex>/<name>` or
+  `bundles/<64-hex>`; anything else is ignored. `prune` refuses to run when
+  `sha256/`, `bundles/` or a hash directory is a symlink, so a planted link
+  cannot redirect `rm` outside the root.
 - `upload` refuses when the computed hash differs from a supplied `sha256`.
-- `fetch` keeps the download in a hidden temp file until the host-side hash
-  matches the pin; a mismatch removes the temp and changes nothing.
+- `fetch` is idempotent (a present object is not downloaded again), stays on
+  `https` across at most five redirects, is size-bounded, and keeps the download
+  in a hidden temp file until the host-side hash matches the pin.
 - `prune` recomputes the plan and refuses when it differs from `plan_sha256`; a
   change since planning deletes nothing.
-- `uninstall` is a clean no-op when the site is absent and never removes the
-  nginx package.
+- `uninstall` is a clean no-op when the site is absent, removes the site's TLS
+  files and htpasswd, and never removes the nginx package.
 
-`SHA256SUMS` is rebuilt under an exclusive `flock` from the blobs actually
-present, written to a same-directory temp file and renamed into place. No
+`SHA256SUMS` is rebuilt under an exclusive `flock` from the blob paths present
+and renamed into place: each line records the content address in the path, not a
+re-read of the bytes. `verify` re-hashes every object and reports a mismatch
+when the actual hash differs from the path hash or from the recorded value. No
 content-derived digest is sent to the host for verification, and no secret is
 placed on a command line.
 

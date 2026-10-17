@@ -19,6 +19,13 @@ import {
 } from "./layout.ts";
 import { probeFile, runScript } from "./remote.ts";
 
+/** Accepted blob relative path: `sha256/<64-hex>/<safe filename>`. */
+const BLOB_REL_RE = /^([0-9a-f]{64})\/([A-Za-z0-9][A-Za-z0-9._-]{0,127})$/;
+/** Accepted bundle directory name: a 64-hex tree hash. */
+const BUNDLE_NAME_RE = /^[0-9a-f]{64}$/;
+/** Accepted ref name. */
+const REF_NAME_RE = /^[a-z0-9][a-z0-9._-]{0,63}$/;
+
 /** One ref as stored on disk. */
 export interface RefEntry {
   /** Ref name. */
@@ -101,19 +108,21 @@ export async function readLayout(
     const match = (value ?? "").trim().match(
       /^(blob|bundle)\s+([0-9a-f]{64})$/,
     );
-    if (name && match) {
+    if (name && match && REF_NAME_RE.test(name)) {
       refs.push({ name, kind: match[1] as "blob" | "bundle", hash: match[2] });
     }
   }
   const blobs: ObjectEntry[] = [];
   for (const line of sections.blobs) {
-    const [rel, size, mtime] = line.split("\t");
-    if (!rel || !rel.includes("/")) continue;
-    const hash = rel.split("/")[0];
+    const parts = line.split("\t");
+    if (parts.length !== 3) continue;
+    const [rel, size, mtime] = parts;
+    const match = rel.match(BLOB_REL_RE);
+    if (!match || !/^\d+$/.test(size) || !/^[0-9.]+$/.test(mtime)) continue;
     blobs.push({
       kind: "blob",
-      hash,
-      name: rel.slice(hash.length + 1),
+      hash: match[1],
+      name: match[2],
       bytes: Number(size) || 0,
       mtimeMs: Math.round((Number(mtime) || 0) * 1000),
       path: `${BLOB_DIR}/${rel}`,
@@ -121,8 +130,11 @@ export async function readLayout(
   }
   const bundles: ObjectEntry[] = [];
   for (const line of sections.bundles) {
-    const [name, size, mtime] = line.split("\t");
-    if (!name) continue;
+    const parts = line.split("\t");
+    if (parts.length !== 3) continue;
+    const [name, size, mtime] = parts;
+    if (!BUNDLE_NAME_RE.test(name)) continue;
+    if (!/^\d+$/.test(size) || !/^[0-9.]+$/.test(mtime)) continue;
     bundles.push({
       kind: "bundle",
       hash: name,
@@ -276,6 +288,23 @@ export async function readFileText(
     sudo,
   );
   return result.exit_code === 0 ? result.stdout : null;
+}
+
+/** Reads a symlink's raw target, or null when the path is not a symlink. */
+export async function readLink(
+  deps: SshDeps,
+  target: SshTarget,
+  path: string,
+  sudo = false,
+): Promise<string | null> {
+  const result = await runScript(
+    deps,
+    target,
+    `if [ -L ${posixQuote(path)} ]; then readlink ${posixQuote(path)}; fi`,
+    sudo,
+  );
+  const text = result.stdout.trim();
+  return result.exit_code === 0 && text !== "" ? text : null;
 }
 
 /** True when the lock file exists. */

@@ -61,7 +61,12 @@ import {
   putUserFile,
   runScript,
 } from "./_lib/remote.ts";
-import { readFileText, readLayout, readNginxState } from "./_lib/observe.ts";
+import {
+  readFileText,
+  readLayout,
+  readLink,
+  readNginxState,
+} from "./_lib/observe.ts";
 import {
   regenerateSha256Sums,
   removeObjects,
@@ -159,10 +164,30 @@ const HOSTNAME_JSON_RE =
   /^(?=.{1,253}$)[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)*$/;
 const ROOT_RE = /^\/[A-Za-z0-9._/-]{1,255}$/;
 const SHA256_RE = /^[0-9a-f]{64}$/;
-const FILENAME_RE = /^[A-Za-z0-9][A-Za-z0-9._+-]{0,127}$/;
+const FILENAME_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
 const REF_RE = /^[a-z0-9][a-z0-9._-]{0,63}$/;
 const CRYPT_RE = /^\$(6|5|y|2[aby])\$[./A-Za-z0-9$]{8,}$/;
 const FETCH_URL_RE = /^https:\/\/[^\s;'"<>|`$()\\@]{1,2040}$/;
+/** Bare top-level system directories that may never be a served root. */
+const SYSTEM_ROOTS = new Set([
+  "/etc",
+  "/usr",
+  "/bin",
+  "/sbin",
+  "/lib",
+  "/lib64",
+  "/boot",
+  "/var",
+  "/home",
+  "/root",
+  "/srv",
+  "/opt",
+  "/proc",
+  "/sys",
+  "/dev",
+  "/run",
+  "/tmp",
+]);
 
 const SshBlockSchema = z.strictObject({
   host: z.string().regex(HOST_RE).max(253).describe(
@@ -191,11 +216,21 @@ const SshBlockSchema = z.strictObject({
 });
 
 const RootSchema = z.string().regex(ROOT_RE).refine(
-  (p) =>
-    p !== "/" && !p.split("/").some((part) => part === ".." || part === "."),
-  "root must be an absolute path that is not / and contains no . or .. segment",
+  (p) => {
+    if (
+      p === "/" || p.split("/").some((part) => part === ".." || part === ".")
+    ) {
+      return false;
+    }
+    // At least two segments, so a bare system directory like /etc or /srv
+    // can never be the served root, and a small deny list for defence in depth.
+    const segments = p.split("/").filter(Boolean);
+    if (segments.length < 2) return false;
+    return !SYSTEM_ROOTS.has(p);
+  },
+  "root must be an absolute path of at least two segments, not / , with no . or .. segment and not a bare system directory",
 ).default("/srv/artifacts").describe(
-  "Absolute served root directory; default /srv/artifacts.",
+  "Absolute served root directory with at least two segments; default /srv/artifacts.",
 );
 
 const ListenSchema = z.strictObject({
@@ -233,7 +268,9 @@ const TlsSchema = z.discriminatedUnion("mode", [
 ]);
 
 const BasicAuthSchema = z.strictObject({
-  realm: z.string().min(1).max(128).describe("Auth realm shown to clients."),
+  realm: z.string().regex(/^[A-Za-z0-9 ._-]{1,64}$/).describe(
+    "Auth realm shown to clients; letters, digits, space, dot, underscore and dash only.",
+  ),
   users: z.array(
     z.strictObject({
       name: z.string().regex(/^[a-z_][a-z0-9_-]{0,31}$/).describe(
@@ -275,10 +312,32 @@ function toTarget(ssh: SshBlock): SshTarget {
 }
 
 /** The stable data key for one target and root. */
+/** Replaces every character outside `[A-Za-z0-9._-]` with `_`. */
+function sanitizeKey(value: string): string {
+  return value.replace(/[^A-Za-z0-9._-]/g, "_");
+}
+
+/** A short, stable FNV-1a hash in hex, to keep encoded keys distinct. */
+function shortKeyHash(value: string): string {
+  let h = 2166136261 >>> 0;
+  for (let i = 0; i < value.length; i++) {
+    h ^= value.charCodeAt(i);
+    h = Math.imul(h, 16777619) >>> 0;
+  }
+  return h.toString(16).padStart(8, "0");
+}
+
+/**
+ * The stable data key for one target and root. The target and root are encoded
+ * so no `/`, `:` or other unsafe character reaches a resource instance name,
+ * and a short hash keeps distinct targets from colliding after encoding.
+ */
 function instanceKey(args: RootArgs): string {
-  const h = args.ssh.host;
-  const u = args.ssh.user;
-  return `a${h.length}-${h}-p${args.ssh.port}-u${u.length}-${u}-r${args.root.length}-${args.root}`;
+  const raw = `${args.ssh.host}:${args.ssh.port}/${args.ssh.user}@${args.root}`;
+  const host = sanitizeKey(args.ssh.host).slice(0, 40);
+  const user = sanitizeKey(args.ssh.user).slice(0, 16);
+  const root = sanitizeKey(args.root).slice(0, 32);
+  return `${host}-${args.ssh.port}-${user}-${root}-${shortKeyHash(raw)}`;
 }
 
 /** Decodes `content`/`content_base64`, refusing both or neither. */
@@ -467,6 +526,10 @@ const FetchArgsSchema = z.strictObject({
     "Required pinned hash; the object is kept only when the download matches.",
   ),
   ref: z.string().regex(REF_RE).nullish().describe("Optional ref to set."),
+  max_bytes: z.number().int().min(1).max(1073741824).default(1073741824)
+    .describe(
+      "Refuse a download larger than this many bytes (default 1 GiB).",
+    ),
 });
 
 const PublishBundleArgs = z.strictObject({
@@ -529,438 +592,442 @@ const UninstallArgs = z.strictObject({
 // Model factory
 // ---------------------------------------------------------------------------
 
-/**
- * Builds the model with injectable transport and clock. The production export
- * is `createModel()`; tests pass a fake runner so no process is spawned.
- */
-export function createModel(deps: SshDeps = denoDeps): ArtifactServerModel {
-  const renderFor = (
-    root: string,
-    listen: { address: string; port: number },
-    serverName: string,
-    tls: z.infer<typeof TlsSchema>,
-    basicAuth: z.infer<typeof BasicAuthSchema> | null | undefined,
-  ): string =>
-    renderSite({
-      root,
-      listen,
-      serverName,
-      tlsProvided: tls.mode === "provided",
-      basicAuth: basicAuth != null,
-      basicAuthRealm: basicAuth?.realm ?? "",
-    });
+/** The active transport dependencies; production uses the real runner. */
+let activeDeps: SshDeps = denoDeps;
 
-  const writeArtifact = async (
-    context: MethodContext,
-    _args: RootArgs,
-    data: {
-      sha256: string;
-      kind: "blob" | "bundle";
-      path: string;
-      url: string;
-      bytes: number;
-      files: number;
-      ref?: string | null;
-      changed: boolean;
+/** Swaps the transport dependencies. Tests use this; production never does. */
+export function setDeps(next: SshDeps): void {
+  activeDeps = next;
+}
+
+/** Renders the site config for a method's inputs. */
+const renderFor = (
+  root: string,
+  listen: { address: string; port: number },
+  serverName: string,
+  tls: z.infer<typeof TlsSchema>,
+  basicAuth: z.infer<typeof BasicAuthSchema> | null | undefined,
+): string =>
+  renderSite({
+    root,
+    listen,
+    serverName,
+    tlsProvided: tls.mode === "provided",
+    basicAuth: basicAuth != null,
+    basicAuthRealm: basicAuth?.realm ?? "",
+  });
+
+const writeArtifact = async (
+  context: MethodContext,
+  args: RootArgs,
+  data: {
+    sha256: string;
+    kind: "blob" | "bundle";
+    path: string;
+    url: string;
+    bytes: number;
+    files: number;
+    ref?: string | null;
+    changed: boolean;
+  },
+): Promise<DataHandle> =>
+  await context.writeResource(
+    "artifact",
+    `artifact-${instanceKey(args)}-${data.sha256}`,
+    ArtifactSchema.parse({
+      ...data,
+      ref: data.ref ?? null,
+      written_at: new Date(activeDeps.now()).toISOString(),
+    }),
+  );
+
+/** The artifact-server model: a plain object literal. */
+export const model: ArtifactServerModel = {
+  type: "@randybias/artifact-server",
+  version: "2026.10.17.1",
+  description:
+    "Serve a directory of pinned artifacts over HTTP(S) from one host and manage it over SSH: nginx site config, upload, host-side fetch, bundles, refs, listing, verification and prune. One generic definition with no host, path or credential in it.",
+  globalArguments: z.strictObject({}),
+  resources: {
+    config: {
+      description: "Rendered nginx site config and its hash",
+      schema: ConfigSchema,
+      lifetime: "infinite",
+      garbageCollection: 10,
     },
-  ): Promise<DataHandle> =>
-    await context.writeResource(
-      "artifact",
-      `artifact-${data.sha256}`,
-      ArtifactSchema.parse({
-        ...data,
-        ref: data.ref ?? null,
-        written_at: new Date(deps.now()).toISOString(),
-      }),
-    );
-
-  return {
-    type: "@randybias/artifact-server",
-    version: "2026.10.17.1",
-    description:
-      "Serve a directory of pinned artifacts over HTTP(S) from one host and manage it over SSH: nginx site config, upload, host-side fetch, bundles, refs, listing, verification and prune. One generic definition with no host, path or credential in it.",
-    globalArguments: z.strictObject({}),
-    resources: {
-      config: {
-        description: "Rendered nginx site config and its hash",
-        schema: ConfigSchema,
-        lifetime: "infinite",
-        garbageCollection: 10,
-      },
-      server: {
-        description: "Observed nginx state and layout summary",
-        schema: ServerSchema,
-        lifetime: "infinite",
-        garbageCollection: 10,
-      },
-      artifact: {
-        description: "One stored blob or bundle: hash, path, url, size",
-        schema: ArtifactSchema,
-        lifetime: "infinite",
-        garbageCollection: 5,
-      },
-      listing: {
-        description: "Refs, blobs and bundles with sizes and mtimes",
-        schema: ListingSchema,
-        lifetime: "infinite",
-        garbageCollection: 10,
-      },
-      verification: {
-        description: "Objects rehashed and compared against SHA256SUMS",
-        schema: VerificationSchema,
-        lifetime: "infinite",
-        garbageCollection: 10,
-      },
-      prune_plan: {
-        description: "Objects not reachable from a ref or keep list",
-        schema: PrunePlanSchema,
-        lifetime: "1d",
-        garbageCollection: 10,
+    server: {
+      description: "Observed nginx state and layout summary",
+      schema: ServerSchema,
+      lifetime: "infinite",
+      garbageCollection: 10,
+    },
+    artifact: {
+      description: "One stored blob or bundle: hash, path, url, size",
+      schema: ArtifactSchema,
+      lifetime: "infinite",
+      garbageCollection: 5,
+    },
+    listing: {
+      description: "Refs, blobs and bundles with sizes and mtimes",
+      schema: ListingSchema,
+      lifetime: "infinite",
+      garbageCollection: 10,
+    },
+    verification: {
+      description: "Objects rehashed and compared against SHA256SUMS",
+      schema: VerificationSchema,
+      lifetime: "infinite",
+      garbageCollection: 10,
+    },
+    prune_plan: {
+      description: "Objects not reachable from a ref or keep list",
+      schema: PrunePlanSchema,
+      lifetime: "1d",
+      garbageCollection: 10,
+    },
+  },
+  methods: {
+    render_config: {
+      description:
+        "READ-ONLY. Render the nginx site config for the given inputs and persist it; deterministic, and contains no secret, only paths to secret files.",
+      arguments: RenderConfigArgs,
+      execute: async (rawArgs: unknown, context: MethodContext) => {
+        const args = RenderConfigArgs.parse(rawArgs);
+        validateCommon(args);
+        if (args.tls.mode === "provided") {
+          await validateTls(activeDeps, args.tls.cert_pem, args.tls.key_pem);
+        }
+        const text = renderFor(
+          args.root,
+          args.listen,
+          args.server_name,
+          args.tls,
+          args.basic_auth,
+        );
+        const configSha = await sha256Hex(text);
+        const base = urlBase(
+          args.server_name,
+          args.listen.port,
+          args.tls.mode === "provided" ? "https" : "http",
+        );
+        const handle = await context.writeResource(
+          "config",
+          `config-${instanceKey(args)}`,
+          ConfigSchema.parse({
+            config_sha256: configSha,
+            text,
+            url_base: base,
+            rendered_at: new Date(activeDeps.now()).toISOString(),
+          }),
+        );
+        return {
+          dataHandles: [handle],
+          result: { config_sha256: configSha, url_base: base, text },
+        };
       },
     },
-    methods: {
-      render_config: {
-        description:
-          "READ-ONLY. Render the nginx site config for the given inputs and persist it; deterministic, and contains no secret, only paths to secret files.",
-        arguments: RenderConfigArgs,
-        execute: async (rawArgs: unknown, context: MethodContext) => {
-          const args = RenderConfigArgs.parse(rawArgs);
-          validateCommon(args);
-          if (args.tls.mode === "provided") {
-            await validateTls(deps, args.tls.cert_pem, args.tls.key_pem);
-          }
-          const text = renderFor(
-            args.root,
-            args.listen,
-            args.server_name,
-            args.tls,
-            args.basic_auth,
-          );
-          const configSha = await sha256Hex(text);
-          const base = urlBase(
-            args.server_name,
-            args.listen.port,
-            args.tls.mode === "provided" ? "https" : "http",
-          );
-          const handle = await context.writeResource(
-            "config",
-            `config-${instanceKey(args)}`,
-            ConfigSchema.parse({
-              config_sha256: configSha,
-              text,
-              url_base: base,
-              rendered_at: new Date(deps.now()).toISOString(),
-            }),
-          );
-          return {
-            dataHandles: [handle],
-            result: { config_sha256: configSha, url_base: base, text },
-          };
-        },
-      },
 
-      install: {
-        kind: "action",
-        description:
-          "DESTRUCTIVE. Install nginx, create the served layout, write the site config, htpasswd and TLS files, prove the config with nginx -t and reload. Idempotent: the same rendered config is not reloaded. A failed nginx -t restores the previous config and never reloads.",
-        arguments: InstallArgs,
-        execute: async (rawArgs: unknown, context: MethodContext) => {
-          const args = InstallArgs.parse(rawArgs);
-          validateCommon(args);
-          if (args.tls.mode === "provided") {
-            await validateTls(deps, args.tls.cert_pem, args.tls.key_pem);
-          }
-          const target = toTarget(args.ssh);
-          let changed = false;
+    install: {
+      kind: "action",
+      description:
+        "DESTRUCTIVE. Install nginx, create the served layout, write the site config, htpasswd and TLS files, prove the config with nginx -t and reload. Idempotent: the same rendered config is not reloaded. A failed nginx -t restores the previous config and never reloads.",
+      arguments: InstallArgs,
+      execute: async (rawArgs: unknown, context: MethodContext) => {
+        const args = InstallArgs.parse(rawArgs);
+        validateCommon(args);
+        if (args.tls.mode === "provided") {
+          await validateTls(activeDeps, args.tls.cert_pem, args.tls.key_pem);
+        }
+        const target = toTarget(args.ssh);
+        const rootKind = await rootState(activeDeps, target, args.root);
+        if (rootKind === "foreign") {
+          throw new SshError(
+            `refusing to install into ${args.root}: it exists but holds no regular ${LAYOUT_VERSION_FILE} sentinel`,
+          );
+        }
 
-          const nginx = await execSudo(deps, target, [
-            "apt-get",
-            "install",
-            "-y",
-            "nginx",
+        const nginx = await execSudo(activeDeps, target, [
+          "apt-get",
+          "install",
+          "-y",
+          "nginx",
+        ]);
+        if (nginx.exit_code !== 0) {
+          throw new SshError("could not install nginx");
+        }
+
+        // Snapshot every file and link this run may touch, before touching any
+        // of them, so a failed nginx -t can restore the whole host.
+        const snapSite = await snapFile(activeDeps, target, NGINX_SITE_PATH);
+        const snapCert = args.tls.mode === "provided"
+          ? await snapFile(activeDeps, target, TLS_CERT_PATH)
+          : null;
+        const snapKey = args.tls.mode === "provided"
+          ? await snapFile(activeDeps, target, TLS_KEY_PATH)
+          : null;
+        const snapHtpasswd = args.basic_auth
+          ? await snapFile(activeDeps, target, HTPASSWD_PATH)
+          : null;
+        const snapEnabled = await snapLink(
+          activeDeps,
+          target,
+          NGINX_ENABLED_PATH,
+        );
+        const snapDefault = args.disable_default_site
+          ? await snapLink(activeDeps, target, NGINX_DEFAULT_SITE)
+          : null;
+
+        const mk = await execSudo(activeDeps, target, [
+          "install",
+          "-d",
+          "-o",
+          args.ssh.user,
+          "-g",
+          args.ssh.user,
+          "-m",
+          "0755",
+          args.root,
+          `${args.root}/${BLOB_DIR}`,
+          `${args.root}/${BUNDLE_DIR}`,
+          `${args.root}/${REFS_DIR}`,
+        ]);
+        if (mk.exit_code !== 0) {
+          throw new SshError("could not create the layout");
+        }
+        await putUserFile(
+          activeDeps,
+          target,
+          `${args.root}/${LOCK_FILE}`,
+          "",
+          "0644",
+        );
+        await putUserFile(
+          activeDeps,
+          target,
+          `${args.root}/${LAYOUT_VERSION_FILE}`,
+          `${LAYOUT_VERSION}\n`,
+          "0644",
+        );
+
+        const text = renderFor(
+          args.root,
+          args.listen,
+          args.server_name,
+          args.tls,
+          args.basic_auth,
+        );
+        const configSha = await sha256Hex(text);
+        const site = await putRootFile(activeDeps, target, {
+          path: NGINX_SITE_PATH,
+          content: text,
+          mode: "0644",
+          owner: "root",
+          group: "root",
+        });
+        const link = await execSudo(activeDeps, target, [
+          "ln",
+          "-sfn",
+          NGINX_SITE_PATH,
+          NGINX_ENABLED_PATH,
+        ]);
+        if (link.exit_code !== 0) {
+          throw new SshError("could not enable the site");
+        }
+        const enabledChanged = snapEnabled.state !== "symlink" ||
+          snapEnabled.target !== NGINX_SITE_PATH;
+        let changed = site.changed || enabledChanged;
+        if (args.disable_default_site) {
+          const rm = await execSudo(activeDeps, target, [
+            "rm",
+            "-f",
+            NGINX_DEFAULT_SITE,
           ]);
-          if (nginx.exit_code !== 0) {
-            throw new SshError("could not install nginx");
-          }
-
-          const mk = await execSudo(deps, target, [
+          changed = changed ||
+            (rm.exit_code === 0 && snapDefault !== null &&
+              snapDefault.state !== "missing");
+        }
+        if (args.tls.mode === "provided") {
+          const sslDir = TLS_CERT_PATH.slice(
+            0,
+            TLS_CERT_PATH.lastIndexOf("/"),
+          );
+          const madeSsl = await execSudo(activeDeps, target, [
             "install",
             "-d",
-            "-o",
-            args.ssh.user,
-            "-g",
-            args.ssh.user,
             "-m",
             "0755",
-            args.root,
-            `${args.root}/${BLOB_DIR}`,
-            `${args.root}/${BUNDLE_DIR}`,
-            `${args.root}/${REFS_DIR}`,
+            sslDir,
           ]);
-          if (mk.exit_code !== 0) {
-            throw new SshError("could not create the layout");
+          if (madeSsl.exit_code !== 0) {
+            throw new SshError(`could not create ${sslDir}`);
           }
-          await putUserFile(
-            deps,
-            target,
-            `${args.root}/${LOCK_FILE}`,
-            "",
-            "0644",
-          );
-          await putUserFile(
-            deps,
-            target,
-            `${args.root}/${LAYOUT_VERSION_FILE}`,
-            `${LAYOUT_VERSION}\n`,
-            "0644",
-          );
-
-          const text = renderFor(
-            args.root,
-            args.listen,
-            args.server_name,
-            args.tls,
-            args.basic_auth,
-          );
-          const configSha = await sha256Hex(text);
-          const previous = await readFileText(
-            deps,
-            target,
-            NGINX_SITE_PATH,
-            true,
-          );
-          const site = await putRootFile(deps, target, {
-            path: NGINX_SITE_PATH,
-            content: text,
+          const cert = await putRootFile(activeDeps, target, {
+            path: TLS_CERT_PATH,
+            content: args.tls.cert_pem,
             mode: "0644",
             owner: "root",
             group: "root",
           });
-          changed = changed || site.changed;
-          const link = await execSudo(deps, target, [
-            "ln",
-            "-sfn",
-            NGINX_SITE_PATH,
-            NGINX_ENABLED_PATH,
+          const key = await putRootFile(activeDeps, target, {
+            path: TLS_KEY_PATH,
+            content: args.tls.key_pem,
+            mode: "0600",
+            owner: "root",
+            group: "root",
+          });
+          changed = changed || cert.changed || key.changed;
+        }
+        if (args.basic_auth) {
+          const htpasswd = args.basic_auth.users.map((u) =>
+            `${u.name}:${u.hash}`
+          ).join("\n") + "\n";
+          const file = await putRootFile(activeDeps, target, {
+            path: HTPASSWD_PATH,
+            content: htpasswd,
+            mode: "0640",
+            owner: "root",
+            group: "www-data",
+          });
+          changed = changed || file.changed;
+        }
+
+        const test = await execSudo(activeDeps, target, ["nginx", "-t"]);
+        if (test.exit_code !== 0) {
+          // Restore everything this run changed, then confirm the restored
+          // config is one nginx accepts. A dangling enabled link from a first
+          // install is removed, so the next host-wide nginx -t stays clean.
+          await restoreFile(activeDeps, target, snapSite);
+          await restoreLink(activeDeps, target, snapEnabled);
+          if (snapDefault !== null) {
+            await restoreLink(activeDeps, target, snapDefault);
+          }
+          if (snapCert !== null) {
+            await restoreFile(activeDeps, target, snapCert);
+          }
+          if (snapKey !== null) await restoreFile(activeDeps, target, snapKey);
+          if (snapHtpasswd !== null) {
+            await restoreFile(activeDeps, target, snapHtpasswd);
+          }
+          const retest = await execSudo(activeDeps, target, ["nginx", "-t"]);
+          throw new SshError(
+            `nginx -t failed on the rendered config; rolled back and not reloaded${
+              retest.exit_code !== 0
+                ? " (the restored config also fails nginx -t)"
+                : ""
+            }: ${test.stderr.slice(0, 300)}`,
+          );
+        }
+        if (changed) {
+          const reload = await execSudo(activeDeps, target, [
+            "systemctl",
+            "reload",
+            "nginx",
           ]);
-          if (link.exit_code !== 0) {
-            throw new SshError("could not enable the site");
+          if (reload.exit_code !== 0) {
+            throw new SshError("nginx reload failed");
           }
-          if (args.disable_default_site) {
-            await execSudo(deps, target, ["rm", "-f", NGINX_DEFAULT_SITE]);
-          }
-          if (args.tls.mode === "provided") {
-            const sslDir = TLS_CERT_PATH.slice(
-              0,
-              TLS_CERT_PATH.lastIndexOf("/"),
-            );
-            const madeSsl = await execSudo(deps, target, [
-              "install",
-              "-d",
-              "-m",
-              "0755",
-              sslDir,
-            ]);
-            if (madeSsl.exit_code !== 0) {
-              throw new SshError(`could not create ${sslDir}`);
-            }
-            const cert = await putRootFile(deps, target, {
-              path: TLS_CERT_PATH,
-              content: args.tls.cert_pem,
-              mode: "0644",
-              owner: "root",
-              group: "root",
-            });
-            const key = await putRootFile(deps, target, {
-              path: TLS_KEY_PATH,
-              content: args.tls.key_pem,
-              mode: "0600",
-              owner: "root",
-              group: "root",
-            });
-            changed = changed || cert.changed || key.changed;
-          }
-          if (args.basic_auth) {
-            const htpasswd = args.basic_auth.users.map((u) =>
-              `${u.name}:${u.hash}`
-            ).join("\n") + "\n";
-            const file = await putRootFile(deps, target, {
-              path: HTPASSWD_PATH,
-              content: htpasswd,
-              mode: "0640",
-              owner: "root",
-              group: "www-data",
-            });
-            changed = changed || file.changed;
-          }
-
-          const test = await execSudo(deps, target, ["nginx", "-t"]);
-          if (test.exit_code !== 0) {
-            if (previous !== null) {
-              await putRootFile(deps, target, {
-                path: NGINX_SITE_PATH,
-                content: previous,
-                mode: "0644",
-                owner: "root",
-                group: "root",
-              });
-            } else {
-              await execSudo(deps, target, ["rm", "-f", NGINX_SITE_PATH]);
-            }
-            throw new SshError(
-              `nginx -t failed on the rendered config; previous config restored and not reloaded: ${
-                test.stderr.slice(0, 300)
-              }`,
-            );
-          }
-          if (changed) {
-            const reload = await execSudo(deps, target, [
-              "systemctl",
-              "reload",
-              "nginx",
-            ]);
-            if (reload.exit_code !== 0) {
-              throw new SshError("nginx reload failed");
-            }
-          }
-          const scheme = args.tls.mode === "provided" ? "https" : "http";
-          const base = urlBase(args.server_name, args.listen.port, scheme);
-          const handle = await context.writeResource(
-            "config",
-            `config-${instanceKey(args)}`,
-            ConfigSchema.parse({
-              config_sha256: configSha,
-              text,
-              url_base: base,
-              rendered_at: new Date(deps.now()).toISOString(),
-            }),
-          );
-          context.logger.info("Installed artifact server on {host}:{port}", {
-            host: args.ssh.host,
-            port: args.listen.port,
-          });
-          return {
-            dataHandles: [handle],
-            result: { config_sha256: configSha, url_base: base, changed },
-          };
-        },
+        }
+        const scheme = args.tls.mode === "provided" ? "https" : "http";
+        const base = urlBase(args.server_name, args.listen.port, scheme);
+        const handle = await context.writeResource(
+          "config",
+          `config-${instanceKey(args)}`,
+          ConfigSchema.parse({
+            config_sha256: configSha,
+            text,
+            url_base: base,
+            rendered_at: new Date(activeDeps.now()).toISOString(),
+          }),
+        );
+        context.logger.info("Installed artifact server on {host}:{port}", {
+          host: args.ssh.host,
+          port: args.listen.port,
+        });
+        return {
+          dataHandles: [handle],
+          result: { config_sha256: configSha, url_base: base, changed },
+        };
       },
+    },
 
-      upload: {
-        kind: "action",
-        description:
-          "Idempotent. Push bytes to sha256/<hex>/<filename> over stdin and regenerate SHA256SUMS; refuses when the computed hash differs from a supplied sha256. Optionally sets a ref. Returns the hash, path, url and whether anything changed.",
-        arguments: UploadArgsSchema,
-        execute: async (rawArgs: unknown, context: MethodContext) => {
-          const args = UploadArgsSchema.parse(rawArgs);
-          const bytes = contentBytes(args);
-          if (bytes.length > args.max_upload_bytes) {
-            throw new SshConfigError(
-              `content is ${bytes.length} bytes, over max_upload_bytes ${args.max_upload_bytes}`,
-            );
-          }
-          const hash = await sha256Hex(bytes);
-          if (args.sha256 != null && args.sha256 !== hash) {
-            throw new SshConfigError(
-              `computed sha256 ${hash} does not match the supplied ${args.sha256}`,
-            );
-          }
-          const target = toTarget(args.ssh);
-          const rel = blobRelPath({ sha256: hash, filename: args.filename });
-          await makeParentDir(deps, target, `${args.root}/${rel}`);
-          const put = await putUserFile(
-            deps,
-            target,
-            `${args.root}/${rel}`,
-            bytes,
-            "0644",
+    upload: {
+      kind: "action",
+      description:
+        "Idempotent. Push bytes to sha256/<hex>/<filename> over stdin and regenerate SHA256SUMS; refuses when the computed hash differs from a supplied sha256. Optionally sets a ref. Returns the hash, path, url and whether anything changed.",
+      arguments: UploadArgsSchema,
+      execute: async (rawArgs: unknown, context: MethodContext) => {
+        const args = UploadArgsSchema.parse(rawArgs);
+        const bytes = contentBytes(args);
+        if (bytes.length > args.max_upload_bytes) {
+          throw new SshConfigError(
+            `content is ${bytes.length} bytes, over max_upload_bytes ${args.max_upload_bytes}`,
           );
-          await regenerateSha256Sums(deps, target, args.root);
-          if (args.ref != null) {
-            await setRef(deps, target, args.root, args.ref, "blob", hash);
-          }
-          const base = await resolveBase(context, args);
-          const url = blobUrl(base, { sha256: hash, filename: args.filename });
-          const handle = await writeArtifact(context, args, {
-            sha256: hash,
-            kind: "blob",
-            path: rel,
-            url,
-            bytes: bytes.length,
-            files: 1,
-            ref: args.ref,
-            changed: put.changed,
-          });
-          return {
-            dataHandles: [handle],
-            result: { sha256: hash, path: rel, url, changed: put.changed },
-          };
-        },
+        }
+        const hash = await sha256Hex(bytes);
+        if (args.sha256 != null && args.sha256 !== hash) {
+          throw new SshConfigError(
+            `computed sha256 ${hash} does not match the supplied ${args.sha256}`,
+          );
+        }
+        const target = toTarget(args.ssh);
+        const rel = blobRelPath({ sha256: hash, filename: args.filename });
+        await makeParentDir(activeDeps, target, `${args.root}/${rel}`);
+        const put = await putUserFile(
+          activeDeps,
+          target,
+          `${args.root}/${rel}`,
+          bytes,
+          "0644",
+        );
+        await regenerateSha256Sums(activeDeps, target, args.root);
+        if (args.ref != null) {
+          await setRef(activeDeps, target, args.root, args.ref, "blob", hash);
+        }
+        const base = await resolveBase(context, args);
+        const url = blobUrl(base, { sha256: hash, filename: args.filename });
+        const handle = await writeArtifact(context, args, {
+          sha256: hash,
+          kind: "blob",
+          path: rel,
+          url,
+          bytes: bytes.length,
+          files: 1,
+          ref: args.ref,
+          changed: put.changed,
+        });
+        return {
+          dataHandles: [handle],
+          result: { sha256: hash, path: rel, url, changed: put.changed },
+        };
       },
+    },
 
-      fetch: {
-        kind: "action",
-        description:
-          "Idempotent. Download one https upstream on the host to a hidden temp file, compare the host's SHA-256 to the required pin, and only then rename it into sha256/<hex>/<filename>; a mismatch removes the temp and changes nothing. Optionally sets a ref.",
-        arguments: FetchArgsSchema,
-        execute: async (rawArgs: unknown, context: MethodContext) => {
-          const args = FetchArgsSchema.parse(rawArgs);
-          const target = toTarget(args.ssh);
-          const token = (await sha256Hex(
-            `${deps.now()}-${
-              crypto.getRandomValues(new Uint32Array(4)).join("")
-            }`,
-          )).slice(0, 16);
-          const tempRel = `.fetch.${token}`;
-          const temp = `${args.root}/${tempRel}`;
-          const destRel = blobRelPath({
-            sha256: args.sha256,
-            filename: args.filename,
-          });
-          const dest = `${args.root}/${destRel}`;
-          const script = [
-            `set -e`,
-            `curl -fsS --proto '=https' --proto-redir '=https' -o ${
-              posixQuote(temp)
-            } ${posixQuote(args.url)}`,
-            `{ sha256sum ${posixQuote(temp)} 2>/dev/null || shasum -a 256 ${
-              posixQuote(temp)
-            } 2>/dev/null; } | awk '{print $1}'`,
-          ].join("\n");
-          const download = await runScript(deps, target, script);
-          if (download.exit_code !== 0) {
-            await runScript(deps, target, `rm -f ${posixQuote(temp)}`).catch(
-              () => undefined,
-            );
-            throw new SshError(
-              "the upstream download failed; no object stored",
-            );
-          }
-          const actual = download.stdout.trim().split(/\s+/)[0] ?? "";
-          if (actual !== args.sha256) {
-            await runScript(deps, target, `rm -f ${posixQuote(temp)}`).catch(
-              () => undefined,
-            );
-            throw new SshError(
-              `downloaded content hash ${actual} does not match the pinned ${args.sha256}; temp removed`,
-            );
-          }
-          const move = await runScript(
-            deps,
-            target,
-            `mkdir -p ${
-              posixQuote(dest.slice(0, dest.lastIndexOf("/")))
-            } && mv -T ${posixQuote(temp)} ${posixQuote(dest)}`,
-          );
-          if (move.exit_code !== 0) {
-            throw new SshError(
-              "could not move the downloaded object into place",
-            );
-          }
-          await regenerateSha256Sums(deps, target, args.root);
+    fetch: {
+      kind: "action",
+      description:
+        "Idempotent. Download one https upstream on the host to a hidden temp file, compare the host's SHA-256 to the required pin, and only then rename it into sha256/<hex>/<filename>; a mismatch removes the temp and changes nothing. Optionally sets a ref.",
+      arguments: FetchArgsSchema,
+      execute: async (rawArgs: unknown, context: MethodContext) => {
+        const args = FetchArgsSchema.parse(rawArgs);
+        const target = toTarget(args.ssh);
+        const token = (await sha256Hex(
+          `${activeDeps.now()}-${
+            crypto.getRandomValues(new Uint32Array(4)).join("")
+          }`,
+        )).slice(0, 16);
+        const tempRel = `.fetch.${token}`;
+        const temp = `${args.root}/${tempRel}`;
+        const destRel = blobRelPath({
+          sha256: args.sha256,
+          filename: args.filename,
+        });
+        const dest = `${args.root}/${destRel}`;
+        const before = await probeFile(activeDeps, target, dest);
+        if (before.state === "file" && before.sha256 === args.sha256) {
+          // Already stored with the pinned bytes: no download, no change.
           if (args.ref != null) {
             await setRef(
-              deps,
+              activeDeps,
               target,
               args.root,
               args.ref,
@@ -968,7 +1035,6 @@ export function createModel(deps: SshDeps = denoDeps): ArtifactServerModel {
               args.sha256,
             );
           }
-          const after = await probeFile(deps, target, dest);
           const base = await resolveBase(context, args);
           const url = blobUrl(base, {
             sha256: args.sha256,
@@ -979,386 +1045,520 @@ export function createModel(deps: SshDeps = denoDeps): ArtifactServerModel {
             kind: "blob",
             path: destRel,
             url,
-            bytes: after.size ?? 0,
+            bytes: before.size ?? 0,
             files: 1,
             ref: args.ref,
-            changed: true,
+            changed: false,
           });
-          return {
-            dataHandles: [handle],
-            result: { sha256: args.sha256, path: destRel, url, changed: true },
-          };
-        },
-      },
-
-      publish_bundle: {
-        kind: "action",
-        description:
-          "Idempotent. Write a set of small named files under bundles/<tree-hash>/ where the tree hash is the SHA-256 of the bundle's sorted SHA256SUMS lines, for seed directories with fixed names. Optionally sets a ref; returns the tree hash and a URL ending in /.",
-        arguments: PublishBundleArgs,
-        execute: async (rawArgs: unknown, context: MethodContext) => {
-          const args = PublishBundleArgs.parse(rawArgs);
-          const target = toTarget(args.ssh);
-          const decoded = args.files.map((f) => ({
-            name: f.name,
-            bytes: contentBytes(f),
-          }));
-          const files = [];
-          for (const f of decoded) {
-            files.push({ name: f.name, sha256: await sha256Hex(f.bytes) });
-          }
-          const tree = await treeHash(files, (t) => sha256Hex(t));
-          let changed = false;
-          for (const f of decoded) {
-            const dest = `${args.root}/${BUNDLE_DIR}/${tree}/${f.name}`;
-            await makeParentDir(deps, target, dest);
-            const put = await putUserFile(
-              deps,
-              target,
-              dest,
-              f.bytes,
-              "0644",
-            );
-            changed = changed || put.changed;
-          }
-          if (args.ref != null) {
-            await setRef(deps, target, args.root, args.ref, "bundle", tree);
-          }
-          const base = await resolveBase(context, args);
-          const url = bundleUrl(base, tree);
-          const total = decoded.reduce((sum, f) => sum + f.bytes.length, 0);
-          const handle = await writeArtifact(context, args, {
-            sha256: tree,
-            kind: "bundle",
-            path: `${BUNDLE_DIR}/${tree}`,
-            url,
-            bytes: total,
-            files: files.length,
-            ref: args.ref,
-            changed,
-          });
-          return { dataHandles: [handle], result: { tree_sha256: tree, url } };
-        },
-      },
-
-      ref: {
-        kind: "action",
-        description:
-          "Idempotent. Point a named ref at a blob or bundle hash; refs make an object referenced and thus protected from prune.",
-        arguments: RefArgs,
-        execute: async (rawArgs: unknown, context: MethodContext) => {
-          const args = RefArgs.parse(rawArgs);
-          const target = toTarget(args.ssh);
-          await setRef(deps, target, args.root, args.ref, args.kind, args.hash);
-          context.logger.info("Set ref {ref} -> {hash}", {
-            ref: args.ref,
-            hash: args.hash,
-          });
-          return {
-            result: { ref: args.ref, kind: args.kind, hash: args.hash },
-          };
-        },
-      },
-
-      unref: {
-        kind: "action",
-        description:
-          "DESTRUCTIVE. Remove a named ref; an absent ref is a clean no-op. Removing a ref can make its object unreachable and eligible for prune.",
-        arguments: UnrefArgs,
-        execute: async (rawArgs: unknown, _context: MethodContext) => {
-          const args = UnrefArgs.parse(rawArgs);
-          const target = toTarget(args.ssh);
-          const existed = await unsetRef(deps, target, args.root, args.ref);
-          return { result: { ref: args.ref, removed: existed } };
-        },
-      },
-
-      list: {
-        description:
-          "READ-ONLY. Read refs, blobs and bundles with their sizes and mtimes from the host and persist the listing. Never returns a digest of secret content.",
-        arguments: ListArgs,
-        execute: async (rawArgs: unknown, context: MethodContext) => {
-          const args = ListArgs.parse(rawArgs);
-          const target = toTarget(args.ssh);
-          const layout = await readLayout(deps, target, args.root);
-          const handle = await context.writeResource(
-            "listing",
-            `listing-${instanceKey(args)}`,
-            ListingSchema.parse({
-              host: args.ssh.host,
-              root: args.root,
-              refs: layout.refs,
-              blobs: layout.blobs.map((b) => ({
-                sha256: b.hash,
-                filename: b.name,
-                bytes: b.bytes,
-                mtime_ms: b.mtimeMs,
-              })),
-              bundles: layout.bundles.map((b) => ({
-                tree_sha256: b.hash,
-                bytes: b.bytes,
-                mtime_ms: b.mtimeMs,
-                files: 0,
-              })),
-              observed_at: new Date(deps.now()).toISOString(),
-            }),
-          );
           return {
             dataHandles: [handle],
             result: {
-              refs: layout.refs.length,
-              blobs: layout.blobs.length,
-              bundles: layout.bundles.length,
+              sha256: args.sha256,
+              path: destRel,
+              url,
+              changed: false,
             },
           };
-        },
-      },
-
-      verify: {
-        description:
-          "READ-ONLY. Rehash every object on the host and compare each blob against its path hash and against SHA256SUMS; reports ok, corrupt, missing and extra and never repairs.",
-        arguments: VerifyArgs,
-        execute: async (rawArgs: unknown, context: MethodContext) => {
-          const args = VerifyArgs.parse(rawArgs);
-          const target = toTarget(args.ssh);
-          const layout = await readLayout(deps, target, args.root);
-          const script = [
-            `set -u`,
-            `r=${posixQuote(args.root)}`,
-            `if [ -d "$r/${BLOB_DIR}" ]; then`,
-            `  find "$r/${BLOB_DIR}" -type f 2>/dev/null | LC_ALL=C sort | while IFS= read -r f; do`,
-            `    rel="\${f#"$r/"}"`,
-            `    h=$( { sha256sum "$f" 2>/dev/null || shasum -a 256 "$f" 2>/dev/null; } | awk '{print $1}' )`,
-            `    printf 'BLOB\\t%s\\t%s\\n' "$rel" "$h"`,
-            `  done`,
-            `fi`,
-            `if [ -d "$r/${BUNDLE_DIR}" ]; then`,
-            `  for d in "$r/${BUNDLE_DIR}"/*/; do`,
-            `    [ -d "$d" ] || continue`,
-            `    tree="\${d%/}"; tree="\${tree##*/}"`,
-            `    lines=$(mktemp)`,
-            `    find "$d" -type f 2>/dev/null | LC_ALL=C sort | while IFS= read -r f; do`,
-            `      sha256sum "$f" 2>/dev/null | awk -v n="\${f##*/}" '{print $1"  "n}'`,
-            `    done > "$lines"`,
-            `    h=$(sha256sum "$lines" 2>/dev/null | awk '{print $1}')`,
-            `    rm -f "$lines"`,
-            `    printf 'BUNDLE\\t%s\\t%s\\n' "$tree" "$h"`,
-            `  done`,
-            `fi`,
-          ].join("\n");
-          const raw = await runScript(deps, target, script);
-          if (raw.exit_code !== 0) {
-            throw new SshError("verify could not read the objects");
-          }
-          const expected = new Map(
-            parseSha256Sums(layout.sha256sums ?? "").map((
-              e,
-            ) => [e.path, e.sha256]),
+        }
+        if (before.state === "symlink") {
+          throw new SshError(
+            `${dest} is a symlink; refusing to write through it`,
           );
-          const ok: string[] = [];
-          const corrupt: { path: string; expected: string; actual: string }[] =
-            [];
-          const seen = new Set<string>();
-          for (const line of raw.stdout.split("\n")) {
-            const [kind, rel, actual] = line.split("\t");
-            if (kind === "BLOB" && rel && actual) {
-              seen.add(rel);
-              const pathHash = rel.split("/")[1] ?? "";
-              if (actual !== pathHash) {
-                corrupt.push({ path: rel, expected: pathHash, actual });
-              } else {
-                ok.push(rel);
-              }
-            } else if (kind === "BUNDLE" && rel && actual) {
-              if (actual === rel) ok.push(`${BUNDLE_DIR}/${rel}`);
-              else {corrupt.push({
-                  path: `${BUNDLE_DIR}/${rel}`,
-                  expected: rel,
-                  actual,
-                });}
-            }
-          }
-          const missing = [...expected.keys()].filter((p) => !seen.has(p));
-          const extra = [...seen].filter((p) => !expected.has(p));
-          const handle = await context.writeResource(
-            "verification",
-            `verification-${instanceKey(args)}`,
-            VerificationSchema.parse({
-              host: args.ssh.host,
-              root: args.root,
-              ok,
-              corrupt,
-              missing,
-              extra,
-              checked_at: new Date(deps.now()).toISOString(),
-            }),
-          );
-          return {
-            dataHandles: [handle],
-            result: {
-              ok: ok.length,
-              corrupt: corrupt.length,
-              missing: missing.length,
-              extra: extra.length,
-            },
-          };
-        },
-      },
-
-      get: {
-        description:
-          "READ-ONLY. Observe nginx state (active, site config hash, TLS and basic-auth mode) and the layout summary, and persist the observation as the server resource.",
-        arguments: GetArgs,
-        execute: async (rawArgs: unknown, context: MethodContext) => {
-          const args = GetArgs.parse(rawArgs);
-          const target = toTarget(args.ssh);
-          return await observeServer(deps, target, args, context);
-        },
-      },
-
-      sync: {
-        description:
-          "READ-ONLY. Refresh the observed nginx state and layout summary into the server resource, instead of failing when the site is absent.",
-        arguments: GetArgs,
-        execute: async (rawArgs: unknown, context: MethodContext) => {
-          const args = GetArgs.parse(rawArgs);
-          const target = toTarget(args.ssh);
-          return await observeServer(deps, target, args, context);
-        },
-      },
-
-      plan_prune: {
-        description:
-          "READ-ONLY. List objects not reachable from any ref and not in keep[], with the total bytes and a plan hash over the sorted list, and persist the plan.",
-        arguments: PlanPruneArgs,
-        execute: async (rawArgs: unknown, context: MethodContext) => {
-          const args = PlanPruneArgs.parse(rawArgs);
-          const target = toTarget(args.ssh);
-          const layout = await readLayout(deps, target, args.root);
-          const blobs: PruneObject[] = layout.blobs.map((b) => ({
-            kind: "blob",
-            hash: b.hash,
-            bytes: b.bytes,
-            path: b.path,
-          }));
-          const bundles: PruneObject[] = layout.bundles.map((b) => ({
-            kind: "bundle",
-            hash: b.hash,
-            bytes: b.bytes,
-            path: b.path,
-          }));
-          const plan = await planPrune(
-            {
-              refs: layout.refs.map((r) => ({
-                name: r.name,
-                target: { kind: r.kind, hash: r.hash },
-              })),
-              blobs,
-              bundles,
-              keep: args.keep,
-            },
-            (t) => sha256Hex(t),
-          );
-          const handle = await context.writeResource(
-            "prune_plan",
-            `prune_plan-${instanceKey(args)}`,
-            PrunePlanSchema.parse({
-              host: args.ssh.host,
-              root: args.root,
-              objects: plan.objects,
-              total_bytes: plan.totalBytes,
-              plan_sha256: plan.planSha256,
-              created_at: new Date(deps.now()).toISOString(),
-            }),
-          );
-          return { dataHandles: [handle], result: plan };
-        },
-      },
-
-      prune: {
-        kind: "action",
-        description:
-          "DESTRUCTIVE. Delete exactly the objects of a plan whose hash matches plan_sha256; refuses when the recomputed plan differs, so a change since planning deletes nothing. Then regenerates SHA256SUMS.",
-        arguments: PruneArgs,
-        execute: async (rawArgs: unknown, context: MethodContext) => {
-          const args = PruneArgs.parse(rawArgs);
-          const target = toTarget(args.ssh);
-          const layout = await readLayout(deps, target, args.root);
-          const blobs: PruneObject[] = layout.blobs.map((b) => ({
-            kind: "blob",
-            hash: b.hash,
-            bytes: b.bytes,
-            path: b.path,
-          }));
-          const bundles: PruneObject[] = layout.bundles.map((b) => ({
-            kind: "bundle",
-            hash: b.hash,
-            bytes: b.bytes,
-            path: b.path,
-          }));
-          const plan = await planPrune(
-            {
-              refs: layout.refs.map((r) => ({
-                name: r.name,
-                target: { kind: r.kind, hash: r.hash },
-              })),
-              blobs,
-              bundles,
-              keep: args.keep,
-            },
-            (t) => sha256Hex(t),
-          );
-          if (plan.planSha256 !== args.plan_sha256) {
-            throw new SshError(
-              "the prune plan changed since planning; nothing deleted",
+        }
+        const script = [
+          `set -e`,
+          `curl -fsS -L --max-redirs 5 --max-filesize ${args.max_bytes} --proto '=https' --proto-redir '=https' -o ${
+            posixQuote(temp)
+          } ${posixQuote(args.url)}`,
+          `s=$(stat -c %s ${posixQuote(temp)} 2>/dev/null || echo 0)`,
+          `[ "$s" -le ${args.max_bytes} ] || { echo "too large" >&2; exit 4; }`,
+          `{ sha256sum ${posixQuote(temp)} 2>/dev/null || shasum -a 256 ${
+            posixQuote(temp)
+          } 2>/dev/null; } | awk '{print $1}'`,
+        ].join("\n");
+        const download = await runScript(activeDeps, target, script);
+        if (download.exit_code !== 0) {
+          await runScript(activeDeps, target, `rm -f ${posixQuote(temp)}`)
+            .catch(
+              () => undefined,
             );
-          }
-          await removeObjects(
-            deps,
+          throw new SshError(
+            "the upstream download failed; no object stored",
+          );
+        }
+        const actual = download.stdout.trim().split(/\s+/)[0] ?? "";
+        if (actual !== args.sha256) {
+          await runScript(activeDeps, target, `rm -f ${posixQuote(temp)}`)
+            .catch(
+              () => undefined,
+            );
+          throw new SshError(
+            `downloaded content hash ${actual} does not match the pinned ${args.sha256}; temp removed`,
+          );
+        }
+        const move = await runScript(
+          activeDeps,
+          target,
+          `mkdir -p ${
+            posixQuote(dest.slice(0, dest.lastIndexOf("/")))
+          } && mv -T ${posixQuote(temp)} ${posixQuote(dest)}`,
+        );
+        if (move.exit_code !== 0) {
+          throw new SshError(
+            "could not move the downloaded object into place",
+          );
+        }
+        await regenerateSha256Sums(activeDeps, target, args.root);
+        if (args.ref != null) {
+          await setRef(
+            activeDeps,
             target,
             args.root,
-            plan.objects.map((o) => o.path),
+            args.ref,
+            "blob",
+            args.sha256,
           );
-          await regenerateSha256Sums(deps, target, args.root);
-          context.logger.warn("Pruned {count} objects ({bytes} bytes)", {
-            count: plan.objects.length,
-            bytes: plan.totalBytes,
-          });
-          return {
-            result: {
-              removed: plan.objects.length,
-              bytes: plan.totalBytes,
-              plan_sha256: plan.planSha256,
-            },
-          };
-        },
+        }
+        const after = await probeFile(activeDeps, target, dest);
+        const base = await resolveBase(context, args);
+        const url = blobUrl(base, {
+          sha256: args.sha256,
+          filename: args.filename,
+        });
+        const handle = await writeArtifact(context, args, {
+          sha256: args.sha256,
+          kind: "blob",
+          path: destRel,
+          url,
+          bytes: after.size ?? 0,
+          files: 1,
+          ref: args.ref,
+          changed: true,
+        });
+        return {
+          dataHandles: [handle],
+          result: { sha256: args.sha256, path: destRel, url, changed: true },
+        };
       },
+    },
 
-      uninstall: {
-        kind: "action",
-        description:
-          "DESTRUCTIVE. Remove the site config and reload nginx; with remove_data also remove the served root. A clean no-op when the site is absent, and it never removes the nginx package.",
-        arguments: UninstallArgs,
-        execute: async (rawArgs: unknown, context: MethodContext) => {
-          const args = UninstallArgs.parse(rawArgs);
-          const target = toTarget(args.ssh);
-          const enabled = await probeFile(
-            deps,
+    publish_bundle: {
+      kind: "action",
+      description:
+        "Idempotent. Write a set of small named files under bundles/<tree-hash>/ where the tree hash is the SHA-256 of the bundle's sorted SHA256SUMS lines, for seed directories with fixed names. Optionally sets a ref; returns the tree hash and a URL ending in /.",
+      arguments: PublishBundleArgs,
+      execute: async (rawArgs: unknown, context: MethodContext) => {
+        const args = PublishBundleArgs.parse(rawArgs);
+        const target = toTarget(args.ssh);
+        const decoded = args.files.map((f) => ({
+          name: f.name,
+          bytes: contentBytes(f),
+        }));
+        const names = decoded.map((f) => f.name);
+        if (new Set(names).size !== names.length) {
+          throw new SshConfigError("bundle file names must be unique");
+        }
+        const files = [];
+        for (const f of decoded) {
+          files.push({ name: f.name, sha256: await sha256Hex(f.bytes) });
+        }
+        const tree = await treeHash(files, (t) => sha256Hex(t));
+        const token = (await sha256Hex(
+          `${activeDeps.now()}-${
+            crypto.getRandomValues(new Uint32Array(4)).join("")
+          }`,
+        )).slice(0, 16);
+        const stage = `${args.root}/${BUNDLE_DIR}/.stage-${token}`;
+        const final = `${args.root}/${BUNDLE_DIR}/${tree}`;
+        // Stage into a hidden dot-directory, which the site config denies and
+        // the layout reader ignores, then publish the directory in one rename.
+        for (const f of decoded) {
+          await makeParentDir(activeDeps, target, `${stage}/${f.name}`);
+          await putUserFile(
+            activeDeps,
             target,
-            NGINX_ENABLED_PATH,
-            true,
+            `${stage}/${f.name}`,
+            f.bytes,
+            "0644",
           );
-          const site = await probeFile(deps, target, NGINX_SITE_PATH, true);
-          const present = enabled.state !== "missing" ||
-            site.state !== "missing";
+        }
+        const finalProbe = await probeFile(activeDeps, target, final);
+        if (finalProbe.state === "symlink") {
+          throw new SshError(
+            `${final} is a symlink; refusing to write through it`,
+          );
+        }
+        const commit = await runScript(
+          activeDeps,
+          target,
+          `if [ -e ${posixQuote(final)} ]; then rm -rf ${
+            posixQuote(stage)
+          }; else mv -T ${posixQuote(stage)} ${posixQuote(final)}; fi`,
+        );
+        if (commit.exit_code !== 0) {
+          throw new SshError("could not publish the bundle");
+        }
+        const changed = finalProbe.state === "missing";
+        if (args.ref != null) {
+          await setRef(activeDeps, target, args.root, args.ref, "bundle", tree);
+        }
+        const base = await resolveBase(context, args);
+        const url = bundleUrl(base, tree);
+        const total = decoded.reduce((sum, f) => sum + f.bytes.length, 0);
+        const handle = await writeArtifact(context, args, {
+          sha256: tree,
+          kind: "bundle",
+          path: `${BUNDLE_DIR}/${tree}`,
+          url,
+          bytes: total,
+          files: files.length,
+          ref: args.ref,
+          changed,
+        });
+        return { dataHandles: [handle], result: { tree_sha256: tree, url } };
+      },
+    },
+
+    ref: {
+      kind: "action",
+      description:
+        "Idempotent. Point a named ref at a blob or bundle hash; refs make an object referenced and thus protected from prune.",
+      arguments: RefArgs,
+      execute: async (rawArgs: unknown, context: MethodContext) => {
+        const args = RefArgs.parse(rawArgs);
+        const target = toTarget(args.ssh);
+        await setRef(
+          activeDeps,
+          target,
+          args.root,
+          args.ref,
+          args.kind,
+          args.hash,
+        );
+        context.logger.info("Set ref {ref} -> {hash}", {
+          ref: args.ref,
+          hash: args.hash,
+        });
+        return {
+          result: { ref: args.ref, kind: args.kind, hash: args.hash },
+        };
+      },
+    },
+
+    unref: {
+      kind: "action",
+      description:
+        "DESTRUCTIVE. Remove a named ref; an absent ref is a clean no-op. Removing a ref can make its object unreachable and eligible for prune.",
+      arguments: UnrefArgs,
+      execute: async (rawArgs: unknown, _context: MethodContext) => {
+        const args = UnrefArgs.parse(rawArgs);
+        const target = toTarget(args.ssh);
+        const existed = await unsetRef(activeDeps, target, args.root, args.ref);
+        return { result: { ref: args.ref, removed: existed } };
+      },
+    },
+
+    list: {
+      description:
+        "READ-ONLY. Read refs, blobs and bundles with their sizes and mtimes from the host and persist the listing. Never returns a digest of secret content.",
+      arguments: ListArgs,
+      execute: async (rawArgs: unknown, context: MethodContext) => {
+        const args = ListArgs.parse(rawArgs);
+        const target = toTarget(args.ssh);
+        const layout = await readLayout(activeDeps, target, args.root);
+        const handle = await context.writeResource(
+          "listing",
+          `listing-${instanceKey(args)}`,
+          ListingSchema.parse({
+            host: args.ssh.host,
+            root: args.root,
+            refs: layout.refs,
+            blobs: layout.blobs.map((b) => ({
+              sha256: b.hash,
+              filename: b.name,
+              bytes: b.bytes,
+              mtime_ms: b.mtimeMs,
+            })),
+            bundles: layout.bundles.map((b) => ({
+              tree_sha256: b.hash,
+              bytes: b.bytes,
+              mtime_ms: b.mtimeMs,
+              files: 0,
+            })),
+            observed_at: new Date(activeDeps.now()).toISOString(),
+          }),
+        );
+        return {
+          dataHandles: [handle],
+          result: {
+            refs: layout.refs.length,
+            blobs: layout.blobs.length,
+            bundles: layout.bundles.length,
+          },
+        };
+      },
+    },
+
+    verify: {
+      description:
+        "READ-ONLY. Rehash every object on the host and compare each blob against its path hash and against SHA256SUMS; reports ok, corrupt, missing and extra and never repairs.",
+      arguments: VerifyArgs,
+      execute: async (rawArgs: unknown, context: MethodContext) => {
+        const args = VerifyArgs.parse(rawArgs);
+        const target = toTarget(args.ssh);
+        const layout = await readLayout(activeDeps, target, args.root);
+        const script = [
+          `set -u`,
+          `r=${posixQuote(args.root)}`,
+          `if [ -d "$r/${BLOB_DIR}" ]; then`,
+          `  find "$r/${BLOB_DIR}" -type f ! -name '.*' 2>/dev/null | LC_ALL=C sort | while IFS= read -r f; do`,
+          `    rel="\${f#"$r/"}"`,
+          `    h=$( { sha256sum "$f" 2>/dev/null || shasum -a 256 "$f" 2>/dev/null; } | awk '{print $1}' )`,
+          `    printf 'BLOB\\t%s\\t%s\\n' "$rel" "$h"`,
+          `  done`,
+          `fi`,
+          `if [ -d "$r/${BUNDLE_DIR}" ]; then`,
+          `  for d in "$r/${BUNDLE_DIR}"/*/; do`,
+          `    [ -d "$d" ] || continue`,
+          `    tree="\${d%/}"; tree="\${tree##*/}"`,
+          `    lines=$(mktemp)`,
+          `    find "$d" -type f 2>/dev/null | LC_ALL=C sort | while IFS= read -r f; do`,
+          `      sha256sum "$f" 2>/dev/null | awk -v n="\${f##*/}" '{print $1"  "n}'`,
+          `    done > "$lines"`,
+          `    h=$(sha256sum "$lines" 2>/dev/null | awk '{print $1}')`,
+          `    rm -f "$lines"`,
+          `    printf 'BUNDLE\\t%s\\t%s\\n' "$tree" "$h"`,
+          `  done`,
+          `fi`,
+        ].join("\n");
+        const raw = await runScript(activeDeps, target, script);
+        if (raw.exit_code !== 0) {
+          throw new SshError("verify could not read the objects");
+        }
+        const expected = new Map(
+          parseSha256Sums(layout.sha256sums ?? "").map((
+            e,
+          ) => [e.path, e.sha256]),
+        );
+        const ok: string[] = [];
+        const corrupt: { path: string; expected: string; actual: string }[] =
+          [];
+        const seen = new Set<string>();
+        for (const line of raw.stdout.split("\n")) {
+          const [kind, rel, actual] = line.split("\t");
+          if (kind === "BLOB" && rel && actual) {
+            seen.add(rel);
+            const pathHash = rel.split("/")[1] ?? "";
+            const sumsHash = expected.get(rel);
+            const bad = actual !== pathHash ||
+              (sumsHash !== undefined && sumsHash !== pathHash);
+            if (bad) {
+              corrupt.push({
+                path: rel,
+                expected: sumsHash ?? pathHash,
+                actual,
+              });
+            } else {
+              ok.push(rel);
+            }
+          } else if (kind === "BUNDLE" && rel && actual) {
+            if (actual === rel) ok.push(`${BUNDLE_DIR}/${rel}`);
+            else {corrupt.push({
+                path: `${BUNDLE_DIR}/${rel}`,
+                expected: rel,
+                actual,
+              });}
+          }
+        }
+        const missing = [...expected.keys()].filter((p) => !seen.has(p));
+        const extra = [...seen].filter((p) => !expected.has(p));
+        const handle = await context.writeResource(
+          "verification",
+          `verification-${instanceKey(args)}`,
+          VerificationSchema.parse({
+            host: args.ssh.host,
+            root: args.root,
+            ok,
+            corrupt,
+            missing,
+            extra,
+            checked_at: new Date(activeDeps.now()).toISOString(),
+          }),
+        );
+        return {
+          dataHandles: [handle],
+          result: {
+            ok: ok.length,
+            corrupt: corrupt.length,
+            missing: missing.length,
+            extra: extra.length,
+          },
+        };
+      },
+    },
+
+    get: {
+      description:
+        "READ-ONLY. Observe nginx state (active, site config hash, TLS and basic-auth mode) and the layout summary, and persist the observation as the server resource.",
+      arguments: GetArgs,
+      execute: async (rawArgs: unknown, context: MethodContext) => {
+        const args = GetArgs.parse(rawArgs);
+        const target = toTarget(args.ssh);
+        return await observeServer(activeDeps, target, args, context);
+      },
+    },
+
+    sync: {
+      description:
+        "READ-ONLY. Refresh the observed nginx state and layout summary into the server resource, instead of failing when the site is absent.",
+      arguments: GetArgs,
+      execute: async (rawArgs: unknown, context: MethodContext) => {
+        const args = GetArgs.parse(rawArgs);
+        const target = toTarget(args.ssh);
+        return await observeServer(activeDeps, target, args, context);
+      },
+    },
+
+    plan_prune: {
+      description:
+        "READ-ONLY. List objects not reachable from any ref and not in keep[], with the total bytes and a plan hash over the sorted list, and persist the plan.",
+      arguments: PlanPruneArgs,
+      execute: async (rawArgs: unknown, context: MethodContext) => {
+        const args = PlanPruneArgs.parse(rawArgs);
+        const target = toTarget(args.ssh);
+        const layout = await readLayout(activeDeps, target, args.root);
+        const blobs: PruneObject[] = layout.blobs.map((b) => ({
+          kind: "blob",
+          hash: b.hash,
+          bytes: b.bytes,
+          path: b.path,
+        }));
+        const bundles: PruneObject[] = layout.bundles.map((b) => ({
+          kind: "bundle",
+          hash: b.hash,
+          bytes: b.bytes,
+          path: b.path,
+        }));
+        const plan = await planPrune(
+          {
+            refs: layout.refs.map((r) => ({
+              name: r.name,
+              target: { kind: r.kind, hash: r.hash },
+            })),
+            blobs,
+            bundles,
+            keep: args.keep,
+          },
+          (t) => sha256Hex(t),
+        );
+        const handle = await context.writeResource(
+          "prune_plan",
+          `prune_plan-${instanceKey(args)}`,
+          PrunePlanSchema.parse({
+            host: args.ssh.host,
+            root: args.root,
+            objects: plan.objects,
+            total_bytes: plan.totalBytes,
+            plan_sha256: plan.planSha256,
+            created_at: new Date(activeDeps.now()).toISOString(),
+          }),
+        );
+        return { dataHandles: [handle], result: plan };
+      },
+    },
+
+    prune: {
+      kind: "action",
+      description:
+        "DESTRUCTIVE. Delete exactly the objects of a plan whose hash matches plan_sha256; refuses when the recomputed plan differs, so a change since planning deletes nothing. Then regenerates SHA256SUMS.",
+      arguments: PruneArgs,
+      execute: async (rawArgs: unknown, context: MethodContext) => {
+        const args = PruneArgs.parse(rawArgs);
+        const target = toTarget(args.ssh);
+        const layout = await readLayout(activeDeps, target, args.root);
+        const blobs: PruneObject[] = layout.blobs.map((b) => ({
+          kind: "blob",
+          hash: b.hash,
+          bytes: b.bytes,
+          path: b.path,
+        }));
+        const bundles: PruneObject[] = layout.bundles.map((b) => ({
+          kind: "bundle",
+          hash: b.hash,
+          bytes: b.bytes,
+          path: b.path,
+        }));
+        const plan = await planPrune(
+          {
+            refs: layout.refs.map((r) => ({
+              name: r.name,
+              target: { kind: r.kind, hash: r.hash },
+            })),
+            blobs,
+            bundles,
+            keep: args.keep,
+          },
+          (t) => sha256Hex(t),
+        );
+        if (plan.planSha256 !== args.plan_sha256) {
+          throw new SshError(
+            "the prune plan changed since planning; nothing deleted",
+          );
+        }
+        await removeObjects(
+          activeDeps,
+          target,
+          args.root,
+          plan.objects.map((o) => o.path),
+        );
+        await regenerateSha256Sums(activeDeps, target, args.root);
+        context.logger.warn("Pruned {count} objects ({bytes} bytes)", {
+          count: plan.objects.length,
+          bytes: plan.totalBytes,
+        });
+        return {
+          result: {
+            removed: plan.objects.length,
+            bytes: plan.totalBytes,
+            plan_sha256: plan.planSha256,
+          },
+        };
+      },
+    },
+
+    uninstall: {
+      kind: "action",
+      description:
+        "DESTRUCTIVE. Remove the site config, its TLS files and htpasswd, and reload nginx; with remove_data also remove the served root, but only when it is a real directory holding a .layout-version sentinel. A clean no-op when absent, and it never removes the nginx package.",
+      arguments: UninstallArgs,
+      execute: async (rawArgs: unknown, context: MethodContext) => {
+        const args = UninstallArgs.parse(rawArgs);
+        const target = toTarget(args.ssh);
+        const enabled = await probeFile(
+          activeDeps,
+          target,
+          NGINX_ENABLED_PATH,
+          true,
+        );
+        const site = await probeFile(activeDeps, target, NGINX_SITE_PATH, true);
+        const present = enabled.state !== "missing" ||
+          site.state !== "missing";
+        const credentialPaths = [TLS_CERT_PATH, TLS_KEY_PATH, HTPASSWD_PATH];
+        const credProbes = await Promise.all(
+          credentialPaths.map((p) => probeFile(activeDeps, target, p, true)),
+        );
+        const credentialsPresent =
+          credProbes.filter((p) => p.state !== "missing").length;
+        if (present || credentialsPresent > 0) {
+          await execSudo(activeDeps, target, [
+            "rm",
+            "-f",
+            NGINX_ENABLED_PATH,
+            NGINX_SITE_PATH,
+            ...credentialPaths,
+          ]);
           if (present) {
-            await execSudo(deps, target, [
-              "rm",
-              "-f",
-              NGINX_ENABLED_PATH,
-              NGINX_SITE_PATH,
-            ]);
-            const reload = await execSudo(deps, target, [
+            const reload = await execSudo(activeDeps, target, [
               "systemctl",
               "reload",
               "nginx",
@@ -1367,20 +1567,172 @@ export function createModel(deps: SshDeps = denoDeps): ArtifactServerModel {
               throw new SshError("nginx reload failed");
             }
           }
-          if (args.remove_data) {
-            await removeRoot(deps, target, args.root);
+        }
+        let dataRemoved = false;
+        if (args.remove_data) {
+          const kind = await rootState(activeDeps, target, args.root);
+          if (kind === "foreign") {
+            throw new SshError(
+              `refusing to remove ${args.root}: it is not a directory holding a regular ${LAYOUT_VERSION_FILE} sentinel`,
+            );
           }
-          context.logger.info(
-            "Uninstalled artifact server site (present={present})",
-            { present },
-          );
-          return {
-            result: { removed: present, data_removed: args.remove_data },
-          };
-        },
+          if (kind === "ours") {
+            await removeRoot(activeDeps, target, args.root);
+            dataRemoved = true;
+          }
+        }
+        context.logger.info(
+          "Uninstalled artifact server site (present={present})",
+          { present },
+        );
+        return {
+          result: {
+            removed: present,
+            credentials_removed: credentialsPresent,
+            data_removed: dataRemoved,
+          },
+        };
       },
     },
+  },
+};
+
+/** Compatibility factory: sets the transport and returns the model. */
+export function createModel(next: SshDeps = denoDeps): ArtifactServerModel {
+  setDeps(next);
+  return model;
+}
+
+/**
+ * Classifies a served root: `missing`, `ours` when it is a real directory that
+ * holds a regular `.layout-version` sentinel, or `foreign` otherwise.
+ */
+async function rootState(
+  activeDeps: SshDeps,
+  target: SshTarget,
+  root: string,
+): Promise<"missing" | "ours" | "foreign"> {
+  const probe = await probeFile(activeDeps, target, root, true);
+  if (probe.state === "missing") return "missing";
+  if (probe.state !== "dir") return "foreign";
+  const sentinel = await probeFile(
+    activeDeps,
+    target,
+    `${root}/${LAYOUT_VERSION_FILE}`,
+    true,
+  );
+  return sentinel.state === "file" ? "ours" : "foreign";
+}
+
+/** One root-owned file's state before a run. */
+interface FileSnap {
+  path: string;
+  existed: boolean;
+  content: string;
+  mode: string;
+  owner: string;
+  group: string;
+}
+
+/** Captures a file's bytes, mode and owner so a rollback can restore it. */
+async function snapFile(
+  activeDeps: SshDeps,
+  target: SshTarget,
+  path: string,
+): Promise<FileSnap> {
+  const probe = await probeFile(activeDeps, target, path, true);
+  if (probe.state !== "file") {
+    return {
+      path,
+      existed: false,
+      content: "",
+      mode: "0644",
+      owner: "root",
+      group: "root",
+    };
+  }
+  return {
+    path,
+    existed: true,
+    content: (await readFileText(activeDeps, target, path, true)) ?? "",
+    mode: probe.mode ?? "0644",
+    owner: probe.owner ?? "root",
+    group: probe.group ?? "root",
   };
+}
+
+/** Restores a file captured by {@link snapFile}, or removes it if it was absent. */
+async function restoreFile(
+  activeDeps: SshDeps,
+  target: SshTarget,
+  snap: FileSnap,
+): Promise<void> {
+  if (!snap.existed) {
+    await execSudo(activeDeps, target, ["rm", "-f", snap.path]);
+    return;
+  }
+  await putRootFile(activeDeps, target, {
+    path: snap.path,
+    content: snap.content,
+    mode: snap.mode,
+    owner: snap.owner,
+    group: snap.group,
+  });
+}
+
+/** A link or file at a fixed path, before a run. */
+interface LinkSnap {
+  path: string;
+  state: "missing" | "symlink" | "file" | "dir";
+  target: string | null;
+  content: string | null;
+}
+
+/** Captures a link or file so a rollback can restore it. */
+async function snapLink(
+  activeDeps: SshDeps,
+  target: SshTarget,
+  path: string,
+): Promise<LinkSnap> {
+  const probe = await probeFile(activeDeps, target, path, true);
+  if (probe.state === "symlink") {
+    return {
+      path,
+      state: "symlink",
+      target: await readLink(activeDeps, target, path, true),
+      content: null,
+    };
+  }
+  if (probe.state === "file") {
+    return {
+      path,
+      state: "file",
+      target: null,
+      content: await readFileText(activeDeps, target, path, true),
+    };
+  }
+  return { path, state: probe.state, target: null, content: null };
+}
+
+/** Restores a link or file captured by {@link snapLink}, or removes it. */
+async function restoreLink(
+  activeDeps: SshDeps,
+  target: SshTarget,
+  snap: LinkSnap,
+): Promise<void> {
+  if (snap.state === "symlink" && snap.target !== null) {
+    await execSudo(activeDeps, target, ["ln", "-sfn", snap.target, snap.path]);
+  } else if (snap.state === "file" && snap.content !== null) {
+    await putRootFile(activeDeps, target, {
+      path: snap.path,
+      content: snap.content,
+      mode: "0644",
+      owner: "root",
+      group: "root",
+    });
+  } else {
+    await execSudo(activeDeps, target, ["rm", "-f", snap.path]);
+  }
 }
 
 /**
@@ -1402,13 +1754,13 @@ async function resolveBase(
 
 /** Reads nginx and the layout and persists the `server` resource. */
 async function observeServer(
-  deps: SshDeps,
+  activeDeps: SshDeps,
   target: SshTarget,
   args: { ssh: SshBlock; root: string },
   context: MethodContext,
 ): Promise<MethodResult> {
-  const nginx = await readNginxState(deps, target, NGINX_SITE_PATH);
-  const layout = await readLayout(deps, target, args.root);
+  const nginx = await readNginxState(activeDeps, target, NGINX_SITE_PATH);
+  const layout = await readLayout(activeDeps, target, args.root);
   const handle = await context.writeResource(
     "server",
     `server-${instanceKey(args)}`,
@@ -1425,7 +1777,7 @@ async function observeServer(
       bundles: layout.bundles.length,
       refs: layout.refs.length,
       layout_version: layout.layoutVersion,
-      observed_at: new Date(deps.now()).toISOString(),
+      observed_at: new Date(activeDeps.now()).toISOString(),
     }),
   );
   return {
@@ -1439,10 +1791,3 @@ async function observeServer(
     },
   };
 }
-
-/** Production model: the factory with no overrides. */
-export const model = {
-  ...createModel(),
-  type: "@randybias/artifact-server",
-  version: "2026.10.17.1",
-} satisfies ArtifactServerModel;

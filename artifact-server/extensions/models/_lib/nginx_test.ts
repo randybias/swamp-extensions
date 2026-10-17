@@ -57,6 +57,23 @@ Deno.test("renderSite adds basic auth with the realm and htpasswd path", () => {
   assertStringIncludes(text, `auth_basic_user_file '${HTPASSWD_PATH}';`);
 });
 
+Deno.test("renderSite denies dotfiles inside the immutable directories too", () => {
+  const text = renderSite(BASE);
+  // The immutable locations must not use ^~, which would skip the dotfile
+  // regex and serve in-flight .ssh-host-upload.* temp files.
+  assertEquals(text.includes("^~ /sha256/"), false);
+  assertEquals(text.includes("^~ /bundles/"), false);
+  const sha = text.slice(
+    text.indexOf("location /sha256/"),
+    text.indexOf("location /bundles/"),
+  );
+  assertEquals(sha.includes("location ~ /\\. {"), true);
+  assertEquals(sha.includes("deny all;"), true);
+  const bundles = text.slice(text.indexOf("location /bundles/"));
+  assertEquals(bundles.includes("location ~ /\\. {"), true);
+  assertEquals(bundles.includes("deny all;"), true);
+});
+
 Deno.test("renderSite quotes a root with no shell metacharacters untouched", () => {
   const text = renderSite({ ...BASE, root: "/srv/a b/c" });
   assertStringIncludes(text, "root '/srv/a b/c';");

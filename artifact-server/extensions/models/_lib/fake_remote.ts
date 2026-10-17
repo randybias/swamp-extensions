@@ -36,6 +36,8 @@ export interface FakeRemote {
   dirs: Set<string>;
   /** Paths that are symlinks. */
   symlinks: Set<string>;
+  /** Raw target of each symlink. */
+  symlinkTarget: Map<string, string>;
   /** Every recovered remote script or argv, in order. */
   commands: string[];
   /** Every argv run under `sudo -n --`, in order. */
@@ -114,12 +116,14 @@ export function makeFakeRemote(): FakeRemote {
   const files = new Map<string, FakeFile>();
   const dirs = new Set<string>(["/"]);
   const symlinks = new Set<string>();
+  const symlinkTarget = new Map<string, string>();
   const commands: string[] = [];
   const sudoArgv: string[][] = [];
   const self: FakeRemote = {
     files,
     dirs,
     symlinks,
+    symlinkTarget,
     commands,
     sudoArgv,
     nginxActive: "active",
@@ -244,7 +248,9 @@ async function handle(
       return ok();
     }
     if (argv[0] === "ln") {
-      host.symlinks.add(argv.at(-1)!);
+      const dest = argv.at(-1)!;
+      host.symlinks.add(dest);
+      host.symlinkTarget.set(dest, argv.at(-2)!);
       return ok();
     }
     return ok();
@@ -283,12 +289,12 @@ async function handle(
   if (script.includes("##VERSION")) return ok(renderLayout(host, script));
   if (script.includes("##ACTIVE")) return ok(renderNginx(host, script));
   if (script.includes("flock 9")) {
-    await regenerate(host, assign(script, "r")!);
+    regenerate(host, assign(script, "r")!);
     return ok();
   }
-  if (/mv -T "\$tmp" "\$r\/refs\//.test(script)) {
+  if (script.includes('mv -T "$tmp"') && script.includes("/refs/")) {
     const r = assign(script, "r")!;
-    const name = script.match(/\/refs\/'([^']+)'/)![1];
+    const name = script.match(/\/refs\/([A-Za-z0-9._-]+)'/)![1];
     const kind = script.match(/printf '%s\s+%s\\n' '([a-z]+)'/)![1];
     const hash = script.match(/'([0-9a-f]{64})'/)![1];
     host.files.set(`${r}/refs/${name}`, {
@@ -297,6 +303,66 @@ async function handle(
       owner: "user",
       group: "user",
     });
+    return ok();
+  }
+  if (
+    /^if \[ -e '.*' \]; then rm -rf '.*'; else mv -T '.*' '.*'; fi$/.test(
+      script,
+    )
+  ) {
+    const final = script.match(/^if \[ -e '([^']+)' \]/)![1];
+    const stage = script.match(/mv -T '([^']+)'/)![1];
+    const exists = host.dirs.has(final) ||
+      [...host.files.keys()].some((k) =>
+        k === final || k.startsWith(`${final}/`)
+      );
+    for (const k of [...host.files.keys()]) {
+      if (k === stage || k.startsWith(`${stage}/`)) {
+        if (!exists) {
+          host.files.set(final + k.slice(stage.length), host.files.get(k)!);
+        }
+        host.files.delete(k);
+      }
+    }
+    for (const k of [...host.dirs]) {
+      if (k === stage || k.startsWith(`${stage}/`)) {
+        if (!exists) host.dirs.add(final + k.slice(stage.length));
+        host.dirs.delete(k);
+      }
+    }
+    if (!exists) host.dirs.add(final);
+    return ok();
+  }
+  if (/^set -eu\nr=/.test(script) && script.includes("for p in ")) {
+    const r = assign(script, "r")!;
+    const list = (script.match(/rm -rf -- (.*)$/m) ?? [])[1] ?? "";
+    const paths = [...list.matchAll(/'([^']+)'/g)].map((m) => m[1]);
+    for (const d of [`${r}/sha256`, `${r}/bundles`]) {
+      if (host.symlinks.has(d)) {
+        return { code: 3, stdout: "", stderr: "symlink" };
+      }
+    }
+    for (const p of paths) {
+      const seg = p.split("/");
+      const dir = p.startsWith("sha256/")
+        ? `${r}/sha256/${seg[1]}`
+        : `${r}/bundles/${seg[1]}`;
+      if (host.symlinks.has(dir)) {
+        return { code: 3, stdout: "", stderr: "symlink" };
+      }
+    }
+    for (const p of paths) {
+      for (const k of [...host.files.keys()]) {
+        if (k === `${r}/${p}` || k.startsWith(`${r}/${p}/`)) {
+          host.files.delete(k);
+        }
+      }
+      for (const k of [...host.dirs]) {
+        if (k === `${r}/${p}` || k.startsWith(`${r}/${p}/`)) {
+          host.dirs.delete(k);
+        }
+      }
+    }
     return ok();
   }
   if (/rm -f '.*\/refs\//.test(script)) {
@@ -329,6 +395,11 @@ async function handle(
     }
     return ok();
   }
+  if (/^if \[ -L '([^']+)' \]; then readlink/.test(script)) {
+    const p = script.match(/^if \[ -L '([^']+)' \]/)![1];
+    return ok(host.symlinkTarget.get(p) ?? "");
+  }
+  if (/^if \[ -L /.test(script)) return ok();
   if (/^mkdir -p /.test(script)) {
     host.dirs.add(script.replace(/^mkdir -p '?/, "").replace(/'$/, ""));
     return ok();
@@ -428,14 +499,12 @@ function renderNginx(host: FakeRemote, script: string): string {
 }
 
 /** Rebuilds `SHA256SUMS` in the fake host from the blobs present. */
-async function regenerate(host: FakeRemote, r: string): Promise<void> {
+function regenerate(host: FakeRemote, r: string): void {
   const rows: { hash: string; rel: string }[] = [];
-  for (const [p, f] of host.files) {
+  for (const p of host.files.keys()) {
     if (p.startsWith(`${r}/sha256/`)) {
-      rows.push({
-        hash: await sha256Hex(f.content),
-        rel: p.slice(r.length + 1),
-      });
+      const rel = p.slice(r.length + 1);
+      rows.push({ hash: rel.split("/")[1] ?? "", rel });
     }
   }
   rows.sort((a, b) => (a.rel < b.rel ? -1 : a.rel > b.rel ? 1 : 0));

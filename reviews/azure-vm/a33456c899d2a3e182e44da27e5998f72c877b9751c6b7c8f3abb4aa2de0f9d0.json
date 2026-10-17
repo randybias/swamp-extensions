@@ -1,0 +1,89 @@
+{
+  "extension": "@randybias/azure-vm",
+  "version": "2026.10.17.1",
+  "reviewedAt": "2026-10-17T12:54:51Z",
+  "dimensions": [
+    {
+      "id": "credentials-secrets",
+      "verdict": "pass",
+      "note": "OAuth2 client credentials: clientSecret is sensitive-marked, sent only in the AAD token POST body, the bearer token lives in memory for one call, and nothing is put on a command line (no az CLI). The shared _lib/arm.ts unwraps ARM {error:{code,message}} and AAD {error,error_description}, redacting the secret and token before truncation and redacting the code (tested). Known external issue swamp-club lab 3555: the CLI prints literal sensitive arguments, so README examples pass clientSecret as a vault reference only and never show --json."
+    },
+    {
+      "id": "logging-quality",
+      "verdict": "pass",
+      "note": "Each method logs once with structured placeholders (VM name, state); no credential, token or request body in log fields."
+    },
+    {
+      "id": "error-handling",
+      "verdict": "pass",
+      "note": "ARM and AAD failures become a typed ArmError with a redacted code and message; get on a missing VM fails typed and sync records not_found; long operations poll with a bounded timeout and fail with a typed timeout."
+    },
+    {
+      "id": "testing-completeness",
+      "verdict": "pass",
+      "note": "26 unit/contract tests with an injected fetch, clock and sleep (no socket): adopt-without-PUT, create and poll, delete and delete-again no-op, deallocate, start no-op when running, strict schemas, injection in every name, no password in the body, error unwrap and redaction. Live end-to-end is BLOCKED (needs an Azure subscription and a service principal scoped to a throwaway resource group); every live cell is recorded as blocked in LOGBOOK, which is why the channel is beta."
+    },
+    {
+      "id": "idempotency-resilience",
+      "verdict": "pass",
+      "note": "create adopts an existing VM and never issues a PUT; delete on an absent VM is a clean no-op; start is a no-op when already running; every mutation polls to the target provisioning or power state before recording. Residual MEDIUM: deallocate and stop always POST even when already in the target state (Azure accepts the repeat; not yet verified live)."
+    },
+    {
+      "id": "api-contracts",
+      "verdict": "pass",
+      "note": "Azure Resource Manager REST, Microsoft.Compute API version 2024-07-01 pinned in every URL; deallocate is a real deallocate with optional hibernate, distinct from stop (power off, still billed)."
+    },
+    {
+      "id": "resource-management",
+      "verdict": "pass",
+      "note": "No local process, file or socket is held past a call; polling is bounded by timeoutMs (max 1 h) and pollIntervalMs."
+    },
+    {
+      "id": "published-surface-hygiene",
+      "verdict": "pass",
+      "note": "Manifest @randybias/azure-vm, two-sentence description, Apache-2.0, additionalFiles README.md and LICENSE.txt. deallocate, stop and delete are DESTRUCTIVE.; get and sync are READ-ONLY. Fixtures use synthetic GUIDs and example names; leak scan, gitleaks and fixture guard pass. Residual MEDIUM: README shows the state key as <subscription>-<resource-group>-<name> but the instance name is length-prefixed; fix in the next version."
+    },
+    {
+      "id": "schema-strictness",
+      "verdict": "pass",
+      "note": "Global arguments are an empty strictObject; every method argument object is strict; subscription is a GUID, names, resource group, location, size and image fields carry grammars and length bounds; admin access is an SSH public key only with password authentication disabled. Residual MEDIUM: tags is not bounded to Azure's tag-count limit."
+    },
+    {
+      "id": "lifetime-gc",
+      "verdict": "pass",
+      "note": "vm resource: lifetime infinite, garbageCollection 10."
+    },
+    {
+      "id": "crud-completeness",
+      "verdict": "pass",
+      "note": "create (or adopt), get, sync, start, deallocate, stop and delete. All mutators are kind action, so no lifecycle verb tombstones the definition."
+    },
+    {
+      "id": "preflight-checks",
+      "verdict": "pass",
+      "note": "All names and the request body are validated before the token request; create GETs first and adopts rather than overwriting."
+    },
+    {
+      "id": "instance-names",
+      "verdict": "pass",
+      "note": "Length-prefixed components of subscription, resource group and VM name (resourceInstanceName), so distinct targets cannot collide."
+    },
+    {
+      "id": "data-access",
+      "verdict": "pass",
+      "note": "Every target and credential arrives as method arguments, so one generic definition serves any subscription; the model reads no other model's data."
+    },
+    {
+      "id": "version-upgrades",
+      "verdict": "pass",
+      "note": "First release (2026.10.17.1): no earlier version or stored data to upgrade."
+    }
+  ],
+  "panel": {
+    "codex-astra": "codex gpt-6-astra conformance seat, rounds 1-3 (9f73a97, 85a59da, delta to 1afafcc): round-1 findings (kind action on create/start/deallocate/stop, DESTRUCTIVE. on deallocate/stop, ARM/AAD error unwrap and redaction) fixed in 85a59da; no azure-vm finding open; residuals in LOGBOOK.",
+    "codex-terra": "codex gpt-5.6-terra adversarial seat, rounds 1-3: round-1 Highs on this package (lifecycle verbs without kind action; error redaction after truncation) fixed in 85a59da; deallocate/stop re-POST downgraded to MEDIUM (Azure accepts the repeat). Round-3 delta: no defects.",
+    "merge-prep": "Post-review change 8650c04: plain model export so the registry catalogs the model type (dry-run uncatalogued-model); no behaviour change, 26 tests and gates 0 to 6 pass.",
+    "live": "blocked: needs an Azure subscription and a service principal scoped to a throwaway resource group (Randy); every live cell recorded as blocked in LOGBOOK.",
+    "ocr-llm": "OCR sonnet5 and glm seats were not run"
+  }
+}

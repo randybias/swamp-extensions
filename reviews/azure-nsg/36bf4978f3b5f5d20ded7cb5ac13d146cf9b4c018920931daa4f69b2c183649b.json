@@ -1,0 +1,89 @@
+{
+  "extension": "@randybias/azure-nsg",
+  "version": "2026.10.17.1",
+  "reviewedAt": "2026-10-17T12:54:51Z",
+  "dimensions": [
+    {
+      "id": "credentials-secrets",
+      "verdict": "pass",
+      "note": "OAuth2 client credentials: clientSecret is sensitive-marked, sent only in the AAD token POST body, the bearer token lives in memory for one call, and nothing is put on a command line (no az CLI). The shared _lib/arm.ts unwraps ARM {error:{code,message}} and AAD {error,error_description}, redacting the secret and token before truncation and redacting the code (tested). Known external issue swamp-club lab 3555: the CLI prints literal sensitive arguments, so README examples pass clientSecret as a vault reference only and never show --json."
+    },
+    {
+      "id": "logging-quality",
+      "verdict": "pass",
+      "note": "Each method logs once with structured placeholders (NSG, rule name, plan counts); no credential, token or request body in log fields."
+    },
+    {
+      "id": "error-handling",
+      "verdict": "pass",
+      "note": "ARM and AAD failures become a typed ArmError with redacted code and message; a rule write that reaches Failed or Canceled fails immediately (tested); apply_rule_set with apply true records the plan and throws when any collision or invalid rule exists. Residual MEDIUM: rule writes poll the rule GET rather than the Azure-AsyncOperation URL, so an async failure that leaves the old rule surfaces as a typed timeout."
+    },
+    {
+      "id": "testing-completeness",
+      "verdict": "pass",
+      "note": "35 unit/contract tests with an injected fetch, clock and sleep, including the real ARM read-back shape (singular value beside an empty plural array, and plural beside an absent singular) for ruleMatches, ensure_rule no-op, apply_rule_set unchanged and rule state; zero PUTs on a priority collision, a swap, and a valid-then-invalid list; '*' in a multi-element port list; Failed settle. Live end-to-end is BLOCKED (needs an Azure subscription and a service principal scoped to a throwaway resource group); every live cell is recorded as blocked in LOGBOOK, which is why the channel is beta."
+    },
+    {
+      "id": "idempotency-resilience",
+      "verdict": "pass",
+      "note": "ensure_rule is a no-op with changed false when the live rule matches (normalized singular/plural compare); remove_rule and delete on an absent target are clean no-ops; apply_rule_set plans first, builds and validates every rule body and checks priority collisions before any PUT, so it never half-converges; each rule write waits for Succeeded AND a live match before recording state from the settled read-back. Residual LOW: a safe ordered priority swap is refused (conservative)."
+    },
+    {
+      "id": "api-contracts",
+      "verdict": "pass",
+      "note": "Azure Resource Manager REST, Microsoft.Network API version 2024-05-01 pinned in every URL. A single value uses the singular field (the only one that accepts a tag or '*'); a plural address list must be all CIDRs and a plural port list may not contain '*', as Azure requires."
+    },
+    {
+      "id": "resource-management",
+      "verdict": "pass",
+      "note": "No local process, file or socket is held past a call; polling is bounded by timeoutMs (max 1 h) and pollIntervalMs. Residual MEDIUM: deleting the NSG does not mark its recorded rule resources deleted."
+    },
+    {
+      "id": "published-surface-hygiene",
+      "verdict": "pass",
+      "note": "Manifest @randybias/azure-nsg, two-sentence description, Apache-2.0, additionalFiles README.md and LICENSE.txt; descriptions no longer claim a create method. ensure_rule, remove_rule, apply_rule_set and delete are DESTRUCTIVE.; get and sync are READ-ONLY. Fixtures use RFC 5737 addresses and synthetic GUIDs; leak scan, gitleaks and fixture guard pass."
+    },
+    {
+      "id": "schema-strictness",
+      "verdict": "pass",
+      "note": "Global arguments are an empty strictObject; every argument object and each declared rule is strict; priority 100-4096; prefixes and port ranges carry grammars, lists are bounded to 64 and a rule set to 200. Residual MEDIUM: rule description is length-bounded (140) but has no character allowlist (sent as JSON, never a shell); IPv6 prefix validation accepts some malformed forms (shared _lib)."
+    },
+    {
+      "id": "lifetime-gc",
+      "verdict": "pass",
+      "note": "nsg, rule and ruleSet resources: lifetime infinite, garbageCollection 10."
+    },
+    {
+      "id": "crud-completeness",
+      "verdict": "pass",
+      "note": "NSG get, sync and delete; rule ensure (create/update), remove and declarative apply_rule_set (plan, then apply only when apply is true; undeclared rules are left alone). NSG creation is out of scope and the descriptions say so. All mutators are kind action."
+    },
+    {
+      "id": "preflight-checks",
+      "verdict": "pass",
+      "note": "apply_rule_set validates every rule body, duplicate names and (direction, priority) collisions against declared and undeclared rules before any write and records the plan either way."
+    },
+    {
+      "id": "instance-names",
+      "verdict": "pass",
+      "note": "Length-prefixed components of subscription, resource group, NSG and rule name, so distinct targets cannot collide."
+    },
+    {
+      "id": "data-access",
+      "verdict": "pass",
+      "note": "Every target and credential arrives as method arguments, so one generic definition serves any NSG; the model reads no other model's data."
+    },
+    {
+      "id": "version-upgrades",
+      "verdict": "pass",
+      "note": "First release (2026.10.17.1): no earlier version or stored data to upgrade."
+    }
+  ],
+  "panel": {
+    "codex-astra": "codex gpt-6-astra conformance seat, rounds 1-3 (9f73a97, 85a59da, delta to 1afafcc): round 3 found 0 Critical/High/Medium and 1 Low (tightness: values.includes('*')); earlier findings dispositioned in LOGBOOK.",
+    "codex-terra": "codex gpt-5.6-terra adversarial seat: round 1 High (no priority-collision preflight) fixed in 85a59da; round 2 Highs (plural-list validation after the first PUT; empty-plural read-back broke idempotency) and Mediums (awaitRule on a stale GET; '*' in plural ports) fixed in 1afafcc; round-3 delta verdict PASS with no defects. Refuted under run rulings: rename delete, cross-direction priority collisions, armed-revert on rule changes.",
+    "merge-prep": "Post-review change 8650c04: plain model export so the registry catalogs the model type (dry-run uncatalogued-model); no behaviour change, 35 tests and gates 0 to 6 pass.",
+    "live": "blocked: needs an Azure subscription and a service principal scoped to a throwaway resource group (Randy); every live cell recorded as blocked in LOGBOOK.",
+    "ocr-llm": "OCR sonnet5 and glm seats were not run"
+  }
+}

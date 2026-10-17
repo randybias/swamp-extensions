@@ -91,3 +91,41 @@ transport.
   keying state, so `.../` and `...` share one record.
 - LOW: curl and prepare stderr pass into errors as the last line, capped at 200
   characters; labels are checked against a printable-ASCII allowlist.
+
+## 2026-10-17 live e2e
+
+Run sp-20261017 on 3f038b4, swamp 20261013.025835.0. Two throwaway VPS nodes,
+`<vps3>` (A) and `<vps4>` (B), Ubuntu archive `syncthing 1.27.2~ds4` run as a
+dedicated system user under the packaged `syncthing@` unit, GUI/API on loopback
+:8384 only. Transport `access=ssh`, `host_key_policy=strict` with pinned keys.
+Each node's API key went from its config.xml over ssh stdout straight into the
+vault through stdin; `api_key` and `private_key` were vault references only and
+no run used `--json`.
+
+| Cell                                        | Result      | Detail                                                                                                                                             |
+| ------------------------------------------- | ----------- | -------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 1 get/sync both nodes                       | PASS        | `reachable true`, `present`, my_id and counts; node record holds the normalized api_url                                                            |
+| 2 ensure_device A->B, B->A, repeat          | PASS        | first runs `changed true`, peer name and `tcp://<peer>:22000` address on each side; repeats `changed false`                                        |
+| 3 ensure_folder both + real sync            | PASS        | first runs `changed true`, repeats `changed false`; a 64 KiB random file written on A appeared on B with identical size and sha256 after 11 s      |
+| 4 label change is a PATCH                   | PASS        | out-of-model fields (rescanIntervalS, order, fsWatcherDelayS) and both device ids survived the label change; repeat `changed false`                |
+| 5 remove_folder / remove_device, repeat     | PASS        | each `changed true`, `removed`, absent on the host API; second round all `changed false`, `not_found`, rc 0                                        |
+| 6 folder id `..` refused before any request | PASS        | rc 1 with the folder_id grammar error; sshd on A saw no connection in the window                                                                   |
+| 7 wrong API key                             | PASS (note) | get/sync: `system status returned 403`, typed `SyncthingError`, rc 1, no record written (not recorded as unreachable); ensure_device: 403 likewise |
+| 8 Syncthing stopped on B                    | PASS        | sync `timeout_s: 5`: `reachable false`, `unreachable` (curl exit 7); a listener that never answers gave curl exit 28 within the timeout; restarted |
+| 9 host-key mismatch                         | PASS        | B's pins for A's address: `host key verification failed`, rc 1, sync rethrows; sshd logged only preauth closes                                     |
+| 10 argv scan + no leftovers                 | PASS        | ps sampled every 50 ms on control, A and B during cells 2-5: 0 hits for keys, substrings or their sha256 (positive control hit); cache dirs empty  |
+| 11 workflows                                | N/A         | the extension ships no workflows                                                                                                                   |
+
+Result 10/10 applicable cells PASS, 0 FAIL, 0 BLOCKED. Both nodes were purged
+(package, unit, user, cache) and the vault emptied afterwards.
+
+- 2026-10-17 (merge-prep, main): review CLEAN at 9f46ceb (rounds 7ecc8c8,
+  863cdf3, 9f46ceb); the 3f038b4 polish (timeouts, `isUnreachable`, DELETE 404,
+  URL normalization, label allowlist) was self-reviewed at merge-prep with no
+  Critical/High. Residuals:
+  - LOW (fixed at merge-prep, message only): a 401/403 now reads
+    `... returned 403 (the API key was rejected)` instead of a bare status (live
+    cell 7 note); unit test asserts the wording.
+  - LOW (open): remote curl stderr is passed into errors as its last line,
+    capped at 200 characters; earlier lines are dropped.
+  - LOW (open): no `docs/specs/` spec exists for this extension.

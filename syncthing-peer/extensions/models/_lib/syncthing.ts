@@ -66,7 +66,11 @@ export class SyncthingError extends Error {
 
   /** Creates a Syncthing error. */
   constructor(message: string, status = 0) {
-    super(message);
+    super(
+      status === 401 || status === 403
+        ? `${message} (the API key was rejected)`
+        : message,
+    );
     this.name = "SyncthingError";
     this.status = status;
   }

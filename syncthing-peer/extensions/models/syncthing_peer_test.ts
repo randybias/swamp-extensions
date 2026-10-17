@@ -325,6 +325,10 @@ Deno.test("sync rethrows an auth failure instead of recording unreachable", asyn
     SyncthingError,
   );
   assertEquals(error.status, 401);
+  assertEquals(
+    error.message,
+    "system status returned 401 (the API key was rejected)",
+  );
   assertEquals(written.length, 0);
 });
 

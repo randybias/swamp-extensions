@@ -51,8 +51,8 @@ swamp model method run syncthing-peer ensure_device \
   --input name=edge-2
 ```
 
-Reach a node over SSH, where curl runs on the host and the key is uploaded as a
-mode-0600 config over stdin:
+Reach a node over SSH, where curl runs on the host and the key is streamed to it
+on stdin:
 
 ```bash
 swamp model method run syncthing-peer ensure_folder \
@@ -73,11 +73,9 @@ Read the change flag with
 ## How it works
 
 - The API key travels only in the `X-API-Key` header. A local call sets it as an
-  in-memory request header; a remote call uploads a mode-0600 `curl --config`
-  file over stdin to a random name in a 0700 `~/.cache/syncthing-peer/`
-  directory, runs `curl` and its trap-based cleanup in **one** remote shell, and
-  sweeps any config older than a few minutes before each upload. The key never
-  reaches a URL, a process argument, a log or stored state.
+  in-memory request header; a remote call streams the whole `curl --config`
+  body, key included, to `curl --config -` on stdin, so it never reaches a URL,
+  a process argument, remote disk, a log or stored state.
 - Plain HTTP is accepted only on a loopback address; any other origin must use
   HTTPS. A redirect is refused rather than re-sending the key.
 - The SSH transport is strict-only: `host_key_policy=strict` and a non-empty

@@ -1,6 +1,6 @@
 manifestVersion: 1
 name: "@randybias/syncthing-peer"
-version: "2026.10.17.1"
+version: "2026.10.17.2"
 description: "Ensure a peer device and a shared folder on one Syncthing node through its REST API, reached locally or over SSH, and inspect or remove them. The API key travels only in the X-API-Key header, plain HTTP is loopback-only, and state is keyed by a SHA-256 of the node label and endpoint."
 license: Apache-2.0
 repository: https://github.com/randybias/swamp-extensions

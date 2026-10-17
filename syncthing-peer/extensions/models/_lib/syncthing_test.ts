@@ -33,7 +33,6 @@ import {
   type CommandResult,
   type CommandRunner,
   type RunOptions,
-  sha256Hex,
 } from "./ssh.ts";
 
 const HEADER_VALUE = "placeholder-header-value";
@@ -186,38 +185,27 @@ Deno.test("the local client sends the key only as a header and refuses redirects
   );
 });
 
-Deno.test("the ssh client keeps the key off argv and runs curl with its cleanup", async () => {
-  const calls: { args: string[]; stdin?: string }[] = [];
-  const run: CommandRunner = async (
+Deno.test("the ssh client streams the config on stdin and never writes a remote file", async () => {
+  const calls: { args: string[]; stdin?: string; timeoutMs?: number }[] = [];
+  const run: CommandRunner = (
     cmd: string,
     args: string[],
     options: RunOptions = {},
   ): Promise<CommandResult> => {
-    const remote = args.at(-1) ?? "";
     const stdin = typeof options.stdin === "string"
       ? options.stdin
       : options.stdin
       ? new TextDecoder().decode(options.stdin)
       : undefined;
-    calls.push({ args: [cmd, ...args], stdin });
-    if (remote.includes("mmin +5")) {
-      return { code: 0, stdout: "/root/.cache/syncthing-peer", stderr: "" };
-    }
-    if (remote.includes("mktemp")) {
-      return {
-        code: 0,
-        stdout: `${await sha256Hex(stdin ?? "")} 600\n`,
-        stderr: "",
-      };
-    }
-    if (remote.includes("trap") && remote.includes("curl")) {
-      return {
+    calls.push({ args: [cmd, ...args], stdin, timeoutMs: options.timeoutMs });
+    if ((args.at(-1) ?? "").includes("curl")) {
+      return Promise.resolve({
         code: 0,
         stdout: '{"ok":true}__SYNCTHING_STATUS__201',
         stderr: "",
-      };
+      });
     }
-    return { code: 0, stdout: "MISSING\n", stderr: "" };
+    return Promise.resolve({ code: 0, stdout: "MISSING\n", stderr: "" });
   };
   const client = createClient({ ...DEPS, run }, "ssh", {
     apiUrl: "http://127.0.0.1:8384",
@@ -234,38 +222,37 @@ Deno.test("the ssh client keeps the key off argv and runs curl with its cleanup"
     deviceID: "x",
   });
   assertEquals(result.status, 201);
-  for (const call of calls) {
-    assertEquals(
-      call.args.join(" ").includes(HEADER_VALUE),
-      false,
-      "key on argv",
-    );
-  }
-  const uploaded = calls.find((call) =>
-    call.stdin?.includes(`header = "X-API-Key: ${HEADER_VALUE}"`)
-  );
-  assert(uploaded, "the curl config must be uploaded over stdin");
-  const prepare = calls.find((call) =>
-    (call.args.at(-1) ?? "").includes("printf")
-  );
-  assert(prepare, "prepare shell must run");
-  assert((prepare.args.at(-1) ?? "").includes("-mmin +5"), "stale sweep");
-  const curl = calls.find((call) => (call.args.at(-1) ?? "").includes("trap"));
-  assert(curl, "curl must run with its trap cleanup");
-  assert((curl.args.at(-1) ?? "").includes(".cache/syncthing-peer"));
+  // The whole remote command is curl reading its config from stdin.
+  const curl = calls.find((call) => (call.args.at(-1) ?? "").includes("curl"));
+  assert(curl, "curl must read its config from stdin");
   assert(
-    (curl.args.at(-1) ?? "").includes("trap 'rm -f"),
-    "the cleanup must run in the same shell",
+    (curl.stdin ?? "").includes(`header = "X-API-Key: ${HEADER_VALUE}"`),
+    "the key must travel in the streamed config",
   );
+  // A remote step carries a timeout, and no secret or temp path is on argv.
+  assert(typeof curl.timeoutMs === "number" && curl.timeoutMs >= 30_000);
+  for (const call of calls) {
+    const text = call.args.join(" ");
+    assertEquals(text.includes(HEADER_VALUE), false, "key on argv");
+    assertEquals(text.includes("mktemp"), false, "no remote temp file");
+    assertEquals(text.includes("curlrc"), false, "no remote config file");
+    assertEquals(text.includes("umask 077"), false, "no secret dir");
+    assertEquals(text.includes(".cache/syncthing-peer"), false, "no cache dir");
+    assertEquals(text.includes("rm -f"), false, "no cleanup path");
+  }
 });
 
-Deno.test("a failed remote prepare aborts before any upload", async () => {
-  const calls: string[] = [];
-  const run: CommandRunner = (cmd, args): Promise<CommandResult> => {
-    const remote = args.at(-1) ?? "";
-    calls.push([cmd, ...args].join(" "));
-    if (remote.includes("mmin +5")) {
-      return Promise.resolve({ code: 1, stdout: "", stderr: "not owner" });
+Deno.test("a failed remote curl is a typed error and leaks no key", async () => {
+  const run: CommandRunner = (
+    _cmd: string,
+    args: string[],
+  ): Promise<CommandResult> => {
+    if ((args.at(-1) ?? "").includes("curl")) {
+      return Promise.resolve({
+        code: 60,
+        stdout: "",
+        stderr: "SSL certificate problem",
+      });
     }
     return Promise.resolve({ code: 0, stdout: "", stderr: "" });
   };
@@ -280,12 +267,12 @@ Deno.test("a failed remote prepare aborts before any upload", async () => {
     host_keys: ["192.0.2.10 ssh-ed25519 AAAA"],
     connect_timeout_s: 15,
   });
-  await assertRejects(
+  const error = await assertRejects(
     () => client.request("GET", "/rest/system/status"),
     Error,
-    "prepare",
-  );
-  assertEquals(calls.some((c) => c.includes("mktemp")), false, "no upload");
+  ) as Error;
+  assert(error.message.includes("exit 60"));
+  assertEquals(error.message.includes(HEADER_VALUE), false);
 });
 
 Deno.test("device and folder specs validate and match", () => {

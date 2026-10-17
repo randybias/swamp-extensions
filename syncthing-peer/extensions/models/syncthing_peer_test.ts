@@ -3,7 +3,6 @@ import { z } from "npm:zod@4.3.6";
 import {
   type CommandResult,
   type CommandRunner,
-  sha256Hex,
   SshConfigError,
   SshError,
 } from "./_lib/ssh.ts";
@@ -393,25 +392,15 @@ Deno.test("sync rethrows an HTTP 500 instead of recording unreachable", async ()
 });
 
 Deno.test("sync rethrows a TLS/curl failure instead of recording unreachable", async () => {
-  const run: CommandRunner = async (_cmd, args, options = {}) => {
-    const remote = args.at(-1) ?? "";
-    if (remote.includes("mmin +5")) {
-      return { code: 0, stdout: "/root/.cache/syncthing-peer", stderr: "" };
+  const run: CommandRunner = (_cmd, args) => {
+    if ((args.at(-1) ?? "").includes("curl")) {
+      return Promise.resolve({
+        code: 60,
+        stdout: "",
+        stderr: "SSL certificate problem",
+      });
     }
-    if (remote.includes("mktemp")) {
-      const config = typeof options.stdin === "string"
-        ? options.stdin
-        : new TextDecoder().decode(options.stdin ?? new Uint8Array());
-      return {
-        code: 0,
-        stdout: `${await sha256Hex(config)} 600\n`,
-        stderr: "",
-      };
-    }
-    if (remote.includes("trap") && remote.includes("curl")) {
-      return { code: 60, stdout: "", stderr: "SSL certificate problem" };
-    }
-    return { code: 0, stdout: "", stderr: "" };
+    return Promise.resolve({ code: 0, stdout: "", stderr: "" });
   };
   const m = createModel(deps(() => Promise.resolve(json({})), run));
   const { context, written } = testContext();
@@ -583,7 +572,7 @@ Deno.test("bad device, folder and path inputs are refused", async () => {
 Deno.test("the ssh transport reaches the API and keeps the key off argv", async () => {
   const calls: { args: string[]; stdin?: string }[] = [];
   let lastConfig = "";
-  const run: CommandRunner = async (
+  const run: CommandRunner = (
     cmd,
     args,
     options = {},
@@ -595,29 +584,19 @@ Deno.test("the ssh transport reaches the API and keeps the key off argv", async 
         : new TextDecoder().decode(options.stdin);
     }
     calls.push({ args: [cmd, ...args], stdin: lastConfig });
-    if (remote.includes("mmin +5")) {
-      return { code: 0, stdout: "/root/.cache/syncthing-peer", stderr: "" };
-    }
-    if (remote.includes("mktemp")) {
-      return {
-        code: 0,
-        stdout: `${await sha256Hex(lastConfig)} 600\n`,
-        stderr: "",
-      };
-    }
-    if (remote.includes("trap") && remote.includes("curl")) {
+    if (remote.includes("curl")) {
       const url = /url = "([^"]+)"/.exec(lastConfig)?.[1] ?? "";
       const path = new URL(url).pathname;
       const body = path === "/rest/system/status"
         ? { myID: MY_ID, version: "v2.0.0" }
         : [];
-      return {
+      return Promise.resolve({
         code: 0,
         stdout: `${JSON.stringify(body)}__SYNCTHING_STATUS__200`,
         stderr: "",
-      };
+      });
     }
-    return { code: 0, stdout: "MISSING\n", stderr: "" };
+    return Promise.resolve({ code: 0, stdout: "MISSING\n", stderr: "" });
   };
   const m = createModel(deps(() => Promise.resolve(json({})), run));
   const { context, written } = testContext();
@@ -645,7 +624,7 @@ Deno.test("the ssh transport reaches the API and keeps the key off argv", async 
     calls.some((call) =>
       (call.stdin ?? "").includes(`X-API-Key: ${HEADER_VALUE}`)
     ),
-    "the key must be uploaded over stdin",
+    "the key must be streamed over stdin",
   );
 });
 

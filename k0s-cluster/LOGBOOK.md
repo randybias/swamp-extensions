@@ -330,3 +330,6 @@ the triage checks, no Critical/High. `_lib/ssh.ts` is the canonical blob
 - `k0s config validate` (v1.36.4) is lenient about unknown fields, so a render
   is checked against the upstream ClusterConfig shape with goldens, not by that
   command alone.
+
+- Prior art: the registry has no k0s package. `@shelson/k3s` and `@rjeschmi/vm`
+  are adjacent but do not cover a k0s cluster.

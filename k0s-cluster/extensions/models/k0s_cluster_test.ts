@@ -2610,11 +2610,13 @@ function upgradeRouter(
       argv[0] === K0S_BINARY_PATH && argv[1] === "kubectl" &&
       argv[2] === "version"
     ) {
+      // k0s reports the API server as "<x.y.z>+k0s", without the .N revision.
+      const server = `${(promoted ? UP_TO : UP_FROM).split("+")[0]}+k0s`;
+      const client = UP_TO.split("+")[0];
       return {
         code: 0,
-        stdout: `{"serverVersion":{"gitVersion":"${
-          promoted ? UP_TO : UP_FROM
-        }"}}\n`,
+        stdout:
+          `{"clientVersion":{"gitVersion":"${client}"},"serverVersion":{"gitVersion":"${server}"}}\n`,
       };
     }
     if (argv[0] === K0S_BINARY_PATH && argv[1] === "kubectl") {
@@ -2879,7 +2881,12 @@ Deno.test("upgrade rolls back on a readiness timeout and on a server-version mis
     exec: upgradeRouter((argv) =>
       argv[0] === K0S_BINARY_PATH && argv[1] === "kubectl" &&
         argv[2] === "version"
-        ? { code: 0, stdout: `{"serverVersion":{"gitVersion":"${UP_FROM}"}}\n` }
+        ? {
+          code: 0,
+          stdout: `{"clientVersion":{"gitVersion":"${
+            UP_TO.split("+")[0]
+          }"},"serverVersion":{"gitVersion":"${UP_FROM.split("+")[0]}+k0s"}}\n`,
+        }
         : undefined
     ),
     fetch: () => Promise.resolve(PAYLOAD),
@@ -2935,6 +2942,79 @@ Deno.test("upgrade refuses patch, revision and minor-skew downgrades, and a stal
       unknown.methods.upgrade.execute(upgradeArgs(), upgradeContext().context),
     Error,
     "could not read",
+  );
+});
+
+Deno.test("upgrade refuses when the lock is held and leaves another's lock", async () => {
+  const fake = makeDeps({
+    exec: upgradeRouter((argv) =>
+      argv[0] === "mkdir" && argv[1] === "/run/k0s-upgrade.lock"
+        ? { code: 1 }
+        : undefined
+    ),
+    fetch: () => Promise.resolve(PAYLOAD),
+  });
+  const model = createModel(fake.deps);
+  const { context } = upgradeContext();
+  await assertRejects(
+    () => model.methods.upgrade.execute(upgradeArgs(), context),
+    Error,
+    "in progress",
+  );
+  assertEquals(fake.execs.some((a) => a[0] === "rmdir"), false);
+});
+
+Deno.test("reset refuses while an upgrade lock is held", async () => {
+  const fake = makeDeps({
+    exec: (argv) =>
+      argv[0] === "mkdir"
+        ? { code: 1 }
+        : argv[0] === "systemctl"
+        ? ABSENT
+        : { code: 0, stdout: "" },
+  });
+  const model = createModel(fake.deps);
+  const args = model.methods.reset.arguments.parse({
+    ssh: SSH,
+    confirm_host: HOST,
+  });
+  await assertRejects(
+    () => model.methods.reset.execute(args, createModelTestContext().context),
+    Error,
+    "in progress",
+  );
+});
+
+Deno.test("upgrade rolls back when the restart during restore fails", async () => {
+  const fake = makeDeps({
+    exec: upgradeRouter((argv) => {
+      if (argv[0] === "systemctl" && argv[1] === "start") return { code: 1 };
+      if (argv[0] === "systemctl" && argv[1] === "restart") return { code: 1 };
+      return undefined;
+    }),
+    fetch: () => Promise.resolve(PAYLOAD),
+  });
+  const model = createModel(fake.deps);
+  const { context } = upgradeContext();
+  await assertRejects(
+    () => model.methods.upgrade.execute(upgradeArgs(), context),
+    Error,
+    "ROLLBACK FAILED",
+  );
+});
+
+Deno.test("upgrade succeeds on a worker and checks the promoted binary", async () => {
+  const fake = makeDeps({
+    exec: upgradeRouter(),
+    fetch: () => Promise.resolve(PAYLOAD),
+  });
+  const model = createModel(fake.deps);
+  const { context } = upgradeContext({ role: "worker", service: "k0sworker" });
+  const out = await model.methods.upgrade.execute(upgradeArgs(), context);
+  assertEquals(out.result.upgraded, true);
+  assertEquals(
+    fake.execs.some((a) => a[0] === K0S_BINARY_PATH && a[1] === "kubectl"),
+    false,
   );
 });
 

@@ -997,6 +997,18 @@ async function cleanupK0sResidue(
   return { binary_removed: true };
 }
 
+/** The API server gitVersion from `k0s kubectl version -o json`, or null. */
+function readServerGitVersion(stdout: string): string | null {
+  try {
+    const parsed = JSON.parse(stdout) as {
+      serverVersion?: { gitVersion?: string };
+    };
+    return parsed.serverVersion?.gitVersion ?? null;
+  } catch {
+    return null;
+  }
+}
+
 function buildK0sModel(deps: K0sDeps) {
   return {
     type: "@randybias/k0s-cluster",
@@ -1518,6 +1530,14 @@ function buildK0sModel(deps: K0sDeps) {
           const stagedPath = `${K0S_BINARY_PATH}.new`;
           const backupPath = `${K0S_BINARY_PATH}.old`;
           try {
+            // A backup left by an earlier rollback means the host is in a state
+            // a clean upgrade should not start from.
+            const stale = await deps.ssh.exec(target, ["ls", "-d", backupPath]);
+            if (ok(stale) && stale.stdout.includes(backupPath)) {
+              throw new Error(
+                `${backupPath} already exists on ${target.host} (a previous rollback did not finish); refusing to upgrade`,
+              );
+            }
             // Everything that can fail without touching the host is done first.
             const uname = await deps.ssh.exec(target, ["uname", "-m"]);
             if (!ok(uname)) {
@@ -1558,54 +1578,64 @@ function buildK0sModel(deps: K0sDeps) {
                 `the staged k0s binary on ${target.host} does not match the pinned SHA-256; removed it before stopping anything`,
               );
             }
+            // Whether the old binary was moved aside; a rollback must restart
+            // an untouched binary rather than move a missing backup over it.
+            let backedUp = false;
             /**
-             * Puts the previous binary back, checks every step and waits for
-             * the old unit to be healthy. Throws when rollback itself fails, and
-             * never deletes the backup, so the operator can recover by hand.
+             * Restores the previous binary when it was moved, starts or
+             * restarts the unit and waits for health. Throws only when recovery
+             * fails, naming where the good binary is, and never deletes the
+             * backup.
              */
             const restore = async (): Promise<void> => {
               await deps.ssh.exec(target, ["rm", "-f", stagedPath]);
-              const back = await deps.ssh.exec(target, [
-                "mv",
-                backupPath,
-                K0S_BINARY_PATH,
+              if (backedUp) {
+                const back = await deps.ssh.exec(target, [
+                  "mv",
+                  backupPath,
+                  K0S_BINARY_PATH,
+                ]);
+                if (!ok(back)) {
+                  throw new Error(
+                    `ROLLBACK FAILED on ${target.host}: ${K0S_BINARY_PATH} holds the new binary and the previous one is at ${backupPath}; the unit may be down`,
+                  );
+                }
+              }
+              const restarted = await deps.ssh.exec(target, [
+                "systemctl",
+                backedUp ? "restart" : "start",
+                service,
               ]);
               let recovered = false;
-              if (ok(back)) {
-                const restarted = await deps.ssh.exec(target, [
-                  "systemctl",
-                  "restart",
-                  service,
-                ]);
-                if (ok(restarted)) {
-                  try {
-                    await waitUnitHealthy(deps, target, service, 90);
-                    recovered = true;
-                  } catch {
-                    recovered = false;
-                  }
+              if (ok(restarted)) {
+                try {
+                  await waitUnitHealthy(deps, target, service, 90);
+                  recovered = true;
+                } catch {
+                  recovered = false;
                 }
               }
               if (!recovered) {
                 throw new Error(
-                  `ROLLBACK FAILED on ${target.host}: the previous binary is at ${backupPath} and the unit may be down`,
+                  `ROLLBACK FAILED on ${target.host}: the previous binary is at ${
+                    backedUp ? backupPath : K0S_BINARY_PATH
+                  } and the unit may be down`,
                 );
               }
             };
-            const stopped = await deps.ssh.exec(target, [
-              "systemctl",
-              "stop",
-              service,
-            ]);
-            if (!ok(stopped)) {
-              await deps.ssh.exec(target, ["rm", "-f", stagedPath]);
-              throw new Error(
-                `systemctl stop ${service} failed on ${target.host} (exit ${stopped.exit_code}); nothing was changed`,
-              );
-            }
-            // One transaction after the stop: any failure restores the old
-            // binary, and the message only claims a restore when it succeeded.
+            // The stop is inside the transaction, so a failing ssh call after it
+            // still restarts the unit.
             try {
+              const stopped = await deps.ssh.exec(target, [
+                "systemctl",
+                "stop",
+                service,
+              ]);
+              if (!ok(stopped)) {
+                throw new Error(
+                  `systemctl stop ${service} failed on ${target.host} (exit ${stopped.exit_code})`,
+                );
+              }
               const saved = await deps.ssh.exec(target, [
                 "mv",
                 K0S_BINARY_PATH,
@@ -1616,6 +1646,7 @@ function buildK0sModel(deps: K0sDeps) {
                   `could not move the running k0s binary aside on ${target.host} (exit ${saved.exit_code})`,
                 );
               }
+              backedUp = true;
               const promoted = await deps.ssh.exec(target, [
                 "mv",
                 stagedPath,
@@ -1642,24 +1673,47 @@ function buildK0sModel(deps: K0sDeps) {
                 service,
                 args.ready_timeout_s,
               );
-              // Prove the API server itself is on the new version, not just the
-              // file we just wrote.
-              const server = await deps.ssh.exec(target, [
-                K0S_BINARY_PATH,
-                "kubectl",
-                "version",
-                "-o",
-                "json",
-              ]);
-              if (!ok(server) || !server.stdout.includes(to)) {
-                throw new Error(
-                  `${target.host} did not report server version ${to} after the upgrade`,
-                );
+              // Prove the running server is the new version, not the file just
+              // written. A controller (or single) asks the API; k0s reports the
+              // server as "<x.y.z>+k0s" without the .N revision. A worker has
+              // no kubeconfig, so it can only check its own binary.
+              if (service === "k0scontroller") {
+                const server = await deps.ssh.exec(target, [
+                  K0S_BINARY_PATH,
+                  "kubectl",
+                  "version",
+                  "-o",
+                  "json",
+                ]);
+                const gitVersion = ok(server)
+                  ? readServerGitVersion(server.stdout)
+                  : null;
+                if (gitVersion !== `${to.split("+")[0]}+k0s`) {
+                  throw new Error(
+                    `${target.host} reports API server ${
+                      gitVersion ?? "unknown"
+                    }, not ${to} after the upgrade`,
+                  );
+                }
+              } else {
+                const version = await deps.ssh.exec(target, [
+                  K0S_BINARY_PATH,
+                  "version",
+                ]);
+                if (!ok(version) || version.stdout.trim() !== to) {
+                  throw new Error(
+                    `${target.host} did not report k0s ${to} after the upgrade`,
+                  );
+                }
               }
             } catch (error) {
               await restore();
               throw new Error(
-                `${(error as Error).message}; restored the previous binary`,
+                `${(error as Error).message}; ${
+                  backedUp
+                    ? "restored the previous binary"
+                    : "the unit was started on the unchanged binary"
+                }`,
               );
             }
             await deps.ssh.exec(target, ["rm", "-f", backupPath]);
@@ -2238,39 +2292,129 @@ function buildK0sModel(deps: K0sDeps) {
                 ...extra,
               }),
             );
-          const upgradeLock = await deps.ssh.exec(target, [
-            "ls",
-            "-d",
-            "/run/k0s-upgrade.lock",
-          ]);
-          if (
-            ok(upgradeLock) &&
-            upgradeLock.stdout.includes("/run/k0s-upgrade.lock")
-          ) {
+          const lockDir = "/run/k0s-upgrade.lock";
+          const locked = await deps.ssh.exec(target, ["mkdir", lockDir]);
+          if (!ok(locked)) {
             throw new Error(
-              `an upgrade is in progress on ${target.host} (/run/k0s-upgrade.lock exists); refusing to reset`,
+              `an upgrade or another reset is in progress on ${target.host} (${lockDir} exists); refusing to reset`,
             );
           }
-          const singleUnit = serviceName("single");
-          const workerUnit = serviceName("worker");
-          const unit = (await unitExists(deps, target, singleUnit))
-            ? singleUnit
-            : (await unitExists(deps, target, workerUnit))
-            ? workerUnit
-            : null;
-          if (!unit) {
-            if (!pending) {
-              context.logger.info(
-                "No k0s service on {host}; reset is a no-op",
-                { host: target.host },
-              );
-              const handle = await writeState({});
+          try {
+            const singleUnit = serviceName("single");
+            const workerUnit = serviceName("worker");
+            const unit = (await unitExists(deps, target, singleUnit))
+              ? singleUnit
+              : (await unitExists(deps, target, workerUnit))
+              ? workerUnit
+              : null;
+            if (!unit) {
+              if (!pending) {
+                context.logger.info(
+                  "No k0s service on {host}; reset is a no-op",
+                  { host: target.host },
+                );
+                const handle = await writeState({});
+                return {
+                  dataHandles: [...handles, handle],
+                  result: { reset: false, binary_removed: false },
+                };
+              }
+              // An earlier reset removed the unit but did not finish its cleanup.
+              let cleanup: { binary_removed: boolean; reason?: string };
+              try {
+                cleanup = await cleanupK0sResidue(
+                  deps,
+                  target,
+                  recorded,
+                  context,
+                );
+              } catch (e) {
+                await writeState({
+                  binary_sha256: recorded?.binary_sha256 ?? null,
+                  cleanup_pending: true,
+                });
+                throw e;
+              }
+              context.logger.info("Finished reset cleanup on {host}", {
+                host: target.host,
+              });
+              const handle = await writeState({
+                binary_removed: cleanup.binary_removed,
+                ...(cleanup.reason
+                  ? { binary_removal_reason: cleanup.reason }
+                  : {}),
+              });
               return {
                 dataHandles: [...handles, handle],
-                result: { reset: false, binary_removed: false },
+                result: { reset: true, ...cleanup },
               };
             }
-            // An earlier reset removed the unit but did not finish its cleanup.
+            // A k0s unit that is already stopped (after a crash or a reboot) makes
+            // `k0s stop` exit non-zero with "already stopped"; skip it when the
+            // unit is inactive, and never trust stderr text alone.
+            const active = await deps.ssh.exec(target, [
+              "systemctl",
+              "is-active",
+              unit,
+            ]);
+            const unitState = active.stdout.trim();
+            const stoppedStates = ["inactive", "failed"];
+            if (unitState === "active") {
+              const stopped = await deps.ssh.exec(target, [
+                K0S_BINARY_PATH,
+                "stop",
+              ]);
+              if (!ok(stopped)) {
+                const after = await deps.ssh.exec(target, [
+                  "systemctl",
+                  "is-active",
+                  unit,
+                ]);
+                const afterState = after.stdout.trim();
+                if (afterState === "active") {
+                  throw new Error(
+                    `k0s stop failed on ${target.host} (exit ${stopped.exit_code}) and ${unit} is still active`,
+                  );
+                }
+                if (!stoppedStates.includes(afterState)) {
+                  throw new ResetStateError(
+                    `k0s stop failed on ${target.host} and ${unit} is ${
+                      afterState || "in an unknown state"
+                    } (systemctl is-active exit ${after.exit_code})`,
+                  );
+                }
+                context.logger.info(
+                  "k0s stop reported {code} but {unit} is {state}; continuing",
+                  { code: stopped.exit_code, unit, state: afterState },
+                );
+              }
+            } else if (!stoppedStates.includes(unitState)) {
+              throw new ResetStateError(
+                `could not tell whether ${unit} is running on ${target.host}: systemctl is-active reported ${
+                  unitState || "no output"
+                } (exit ${active.exit_code})`,
+              );
+            }
+            const result = await deps.ssh.exec(target, [
+              K0S_BINARY_PATH,
+              "reset",
+            ]);
+            if (!ok(result)) {
+              throw new Error(
+                `k0s reset failed on ${target.host} (exit ${result.exit_code})`,
+              );
+            }
+            const cleaned = await deps.ssh.exec(target, [
+              "rm",
+              "-f",
+              K0S_CONFIG_PATH,
+              K0S_WORKER_TOKEN_PATH,
+            ]);
+            if (!ok(cleaned)) {
+              throw new Error(
+                `could not remove the k0s configuration on ${target.host} (exit ${cleaned.exit_code})`,
+              );
+            }
             let cleanup: { binary_removed: boolean; reason?: string };
             try {
               cleanup = await cleanupK0sResidue(
@@ -2286,9 +2430,7 @@ function buildK0sModel(deps: K0sDeps) {
               });
               throw e;
             }
-            context.logger.info("Finished reset cleanup on {host}", {
-              host: target.host,
-            });
+            context.logger.info("Reset k0s on {host}", { host: target.host });
             const handle = await writeState({
               binary_removed: cleanup.binary_removed,
               ...(cleanup.reason
@@ -2299,94 +2441,9 @@ function buildK0sModel(deps: K0sDeps) {
               dataHandles: [...handles, handle],
               result: { reset: true, ...cleanup },
             };
+          } finally {
+            await deps.ssh.exec(target, ["rmdir", lockDir]);
           }
-          // A k0s unit that is already stopped (after a crash or a reboot) makes
-          // `k0s stop` exit non-zero with "already stopped"; skip it when the
-          // unit is inactive, and never trust stderr text alone.
-          const active = await deps.ssh.exec(target, [
-            "systemctl",
-            "is-active",
-            unit,
-          ]);
-          const unitState = active.stdout.trim();
-          const stoppedStates = ["inactive", "failed"];
-          if (unitState === "active") {
-            const stopped = await deps.ssh.exec(target, [
-              K0S_BINARY_PATH,
-              "stop",
-            ]);
-            if (!ok(stopped)) {
-              const after = await deps.ssh.exec(target, [
-                "systemctl",
-                "is-active",
-                unit,
-              ]);
-              const afterState = after.stdout.trim();
-              if (afterState === "active") {
-                throw new Error(
-                  `k0s stop failed on ${target.host} (exit ${stopped.exit_code}) and ${unit} is still active`,
-                );
-              }
-              if (!stoppedStates.includes(afterState)) {
-                throw new ResetStateError(
-                  `k0s stop failed on ${target.host} and ${unit} is ${
-                    afterState || "in an unknown state"
-                  } (systemctl is-active exit ${after.exit_code})`,
-                );
-              }
-              context.logger.info(
-                "k0s stop reported {code} but {unit} is {state}; continuing",
-                { code: stopped.exit_code, unit, state: afterState },
-              );
-            }
-          } else if (!stoppedStates.includes(unitState)) {
-            throw new ResetStateError(
-              `could not tell whether ${unit} is running on ${target.host}: systemctl is-active reported ${
-                unitState || "no output"
-              } (exit ${active.exit_code})`,
-            );
-          }
-          const result = await deps.ssh.exec(target, [
-            K0S_BINARY_PATH,
-            "reset",
-          ]);
-          if (!ok(result)) {
-            throw new Error(
-              `k0s reset failed on ${target.host} (exit ${result.exit_code})`,
-            );
-          }
-          const cleaned = await deps.ssh.exec(target, [
-            "rm",
-            "-f",
-            K0S_CONFIG_PATH,
-            K0S_WORKER_TOKEN_PATH,
-          ]);
-          if (!ok(cleaned)) {
-            throw new Error(
-              `could not remove the k0s configuration on ${target.host} (exit ${cleaned.exit_code})`,
-            );
-          }
-          let cleanup: { binary_removed: boolean; reason?: string };
-          try {
-            cleanup = await cleanupK0sResidue(deps, target, recorded, context);
-          } catch (e) {
-            await writeState({
-              binary_sha256: recorded?.binary_sha256 ?? null,
-              cleanup_pending: true,
-            });
-            throw e;
-          }
-          context.logger.info("Reset k0s on {host}", { host: target.host });
-          const handle = await writeState({
-            binary_removed: cleanup.binary_removed,
-            ...(cleanup.reason
-              ? { binary_removal_reason: cleanup.reason }
-              : {}),
-          });
-          return {
-            dataHandles: [...handles, handle],
-            result: { reset: true, ...cleanup },
-          };
         },
       },
     },

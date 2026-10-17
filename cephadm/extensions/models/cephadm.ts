@@ -971,7 +971,7 @@ const RgwUserResultSchema = z.strictObject({
   email: z.string(),
   existedBefore: z.boolean(),
   changes: z.array(z.string()),
-  accessKey: z.string().optional(),
+  accessKey: z.string().meta({ sensitive: true }).optional(),
   key: z.string().meta({ sensitive: true }).optional(),
   maxBuckets: z.number(),
   suspended: z.boolean(),
@@ -985,6 +985,12 @@ const S3_ORIGIN_SCHEMA = (scheme: "https" | "http", what: string) =>
     `an ${scheme} origin (${what}) with no path, query, fragment or userinfo`,
   );
 
+/** The S3 key grammar; each use marks the field sensitive on its own line. */
+const S3_PRINTABLE_FIELD = z.string().min(1).max(512).refine(
+  isCredential,
+  "1-512 printable non-space ASCII characters",
+);
+
 /** The common S3-plane arguments. */
 const S3_COMMON_FIELDS = {
   endpoint: S3_ORIGIN_SCHEMA("https", "RGW S3 endpoint").describe(
@@ -994,16 +1000,10 @@ const S3_COMMON_FIELDS = {
     .describe("Zonegroup api name; the SigV4 region."),
   bucket: z.string().min(3).max(63).refine(isBucketName, "an S3 bucket name")
     .describe("Bucket name."),
-  accessKey: z.string().min(1).max(512).refine(
-    isCredential,
-    "1-512 printable non-space ASCII characters",
-  ).meta({ sensitive: true }).describe(
+  accessKey: S3_PRINTABLE_FIELD.meta({ sensitive: true }).describe(
     "Owner's S3 access key id, from the vault.",
   ),
-  secretKey: z.string().min(1).max(512).refine(
-    isCredential,
-    "1-512 printable non-space ASCII characters",
-  ).meta({ sensitive: true }).describe(
+  secretKey: S3_PRINTABLE_FIELD.meta({ sensitive: true }).describe(
     "Owner's S3 secret, from the vault; used only to sign.",
   ),
   requestTimeoutMs: z.number().int().min(1000).max(300000).describe(
@@ -3533,7 +3533,11 @@ export function createCephadmModel(overrides: Partial<CephadmDeps> = {}) {
 }
 
 /** Production model export. */
-export const model = createCephadmModel();
+export const model = {
+  ...createCephadmModel(),
+  type: "@randybias/cephadm",
+  version: "2026.10.17.1",
+} satisfies ReturnType<typeof createCephadmModel>;
 
 /** Outcome of the package-source check. */
 interface PackageSourceResult {

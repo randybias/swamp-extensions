@@ -122,7 +122,8 @@ async function world(): Promise<World> {
       };
     }
     if (cmd !== "ssh") return { code: 0, stdout: "", stderr: "" };
-    const remote = args[args.length - 1].replace(re, (m) => root + m);
+    const remote = `export SIM_SESSION_PID=$$; ` +
+      args[args.length - 1].replace(re, (m) => root + m);
     const p = new Deno.Command("sh", {
       args: ["-c", remote],
       stdin: "piped",
@@ -761,6 +762,28 @@ Deno.test("no host-net-revert timer is left after revert_now (pass or fail) or c
     assertEquals(leftUnits(w.root).length, 1);
     await w.call("commit", net("netplan", [A]));
     assertEquals(leftUnits(w.root), []);
+  } finally {
+    await w.cleanup();
+  }
+});
+
+Deno.test("revert_now survives the apply killing the SSH session: the restore runs detached and passes", async () => {
+  if (!await simAvailable()) return;
+  const w = await world();
+  try {
+    const armed = await w.call("apply", net("netplan", [A]));
+    // From here every netplan apply hangs up the session that started it.
+    await Deno.writeTextFile(`${w.root}/state/apply_kills_session`, "");
+    const fired = await w.call("revert_now", {
+      ...SSH,
+      token: armed.revert_token,
+    });
+    assertEquals(fired.result, "pass");
+    assertEquals(w.store.get(`revert-${KEY}`)!.result, "pass");
+    // The marker on the host says pass and the current marker is gone, so the
+    // next apply is accepted (this one's NIC no longer bounces).
+    await Deno.remove(`${w.root}/state/apply_kills_session`);
+    await w.call("apply", net("netplan", [A, B]));
   } finally {
     await w.cleanup();
   }

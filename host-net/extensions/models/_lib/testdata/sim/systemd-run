@@ -1,3 +1,12 @@
 #!/bin/sh
+# The armed timer is only recorded. A "revert-now" unit really runs its command,
+# detached from the caller's process tree like a systemd service.
 for a in "$@"; do case "$a" in --unit=*) u="${a#--unit=}";; esac; done
+case "$u" in
+  host-net-revert-now-*)
+    while [ $# -gt 0 ]; do case "$1" in --*) shift;; *) break;; esac; done
+    export SIMROOT SIMBIN PATH
+    env -u SIM_SESSION_PID setsid "$@" >/dev/null 2>&1 </dev/null &
+    exit 0;;
+esac
 touch "$SIMROOT/state/units/$u.timer"; exit 0

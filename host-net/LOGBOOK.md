@@ -247,3 +247,12 @@ Every one of those tests fails on the previous round's code.
   before anything is armed, when it exceeds the declared ethernet MTU or, if the
   link is undeclared or declared without one, its live MTU (no probe entry:
   refused).
+- Live fix: `revert_now` ran restore.sh inside the SSH session, so its
+  `netplan apply` killed the session mid-run and the EXIT trap recorded `fail`
+  on a restored host. It now starts the restore as a detached transient service
+  (`systemd-run --no-block`, like the expiry path), tolerates the session
+  dropping, and polls the marker (bounded, 120 s) for pass or fail. The restore
+  stops its timer and removes the current marker before recording the result.
+  The sim hangs up the session on `netplan apply` to model it. `commit` only
+  stops the timer; `apply` and `remove` still run their forward `netplan apply`
+  in-session (an armed revert covers a dropped session).

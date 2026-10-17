@@ -236,14 +236,15 @@ fi
 # 5. record the outcome; pass needs the recorded management path to hold again.
 ${RUN_CHECKS}
 RESULT=$CHECK
-write_result
-if [ "$RESULT" = pass ]; then rm -f "${CURRENT_PATH}"; fi
-# The revert has run, however it ended: its timer is residue. (Only the timer:
-# this may be the service the timer started.)
+# The revert has run, however it ended: its timer is residue, gone before the
+# result is recorded so a caller that sees the result sees no timer. (Only the
+# timer: this may be the service the timer started.)
 systemctl stop "${unitName(ctx.token)}.timer" 2>/dev/null || true
 systemctl reset-failed "${unitName(ctx.token)}.timer" "${
     unitName(ctx.token)
   }.service" 2>/dev/null || true
+if [ "$RESULT" = pass ]; then rm -f "${CURRENT_PATH}"; fi
+write_result
 trap - EXIT
 exit 0
 `;
@@ -428,4 +429,16 @@ rm -f "${CURRENT_PATH}"
 rm -rf "$dir"
 printf 'cleared %s\\n' "$cur"
 `;
+}
+
+/**
+ * Starts the restore detached, as its own transient systemd service, and
+ * returns at once. The restore bounces the management NIC, which kills the SSH
+ * session it was started from; a systemd unit does not die with the session,
+ * exactly like the expiry path.
+ */
+export function renderStartRestoreScript(token: string): string {
+  return `systemd-run --unit=host-net-revert-now-${token} --no-block --collect ${
+    shq(restorePath(token))
+  } ${shq(token)}`;
 }

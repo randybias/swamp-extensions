@@ -47,7 +47,7 @@ import {
   renderDisarmScript,
   renderMarkerJsonReadScript,
   renderMarkerReadScript,
-  restorePath,
+  renderStartRestoreScript,
   type RevertContext,
   revertDir,
   unitName,
@@ -394,6 +394,10 @@ interface ArmInput {
   /** `apply` or `remove`. */
   operation: "apply" | "remove";
 }
+
+/** How long revert_now waits for the detached restore to record a result. */
+const REVERT_NOW_WAIT_MS = 120_000;
+const REVERT_NOW_POLL_MS = 2_000;
 
 function revertContext(token: string, input: ArmInput): RevertContext {
   return {
@@ -1477,33 +1481,57 @@ export function createModel(overrides: Partial<HostNetDeps> = {}) {
         if (typeof recorded.firedAt === "string") {
           throw new HostNetConfigError("this revert already fired");
         }
-        // Allow a non-zero exit so a failed restore is still recorded.
-        const restoreRes = await sshExec(deps, target, [
-          restorePath(args.token),
-          args.token,
-        ]);
-        // The restore's superseded path exits 0 without running; only a marker
-        // with a fired_at proves it actually restored.
-        const markerOut = await run(
-          deps,
-          target,
-          ["sh", "-c", renderMarkerJsonReadScript(args.token)],
-          "the marker read",
-        );
-        let marker: { result?: string; fired_at?: number | null } = {};
+        // The restore runs as a detached systemd service, not inside this SSH
+        // session: its apply bounces the management NIC and a session-bound
+        // script would be killed mid-run, recording a false fail. The session
+        // dropping during the start call is expected, not an error.
         try {
-          marker = JSON.parse(markerOut.stdout || "{}");
-        } catch {
-          marker = {};
+          const started = await sshExec(deps, target, [
+            "sh",
+            "-c",
+            renderStartRestoreScript(args.token),
+          ]);
+          if (started.exit_code !== 0) {
+            throw new HostNetConfigError(
+              `the restore could not be started (exit ${started.exit_code})`,
+            );
+          }
+        } catch (e) {
+          if (!(e instanceof SshError)) throw e;
         }
-        if (marker.fired_at === undefined || marker.fired_at === null) {
-          throw new HostNetConfigError(
-            "the restore was superseded; nothing fired",
-          );
+        // Reconnect and poll the marker until the restore records a result.
+        // Transport errors are expected while the NIC bounces.
+        const waitUntil = deps.now() + REVERT_NOW_WAIT_MS;
+        let marker: { result?: string; fired_at?: number | null } = {};
+        for (;;) {
+          try {
+            const markerOut = await run(
+              deps,
+              target,
+              ["sh", "-c", renderMarkerJsonReadScript(args.token)],
+              "the marker read",
+            );
+            try {
+              marker = JSON.parse(markerOut.stdout || "{}");
+            } catch {
+              marker = {};
+            }
+            if (marker.fired_at !== undefined && marker.fired_at !== null) {
+              break;
+            }
+          } catch (e) {
+            if (!(e instanceof SshError)) throw e;
+          }
+          if (deps.now() >= waitUntil) {
+            throw new HostNetConfigError(
+              `no restore result was recorded within ${
+                REVERT_NOW_WAIT_MS / 1000
+              }s (it may have been superseded or still be running); the host marker holds the state`,
+            );
+          }
+          await deps.sleep(REVERT_NOW_POLL_MS);
         }
-        const result = marker.result === "fail" || restoreRes.exit_code !== 0
-          ? "fail"
-          : "pass";
+        const result = marker.result === "pass" ? "pass" : "fail";
         await context.writeResource("revert", `revert-${targetKey(args)}`, {
           ...recorded,
           firedAt: new Date(deps.now()).toISOString(),

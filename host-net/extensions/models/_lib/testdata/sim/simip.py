@@ -67,6 +67,18 @@ def main():
         if a and a[0] == "generate": return 0
         if a == ["apply"]:
             log("netplan apply")
+            if flag("apply_kills_session"):
+                # The management NIC bounces and the SSH session dies: whatever
+                # the session started is hung up (SIGHUP), like sshd does.
+                try:
+                    sp = int(os.environ["SIM_SESSION_PID"])
+                    for d in os.listdir("/proc"):
+                        if d.isdigit():
+                            try:
+                                ppid = int(open("/proc/%s/stat" % d).read().rsplit(")", 1)[1].split()[1])
+                            except Exception: continue
+                            if ppid == sp: os.kill(int(d), 1)
+                except Exception: pass
             for f in sorted(glob.glob(R + "/etc/netplan/*.yaml")):
                 txt = open(f).read()
                 for m in re.finditer(r'^    "([^"]+)":\n((?:      .*\n)*)', txt, re.M):

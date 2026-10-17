@@ -6,6 +6,7 @@ import {
   renderMarker,
   renderMarkerReadScript,
   renderRestoreScript,
+  renderStartRestoreScript,
   restorePath,
   type RevertContext,
   revertDir,
@@ -179,5 +180,15 @@ Deno.test("the arm script records the path actually used and refuses if it does 
   assertEquals(
     script.indexOf("its own checks") < script.indexOf("systemd-run"),
     true,
+  );
+});
+
+Deno.test("the start script runs the restore as its own detached systemd service", () => {
+  const script = renderStartRestoreScript(CTX.token);
+  assertEquals(
+    script,
+    `systemd-run --unit=host-net-revert-now-${CTX.token} --no-block --collect '${
+      restorePath(CTX.token)
+    }' '${CTX.token}'`,
   );
 });

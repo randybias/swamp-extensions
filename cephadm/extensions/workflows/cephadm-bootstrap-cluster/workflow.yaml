@@ -26,6 +26,7 @@ inputs:
       items:
         type: string
       default: []
+      maxItems: 64
       description: ssh-keyscan host keys, each naming its host; required for strict
     monIp:
       type: string

@@ -198,7 +198,6 @@ function sessionOn(
   let persisted = pending === undefined;
   const persist = async (): Promise<void> => {
     if (persisted || pending === undefined || context === undefined) return;
-    persisted = true;
     await context.writeResource(
       "hostkeys",
       pending.key,
@@ -209,6 +208,7 @@ function sessionOn(
         learned_at: new Date(deps.now()).toISOString(),
       }),
     );
+    persisted = true;
   };
   const run = async (opts: RunOptions): Promise<CommandResult> => {
     const command = opts.sudo ? `sudo -n -- ${opts.command}` : opts.command;

@@ -82,20 +82,28 @@ async function dockerOut(...args: string[]): Promise<string> {
   }
 }
 
-/** True once the server on `port` has sent its INFO line. */
+/** True once the server on `port` has sent its INFO line (within 2 s). */
 async function answersInfo(port: number): Promise<boolean> {
+  let conn: Deno.Conn | undefined;
   try {
-    const conn = await Deno.connect({ hostname: "127.0.0.1", port });
+    conn = await Deno.connect({ hostname: "127.0.0.1", port });
+    // A peer that accepts and never writes (docker's proxy before the server
+    // is up) would block read() forever; closing the connection ends it.
+    const timer = setTimeout(() => conn?.close(), 2000);
     try {
       const buf = new Uint8Array(16);
       const n = await conn.read(buf);
       return n !== null &&
         new TextDecoder().decode(buf.subarray(0, n)).startsWith("INFO");
     } finally {
-      conn.close();
+      clearTimeout(timer);
     }
   } catch {
-    return false; // docker's proxy accepts before the server is up, then resets
+    return false; // refused, reset, or closed by the timer
+  } finally {
+    try {
+      conn?.close();
+    } catch { /* already closed */ }
   }
 }
 
@@ -117,7 +125,7 @@ async function nats(
     name,
     "-p",
     // host port left empty: docker picks a free one
-    ["127.0.0.1", "4222"].join("::"),
+    "127.0.0.1::4222", // leak-allow(docker -p host-ip::container-port, empty host port)
     ...dockerArgs,
     NATS_IMAGE,
     ...serverArgs,

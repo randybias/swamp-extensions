@@ -261,6 +261,15 @@ Deno.test("the NATS token travels as a vault value in an environment variable or
     stepText(s, "check-nats-token"),
     'NATS_TOKEN: ${{ vault.get("server-stack", inputs.nats_auth_token_key) }}',
   );
+  // The chart steps name check-nats-token themselves: through apply-nats-auth
+  // alone, a refused token would be skipped past (scratch-repo reproduction).
+  const direct =
+    "- step: check-nats-token\n            condition:\n              type: or\n";
+  for (
+    const step of ["apply-nats", "apply-nats-after-secrets", "apply-namespaces"]
+  ) {
+    assertStringIncludes(stepText(s, step), direct);
+  }
   for (const step of ["apply-nats", "apply-nats-after-secrets"]) {
     assertStringIncludes(
       stepText(s, step),

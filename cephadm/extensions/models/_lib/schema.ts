@@ -19,6 +19,7 @@ import {
   FSID_RE,
   HOSTNAME_RE,
   isContainerImage,
+  isHostKeyLine,
   isHostTarget,
   isHttpUrl,
   isIpv4,
@@ -101,8 +102,16 @@ export const SSH_FIELDS = {
   }).describe(
     "OpenSSH private key content, normally a vault reference; mutually exclusive with keyPath.",
   ),
-  strictHostKeyChecking: z.enum(["yes", "no"]).describe(
-    "Host-key policy: yes (strict) or no (explicitly insecure). Required; there is no silent default.",
+  host_key_policy: z.enum(["strict", "insecure_tofu"]).describe(
+    "Host-key policy: strict (pinned host_keys required) or insecure_tofu (learn and pin the first key per host:port). Required; there is no silent default.",
+  ),
+  host_keys: z.array(
+    z.string().max(8192).refine(
+      isHostKeyLine,
+      "an ssh-keyscan line (type blob or host type blob)",
+    ),
+  ).max(64).nullish().describe(
+    "ssh-keyscan-format host keys; required for strict, learned for insecure_tofu.",
   ),
   multiplex: z.boolean().nullish().describe(
     "Reuse one authenticated SSH master per host; absent means false.",
@@ -123,7 +132,9 @@ export interface SshFieldValues {
   /** Key content or null. */
   privateKey?: string | null;
   /** Host-key policy or null. */
-  strictHostKeyChecking?: "yes" | "no" | null;
+  host_key_policy?: "strict" | "insecure_tofu" | null;
+  /** Pinned ssh-keyscan lines or null. */
+  host_keys?: string[] | null;
   /** Multiplex switch or null. */
   multiplex?: boolean | null;
 }

@@ -85,7 +85,7 @@ function deps(spawn: Spawner, extra: Partial<SshDeps> = {}): SshDeps {
 }
 
 const TARGET = toTarget({
-  strictHostKeyChecking: "yes",
+  host_key_policy: "strict",
   host: "192.0.2.10",
   sshUser: "admin",
 });
@@ -113,7 +113,7 @@ Deno.test("an explicit port is dialled and stdin is delivered then closed", asyn
   const session = await openSession(
     deps(f.spawn),
     toTarget({
-      strictHostKeyChecking: "yes",
+      host_key_policy: "strict",
       host: "node1.example.com",
       sshUser: "admin",
       port: 2222,
@@ -173,7 +173,7 @@ Deno.test(
     const s1 = await openSession(
       deps(f.spawn),
       toTarget({
-        strictHostKeyChecking: "yes",
+        host_key_policy: "strict",
         host: "192.0.2.10",
         sshUser: "admin",
         keyPath: "/home/admin/.ssh/id_ed25519",
@@ -213,7 +213,7 @@ Deno.test(
     const session = await openSession(
       deps(f.spawn),
       toTarget({
-        strictHostKeyChecking: "yes",
+        host_key_policy: "strict",
         host: "192.0.2.10",
         sshUser: "admin",
         privateKey: key,
@@ -248,7 +248,7 @@ Deno.test("the inline key file is removed after a failure", async () => {
   const session = await openSession(
     deps(f.spawn),
     toTarget({
-      strictHostKeyChecking: "yes",
+      host_key_policy: "strict",
       host: "192.0.2.10",
       sshUser: "admin",
       privateKey: "KEY\n",
@@ -264,7 +264,7 @@ Deno.test("both identities are refused at conversion and at the transport", asyn
   assertThrows(
     () =>
       toTarget({
-        strictHostKeyChecking: "yes",
+        host_key_policy: "strict",
         host: "192.0.2.10",
         sshUser: "admin",
         keyPath: "/k",
@@ -320,7 +320,7 @@ Deno.test(
       toTarget({
         host: "192.0.2.10",
         sshUser: "admin",
-        strictHostKeyChecking: "no",
+        host_key_policy: "insecure_tofu",
       }),
       { multiplex: false },
     )).run({ command: "true" });
@@ -486,7 +486,7 @@ Deno.test("control socket paths are stable and differ per identity", async () =>
   const env = () => "/run/user/1000";
   const a = await controlSocketPath(
     toTarget({
-      strictHostKeyChecking: "yes",
+      host_key_policy: "strict",
       host: "192.0.2.10",
       sshUser: "admin",
     }),
@@ -494,7 +494,7 @@ Deno.test("control socket paths are stable and differ per identity", async () =>
   );
   const b = await controlSocketPath(
     toTarget({
-      strictHostKeyChecking: "yes",
+      host_key_policy: "strict",
       host: "192.0.2.10",
       sshUser: "admin",
     }),
@@ -504,7 +504,7 @@ Deno.test("control socket paths are stable and differ per identity", async () =>
   assertEquals(a.path.endsWith(".sock"), true);
   const user = await controlSocketPath(
     toTarget({
-      strictHostKeyChecking: "yes",
+      host_key_policy: "strict",
       host: "192.0.2.10",
       sshUser: "other",
     }),
@@ -512,7 +512,7 @@ Deno.test("control socket paths are stable and differ per identity", async () =>
   );
   const host = await controlSocketPath(
     toTarget({
-      strictHostKeyChecking: "yes",
+      host_key_policy: "strict",
       host: "198.51.100.9",
       sshUser: "admin",
     }),
@@ -520,7 +520,7 @@ Deno.test("control socket paths are stable and differ per identity", async () =>
   );
   const port = await controlSocketPath(
     toTarget({
-      strictHostKeyChecking: "yes",
+      host_key_policy: "strict",
       host: "192.0.2.10",
       sshUser: "admin",
       port: 2222,
@@ -530,7 +530,7 @@ Deno.test("control socket paths are stable and differ per identity", async () =>
   assertEquals(new Set([a.path, user.path, host.path, port.path]).size, 4);
   const long = await controlSocketPath(
     toTarget({
-      strictHostKeyChecking: "yes",
+      host_key_policy: "strict",
       host: "192.0.2.10",
       sshUser: "admin",
     }),
@@ -685,14 +685,14 @@ Deno.test(
       toTarget({
         host: "192.0.2.10",
         sshUser: "admin",
-        strictHostKeyChecking: null,
+        host_key_policy: null,
       })
     );
     assertEquals(
       toTarget({
         host: "192.0.2.10",
         sshUser: "admin",
-        strictHostKeyChecking: "no",
+        host_key_policy: "insecure_tofu",
       })
         .strictHostKeyChecking,
       "no",
@@ -708,7 +708,7 @@ Deno.test(
       toTarget({
         host: "192.0.2.10",
         sshUser: "admin",
-        strictHostKeyChecking: "yes",
+        host_key_policy: "strict",
       }),
       env,
     );
@@ -716,7 +716,7 @@ Deno.test(
       toTarget({
         host: "192.0.2.10",
         sshUser: "admin",
-        strictHostKeyChecking: "no",
+        host_key_policy: "insecure_tofu",
       }),
       env,
     );
@@ -724,7 +724,7 @@ Deno.test(
       toTarget({
         host: "192.0.2.10",
         sshUser: "admin",
-        strictHostKeyChecking: "yes",
+        host_key_policy: "strict",
         keyPath: "/home/admin/.ssh/id_ed25519",
       }),
       env,
@@ -733,7 +733,7 @@ Deno.test(
       toTarget({
         host: "192.0.2.10",
         sshUser: "admin",
-        strictHostKeyChecking: "yes",
+        host_key_policy: "strict",
         privateKey: "KEY\n",
       }),
       env,
@@ -751,7 +751,7 @@ Deno.test("private key content cannot influence the control socket or argv", asy
     toTarget({
       host: "192.0.2.10",
       sshUser: "admin",
-      strictHostKeyChecking: "yes",
+      host_key_policy: "strict",
       privateKey: "KEY-A\n",
     }),
     env,
@@ -760,7 +760,7 @@ Deno.test("private key content cannot influence the control socket or argv", asy
     toTarget({
       host: "192.0.2.10",
       sshUser: "admin",
-      strictHostKeyChecking: "yes",
+      host_key_policy: "strict",
       privateKey: "KEY-B\n",
     }),
     env,
@@ -771,7 +771,7 @@ Deno.test("private key content cannot influence the control socket or argv", asy
     toTarget({
       host: "192.0.2.10",
       sshUser: "admin",
-      strictHostKeyChecking: "yes",
+      host_key_policy: "strict",
       privateKey: "KEY-A\n",
     }),
     env,
@@ -783,7 +783,7 @@ Deno.test("private key content cannot influence the control socket or argv", asy
     toTarget({
       host: "192.0.2.10",
       sshUser: "admin",
-      strictHostKeyChecking: "yes",
+      host_key_policy: "strict",
       privateKey: "KEY-A\n",
     }),
     { multiplex: true, env },
@@ -801,7 +801,7 @@ Deno.test("private key content cannot influence the control socket or argv", asy
     toTarget({
       host: "192.0.2.10",
       sshUser: "admin",
-      strictHostKeyChecking: "yes",
+      host_key_policy: "strict",
       privateKey: "KEY-B\n",
     }),
     { multiplex: true, env },

@@ -201,6 +201,29 @@ export function isSshPublicKey(value: string): boolean {
   return true;
 }
 
+const HOST_FIELD_RE = /^[A-Za-z0-9.,:_\[\]-]{1,512}$/;
+
+/**
+ * True when `value` is one ssh-keyscan line: `type blob`, or `host type blob`
+ * where the host may be a name, IP, comma list or `[host]:port`. This is the
+ * pinned-host-key form the canonical transport consumes, not a bare public key.
+ */
+export function isHostKeyLine(value: string): boolean {
+  if (/[\r\n]/.test(value) || value.length < 1 || value.length > 8192) {
+    return false;
+  }
+  const fields = value.split(" ");
+  if (fields.some((f) => f === "")) return false;
+  if (fields.length === 2) {
+    return SSH_KEY_TYPES.has(fields[0]) && KEY_BLOB_RE.test(fields[1]);
+  }
+  if (fields.length === 3) {
+    return HOST_FIELD_RE.test(fields[0]) && SSH_KEY_TYPES.has(fields[1]) &&
+      KEY_BLOB_RE.test(fields[2]);
+  }
+  return false;
+}
+
 const IMAGE_COMPONENT_RE = /^[a-z0-9]+(?:(?:[._]|__|[-]+)[a-z0-9]+)*$/;
 const TAG_RE = /^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$/;
 const DIGEST_RE = /^sha256:[0-9a-f]{64}$/;

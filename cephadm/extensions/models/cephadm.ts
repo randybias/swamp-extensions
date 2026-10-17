@@ -12,6 +12,7 @@
  */
 
 import { z } from "npm:zod@4.3.6";
+import { HostKeysSchema } from "./_lib/hostkeys.ts";
 import { CEPH_ID_CREATE_RE } from "./_lib/validate.ts";
 import { PhaseError } from "./_lib/errors.ts";
 import {
@@ -128,7 +129,7 @@ import { fail, TransportError } from "./_lib/errors.ts";
 import { wipeDiskToRaw, type WipeRecord } from "./_lib/wipe.ts";
 
 /** Model type version; must equal the manifest version. */
-export const VERSION = "2026.10.17.2";
+export const VERSION = "2026.10.17.3";
 
 /**
  * The S3-plane methods: they open no SSH session, so they are excluded from
@@ -1269,10 +1270,33 @@ const MODEL_UPGRADES = [
     upgradeAttributes: (old: Record<string, unknown>) => old,
   },
   {
-    toVersion: VERSION,
+    toVersion: "2026.10.17.2",
     description:
       "Workflow catalog safety fixes and wipe-guard fixes; no schema changes",
     upgradeAttributes: (old: Record<string, unknown>) => old,
+  },
+  {
+    toVersion: VERSION,
+    description:
+      "SSH host-key policy is now host_key_policy strict|insecure_tofu with ssh-keyscan host_keys; strict requires pins, insecure_tofu learns and pins the first key per host:port. Legacy strictHostKeyChecking yes maps to strict, no to insecure_tofu.",
+    upgradeAttributes: (old: Record<string, unknown>) => {
+      const { strictHostKeyChecking, ...rest } = old;
+      if (strictHostKeyChecking === "yes") {
+        return {
+          ...rest,
+          host_key_policy: "strict",
+          host_keys: rest.host_keys ?? [],
+        };
+      }
+      if (strictHostKeyChecking === "no") {
+        return {
+          ...rest,
+          host_key_policy: "insecure_tofu",
+          host_keys: rest.host_keys ?? [],
+        };
+      }
+      return old;
+    },
   },
 ];
 
@@ -1290,7 +1314,8 @@ export function createCephadmModel(overrides: Partial<CephadmDeps> = {}) {
       port?: number | null;
       keyPath?: string | null;
       privateKey?: string | null;
-      strictHostKeyChecking: "yes" | "no";
+      host_key_policy: "strict" | "insecure_tofu";
+      host_keys?: string[] | null;
       multiplex?: boolean | null;
     },
   ) =>
@@ -1302,7 +1327,8 @@ export function createCephadmModel(overrides: Partial<CephadmDeps> = {}) {
         port: a.port,
         keyPath: a.keyPath,
         privateKey: a.privateKey,
-        strictHostKeyChecking: a.strictHostKeyChecking,
+        host_key_policy: a.host_key_policy,
+        host_keys: a.host_keys,
       }),
       { multiplex: a.multiplex ?? false },
     );
@@ -1323,7 +1349,8 @@ export function createCephadmModel(overrides: Partial<CephadmDeps> = {}) {
           port: args.port,
           keyPath: args.keyPath,
           privateKey: args.privateKey,
-          strictHostKeyChecking: args.strictHostKeyChecking,
+          host_key_policy: args.host_key_policy,
+          host_keys: args.host_keys,
         });
         const session = await openSession(deps, target, { multiplex: true });
         context.logger.info("Preparing host {host}", { host: args.host });
@@ -1389,7 +1416,8 @@ export function createCephadmModel(overrides: Partial<CephadmDeps> = {}) {
           port: args.port,
           keyPath: args.keyPath,
           privateKey: args.privateKey,
-          strictHostKeyChecking: args.strictHostKeyChecking,
+          host_key_policy: args.host_key_policy,
+          host_keys: args.host_keys,
         });
         const session = await openSession(deps, target, {
           multiplex: args.multiplex ?? false,
@@ -1443,7 +1471,8 @@ export function createCephadmModel(overrides: Partial<CephadmDeps> = {}) {
           port: args.port,
           keyPath: args.keyPath,
           privateKey: args.privateKey,
-          strictHostKeyChecking: args.strictHostKeyChecking,
+          host_key_policy: args.host_key_policy,
+          host_keys: args.host_keys,
         });
         const session = await openSession(deps, target, {
           multiplex: args.multiplex ?? false,
@@ -1498,7 +1527,8 @@ export function createCephadmModel(overrides: Partial<CephadmDeps> = {}) {
           port: args.port,
           keyPath: args.keyPath,
           privateKey: args.privateKey,
-          strictHostKeyChecking: args.strictHostKeyChecking,
+          host_key_policy: args.host_key_policy,
+          host_keys: args.host_keys,
         });
         const session = await openSession(deps, target, { multiplex: true });
         context.logger.info("Bootstrapping {host}", { host: args.host });
@@ -1558,7 +1588,8 @@ export function createCephadmModel(overrides: Partial<CephadmDeps> = {}) {
             port: entry.port,
             keyPath: args.keyPath,
             privateKey: args.privateKey,
-            strictHostKeyChecking: args.strictHostKeyChecking,
+            host_key_policy: args.host_key_policy,
+            host_keys: args.host_keys,
           });
           const session = await openSession(deps, target, {
             multiplex: args.multiplex ?? false,
@@ -1637,7 +1668,8 @@ export function createCephadmModel(overrides: Partial<CephadmDeps> = {}) {
             port: args.port,
             keyPath: args.keyPath,
             privateKey: args.privateKey,
-            strictHostKeyChecking: args.strictHostKeyChecking,
+            host_key_policy: args.host_key_policy,
+            host_keys: args.host_keys,
           }),
           { multiplex: args.multiplex ?? false },
         );
@@ -1682,7 +1714,8 @@ export function createCephadmModel(overrides: Partial<CephadmDeps> = {}) {
             port: args.port,
             keyPath: args.keyPath,
             privateKey: args.privateKey,
-            strictHostKeyChecking: args.strictHostKeyChecking,
+            host_key_policy: args.host_key_policy,
+            host_keys: args.host_keys,
           }),
           { multiplex: args.multiplex ?? false },
         );
@@ -1732,7 +1765,8 @@ export function createCephadmModel(overrides: Partial<CephadmDeps> = {}) {
             port: args.port,
             keyPath: args.keyPath,
             privateKey: args.privateKey,
-            strictHostKeyChecking: args.strictHostKeyChecking,
+            host_key_policy: args.host_key_policy,
+            host_keys: args.host_keys,
           }),
           { multiplex: args.multiplex ?? false },
         );
@@ -1783,7 +1817,8 @@ export function createCephadmModel(overrides: Partial<CephadmDeps> = {}) {
             port: args.port,
             keyPath: args.keyPath,
             privateKey: args.privateKey,
-            strictHostKeyChecking: args.strictHostKeyChecking,
+            host_key_policy: args.host_key_policy,
+            host_keys: args.host_keys,
           }),
           { multiplex: args.multiplex ?? false },
         );
@@ -1837,7 +1872,8 @@ export function createCephadmModel(overrides: Partial<CephadmDeps> = {}) {
             port: args.port,
             keyPath: args.keyPath,
             privateKey: args.privateKey,
-            strictHostKeyChecking: args.strictHostKeyChecking,
+            host_key_policy: args.host_key_policy,
+            host_keys: args.host_keys,
           }),
           { multiplex: args.multiplex ?? false },
         );
@@ -1852,7 +1888,8 @@ export function createCephadmModel(overrides: Partial<CephadmDeps> = {}) {
                 port: args.targetPort ?? args.port,
                 keyPath: args.keyPath,
                 privateKey: args.privateKey,
-                strictHostKeyChecking: args.strictHostKeyChecking,
+                host_key_policy: args.host_key_policy,
+                host_keys: args.host_keys,
               }),
               { multiplex: args.multiplex ?? false },
             );
@@ -1904,7 +1941,8 @@ export function createCephadmModel(overrides: Partial<CephadmDeps> = {}) {
             port: args.port,
             keyPath: args.keyPath,
             privateKey: args.privateKey,
-            strictHostKeyChecking: args.strictHostKeyChecking,
+            host_key_policy: args.host_key_policy,
+            host_keys: args.host_keys,
           }),
           { multiplex: args.multiplex ?? false },
         );
@@ -1946,7 +1984,8 @@ export function createCephadmModel(overrides: Partial<CephadmDeps> = {}) {
             port: args.port,
             keyPath: args.keyPath,
             privateKey: args.privateKey,
-            strictHostKeyChecking: args.strictHostKeyChecking,
+            host_key_policy: args.host_key_policy,
+            host_keys: args.host_keys,
           }),
           { multiplex: args.multiplex ?? false },
         );
@@ -1985,7 +2024,8 @@ export function createCephadmModel(overrides: Partial<CephadmDeps> = {}) {
             port: args.port,
             keyPath: args.keyPath,
             privateKey: args.privateKey,
-            strictHostKeyChecking: args.strictHostKeyChecking,
+            host_key_policy: args.host_key_policy,
+            host_keys: args.host_keys,
           }),
           { multiplex: args.multiplex ?? false },
         );
@@ -2022,7 +2062,8 @@ export function createCephadmModel(overrides: Partial<CephadmDeps> = {}) {
             port: args.port,
             keyPath: args.keyPath,
             privateKey: args.privateKey,
-            strictHostKeyChecking: args.strictHostKeyChecking,
+            host_key_policy: args.host_key_policy,
+            host_keys: args.host_keys,
           }),
           { multiplex: args.multiplex ?? false },
         );
@@ -2056,7 +2097,8 @@ export function createCephadmModel(overrides: Partial<CephadmDeps> = {}) {
             port: args.port,
             keyPath: args.keyPath,
             privateKey: args.privateKey,
-            strictHostKeyChecking: args.strictHostKeyChecking,
+            host_key_policy: args.host_key_policy,
+            host_keys: args.host_keys,
           }),
           { multiplex: args.multiplex ?? false },
         );
@@ -2096,7 +2138,8 @@ export function createCephadmModel(overrides: Partial<CephadmDeps> = {}) {
             port: args.port,
             keyPath: args.keyPath,
             privateKey: args.privateKey,
-            strictHostKeyChecking: args.strictHostKeyChecking,
+            host_key_policy: args.host_key_policy,
+            host_keys: args.host_keys,
           }),
           { multiplex: args.multiplex ?? false },
         );
@@ -2136,7 +2179,8 @@ export function createCephadmModel(overrides: Partial<CephadmDeps> = {}) {
             port: args.port,
             keyPath: args.keyPath,
             privateKey: args.privateKey,
-            strictHostKeyChecking: args.strictHostKeyChecking,
+            host_key_policy: args.host_key_policy,
+            host_keys: args.host_keys,
           }),
           { multiplex: args.multiplex ?? false },
         );
@@ -2175,7 +2219,8 @@ export function createCephadmModel(overrides: Partial<CephadmDeps> = {}) {
             port: args.port,
             keyPath: args.keyPath,
             privateKey: args.privateKey,
-            strictHostKeyChecking: args.strictHostKeyChecking,
+            host_key_policy: args.host_key_policy,
+            host_keys: args.host_keys,
           }),
           { multiplex: args.multiplex ?? false },
         );
@@ -2216,7 +2261,8 @@ export function createCephadmModel(overrides: Partial<CephadmDeps> = {}) {
             port: args.port,
             keyPath: args.keyPath,
             privateKey: args.privateKey,
-            strictHostKeyChecking: args.strictHostKeyChecking,
+            host_key_policy: args.host_key_policy,
+            host_keys: args.host_keys,
           }),
           { multiplex: args.multiplex ?? false },
         );
@@ -2255,7 +2301,8 @@ export function createCephadmModel(overrides: Partial<CephadmDeps> = {}) {
             port: args.port,
             keyPath: args.keyPath,
             privateKey: args.privateKey,
-            strictHostKeyChecking: args.strictHostKeyChecking,
+            host_key_policy: args.host_key_policy,
+            host_keys: args.host_keys,
           }),
           { multiplex: args.multiplex ?? false },
         );
@@ -2299,7 +2346,8 @@ export function createCephadmModel(overrides: Partial<CephadmDeps> = {}) {
             port: args.port,
             keyPath: args.keyPath,
             privateKey: args.privateKey,
-            strictHostKeyChecking: args.strictHostKeyChecking,
+            host_key_policy: args.host_key_policy,
+            host_keys: args.host_keys,
           }),
           { multiplex: args.multiplex ?? false },
         );
@@ -2341,7 +2389,8 @@ export function createCephadmModel(overrides: Partial<CephadmDeps> = {}) {
             port: args.port,
             keyPath: args.keyPath,
             privateKey: args.privateKey,
-            strictHostKeyChecking: args.strictHostKeyChecking,
+            host_key_policy: args.host_key_policy,
+            host_keys: args.host_keys,
           }),
           { multiplex: args.multiplex ?? false },
         );
@@ -2381,7 +2430,8 @@ export function createCephadmModel(overrides: Partial<CephadmDeps> = {}) {
             port: args.port,
             keyPath: args.keyPath,
             privateKey: args.privateKey,
-            strictHostKeyChecking: args.strictHostKeyChecking,
+            host_key_policy: args.host_key_policy,
+            host_keys: args.host_keys,
           }),
           { multiplex: args.multiplex ?? false },
         );
@@ -2421,7 +2471,8 @@ export function createCephadmModel(overrides: Partial<CephadmDeps> = {}) {
             port: args.port,
             keyPath: args.keyPath,
             privateKey: args.privateKey,
-            strictHostKeyChecking: args.strictHostKeyChecking,
+            host_key_policy: args.host_key_policy,
+            host_keys: args.host_keys,
           }),
           { multiplex: args.multiplex ?? false },
         );
@@ -2462,7 +2513,8 @@ export function createCephadmModel(overrides: Partial<CephadmDeps> = {}) {
             port: args.port,
             keyPath: args.keyPath,
             privateKey: args.privateKey,
-            strictHostKeyChecking: args.strictHostKeyChecking,
+            host_key_policy: args.host_key_policy,
+            host_keys: args.host_keys,
           }),
           { multiplex: args.multiplex ?? false },
         );
@@ -2510,7 +2562,8 @@ export function createCephadmModel(overrides: Partial<CephadmDeps> = {}) {
                 port,
                 keyPath: args.keyPath,
                 privateKey: args.privateKey,
-                strictHostKeyChecking: args.strictHostKeyChecking,
+                host_key_policy: args.host_key_policy,
+                host_keys: args.host_keys,
               }),
               { multiplex: false },
             ),
@@ -2565,7 +2618,8 @@ export function createCephadmModel(overrides: Partial<CephadmDeps> = {}) {
             port: args.port,
             keyPath: args.keyPath,
             privateKey: args.privateKey,
-            strictHostKeyChecking: args.strictHostKeyChecking,
+            host_key_policy: args.host_key_policy,
+            host_keys: args.host_keys,
           }),
           { multiplex: args.multiplex ?? false },
         );
@@ -2603,7 +2657,8 @@ export function createCephadmModel(overrides: Partial<CephadmDeps> = {}) {
             port: args.port,
             keyPath: args.keyPath,
             privateKey: args.privateKey,
-            strictHostKeyChecking: args.strictHostKeyChecking,
+            host_key_policy: args.host_key_policy,
+            host_keys: args.host_keys,
           }),
           { multiplex: args.multiplex ?? false },
         );
@@ -2645,7 +2700,8 @@ export function createCephadmModel(overrides: Partial<CephadmDeps> = {}) {
             port: args.port,
             keyPath: args.keyPath,
             privateKey: args.privateKey,
-            strictHostKeyChecking: args.strictHostKeyChecking,
+            host_key_policy: args.host_key_policy,
+            host_keys: args.host_keys,
           }),
           { multiplex: args.multiplex ?? false },
         );
@@ -2687,7 +2743,8 @@ export function createCephadmModel(overrides: Partial<CephadmDeps> = {}) {
             port: args.port,
             keyPath: args.keyPath,
             privateKey: args.privateKey,
-            strictHostKeyChecking: args.strictHostKeyChecking,
+            host_key_policy: args.host_key_policy,
+            host_keys: args.host_keys,
           }),
           { multiplex: args.multiplex ?? false },
         );
@@ -2733,7 +2790,8 @@ export function createCephadmModel(overrides: Partial<CephadmDeps> = {}) {
             port: args.port,
             keyPath: args.keyPath,
             privateKey: args.privateKey,
-            strictHostKeyChecking: args.strictHostKeyChecking,
+            host_key_policy: args.host_key_policy,
+            host_keys: args.host_keys,
           }),
           { multiplex: args.multiplex ?? false },
         );
@@ -2775,7 +2833,8 @@ export function createCephadmModel(overrides: Partial<CephadmDeps> = {}) {
             port: args.port,
             keyPath: args.keyPath,
             privateKey: args.privateKey,
-            strictHostKeyChecking: args.strictHostKeyChecking,
+            host_key_policy: args.host_key_policy,
+            host_keys: args.host_keys,
           }),
           { multiplex: args.multiplex ?? false },
         );
@@ -3299,12 +3358,19 @@ export function createCephadmModel(overrides: Partial<CephadmDeps> = {}) {
   return {
     type: "@randybias/cephadm",
     // The consistency gate requires this literal; VERSION mirrors it.
-    version: "2026.10.17.2",
+    version: "2026.10.17.3",
     description:
       "Install and operate a standalone Ceph cluster managed by cephadm on Debian-family hosts reached over SSH. One model type serves any number of hosts and clusters; every method takes its own target.",
     upgrades: MODEL_UPGRADES,
     globalArguments: GlobalArgsSchema,
     resources: {
+      hostkeys: {
+        description:
+          "SSH host keys pinned for one host and port, learned on first insecure_tofu use",
+        schema: HostKeysSchema,
+        lifetime: "infinite" as const,
+        garbageCollection: 10,
+      },
       cephVerifyResult: {
         description:
           "A shared verify-result record: method, host, pass, expected, actual, detail and optional subject",
@@ -3553,7 +3619,7 @@ export function createCephadmModel(overrides: Partial<CephadmDeps> = {}) {
 export const model = {
   ...createCephadmModel(),
   type: "@randybias/cephadm",
-  version: "2026.10.17.2",
+  version: "2026.10.17.3",
   // The registry's upgrade check reads this literal chain from the export; a
   // test keeps it equal to MODEL_UPGRADES.
   upgrades: [
@@ -3567,6 +3633,29 @@ export const model = {
       description:
         "Workflow catalog safety fixes and wipe-guard fixes; no schema changes",
       upgradeAttributes: (old: Record<string, unknown>) => old,
+    },
+    {
+      toVersion: "2026.10.17.3",
+      description:
+        "SSH host-key policy is now host_key_policy strict|insecure_tofu with ssh-keyscan host_keys; strict requires pins, insecure_tofu learns and pins the first key per host:port. Legacy strictHostKeyChecking yes maps to strict, no to insecure_tofu.",
+      upgradeAttributes: (old: Record<string, unknown>) => {
+        const { strictHostKeyChecking, ...rest } = old;
+        if (strictHostKeyChecking === "yes") {
+          return {
+            ...rest,
+            host_key_policy: "strict",
+            host_keys: rest.host_keys ?? [],
+          };
+        }
+        if (strictHostKeyChecking === "no") {
+          return {
+            ...rest,
+            host_key_policy: "insecure_tofu",
+            host_keys: rest.host_keys ?? [],
+          };
+        }
+        return old;
+      },
     },
   ],
 } satisfies ReturnType<typeof createCephadmModel>;

@@ -46,6 +46,8 @@ export interface Target {
   privateKey?: string;
   /** `yes` (strict) or an explicit `no`. Required. */
   strictHostKeyChecking: "yes" | "no";
+  /** Pinned ssh-keyscan lines carried for the canonical transport. */
+  hostKeys?: string[];
 }
 
 /** An already-spawned child with a writable stdin; injectable for tests. */
@@ -120,16 +122,21 @@ export function toTarget(fields: {
   port?: number | null;
   keyPath?: string | null;
   privateKey?: string | null;
-  strictHostKeyChecking?: "yes" | "no" | null;
+  host_key_policy?: "strict" | "insecure_tofu" | null;
+  host_keys?: string[] | null;
 }): Target {
   if (
-    fields.strictHostKeyChecking !== "yes" &&
-    fields.strictHostKeyChecking !== "no"
+    fields.host_key_policy !== "strict" &&
+    fields.host_key_policy !== "insecure_tofu"
   ) {
-    fail("validate", "strictHostKeyChecking is required (yes or no)", {
-      field: "strictHostKeyChecking",
-      value: fields.strictHostKeyChecking ?? "absent",
-    });
+    fail(
+      "validate",
+      "host_key_policy is required (strict or insecure_tofu)",
+      {
+        field: "host_key_policy",
+        value: fields.host_key_policy ?? "absent",
+      },
+    );
   }
   const clean = (v: string | null | undefined): string | undefined =>
     v === null || v === undefined || v === "" ? undefined : v;
@@ -156,13 +163,17 @@ export function toTarget(fields: {
   const target: Target = {
     host: fields.host,
     user,
-    strictHostKeyChecking: fields.strictHostKeyChecking as "yes" | "no",
+    strictHostKeyChecking: fields.host_key_policy === "strict" ? "yes" : "no",
   };
   if (fields.port !== undefined && fields.port !== null) {
     target.port = fields.port;
   }
   if (keyPath !== undefined) target.keyPath = keyPath;
   if (privateKey !== undefined) target.privateKey = privateKey;
+  const hostKeys = (fields.host_keys ?? []).filter(
+    (k): k is string => typeof k === "string" && k !== "",
+  );
+  if (hostKeys.length > 0) target.hostKeys = hostKeys;
   return target;
 }
 

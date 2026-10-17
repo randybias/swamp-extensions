@@ -87,7 +87,8 @@ Deno.test(
           "port",
           "keyPath",
           "privateKey",
-          "strictHostKeyChecking",
+          "host_key_policy",
+          "host_keys",
           "multiplex",
         ]
       ) {
@@ -96,6 +97,25 @@ Deno.test(
     }
   },
 );
+
+Deno.test("the 2026.10.17.3 upgrade maps the legacy host-key fields", () => {
+  const up = model.upgrades.find((u) => u.toVersion === "2026.10.17.3");
+  assertEquals(up !== undefined, true);
+  const upgrade = up!.upgradeAttributes as (
+    old: Record<string, unknown>,
+  ) => Record<string, unknown>;
+  assertEquals(upgrade({ strictHostKeyChecking: "yes", sshUser: "admin" }), {
+    sshUser: "admin",
+    host_key_policy: "strict",
+    host_keys: [],
+  });
+  assertEquals(upgrade({ strictHostKeyChecking: "no" }), {
+    host_key_policy: "insecure_tofu",
+    host_keys: [],
+  });
+  // A record without the legacy field is returned untouched.
+  assertEquals(upgrade({ sshUser: "admin" }), { sshUser: "admin" });
+});
 
 Deno.test(
   "the ssh-installed check applies to exactly the SSH methods", // leak-allow(decision D19)
@@ -115,7 +135,7 @@ Deno.test(
 
 Deno.test("the upgrade chain ends at the model version", () => {
   const upgrades = model.upgrades as unknown as { toVersion: string }[];
-  assertEquals(upgrades.length, 2);
+  assertEquals(upgrades.length, 3);
   assertEquals(upgrades.at(-1)!.toVersion, model.version);
   const factory = createCephadmModel().upgrades as unknown as {
     toVersion: string;
@@ -134,7 +154,7 @@ Deno.test("host preparation rejects hostile hosts, packages, URLs and budgets", 
     port: null,
     keyPath: null,
     privateKey: null,
-    strictHostKeyChecking: "yes",
+    host_key_policy: "strict",
     multiplex: null,
     packages: ["chrony"],
     cephadmUrl: "https://download.example.com/cephadm",
@@ -182,7 +202,7 @@ Deno.test("wipe requires both device lists and rejects injection serials", () =>
     port: null,
     keyPath: null,
     privateKey: null,
-    strictHostKeyChecking: "yes",
+    host_key_policy: "strict",
     multiplex: null,
     dataDevices: [{ serial: "SN0001" }],
     excludeDevices: [],
@@ -247,7 +267,7 @@ Deno.test("a ready host preparing end to end writes a complete record", async ()
     port: null,
     keyPath: null,
     privateKey: null,
-    strictHostKeyChecking: "yes",
+    host_key_policy: "strict",
     multiplex: null,
     packages: ["chrony"],
     cephadmUrl: "https://download.example.com/cephadm",
@@ -315,7 +335,7 @@ const SSH_NULLS = {
   port: null,
   keyPath: null,
   privateKey: null,
-  strictHostKeyChecking: "yes",
+  host_key_policy: "strict",
   multiplex: null,
   sshUser: "admin",
 } as const;
@@ -668,7 +688,7 @@ Deno.test("verifyPackageSource records first, then throws, when throwOnFail is u
         port: null,
         keyPath: null,
         privateKey: null,
-        strictHostKeyChecking: "yes",
+        host_key_policy: "strict",
         multiplex: null,
         cephadmUrl: "https://download.example.com/cephadm",
         throwOnFail: null,
@@ -808,7 +828,7 @@ Deno.test("the raw-disk gate accepts the wipe's boot-partition acknowledgement a
   const base = {
     host: "192.0.2.10",
     sshUser: "admin",
-    strictHostKeyChecking: "yes",
+    host_key_policy: "strict",
     port: 22,
   };
   const withAck = gate.safeParse({

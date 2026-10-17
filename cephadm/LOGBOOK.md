@@ -686,3 +686,73 @@ catalog fixes after it (a59e5b3, 64cfc1f, c3b928e) do not touch either file.
     workflow inputs.
   - LOW (from 2026.10.17.1): probe-cleanup fallback on a versioned bucket,
     `stackOf` duplication, `cephadmUrl` accepts http.
+
+## Transport convergence preparation (2026.10.17.3)
+
+Schema: `host_key_policy` (strict|insecure_tofu) replaced
+`strictHostKeyChecking` and `host_keys[]` (ssh-keyscan form) was added; the
+model export carries a literal `upgrades` entry to 2026.10.17.3 mapping legacy
+yes -> strict (supply pins), no -> insecure_tofu. A new `hostkeys` resource
+persists learned pins per host:port via `_lib/hostkeys.ts` (`resolvePins`,
+`assertPinsApply`), unit-tested.
+
+Call sites that will move to the canonical
+`exec(argv, {stdin, timeout, truncation})`: **46 sites across 9 files**
+(cephadm.ts 2, hostprep.ts 10, lifecycle.ts 7, maintenance.ts 2, resolve.ts 2,
+shell.ts 5, ssh.ts 1, verify.ts 5, wipe.ts 12).
+
+Mapping rule: `session.run({command, stdin, sudo, allowNonZero, budgetMs})` ->
+`exec(deps, target, sudo ? ["sudo","-n","--","sh","-c",command] : ["sh","-c",command], {stdin, timeout_ms: budgetMs})`,
+then apply the existing policy: non-zero without `allowNonZero` throws
+`RemoteExitError`; a sudo refusal throws `SudoPolicyError`; ssh 255 is the typed
+`TransportError`; `runStep` keeps its resend policy keyed on the transport kind.
+Sites with `stdin` keep streaming on stdin.
+
+| file:line           | command                                                | flags                                |
+| ------------------- | ------------------------------------------------------ | ------------------------------------ |
+| hostprep.ts:211     | `"bash -s --"`                                         | stdin,sudo,allowNonZero              |
+| hostprep.ts:221     | `dpkg -s ${quote(name)}`                               | allowNonZero                         |
+| hostprep.ts:342     | `"apt-get update"`                                     | sudo,allowNonZero                    |
+| hostprep.ts:357     | `apt-get install -y ${missing.map(quote).join(" ")}`   | sudo,allowNonZero                    |
+| hostprep.ts:468     | `${CEPHADM_PATH} version`                              | sudo,allowNonZero                    |
+| hostprep.ts:510     | `test -x ${CEPHADM_PATH}`                              | allowNonZero                         |
+| hostprep.ts:531     | `"bash -s --"`                                         | stdin,sudo,allowNonZero              |
+| hostprep.ts:543     | `chmod +x ${CEPHADM_PATH}`                             | sudo,allowNonZero                    |
+| hostprep.ts:574     | `systemctl is-active ${quote(unit)}`                   | sudo,allowNonZero                    |
+| hostprep.ts:581     | `systemctl enable --now ${quote(unit)}`                | sudo,allowNonZero                    |
+| lifecycle.ts:43     | `"cephadm ls"`                                         | sudo,allowNonZero,resend,phase       |
+| lifecycle.ts:92     | `"cat /etc/ceph/ceph.pub"`                             | sudo,allowNonZero,resend,phase       |
+| lifecycle.ts:215    | `sh -c ${quote(compound)}`                             | sudo,allowNonZero,budgetMs           |
+| lifecycle.ts:303    | `'mkdir -p "$HOME/.ssh" && chmod 700 "$HOME/.ssh" &&`  | resend,phase                         |
+| lifecycle.ts:319    | ``grep -Fqx -- ${quote(cephPubKey)} "$HOME/.ssh/autho` | stdin,allowNonZero,resend,phase      |
+| lifecycle.ts:327    | `'cat >> "$HOME/.ssh/authorized_keys"'`                | stdin,resend,phase                   |
+| lifecycle.ts:344    | ``grep -Fq -- ${quote(needle)} "$HOME/.ssh/authorized` | allowNonZero,resend,phase            |
+| maintenance.ts:255  | `"bash -s --"`                                         | stdin,sudo,allowNonZero              |
+| maintenance.ts:1176 | `?`                                                    | sudo,allowNonZero,budgetMs           |
+| resolve.ts:95       | `listByIdCommand()`                                    | allowNonZero                         |
+| resolve.ts:108      | `readlinkCommand(fullPaths) });`                       |                                      |
+| shell.ts:164        | `mktemp -d ${SHELL_DIR_PREFIX}XXXXXXXXXX`              | stdin,resend,phase                   |
+| shell.ts:174        | `writeScriptCommand(` ${dir}/${file.name}``            | stdin,sudo,resend,phase              |
+| shell.ts:181        | `writeScriptCommand(scriptPath)`                       | stdin,sudo,allowNonZero,resend,phase |
+| shell.ts:187        | `shellRunCommand(dir`                                  | sudo,allowNonZero,resend,phase       |
+| shell.ts:212        | `rm -rf -- ${quote(dir)}`                              | allowNonZero                         |
+| ssh.ts:756          | `?`                                                    | resend,phase                         |
+| verify.ts:672       | `dpkg -s ${quote(name)}`                               | allowNonZero                         |
+| verify.ts:685       | `test -x ${CEPHADM_PATH}`                              | allowNonZero                         |
+| verify.ts:700       | ``systemctl is-active ${quote(args.expectedTimeSyncSe` | allowNonZero                         |
+| verify.ts:737       | `lsblkCommand()`                                       | allowNonZero                         |
+| verify.ts:849       | ``grep -qF -- ${`                                      | allowNonZero                         |
+| wipe.ts:271         | `cmd`                                                  | allowNonZero                         |
+| wipe.ts:275         | `cat -- ${quote(path)}`                                | allowNonZero                         |
+| wipe.ts:373         | `?`                                                    | stdin,sudo,allowNonZero              |
+| wipe.ts:481         | `"cat /proc/mdstat"`                                   | allowNonZero                         |
+| wipe.ts:496         | `lsblkCommand()`                                       | allowNonZero                         |
+| wipe.ts:743         | `test -e ${MDADM_CONF}`                                | allowNonZero                         |
+| wipe.ts:751         | `test -e ${quote(MDADM_BACKUP)}`                       | allowNonZero                         |
+| wipe.ts:774         | `"cat /etc/fstab"`                                     | allowNonZero                         |
+| wipe.ts:1005        | `cat ${MDADM_CONF}`                                    | stdin,allowNonZero                   |
+| wipe.ts:1023        | `cat ${quote(temp)}`                                   | allowNonZero                         |
+| wipe.ts:1070        | `cat ${MDADM_CONF}`                                    | allowNonZero                         |
+| wipe.ts:1158        | ``lsblk -nro NAME`                                     | allowNonZero                         |
+| cephadm.ts:3688     | `"bash -s --"`                                         | stdin,allowNonZero                   |
+| cephadm.ts:3716     | `"bash -s --"`                                         | stdin,allowNonZero                   |

@@ -1125,4 +1125,8 @@ export function createModel(deps: ArmDeps = denoArmDeps): NsgModel {
 }
 
 /** Production model: the factory with no overrides. */
-export const model: NsgModel = createModel();
+export const model = {
+  ...createModel(),
+  type: "@randybias/azure-nsg",
+  version: "2026.10.17.1",
+} satisfies NsgModel;

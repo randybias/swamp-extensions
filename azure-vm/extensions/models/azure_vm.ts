@@ -829,4 +829,8 @@ export function createModel(deps: ArmDeps = denoArmDeps): VmModel {
 }
 
 /** Production model: the factory with no overrides. */
-export const model: VmModel = createModel();
+export const model = {
+  ...createModel(),
+  type: "@randybias/azure-vm",
+  version: "2026.10.17.1",
+} satisfies VmModel;

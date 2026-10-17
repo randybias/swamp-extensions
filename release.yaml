@@ -179,5 +179,8 @@ ubuntu-autoinstall:
 
 knot-dns:
   channel: beta
-  ci: false
-  published: {}
+  ci: true
+  published:
+    2026.10.17.1: 36e2012c3e40544fd847350d49347d8c3b7f958b67cbfce9f35017f62cf05a43
+  notes:
+    2026.10.17.1: 'First release, beta. Manage authoritative Knot DNS zones and a Knot Resolver 6 recursive resolver over SSH. Each zone is a whole-file declaration in its own config fragment (DDNS refused), rendered deterministically and checked with kzonecheck and knotc conf-check before an atomic swap; listen changes restart knotd under a host lock, every listen address is proven with kdig, and a failure restores the backup. DNSSEC signing with KSK submission and DS read-back, TSIG transfers and NOTIFY secondaries as configuration. install brings knot, knot-dnsutils and knot-dnssecutils from the archive and, for the resolver, Knot Resolver 6 from the CZ.NIC repository with a pinned, independently confirmed signing-key fingerprint, pinned at apt priority 100 so Knot DNS keeps the archive version; the resolver config is validated by kresctl and proven with a test query on a name the upstream serves. The SSH key and TSIG secrets are vault references that reach the host over stdin; host keys are strict only. Outcomes are persisted as records. Live end to end on a fresh Ubuntu 24.04 VPS, loopback only: 11/13 on the first head, then 13/13 on the fixes from a clean baseline, with 0 secret hits in an argv scan. Residuals: KASP keys are not purged on remove (use keymgr); parent_ds_check is accepted but not rendered; the resolver install''s curl dependency can upgrade curl and libcurl; a resolver test query on an address excluded by allow_query_from is refused and the apply rolls back.'

@@ -2,6 +2,7 @@ import json, os, sys, re, glob
 R = os.environ["SIMROOT"]; F = R + "/state/links.json"
 def load(): return json.load(open(F))
 def save(l): json.dump(l, open(F, "w"))
+def flag(n): return os.path.exists(R + "/state/" + n)
 def log(m): open(R + "/state/log", "a").write(m + "\n")
 def ensure(l, name, kind, mtu=1500):
     if not any(x["ifname"] == name for x in l):
@@ -16,7 +17,11 @@ def main():
         s = " ".join(a)
         if s == "-d -j link": print(json.dumps(l)); return 0
         if s == "-j addr": print(json.dumps([{"ifname":"enp1s0","addr_info":[{"family":"inet","local":"192.0.2.10","prefixlen":24}]}])); return 0
-        if s == "-j route show default": print(json.dumps([{"dst":"default","gateway":"192.0.2.1","dev":"enp1s0"}])); return 0
+        if a[:3] == ["-j", "addr", "show"]:
+            if flag("no_addr"): print("[]"); return 0
+            print(json.dumps([{"ifname":a[4],"addr_info":[{"family":"inet","local":"192.0.2.10","prefixlen":24,"scope":"global"}]}])); return 0
+        if s == "-j route show default":
+            print("[]" if flag("no_route") else json.dumps([{"dst":"default","gateway":"192.0.2.1","dev":"enp1s0"}])); return 0
         if a[:3] == ["-j", "route", "get"]: print(json.dumps([{"dev":"enp1s0"}])); return 0
         if a[:3] == ["link", "show", "dev"]:
             return 0 if any(x["ifname"] == a[3] for x in l) else 1
@@ -39,7 +44,9 @@ def main():
                     mtu = re.search(r"mtu: (\d+)", body)
                     if "id:" in body: ensure(l, name, "vlan")
                     if mtu: setmtu(l, name, int(mtu.group(1)))
-            save(l); return 0
+            save(l)
+            if flag("apply_fails"): print("Cannot find unique matching interface for enp1s0", file=sys.stderr); return 1
+            return 0
     if tool == "networkctl":
         log("networkctl " + " ".join(a))
         for f in glob.glob(R + "/etc/systemd/network/*.netdev"):

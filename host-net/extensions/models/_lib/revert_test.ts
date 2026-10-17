@@ -1,6 +1,7 @@
 import { assertEquals, assertThrows } from "jsr:@std/assert@1.0.19";
 import {
   renderArmScript,
+  renderClearFailedScript,
   renderDisarmScript,
   renderMarker,
   renderMarkerReadScript,
@@ -49,6 +50,22 @@ Deno.test("restore is token-guarded, fail-closed and never reboots", () => {
   // The default-route check must require a non-empty route.
   assertEquals(script.includes('route="$(ip -j route show default'), true);
   assertEquals(script.includes('case "$route" in ""|"[]")'), true);
+  // The apply exit status is advisory: captured, logged, never fatal.
+  assertEquals(script.includes("netplan apply || applyrc=$?"), true);
+  assertEquals(script.includes("logger -t host-net"), true);
+  assertEquals(script.includes("RESULT=$CHECK"), true);
+  assertEquals(/^netplan apply$/m.test(script), false);
+});
+
+Deno.test("the clear script gates on a fail marker and passing checks, then stops the leftover timer", () => {
+  const script = renderClearFailedScript();
+  assertEquals(script.includes('"result":"fail"'), true);
+  assertEquals(script.includes("systemctl stop"), true);
+  assertEquals(script.includes('CHECK" != pass'), true);
+  assertEquals(
+    script.indexOf('CHECK" != pass') < script.indexOf("rm -f"),
+    true,
+  );
 });
 
 Deno.test("restore exits non-zero when invoked with the wrong token", () => {

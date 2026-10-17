@@ -94,11 +94,29 @@ function ownedList(ctx: RevertContext): string {
 }
 
 /**
+ * The post-restore checks, as a shell fragment that sets CHECK=pass only when
+ * a default route exists AND the interface carrying it has a global address.
+ * The restore and the operator's clear step judge the host by the same test.
+ */
+export const POST_CHECKS = `CHECK=fail
+route="$(ip -j route show default 2>/dev/null | tr -d ' ' || true)"
+case "$route" in ""|"[]") ;; *)
+  dev="$(printf '%s' "$route" | sed -n 's/.*"dev":"\\([^"]*\\)".*/\\1/p' | head -n 1)"
+  if [ -n "$dev" ]; then
+    addrs="$(ip -j addr show dev "$dev" 2>/dev/null | tr -d ' ' || true)"
+    case "$addrs" in *'"scope":"global"'*) CHECK=pass ;; esac
+  fi ;;
+esac`;
+
+/**
  * Renders the per-token restore script. It exits non-zero unless invoked with
  * its own token, is a no-op when superseded, deletes only created devices
  * (bridges first), restores the parent MTUs and exactly the owned files from
  * the manifest, and records its outcome under a trap so a mid-restore failure
- * still writes `fail`. The current marker is cleared only on success.
+ * still writes `fail`. The apply command's exit status is advisory (a cloud-init
+ * netplan that matches a renamed NIC by MAC can exit non-zero on a host that is
+ * in fact restored): it is logged, and pass or fail rests on the post-restore
+ * checks alone. The current marker is cleared only on success.
  */
 export function renderRestoreScript(ctx: RevertContext): string {
   if (!TOKEN_RE.test(ctx.token)) throw new Error("invalid revert token");
@@ -160,11 +178,17 @@ if [ -f "$DIR/owned.txt" ]; then
 fi
 # 3. restore the parent MTUs this change raised, after the files.
 ${parentLines}
-# 4. apply the restored configuration.
-${applyCmd}
-# 5. record the outcome; only a non-empty default route is a pass.
-route="$(ip -j route show default 2>/dev/null || true)"
-case "$route" in ""|"[]") ;; *) RESULT=pass ;; esac
+# 4. apply the restored configuration. Its exit status is advisory.
+applyrc=0
+${applyCmd} || applyrc=$?
+if [ "$applyrc" -ne 0 ]; then
+  msg="host-net: restore: apply exited $applyrc; judging by the post-restore checks"
+  echo "$msg" >&2
+  logger -t host-net "$msg" 2>/dev/null || true
+fi
+# 5. record the outcome; pass needs a default route and a management address.
+${POST_CHECKS}
+RESULT=$CHECK
 write_result
 if [ "$RESULT" = pass ]; then rm -f "${CURRENT_PATH}"; fi
 trap - EXIT
@@ -310,4 +334,40 @@ export function renderMarkerReadScript(): string {
 export function renderMarkerJsonReadScript(token: string): string {
   const marker = `${revertDir(token)}/marker.json`;
   return `if [ -e ${shq(marker)} ]; then cat ${shq(marker)}; fi`;
+}
+
+/**
+ * Renders the operator's clear script. Under the host lock it removes the
+ * current revert's state (stopping its leftover timer) only when that revert's
+ * marker says `fail` and the post-restore checks pass right now.
+ * Exit codes: 2 nothing to clear, 3 marker is not fail, 5 checks fail (the host
+ * still needs hands), 75 lock busy.
+ */
+export function renderClearFailedScript(): string {
+  return `set -eu
+exec 9>"${LOCK_PATH}"
+flock -w 30 9 || { echo 'host-net: lock busy' >&2; exit 75; }
+cur=
+if [ -f "${CURRENT_PATH}" ]; then read cur _ < "${CURRENT_PATH}" || true; fi
+case "$cur" in ""|*[!0-9a-f]*) echo 'no revert marker to clear' >&2; exit 2 ;; esac
+[ "\${#cur}" -eq 16 ] || { echo 'no revert marker to clear' >&2; exit 2; }
+dir="${STATE_DIR}/revert/$cur"
+if [ ! -f "$dir/marker.json" ] || ! tr -d ' ' < "$dir/marker.json" | grep -q '"result":"fail"'; then
+  echo 'the revert marker is not a failed restore' >&2
+  exit 3
+fi
+unit="host-net-revert-$cur"
+${POST_CHECKS}
+if [ "$CHECK" != pass ]; then
+  echo 'the post-restore checks still fail; fix the host first' >&2
+  exit 5
+fi
+# Holding the lock means no restore is running; a leftover timer would only
+# re-run a restore the host no longer needs.
+systemctl stop "$unit.timer" 2>/dev/null || true
+systemctl stop "$unit.service" 2>/dev/null || true
+rm -f "${CURRENT_PATH}"
+rm -rf "$dir"
+printf 'cleared %s\\n' "$cur"
+`;
 }

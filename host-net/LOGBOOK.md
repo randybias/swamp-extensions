@@ -214,3 +214,16 @@ Every one of those tests fails on the previous round's code.
 - **Host keys are strict-only.** The model does not persist a first-seen key, so
   `insecure_tofu` is gone and `host_keys` is required (at least one) on every
   method.
+
+## Round 6 (live finding)
+
+- The restore's `netplan apply` exit status is advisory (logged); pass or fail
+  rests on the post-restore checks (default route and a global address on its
+  interface). Found live: a cloud-init netplan matching a renamed NIC by MAC
+  made `apply` exit 1 on a host that was restored, so the EXIT trap wrote `fail`
+  and fail-closed every later apply.
+- New `clear_failed_revert` action (refuses unless the marker is `fail` and the
+  checks pass now); recovery documented in the README.
+- Sim tests: apply exits 1 with passing checks gives `pass` and clears the
+  marker; failing checks give `fail`, block until cleared, and the clear refuses
+  until the checks pass.

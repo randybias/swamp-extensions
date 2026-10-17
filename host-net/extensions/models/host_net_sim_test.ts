@@ -8,7 +8,7 @@
  * directory standing in for `/`. These are the sequences that single-step tests
  * missed: ownership, provenance and MTU baselines across several commits.
  */
-import { assert, assertEquals } from "jsr:@std/assert@1.0.19";
+import { assert, assertEquals, assertRejects } from "jsr:@std/assert@1.0.19";
 import { createModel } from "./host_net.ts";
 import type { CommandRunner } from "./_lib/ssh.ts";
 
@@ -335,6 +335,78 @@ Deno.test("takeover: the precheck stage has the cloud-init directory, and remove
     assertEquals(
       (await w.files()).filter((f) => f.includes("host-net")),
       [],
+    );
+  } finally {
+    await w.cleanup();
+  }
+});
+
+Deno.test("a restore whose netplan apply exits non-zero still passes on the checks and clears the marker", async () => {
+  if (!await simAvailable()) return;
+  const w = await world();
+  try {
+    const armed = await w.call("apply", net("netplan", [A]));
+    await Deno.writeTextFile(`${w.root}/state/apply_fails`, "");
+    const fired = await w.call("revert_now", {
+      ...SSH,
+      token: armed.revert_token,
+    });
+    assertEquals(fired.result, "pass");
+    assertEquals(w.store.get(`revert-${KEY}`)!.result, "pass");
+    // The current marker is gone, so the next apply is accepted.
+    await Deno.remove(`${w.root}/state/apply_fails`);
+    await w.call("apply", net("netplan", [A, B]));
+  } finally {
+    await w.cleanup();
+  }
+});
+
+Deno.test("a restore whose post-checks fail records fail and blocks later applies until cleared", async () => {
+  if (!await simAvailable()) return;
+  const w = await world();
+  try {
+    const armed = await w.call("apply", net("netplan", [A]));
+    await Deno.writeTextFile(`${w.root}/state/no_route`, "");
+    await assertRejects(
+      () => w.call("revert_now", { ...SSH, token: armed.revert_token }),
+      Error,
+      "restore reported fail",
+    );
+    assertEquals(w.store.get(`revert-${KEY}`)!.result, "fail");
+    // Fail-closed: the host marker blocks the next apply.
+    await Deno.remove(`${w.root}/state/no_route`);
+    // The clear refuses while the checks fail ...
+    await Deno.writeTextFile(`${w.root}/state/no_addr`, "");
+    await assertRejects(
+      () => w.call("clear_failed_revert", { ...SSH }),
+      Error,
+      "post-restore checks",
+    );
+    // ... and clears once they pass.
+    await Deno.remove(`${w.root}/state/no_addr`);
+    const cleared = await w.call("clear_failed_revert", { ...SSH });
+    assertEquals(cleared.cleared, true);
+    // Nothing left to clear.
+    await assertRejects(
+      () => w.call("clear_failed_revert", { ...SSH }),
+      Error,
+      "no revert marker",
+    );
+    await w.call("apply", net("netplan", [A]));
+  } finally {
+    await w.cleanup();
+  }
+});
+
+Deno.test("clear_failed_revert refuses a marker that is not a failed restore", async () => {
+  if (!await simAvailable()) return;
+  const w = await world();
+  try {
+    await w.call("apply", net("netplan", [A]));
+    await assertRejects(
+      () => w.call("clear_failed_revert", { ...SSH }),
+      Error,
+      "not a failed restore",
     );
   } finally {
     await w.cleanup();

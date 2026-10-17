@@ -16,15 +16,16 @@ transport shared by these extensions.
 
 ### `@randybias/host-net`
 
-| Method       | Kind   | Description                                                                                      |
-| ------------ | ------ | ------------------------------------------------------------------------------------------------ |
-| `render`     | query  | READ-ONLY. Return the files the backend would write, the ordered step plan and the config sha256 |
-| `apply`      | action | DESTRUCTIVE. Pre-check, snapshot, **arm the revert**, apply with MTU ordering, verify            |
-| `commit`     | action | DESTRUCTIVE. Verify over a fresh connection, then cancel the armed revert                        |
-| `get`        | query  | READ-ONLY. Recorded config and revert plus a live link/addr/route probe                          |
-| `sync`       | query  | READ-ONLY. Re-probe and reconcile recorded state with the host                                   |
-| `remove`     | action | DESTRUCTIVE. Remove managed devices and files, MTUs in reverse order, same armed revert          |
-| `revert_now` | action | DESTRUCTIVE. Fire the armed revert immediately (tests and operator recovery)                     |
+| Method                | Kind   | Description                                                                                      |
+| --------------------- | ------ | ------------------------------------------------------------------------------------------------ |
+| `render`              | query  | READ-ONLY. Return the files the backend would write, the ordered step plan and the config sha256 |
+| `apply`               | action | DESTRUCTIVE. Pre-check, snapshot, **arm the revert**, apply with MTU ordering, verify            |
+| `commit`              | action | DESTRUCTIVE. Verify over a fresh connection, then cancel the armed revert                        |
+| `get`                 | query  | READ-ONLY. Recorded config and revert plus a live link/addr/route probe                          |
+| `sync`                | query  | READ-ONLY. Re-probe and reconcile recorded state with the host                                   |
+| `remove`              | action | DESTRUCTIVE. Remove managed devices and files, MTUs in reverse order, same armed revert          |
+| `revert_now`          | action | DESTRUCTIVE. Fire the armed revert immediately (tests and operator recovery)                     |
+| `clear_failed_revert` | action | DESTRUCTIVE. Clear a revert whose restore recorded `fail`, once the host checks pass again       |
 
 The revert removes **only** the virtual devices this change created and restores
 the managed config files from the snapshot; it never flushes the OVS database or
@@ -67,6 +68,27 @@ fires even if the SSH session dies; `commit` cancels it only after a fresh
 connection proves the management path, and `revert_now` fires it early. If the
 restore itself fails, the marker records `fail` and further applies are refused
 until an operator clears it — the model never reboots the host.
+
+The restore judges itself by two checks after it re-applies the network: a
+default route exists, and the interface carrying it has a global address. The
+exit status of `netplan apply` / `networkctl reconfigure` is only logged (to
+stderr and the journal as `host-net`), because a cloud-init netplan that matches
+an already-renamed NIC by MAC can exit non-zero on a host that is in fact
+restored.
+
+### Clearing a failed restore
+
+1. Inspect the host: `ip -br addr`, `ip route show default`,
+   `journalctl -t host-net -u 'host-net-revert-*'`, and
+   `cat /var/lib/host-net/revert/*/marker.json` (look for `"result":"fail"`).
+   Repair the network by hand if the checks above do not hold.
+2. Run the `clear_failed_revert` method with the same target arguments. It
+   refuses unless the host marker says `fail` and the two checks pass right now;
+   then it stops any leftover revert timer and removes the marker and revert
+   state, so the next `apply` is accepted. It never edits the network.
+
+Without the method, the equivalent by hand is `rm -rf /var/lib/host-net` after
+step 1, which also discards the snapshots of every earlier revert.
 
 ## Dependencies
 

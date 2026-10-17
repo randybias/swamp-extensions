@@ -42,6 +42,7 @@ import {
   CURRENT_PATH,
   LOCK_PATH,
   renderArmScript,
+  renderClearFailedScript,
   renderDisarmScript,
   renderMarkerJsonReadScript,
   renderMarkerReadScript,
@@ -171,6 +172,7 @@ const GetArgs = z.strictObject({
 });
 const SyncArgs = GetArgs;
 const RemoveArgs = RenderArgs;
+const ClearFailedArgs = z.strictObject({ ...TargetFields });
 const RevertNowArgs = z.strictObject({
   ...TargetFields,
   token: z.string().regex(TOKEN_RE),
@@ -220,6 +222,7 @@ const RevertSchema = z.strictObject({
   cancelledAt: z.string().optional(),
   firedAt: z.string().optional(),
   result: z.string().optional(),
+  clearedAt: z.string().optional(),
 });
 
 const ProbeSchema = z.strictObject({
@@ -1506,6 +1509,42 @@ export function createModel(overrides: Partial<HostNetDeps> = {}) {
         return {
           result: { host: args.host, token: args.token, fired: true, result },
         };
+      },
+    },
+    clear_failed_revert: {
+      kind: "action" as const,
+      description:
+        "DESTRUCTIVE. Clear a revert whose restore recorded fail, so later applies are accepted again. Refuses unless the host marker says fail and the post-restore checks (a default route and a global address on its interface) pass right now.",
+      arguments: ClearFailedArgs,
+      execute: async (
+        args: z.infer<typeof ClearFailedArgs>,
+        context: MethodContext,
+      ) => {
+        const key = await resolveKey(deps, context, args.ssh_key_ref);
+        const target: SshTarget = { ...targetOf(args), private_key: key };
+        const res = await sshExec(deps, target, [
+          "sh",
+          "-c",
+          renderClearFailedScript(),
+        ]);
+        if (res.exit_code !== 0) {
+          const why = res.stderr.trim() || `exit ${res.exit_code}`;
+          throw new HostNetConfigError(`nothing was cleared: ${why}`);
+        }
+        const recorded = await context.readResource(
+          `revert-${targetKey(args)}`,
+        );
+        if (recorded !== null && typeof recorded.token === "string") {
+          await context.writeResource("revert", `revert-${targetKey(args)}`, {
+            ...recorded,
+            firedAt: typeof recorded.firedAt === "string"
+              ? recorded.firedAt
+              : new Date(deps.now()).toISOString(),
+            result: "fail",
+            clearedAt: new Date(deps.now()).toISOString(),
+          });
+        }
+        return { result: { host: args.host, cleared: true } };
       },
     },
   };

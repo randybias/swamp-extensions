@@ -16,6 +16,7 @@
  */
 
 import { assert, assertEquals } from "jsr:@std/assert@1.0.19";
+import { Environment } from "npm:@marcbachmann/cel-js@7.6.1";
 
 /** A JSON-like parsed YAML object. */
 type Json = Record<string, unknown>;
@@ -158,6 +159,144 @@ function task(step: Json): Json {
   return asObj(step.task);
 }
 
+/** Methods that only read; anything else in a step is a mutation. */
+const READ_ONLY_METHODS = new Set([
+  "cephVerifyHostPrep",
+  "cephVerifyMonQuorum",
+  "cephVerifyMgr",
+  "cephVerifyOsd",
+  "cephVerifyCsiUsers",
+  "cephVerifyHealth",
+  "cephVerifyDisksRaw",
+  "cephVerifyMonPlacement",
+  "cephVerifyMgrPlacement",
+  "cephVerifyOsdClaimable",
+  "cephVerifyKeyDistributed",
+  "cephVerifyPool",
+  "cephVerifyClusterFsid",
+  "cephVerifyHostNoout",
+  "cephVerifyHostTornDown",
+  "cephVerifyPackageSource",
+  "cephVerifyRbdSmoke",
+  "cephHostClusterState",
+  "cephHostMaintenanceState",
+  "cephCephadmCheckHost",
+  "cephOsdOkToStop",
+  "cephGetConnBundle",
+  "cephFetchCsiKey",
+  "cephCapacityReport",
+  "cephRgwBucketInventory",
+]);
+
+/** The step names a step depends on, within its job. */
+function dependsOnSteps(step: Json): string[] {
+  return asArr(step.dependsOn).map((entry) => asStr(asObj(entry).step)).filter(
+    (name) => name !== "",
+  );
+}
+
+/** Every step name reachable from `name` through `dependsOn` in one job. */
+function ancestors(jobSteps: Json[], name: string): Set<string> {
+  const byName = new Map(jobSteps.map((step) => [asStr(step.name), step]));
+  const seen = new Set<string>();
+  const start = byName.get(name);
+  const stack = start ? dependsOnSteps(start) : [];
+  while (stack.length > 0) {
+    const next = stack.pop() as string;
+    if (seen.has(next)) continue;
+    seen.add(next);
+    const step = byName.get(next);
+    if (step) stack.push(...dependsOnSteps(step));
+  }
+  return seen;
+}
+
+/** Recursively collects every string in a parsed document. */
+function collectStrings(value: unknown, out: string[]): void {
+  if (typeof value === "string") out.push(value);
+  else if (Array.isArray(value)) {
+    for (const item of value) collectStrings(item, out);
+  } else if (value !== null && typeof value === "object") {
+    for (const item of Object.values(value)) collectStrings(item, out);
+  }
+}
+
+/** Every `${{ ... }}` expression in one string. */
+function expressions(text: string): string[] {
+  const out: string[] = [];
+  for (const part of text.split("${{").slice(1)) {
+    const end = part.indexOf("}}");
+    out.push((end >= 0 ? part.slice(0, end) : part).trim());
+  }
+  return out;
+}
+
+/** Inputs that are neither required nor defaulted, so they may be absent. */
+function optionalNames(inputs: Json): Set<string> {
+  const props = asObj(inputs.properties);
+  const required = new Set(asArr(inputs.required).map(asStr));
+  return new Set(
+    Object.keys(props).filter((name) =>
+      !required.has(name) && !("default" in asObj(props[name]))
+    ),
+  );
+}
+
+/** Builds a value for one declared input. */
+function synthValue(name: string, schema: Json): unknown {
+  if (Array.isArray(schema.enum) && schema.enum.length > 0) {
+    return schema.enum[0];
+  }
+  const type = asStr(schema.type);
+  if (type === "boolean") return true;
+  if (type === "integer" || type === "number") {
+    if (name === "port") return 22;
+    if (name === "priority") return 100;
+    return 1;
+  }
+  if (type === "array") {
+    const items = asObj(schema.items);
+    if (asStr(items.type) === "object") return [synthObject(items)];
+    if (name === "placement") return ["web-1.example.com"];
+    return ["example"];
+  }
+  if (type === "object") return synthObject(schema);
+  if (name === "host" || name === "adminHost" || name === "targetHost") {
+    return "192.0.2.10";
+  }
+  if (name === "targetAddr") return "192.0.2.11";
+  if (name === "monIp" || name === "addr") return "192.0.2.10";
+  if (name === "publicNet" || name === "clusterNet") return "192.0.2.0/24";
+  if (name === "sshUser" || name === "adminUsername") return "root";
+  if (name === "strictHostKeyChecking") return "yes";
+  if (name === "scheme") return "replicated";
+  if (name === "cephImage") return "registry.example.com/ceph/ceph:v19.2.1";
+  return "example";
+}
+
+/** Builds an object from a schema's properties. */
+function synthObject(schema: Json): Record<string, unknown> {
+  const props = asObj(schema.properties);
+  const out: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(props)) {
+    out[key] = synthValue(key, asObj(value));
+  }
+  return out;
+}
+
+/** Required and defaulted inputs, with the optional ones omitted. */
+function buildInputs(inputs: Json): Record<string, unknown> {
+  const props = asObj(inputs.properties);
+  const required = new Set(asArr(inputs.required).map(asStr));
+  const out: Record<string, unknown> = {};
+  for (const [name, rawSchema] of Object.entries(props)) {
+    const schema = asObj(rawSchema);
+    if (required.has(name)) out[name] = synthValue(name, schema);
+    else if ("default" in schema) out[name] = schema.default;
+  }
+  return out;
+}
+
 const here = import.meta.dirname ?? "extensions/workflows";
 const root = `${here}/../..`;
 const manifest = parseYaml(
@@ -292,20 +431,40 @@ for (const { rel, doc } of catalog) {
     }
   });
 
-  Deno.test(`${label}: mutating workflows have pre-approval, prove and report jobs`, () => {
+  Deno.test(`${label}: every mutating method sits behind an approval, with a prove job`, () => {
     const all = steps(doc);
-    const mutating = all.some(({ step }) =>
-      asStr(task(step).type) === "manual_approval"
-    );
-    if (!mutating) return;
+    const mutating = all.filter(({ step }) => {
+      const t = task(step);
+      const method = asStr(t.methodName);
+      return asStr(t.type) === "model_method" && method !== "" &&
+        !READ_ONLY_METHODS.has(method);
+    });
+    if (mutating.length === 0) return;
     const jobs = asArr(doc.jobs).map(asObj);
-    const approvalJob = jobs.find((job) =>
+    const approvals = new Set(
+      all.filter(({ step }) => asStr(task(step).type) === "manual_approval")
+        .map(({ name }) => name),
+    );
+    assert(approvals.size > 0, "mutating workflow has no manual_approval step");
+    for (const { job, name, step } of mutating) {
+      const jobRecord = jobs.find((entry) => asStr(entry.name) === job);
+      const jobSteps = asArr(asObj(jobRecord).steps).map(asObj);
+      const reached = ancestors(jobSteps, name);
+      const approved = [...approvals].some((approval) => reached.has(approval));
+      assert(
+        approved,
+        `${label}: ${name} (${
+          asStr(task(step).methodName)
+        }) is not behind an approval`,
+      );
+    }
+    const approvalJobs = jobs.filter((job) =>
       asArr(job.steps).some((s) =>
         asStr(task(asObj(s)).type) === "manual_approval"
       )
     );
     const proveJob = jobs.find((job) => {
-      if (job === approvalJob) return false;
+      if (approvalJobs.includes(job)) return false;
       const jobSteps = asArr(job.steps).map(asObj);
       const read = jobSteps.some((s) => asStr(task(s).type) === "model_method");
       const asserts = jobSteps.some((s) => asStr(task(s).type) === "assert");
@@ -336,3 +495,57 @@ for (const { rel, doc } of catalog) {
     }
   });
 }
+
+Deno.test("optional inputs are referenced only inside has() ternaries", () => {
+  const failures: string[] = [];
+  for (const { rel, doc } of catalog) {
+    const optional = optionalNames(asObj(doc.inputs));
+    if (optional.size === 0) continue;
+    const strings: string[] = [];
+    collectStrings(doc, strings);
+    for (const text of strings) {
+      for (const expr of expressions(text)) {
+        for (const name of optional) {
+          if (!new RegExp(`\\binputs\\.${name}\\b`).test(expr)) continue;
+          if (new RegExp(`has\\(\\s*inputs\\.${name}\\s*\\)`).test(expr)) {
+            continue;
+          }
+          failures.push(`${rel}: inputs.${name} unguarded in: ${expr}`);
+        }
+      }
+    }
+  }
+  assertEquals(failures, [], failures.join("\n"));
+});
+
+Deno.test("every workflow expression evaluates with optional inputs absent", () => {
+  const cel = new Environment({ unlistedVariablesAreDyn: true });
+  const failures: string[] = [];
+  for (const { rel, doc } of catalog) {
+    const optional = optionalNames(asObj(doc.inputs));
+    if (optional.size === 0) continue;
+    const inputs = buildInputs(asObj(doc.inputs));
+    const strings: string[] = [];
+    collectStrings(doc, strings);
+    for (const text of strings) {
+      for (const expr of expressions(text)) {
+        try {
+          cel.evaluate(expr, {
+            inputs,
+            run: { startedAt: "2000-01-01T00:00:00.000Z" },
+            self: {},
+          });
+        } catch (error) {
+          const message = error instanceof Error
+            ? error.message
+            : String(error);
+          const match = /No such key: ([A-Za-z_][A-Za-z0-9_]*)/.exec(message);
+          if (match && optional.has(match[1])) {
+            failures.push(`${rel}: ${expr} -> ${message.split("\n")[0]}`);
+          }
+        }
+      }
+    }
+  }
+  assertEquals(failures, [], failures.join("\n"));
+});

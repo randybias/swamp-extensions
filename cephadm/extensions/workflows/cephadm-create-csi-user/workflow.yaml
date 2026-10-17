@@ -97,7 +97,7 @@ jobs:
             expectedUserNames: "${{ [inputs.name] }}"
             throwOnFail: false
       - name: assert-csi-user
-        description: Assert the client entity exists with the requested caps
+        description: Assert the client entity exists; caps are set, not re-read
         dependsOn:
           - step: verify-csi-users
             condition:
@@ -107,9 +107,10 @@ jobs:
           expr: >-
             data.latest("cephadm", "cephVerifyCsiUsers-" + inputs.host).attributes.pass == true
           message: >-
-            Expected client entity ${{ inputs.name }} with caps
-            ${{ inputs.caps }}, observed
+            Expected client entity ${{ inputs.name }} to exist after setting caps
+            ${{ inputs.caps }}; observed
             pass=${{ data.latest("cephadm", "cephVerifyCsiUsers-" + inputs.host).attributes.pass }}
+            users=${{ data.latest("cephadm", "cephVerifyCsiUsers-" + inputs.host).attributes.detail.users }}
           severity: high
   - name: report-failure
     description: Report that nothing was rolled back or retried

@@ -70,7 +70,8 @@ jobs:
           message: >-
             Expected replicated to carry size and no erasureProfile, or erasure
             to carry erasureProfile and no size. Observed scheme=${{ inputs.scheme }}
-            size=${{ inputs.size }} erasureProfile=${{ inputs.erasureProfile }}
+            size=${{ has(inputs.size) ? inputs.size : "unset" }}
+            erasureProfile=${{ has(inputs.erasureProfile) ? inputs.erasureProfile : "unset" }}
           severity: high
       - name: approve
         description: Approve creating or converging the named pool
@@ -82,9 +83,9 @@ jobs:
           type: manual_approval
           prompt: >-
             Create or converge pool ${{ inputs.name }} with scheme
-            ${{ inputs.scheme }}, size ${{ inputs.size }} or profile
-            ${{ inputs.erasureProfile }} on ${{ inputs.host }}. This changes
-            cluster data placement.
+            ${{ inputs.scheme }}, size ${{ has(inputs.size) ? inputs.size : "unset" }}
+            or profile ${{ has(inputs.erasureProfile) ? inputs.erasureProfile : "unset" }}
+            on ${{ inputs.host }}. This changes cluster data placement.
           timeout: 3600
       - name: create-pool
         description: Create or converge the pool through ceph
@@ -128,7 +129,7 @@ jobs:
             keyPath: '${{ inputs.keyPath == "" ? dyn(null) : dyn(inputs.keyPath) }}'
             strictHostKeyChecking: ${{ inputs.strictHostKeyChecking }}
             poolName: ${{ inputs.name }}
-            expectedSize: '${{ inputs.scheme == "replicated" ? inputs.size : inputs.erasureProfile.k + inputs.erasureProfile.m }}'
+            expectedSize: '${{ inputs.scheme == "replicated" ? (has(inputs.size) ? inputs.size : 0) : (has(inputs.erasureProfile) ? inputs.erasureProfile.k + inputs.erasureProfile.m : 0) }}'
             throwOnFail: false
       - name: assert-pool
         description: Assert the pool shape matches the request

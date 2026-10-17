@@ -34,7 +34,7 @@ inputs:
           port:
             type: integer
         required: ["host", "port"]
-      description: Targets each with its own port, sorted by host:port ascending
+      description: Targets; every port must equal the single port input, because the key read-back uses one port
   required:
     - adminHost
     - port
@@ -44,10 +44,25 @@ inputs:
     - hosts
 jobs:
   - name: distribute
-    description: Approve and append the cluster key on every listed host
+    description: Check the ports, approve, then append the cluster key
     steps:
+      - name: assert-single-port
+        description: Assert every listed host uses the single read-back port
+        task:
+          type: assert
+          expr: >-
+            size(inputs.hosts) > 0 && inputs.hosts.all(h, h.port == inputs.port)
+          message: >-
+            Expected every hosts[].port to equal the single port input
+            ${{ inputs.port }} so the key read-back can use one port, observed
+            hosts=${{ inputs.hosts }}
+          severity: high
       - name: approve
         description: Approve installing the cluster key on the listed hosts
+        dependsOn:
+          - step: assert-single-port
+            condition:
+              type: succeeded
         task:
           type: manual_approval
           prompt: >-
@@ -101,15 +116,11 @@ jobs:
         task:
           type: assert
           expr: >-
-            data.latest("cephadm",
-            "cephVerifyKeyDistributed-" +
-            inputs.hosts.map(h, h.host + ":" + string(h.port)).join(",")).attributes.pass == true
+            data.findBySpec("cephadm", "cephVerifyResult").exists(r, r.attributes.method == "cephVerifyKeyDistributed" && r.attributes.pass == true && r.attributes.capturedAt >= run.startedAt)
           message: >-
-            Expected the cluster key to be present on every listed host;
-            observed pass=${{ data.latest("cephadm", "cephVerifyKeyDistributed-" + inputs.hosts.map(h, h.host + ":" + string(h.port)).join(",")).attributes.pass }},
-            missing=${{ data.latest("cephadm", "cephVerifyKeyDistributed-" + inputs.hosts.map(h, h.host + ":" + string(h.port)).join(",")).attributes.detail.missingHosts }},
-            absent=${{ data.latest("cephadm", "cephVerifyKeyDistributed-" + inputs.hosts.map(h, h.host + ":" + string(h.port)).join(",")).attributes.detail.absentOn }},
-            unreadable=${{ data.latest("cephadm", "cephVerifyKeyDistributed-" + inputs.hosts.map(h, h.host + ":" + string(h.port)).join(",")).attributes.detail.unreadableOn }}
+            Expected the cluster key to be present on every listed host
+            ${{ inputs.hosts }}; see the cephVerifyKeyDistributed record for
+            per-host detail.
           severity: high
   - name: check-hosts
     description: Ask cephadm on the admin host to check each listed host

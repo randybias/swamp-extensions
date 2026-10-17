@@ -103,7 +103,8 @@ jobs:
             Expected one complete OSD mode: fleet-wide needs a non-empty
             excludeDevices; by-serial needs targetHost, targetPort and
             dataDevices. Observed allAvailableDevices=${{ inputs.allAvailableDevices }}
-            targetHost=${{ inputs.targetHost }} targetPort=${{ inputs.targetPort }}
+            targetHost=${{ inputs.targetHost }}
+            targetPort=${{ has(inputs.targetPort) ? inputs.targetPort : "unset" }}
             dataDevices=${{ inputs.dataDevices }} excludeDevices=${{ inputs.excludeDevices }}
           severity: high
       - name: gate-osd-claimable
@@ -151,7 +152,8 @@ jobs:
           type: manual_approval
           prompt: >-
             Apply OSDs with allAvailableDevices=${{ inputs.allAvailableDevices }},
-            targetHost=${{ inputs.targetHost }}, targetPort=${{ inputs.targetPort }},
+            targetHost=${{ inputs.targetHost }},
+            targetPort=${{ has(inputs.targetPort) ? inputs.targetPort : "unset" }},
             dataDevices=${{ inputs.dataDevices }} through
             ${{ inputs.adminHost }}. The pre-check record is
             cephVerifyOsdClaimable-${{ inputs.adminHost }}.

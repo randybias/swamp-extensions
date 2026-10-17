@@ -55,6 +55,16 @@ Read-only workflows halt on a failed verdict; mutating ones write evidence and
 never roll back. `cephadm-fetch-csi-key` vaults the key it reads and no workflow
 reads that field.
 
+Known limits, checked before approval where they can be:
+
+- `cephadm-distribute-key` re-reads keys with one port, so every `hosts[].port`
+  must equal the single `port` input; a pre-approval assert enforces that.
+- `cephadm-add-host` proves the host is present in the orchestrator host list;
+  the host-list record carries no address, so the requested address is not
+  re-read.
+- `cephadm-create-csi-user` proves the entity exists; the requested caps are set
+  by the mutation and are not independently re-read.
+
 ## Dependencies
 
 - A control machine with the OpenSSH client (`ssh`).

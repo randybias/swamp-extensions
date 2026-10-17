@@ -24,6 +24,7 @@ import {
   folderMatches,
   type FolderSpec,
   folderSpecOf,
+  normalizeApiUrl,
   type SyncthingAccess,
   type SyncthingClient,
   type SyncthingDeps,
@@ -158,6 +159,9 @@ const ACCESS_FIELDS = {
   api_key: z.string().min(8).max(128).meta({ sensitive: true }).describe(
     "Syncthing API key. Sent only in the X-API-Key header; wire a vault reference.",
   ),
+  timeout_s: z.number().int().min(1).max(600).default(30).describe(
+    "Per-request timeout in seconds, applied to fetch and to curl.",
+  ),
 };
 
 const DEVICE_FIELDS = {
@@ -265,6 +269,7 @@ interface AccessArgs {
   node: string;
   api_url: string;
   api_key: string;
+  timeout_s: number;
   host?: string | null;
   port: number;
   user?: string | null;
@@ -342,7 +347,16 @@ function isUnreachable(error: unknown): boolean {
     const curl = /remote curl failed \(exit (\d+)\)/.exec(error.message);
     return curl !== null && ["6", "7", "28"].includes(curl[1]);
   }
-  if (error instanceof TypeError) return true;
+  if (error instanceof TypeError) {
+    const cause =
+      (error as { cause?: { name?: string; code?: string; message?: string } })
+        .cause;
+    const text = [error.message, cause?.name, cause?.code, cause?.message]
+      .filter((part) => typeof part === "string")
+      .join(" ");
+    return /connection refused|failed to lookup|name or service not known|dns error|could not resolve|timed? ?out|timeout|network is unreachable|no route to host|connection reset/i
+      .test(text);
+  }
   return false;
 }
 
@@ -354,7 +368,11 @@ function clientOf(
   return createClient(
     deps,
     args.access,
-    { apiUrl: args.api_url, apiKey: args.api_key },
+    {
+      apiUrl: args.api_url,
+      apiKey: args.api_key,
+      timeoutMs: (args.timeout_s ?? 30) * 1000,
+    },
     sshTargetOf(args),
   );
 }
@@ -364,7 +382,7 @@ export async function nodeInstance(
   node: string,
   apiUrl: string,
 ): Promise<string> {
-  const digest = await sha256Hex(`${node}\u0000${apiUrl}`);
+  const digest = await sha256Hex(`${node}\u0000${normalizeApiUrl(apiUrl)}`);
   return `syncthing-${digest.slice(0, 32)}`;
 }
 
@@ -498,7 +516,7 @@ async function writeNode(
     instance,
     NodeStateSchema.parse({
       node: args.node,
-      api_url: args.api_url,
+      api_url: normalizeApiUrl(args.api_url),
       observed_at: observedAt,
       ...state,
     }),
@@ -805,7 +823,8 @@ export function createModel(
             "DELETE",
             `/rest/config/devices/${encodeURIComponent(args.device_id)}`,
           );
-          if (del.status < 200 || del.status > 299) {
+          // A 404 here means a concurrent delete already removed it.
+          if (del.status !== 404 && (del.status < 200 || del.status > 299)) {
             throw new SyncthingError(
               `device delete returned ${del.status}`,
               del.status,
@@ -954,7 +973,8 @@ export function createModel(
             "DELETE",
             `/rest/config/folders/${encodeURIComponent(args.folder_id)}`,
           );
-          if (del.status < 200 || del.status > 299) {
+          // A 404 here means a concurrent delete already removed it.
+          if (del.status !== 404 && (del.status < 200 || del.status > 299)) {
             throw new SyncthingError(
               `folder delete returned ${del.status}`,
               del.status,

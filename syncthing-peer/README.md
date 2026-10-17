@@ -89,9 +89,12 @@ Read the change flag with
   node's own device to a folder, so the comparison ignores it and stored state
   keeps the observed read-back.
 - `remove_device` and `remove_folder` delete and prove the config is gone; an
-  already-absent config is a clean no-op.
-- State is keyed by `sha256(node, api_url)`, with device and folder records
-  appended by a length-prefixed id.
+  already-absent config, and a DELETE that returns 404, are a clean no-op.
+- Every request is bounded: `timeout_s` (default 30) becomes an `AbortSignal`
+  for a local fetch and `--max-time`/`--connect-timeout` for the remote curl.
+- State is keyed by `sha256(node, api_url)` after normalizing the URL
+  (lowercased host, no trailing slash), with device and folder records appended
+  by a length-prefixed id.
 
 ## License
 

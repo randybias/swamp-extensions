@@ -264,6 +264,12 @@ Deno.test("schemas are strict, mark secrets, and default the API origin", () => 
   }) as { api_url: string; port: number };
   assertEquals(parsed.api_url, "http://127.0.0.1:8384");
   assertEquals(parsed.port, 22);
+  const parsedTimeout = model.methods.get.arguments.parse({
+    access: "local",
+    node: "edge-1",
+    api_key: HEADER_VALUE,
+  }) as { timeout_s: number };
+  assertEquals(parsedTimeout.timeout_s, 30);
 });
 
 Deno.test("node instance names are distinct SHA-256 keys", async () => {
@@ -273,6 +279,11 @@ Deno.test("node instance names are distinct SHA-256 keys", async () => {
   assertEquals(a === b, false);
   assertEquals(a === c, false);
   assert(/^syncthing-[0-9a-f]{32}$/.test(a), a);
+  // A trailing slash or host case must not create a second record.
+  assertEquals(
+    await nodeInstance("edge-1", "http://127.0.0.1:8384/"),
+    a,
+  );
 });
 
 Deno.test("get stores node status and counts", async () => {
@@ -315,6 +326,54 @@ Deno.test("sync rethrows an auth failure instead of recording unreachable", asyn
   );
   assertEquals(error.status, 401);
   assertEquals(written.length, 0);
+});
+
+Deno.test("sync rethrows a non-connect TypeError", async () => {
+  const fetch: FetchFn = () =>
+    Promise.reject(new TypeError("cannot read properties of undefined"));
+  const m = createModel(deps(fetch));
+  const { context, written } = testContext();
+  await assertRejects(
+    () => m.methods.sync.execute(BASE, context),
+    TypeError,
+  );
+  assertEquals(written.length, 0);
+});
+
+Deno.test("a 404 on DELETE is treated as already gone", async () => {
+  let deleted = false;
+  const fetch: FetchFn = (input, init) => {
+    const url = new URL(String(input));
+    const method = init?.method ?? "GET";
+    const path = url.pathname;
+    if (path === "/rest/system/status") {
+      return Promise.resolve(json({ myID: MY_ID }));
+    }
+    if (method === "DELETE") {
+      deleted = true;
+      return Promise.resolve(json({ error: "not found" }, 404));
+    }
+    if (method === "GET") {
+      return Promise.resolve(
+        deleted ? json({ error: "not found" }, 404) : json({
+          deviceID: DEVICE,
+          name: "edge-2",
+          addresses: ["dynamic"],
+          introducer: false,
+          paused: false,
+        }),
+      );
+    }
+    return Promise.resolve(json({}, 200));
+  };
+  const m = createModel(deps(fetch));
+  const { context, written } = testContext();
+  const result = await m.methods.remove_device.execute(
+    { ...BASE, device_id: DEVICE },
+    context,
+  );
+  assertEquals((result.result as { changed: boolean }).changed, true);
+  assertEquals(written[0].data.status, "removed");
 });
 
 Deno.test("sync rethrows an HTTP 500 instead of recording unreachable", async () => {

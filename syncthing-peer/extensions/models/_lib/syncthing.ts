@@ -47,6 +47,8 @@ export interface SyncthingApi {
   apiUrl: string;
   /** API key, sensitive. */
   apiKey: string;
+  /** Per-request timeout in milliseconds; defaults to 30 s. */
+  timeoutMs?: number;
 }
 
 /** One REST result. */
@@ -140,14 +142,13 @@ export function isDeviceAddress(value: string): boolean {
   return /^[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?$/.test(host);
 }
 
-/** True when `value` has no control characters and is not blank. */
+/**
+ * True when `value` is a non-blank label of printable ASCII. An allowlist, so
+ * control characters, unicode and every other byte are refused.
+ */
 export function isSafeLabel(value: string): boolean {
-  if (typeof value !== "string" || value.trim() === "") return false;
-  for (const ch of value) {
-    const code = ch.codePointAt(0) ?? 0;
-    if (code < 0x20 || code === 0x7f) return false;
-  }
-  return true;
+  return typeof value === "string" && /^[\x20-\x7e]{1,256}$/.test(value) &&
+    value.trim() !== "";
 }
 
 /**
@@ -180,6 +181,17 @@ export function assertApiUrl(value: string): void {
   }
 }
 
+/** The canonical origin of an API URL: lowercased host, no trailing slash. */
+export function normalizeApiUrl(value: string): string {
+  return new URL(value).origin;
+}
+
+/** The last non-empty line of `text`, trimmed and capped. */
+function lastLine(text: string, cap = 200): string {
+  const lines = text.split(/\r?\n/).filter((line) => line.trim() !== "");
+  return (lines.at(-1) ?? "").trim().slice(0, cap);
+}
+
 /** Parses JSON, or returns the raw text when it is not JSON. */
 function parseBody(text: string): unknown {
   if (text === "") return null;
@@ -204,7 +216,10 @@ export function curlRequestConfig(
   url: string,
   apiKey: string,
   body?: unknown,
+  timeoutMs = 30_000,
 ): string {
+  const seconds = Math.max(1, Math.ceil(timeoutMs / 1000));
+  const connect = Math.max(1, Math.min(10, seconds));
   const lines = [
     "silent",
     "show-error",
@@ -213,6 +228,8 @@ export function curlRequestConfig(
     `header = ${curlConfigValue(`X-API-Key: ${apiKey}`)}`,
     `header = ${curlConfigValue("Accept: application/json")}`,
     `proto = ${curlConfigValue("=http,https")}`,
+    `max-time = ${curlConfigValue(String(seconds))}`,
+    `connect-timeout = ${curlConfigValue(String(connect))}`,
     `write-out = ${curlConfigValue("__SYNCTHING_STATUS__%{http_code}")}`,
   ];
   if (body !== undefined) {
@@ -248,7 +265,8 @@ export function createClient(
 ): SyncthingClient {
   assertApiUrl(api.apiUrl);
   assertApiKey(api.apiKey);
-  const base = api.apiUrl.replace(/\/$/, "");
+  const base = normalizeApiUrl(api.apiUrl);
+  const timeoutMs = api.timeoutMs ?? 30_000;
   const request = async (
     method: string,
     path: string,
@@ -268,6 +286,7 @@ export function createClient(
         headers,
         body: body === undefined ? undefined : JSON.stringify(body),
         redirect: "manual",
+        signal: AbortSignal.timeout(timeoutMs),
       });
       if (res.status >= 300 && res.status <= 399) {
         throw new SyncthingError(
@@ -282,7 +301,7 @@ export function createClient(
       throw new SshConfigError("the ssh transport needs an SSH target");
     }
     const url = `${base}${path}`;
-    const config = curlRequestConfig(method, url, api.apiKey, body);
+    const config = curlRequestConfig(method, url, api.apiKey, body, timeoutMs);
     // One shell resolves a 0700 per-user cache directory and sweeps configs left
     // by an earlier interrupted call; the config is uploaded there over stdin
     // under a random name; curl and its trap-based cleanup then run in one
@@ -301,7 +320,9 @@ export function createClient(
     ]);
     if (prepared.exit_code !== 0) {
       throw new SshError(
-        `could not prepare the remote config directory (exit ${prepared.exit_code})`,
+        `could not prepare the remote config directory (exit ${prepared.exit_code}): ${
+          lastLine(prepared.stderr)
+        }`,
       );
     }
     const dir = prepared.stdout.trim();
@@ -325,7 +346,7 @@ export function createClient(
       if (result.exit_code !== 0) {
         throw new SshError(
           `remote curl failed (exit ${result.exit_code}): ${
-            result.stderr.trim().slice(0, 200)
+            lastLine(result.stderr)
           }`,
         );
       }

@@ -24,6 +24,7 @@ import {
   folderSpecOf,
   isDeviceAddress,
   isSafeLabel,
+  normalizeApiUrl,
   parseCurlOutput,
   type SyncthingDeps,
   SyncthingError,
@@ -95,6 +96,15 @@ Deno.test("api key, device id, folder id and path grammars", () => {
   assert(isSafeLabel("edge-2"));
   assert(!isSafeLabel("  "));
   assert(!isSafeLabel("bad\u0007name"));
+  assert(!isSafeLabel("caf\u00e9"), "non-ASCII is outside the allowlist");
+  assertEquals(
+    normalizeApiUrl("http://127.0.0.1:8384/"),
+    "http://127.0.0.1:8384",
+  );
+  assertEquals(
+    normalizeApiUrl("HTTPS://Syncthing.Example.com/"),
+    "https://syncthing.example.com",
+  );
 });
 
 Deno.test("curl config carries the key over stdin and escapes quotes", () => {
@@ -109,6 +119,9 @@ Deno.test("curl config carries the key over stdin and escapes quotes", () => {
   assert(config.includes("hi"));
   assert(config.includes("back"));
   assert(config.includes('request = "PUT"'));
+  assert(config.includes('max-time = "30"'));
+  assert(config.includes('connect-timeout = "10"'));
+  assert(config.includes('proto = "=http,https"'));
   assertEquals(curlConfigValue('a"b'), '"a\\"b"');
   assertThrows(() => curlConfigValue("a\nb"), Error, "newline");
 });

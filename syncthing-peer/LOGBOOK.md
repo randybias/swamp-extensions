@@ -76,3 +76,18 @@ transport.
   userinfo, query, an extra colon and a port outside 1-65535.
 - LOW: test fixture uses `https://evil.test`; `remove_folder` records the
   observed device list without the node's own `myID`, matching `ensure_folder`.
+
+## Final polish
+
+- MEDIUM: `isUnreachable` no longer treats every `TypeError` as unreachable; it
+  classifies only a connection-refused, DNS or timeout failure by message/cause,
+  and rethrows a code error.
+- MEDIUM: requests are bounded. `timeout_s` (default 30) drives
+  `AbortSignal.timeout` on the local fetch and `--max-time`/`--connect-timeout`
+  in the remote curl config.
+- MEDIUM: a DELETE that returns 404 is treated as already gone and absence is
+  still confirmed.
+- MEDIUM: the API URL is normalized (lowercased host, no trailing slash) before
+  keying state, so `.../` and `...` share one record.
+- LOW: curl and prepare stderr pass into errors as the last line, capped at 200
+  characters; labels are checked against a printable-ASCII allowlist.

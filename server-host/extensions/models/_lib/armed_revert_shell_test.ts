@@ -95,8 +95,12 @@ echo active > "${dir}/unit-$u.timer"`,
         env: { PATH: `${bin}:/usr/bin:/bin` },
       }).spawn();
       const w = child.stdin.getWriter();
-      await w.write(new TextEncoder().encode(stdin));
-      await w.close();
+      try {
+        await w.write(new TextEncoder().encode(stdin));
+        await w.close();
+      } catch {
+        // The script may exit before reading its stdin; that is not a failure.
+      }
       return (await child.output()).code;
     },
     async file(name) {

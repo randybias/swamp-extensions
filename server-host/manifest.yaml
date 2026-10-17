@@ -1,6 +1,6 @@
 manifestVersion: 1
 name: "@randybias/server-host"
-version: "2026.10.17.2"
+version: "2026.10.17.3"
 description: "Harden a freshly provisioned Linux host over SSH in three phases: base packages and users, an nftables firewall rendered from inputs, and an SSH lockdown. The target and every phase input are method arguments, and the firewall and lockdown phases arm a host-side revert timer before they change anything unless commit cancels it."
 license: Apache-2.0
 repository: https://github.com/randybias/swamp-extensions

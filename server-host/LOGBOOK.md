@@ -443,3 +443,30 @@ Review of 16f38c5:
   netns when run as root with nft installed. It now always uses the container,
   with a `mktemp` file.
 - LOW the leading `-` rule is part of the schema regex.
+
+2026.10.17.3 (first adopt re-run and review of cec6bfd):
+
+- The first adopt re-run of the stack re-applied `allow_ssh_from_anywhere` to a
+  locked-down host for about 20 seconds before lockdown closed it again.
+  `apply_firewall` now reads the live managed table and refuses to replace a
+  management-only SSH rule with an open one unless `allow_widening_ssh_exposure`
+  is set. This is the model's own guard; the stack workflow also stops asking
+  for it.
+- A rebuilt server that Cherry gave the address of a deleted one inherited the
+  deleted one's record, so `apply_base` ran 0 steps. Records now carry an
+  optional `identity` (the provider server id); every method refuses a record
+  for another identity, and the new `forget` action empties the records of a
+  machine that is gone. Records written without an identity are accepted and
+  then stamped.
+- HIGH (review): the uplink probe ran under `sudo`, whose env_reset strips
+  `SSH_CLIENT`, so a management NIC that was not the default route could be
+  trusted. The probe now runs without sudo (checked against a real shell: exit 3
+  when `SSH_CLIENT` is empty or when run under `sudo -n`), and fails closed:
+  `set
+  -e`, no `2>/dev/null`, a missing `ip`, no default route or no session
+  route all refuse; ECMP `nexthops[].dev` are read. The test fake now returns no
+  session route when the probe is wrapped in sudo. The apply script does not
+  repeat the check (a small window between probe and apply, accepted and
+  documented).
+- The shell tests ignore a broken stdin pipe when the script exits before
+  reading.

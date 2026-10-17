@@ -7,6 +7,22 @@ Not packaged. Notes for whoever maintains this extension.
   the sibling extensions: a model entry point plus `_lib/` helpers, a sibling
   `_test.ts` for every `.ts`, and golden fixtures under `_lib/testdata/`.
 
+## Prior art
+
+Swept on 2026-10-17 with `swamp extension search` on the stable and beta
+channels (apt, proxy, cache, mirror and related terms) plus the first-party
+`@swamp/*` listing. No apt proxy package exists.
+
+- `@taylor/nexus@2026.10.14.1` (AGPL): runs Sonatype Nexus in Docker or Apple
+  container and declares apt proxy, hosted and group repositories. It is a
+  heavyweight JVM repository manager, not a lightweight apt cache, and it does
+  no client-side `Acquire::http::Proxy` setup. Gaps vs this model: no Apt-Cacher
+  NG, no client configuration with a direct fallback, no HTTPS-backend policy.
+- `@aaronge/apt-inventory` and `@adam/cfgmgmt` `apt_repository` manage packages
+  and sources, not a caching proxy.
+- No apt-cacher-ng or squid-deb-proxy package. Nothing to file upstream: this is
+  a new capability, not a gap in an existing package.
+
 ## Design decisions
 
 - **Transport seam.** All remote work goes through the vendored, byte-identical
@@ -274,15 +290,8 @@ uploads.
 
 ## Live end-to-end status
 
-- Offline gates plus targeted real-tool checks, no full end-to-end run yet, so
-  this version is `beta` and `ci: false`. Beyond the unit tests: the fragment
-  served a real `/ubuntu-ports` request through apt-cacher-ng 3.7.4 (200 vs the
-  pre-fix 503), `apt-config` accepted the snippet and reported every key, the
-  auto-detect script ran under `sh -eu` and printed the proxy URL or `DIRECT`,
-  and the log parser read a real request log. Planned live run on one
-  Debian/Ubuntu host: install and adopt, apply with each policy, verify with
-  `get`/`sync`/`stats`, point a second host at it and check a real package
-  fetch, then `remove_server` with and without `purge_cache_ack`.
+Superseded: see "2026-10-17 live e2e" below (full runs at d256e1a, 1a24f7b and
+cf83525).
 
 ## Round 5 (delta d256e1a review)
 
@@ -322,3 +331,97 @@ uploads.
   showed 0.0.0.0:3142 and [::]:3142. (A policy-rc.d deny was not used: it would
   leave an enabled service that starts open on the next boot.)
 - LOW: unconfigure_client removes the script directory when empty.
+
+## 2026-10-17 live e2e (2026.10.17.1): 21 pass, 1 fail (fixed), 0 blocked
+
+Receipts: `~/code/swamp-e2e/receipts/apt-cache.md`. Target: one throwaway VPS
+`<vps2>` (Ubuntu 24.04, amd64) as both server and client (proxy on loopback).
+Server: `listen: [loopback, <vps2-private>]` (never the public address or a
+wildcard), `https_policy: https_backends`, an https Ubuntu backend, and
+`admin_auth_ref` to a throwaway vault value. Client: `proxy_url` on loopback,
+`https_backends`, `fallback_direct: true`. Strict pinned host keys, SSH key as a
+vault reference. An argv sampler (`ps -eww -o args`, positive canary) ran for
+every pass.
+
+d256e1a (d5's head): 9 pass, 1 fail.
+
+| Cell                                                | Result         |
+| --------------------------------------------------- | -------------- |
+| 1 install_server, apply_server                      | FAIL (install) |
+| 2 configure_client, apt-get update via the proxy    | PASS           |
+| 3 package via proxy, second fetch a hit, stats      | PASS           |
+| 4 acng stopped, fallback_direct goes DIRECT         | PASS           |
+| 5 client_get stores no credentials                  | PASS           |
+| 6 re-apply is a no-op (MainPID, mtimes, sha256)     | PASS           |
+| 7 debian-security refused, nothing touched          | PASS           |
+| 8 unconfigure_client, remove_server (no purge ack)  | PASS           |
+| 9 remove_server again is a no-op                    | PASS           |
+| 10 argv scan: admin credential, 0 hits in 547 lines | PASS           |
+
+Cell 1 failed twice over: the stock image had no `universe` index, so the
+install could not find the package, and straight after install the package
+listened on `0.0.0.0:3142` and `[::]:3142` until apply_server ran. Both are
+fixed in cf83525 (Round 6 above).
+
+1a24f7b (restart and verify after a dropped file): 7 pass, 0 fail.
+
+| Cell                                                     | Result |
+| -------------------------------------------------------- | ------ |
+| B0 install_server over the `rc` package                  | PASS   |
+| B1 apply with admin_auth_ref: 401 without, 200 with      | PASS   |
+| B2 apply without it: restarted, `security.conf` restored | PASS   |
+| B3 re-apply is a no-op                                   | PASS   |
+| B4 remove_server (no purge ack), files restored          | PASS   |
+| B5 unconfigure_client                                    | PASS   |
+| argv scan: 0 hits in 642 lines                           | PASS   |
+
+cf83525 (install without an exposed listener), from empty package lists: 5 pass,
+0 fail. An `ss -lntp` sampler ran every 0.1 s throughout.
+
+| Cell                                                    | Result |
+| ------------------------------------------------------- | ------ |
+| C1 install_server: lists refreshed, loopback only       | PASS   |
+| C2 apply_server: exactly loopback and the private NIC   | PASS   |
+| C3 configure_client                                     | PASS   |
+| C4 remove_server (no purge ack)                         | PASS   |
+| C5 unconfigure_client: the script directory is gone too | PASS   |
+
+Across the 554 samples taken during install, the only :3142 listener was
+loopback. There was never a wildcard listener.
+
+Cleanup: apt-cacher-ng, `sl` and the four dependency packages were purged, and
+the cache, the log and `/etc/apt-cacher-ng` were removed. `/etc/apt` matches the
+baseline (`diff -r` empty, same modes and owners). The samplers and captures
+were removed, and so were the local vault keys, the agent and the worktrees.
+
+## Merge-prep quality pass (2026-10-17)
+
+Applied the open Mediums and Lows from the 1a24f7b review:
+
+- After admin_auth_ref is dropped, the verify step now requires HTTP 200
+  (measured live in B2). Before, it accepted anything except 401, so a 403, 404
+  or 500 passed. A new test covers a 500 after the drop.
+- Both local verify curls pass `--noproxy '*'`, so an environment proxy on the
+  server cannot answer in place of the local daemon.
+- Test tightness: `applyArgsOf` is reused, and the mutable `enforced` flag and
+  the redundant `ok` alias in `boxFake` are gone.
+
+These changes came after the live runs and are covered by the unit tests only.
+The 200 requirement matches what the live daemon returned in B2.
+
+## Residuals (2026.10.17.1, not blocking beta)
+
+- Proxy-style requests for `security.ubuntu.com` go upstream over :80 and are
+  not cached through an https backend. Apt-Cacher NG has no built-in remap for
+  that host, as the README documents.
+- `debian-security` is refused by design: the package's built-in `Remap-secdeb`
+  owns those routes.
+- `stats` `bytes_from_cache` follows Apt-Cacher NG's own report formula,
+  `max(in, out) - in`, so it can read 0 when upstream InRelease bytes outweigh
+  the cache hits (cell 3: 12,990 B served from cache, reported as 0).
+- On the test host the install upgraded one library, `libevent-core-2.1-7t64`
+  (2.1.12-stable-9ubuntu2.1 to 9ubuntu2.2, a security update). It was not
+  downgraded, because the old version is no longer in the archive.
+- The test fixtures hold a hardcoded synthetic admin credential. The conformance
+  seat flagged this as Medium. It is kept because it is a placeholder, not a
+  secret.

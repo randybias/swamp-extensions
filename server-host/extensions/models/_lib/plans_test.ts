@@ -262,10 +262,14 @@ Deno.test("base config: deterministic sorted sysctl and a fixed journald drop-in
   assertEquals(renderJournaldConf().includes("ForwardToSyslog=no"), true);
 });
 
+const EMPTY_TABLE = JSON.stringify({
+  nftables: [{ table: { family: "inet", name: "server_host", handle: 1 } }],
+});
+
 Deno.test("probe: reads the ruleset sha and timer state without mutating", async () => {
   const f = fakeTransport((c) => {
-    if (c.includes("'nft' 'list' 'ruleset'")) {
-      return { code: 0, stdout: "table inet server_host {\n}\n" };
+    if (c.includes("'nft' '-j' 'list' 'ruleset'")) {
+      return { code: 0, stdout: EMPTY_TABLE };
     }
     if (c.includes("'systemctl' 'is-active'")) {
       return { code: 0, stdout: "active\n" };
@@ -285,15 +289,15 @@ Deno.test("probe: reads the ruleset sha and timer state without mutating", async
 
 Deno.test("probe: a failed or truncated ruleset read is an error, not an observation", async () => {
   const failed = fakeTransport((c) =>
-    c.includes("'nft' 'list' 'ruleset'") ? { code: 1 } : { code: 0 }
+    c.includes("'nft' '-j' 'list' 'ruleset'") ? { code: 1 } : { code: 0 }
   );
   await assertRejects(
     () => probeState(failed.deps, TARGET, { sudo: true }),
     HostOpsError,
-    "nft list ruleset",
+    "nft -j list ruleset",
   );
   const truncated = fakeTransport((c) => {
-    if (c.includes("'nft' 'list' 'ruleset'")) {
+    if (c.includes("'nft' '-j' 'list' 'ruleset'")) {
       return { code: 0, stdout: "x".repeat(2_000_000) };
     }
     return { code: 0 };
@@ -307,8 +311,8 @@ Deno.test("probe: a failed or truncated ruleset read is an error, not an observa
 
 Deno.test("probe: an unexpected timer-probe exit is an error", async () => {
   const f = fakeTransport((c) => {
-    if (c.includes("'nft' 'list' 'ruleset'")) {
-      return { code: 0, stdout: "table inet server_host {\n}\n" };
+    if (c.includes("'nft' '-j' 'list' 'ruleset'")) {
+      return { code: 0, stdout: EMPTY_TABLE };
     }
     if (c.includes("'systemctl' 'is-active'")) return { code: 1 };
     return { code: 0 };
@@ -323,8 +327,8 @@ Deno.test("probe: an unexpected timer-probe exit is an error", async () => {
 Deno.test("probe: inactive and unknown timers are simply not armed", async () => {
   for (const code of [3, 4]) {
     const f = fakeTransport((c) => {
-      if (c.includes("'nft' 'list' 'ruleset'")) {
-        return { code: 0, stdout: "table inet server_host {\n}\n" };
+      if (c.includes("'nft' '-j' 'list' 'ruleset'")) {
+        return { code: 0, stdout: EMPTY_TABLE };
       }
       if (c.includes("'systemctl' 'is-active'")) {
         return { code, stdout: "inactive\n" };

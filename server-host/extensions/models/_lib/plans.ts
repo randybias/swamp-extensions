@@ -17,7 +17,7 @@
  * @module
  */
 
-import { exec, type SshDeps, type Target } from "./ssh.ts";
+import { exec, type ExecResult, type SshDeps, type Target } from "./ssh.ts";
 import {
   isTimerActive,
   parseMarker,
@@ -32,7 +32,7 @@ import {
   STATE_DIR,
   withSudo,
 } from "./armed_revert.ts";
-import { managedTableSha256, rulesetSha256 } from "./nftables.ts";
+import { listingSha256, managedSha256, normalizeListing } from "./nftables.ts";
 import { HostConfigError } from "./validate.ts";
 
 /** The risk class of a step, used to assert ordering. */
@@ -381,6 +381,7 @@ export function planFirewallChange(input: FirewallChangeInput): Step[] {
       label: "read table back",
       argv: withSudo(input.sudo, [
         "nft",
+        "-j",
         "list",
         "table",
         "inet",
@@ -426,7 +427,7 @@ export interface ReadInput {
 
 /** The READ-ONLY result of probing a host's current firewall state. */
 export interface ProbeResult {
-  /** SHA-256 of the full `nft list ruleset` output. */
+  /** SHA-256 of the full `nft -j list ruleset` output without handles. */
   ruleset_sha256: string;
   /** SHA-256 of the canonical managed table. */
   managed_sha256: string;
@@ -457,20 +458,28 @@ export async function probeState(
   const listed = await exec(
     deps,
     target,
-    withSudo(input.sudo, ["nft", "list", "ruleset"]),
+    withSudo(input.sudo, ["nft", "-j", "list", "ruleset"]),
     { timeoutS: 60 },
   );
   if (listed.exit_code !== 0) {
     throw new HostOpsError(
-      `nft list ruleset on ${target.host} failed with exit code ${listed.exit_code}; refusing to record firewall state`,
+      `nft -j list ruleset on ${target.host} failed with exit code ${listed.exit_code}; refusing to record firewall state`,
     );
   }
   if (listed.truncated) {
     throw new HostOpsError(
-      `nft list ruleset on ${target.host} output was truncated; refusing to record firewall state`,
+      `nft -j list ruleset on ${target.host} output was truncated; refusing to record firewall state`,
     );
   }
-  const managed = listed.stdout.includes("table inet server_host");
+  let table;
+  try {
+    table = normalizeListing(listed.stdout);
+  } catch {
+    throw new HostOpsError(
+      `nft -j list ruleset on ${target.host} did not return JSON; refusing to record firewall state`,
+    );
+  }
+  const managed = table !== null;
   const marked = await exec(
     deps,
     target,
@@ -513,8 +522,8 @@ export async function probeState(
     }
   }
   return {
-    ruleset_sha256: await rulesetSha256(listed.stdout),
-    managed_sha256: await managedTableSha256(listed.stdout),
+    ruleset_sha256: await listingSha256(listed.stdout),
+    managed_sha256: await managedSha256(table),
     managed_table: managed,
     armed,
     ...(marker
@@ -541,7 +550,7 @@ export async function executePlan(
   deps: SshDeps,
   target: Target,
   steps: Step[],
-  after?: (step: Step) => Promise<void>,
+  after?: (step: Step, result: ExecResult) => Promise<void>,
 ): Promise<EmittedStep[]> {
   const emitted: EmittedStep[] = [];
   for (const step of steps) {
@@ -562,7 +571,7 @@ export async function executePlan(
       argv: step.argv,
       exit_code: res.exit_code,
     });
-    if (after) await after(step);
+    if (after) await after(step, res);
   }
   return emitted;
 }

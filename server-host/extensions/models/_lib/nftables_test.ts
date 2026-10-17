@@ -1,10 +1,12 @@
 import { assertEquals, assertThrows } from "jsr:@std/assert@1.0.19";
 import {
   assertFirewallRules,
-  canonicalTable,
+  assertListingMatches,
+  expectedManagedSha256,
   type FirewallRules,
-  managedTableSha256,
-  managedTableText,
+  listingSha256,
+  managedSha256,
+  normalizeListing,
   renderRuleset,
   rulesetSha256,
   splitCidrs,
@@ -122,29 +124,158 @@ Deno.test("sha256: deterministic and content-addressed", async () => {
   assertEquals(one === await rulesetSha256(text + "# x\n"), false);
 });
 
-Deno.test("canonical: a rendered script and an nft listing agree, other tables do not confuse it", async () => {
-  const rendered = renderRuleset(BASE);
-  const listing = `table inet other {\n\tchain x {\n\t}\n}\n${
-    rendered.split("\n").slice(2).join("\n")
-  }`;
-  assertEquals(canonicalTable(rendered), canonicalTable(listing));
-  assertEquals(
-    await managedTableSha256(rendered),
-    await managedTableSha256(listing),
-  );
-  assertEquals(
-    managedTableText(listing).startsWith("table inet server_host {"),
-    true,
-  );
-  assertEquals(managedTableText("table inet other {\n}\n"), "");
+interface Sample {
+  management_cidrs: string[];
+  allow_tcp: number[];
+  allow_udp: number[] | null;
+  text: string;
+  json: unknown;
+}
+
+const REAL: Record<string, Sample> = JSON.parse(
+  await Deno.readTextFile(new URL("nft-real-listings.json", FIX)),
+);
+
+const rulesOf = (x: Sample): FirewallRules => ({
+  managementCidrs: x.management_cidrs,
+  allowTcp: x.allow_tcp,
+  allowUdp: x.allow_udp ?? [],
+  defaultPolicy: "drop",
+  sshPort: 22,
+  allowSshFromAnywhere: false,
 });
 
-Deno.test("canonical: the full-script hash differs from the managed-table hash", async () => {
-  const rendered = renderRuleset(BASE);
+Deno.test("real nft output differs from the rendered text, yet matches the rendered rules", async () => {
+  for (const [name, x] of Object.entries(REAL)) {
+    const rules = rulesOf(x);
+    const rendered = renderRuleset(rules);
+    // nft drops braces on one-element sets, collapses /32 and reorders: the
+    // text a hash of the render would have been compared against is different.
+    const sshLine = rendered.split("\n").find((l) => l.includes("saddr"))!
+      .trim();
+    assertEquals(x.text.includes(sshLine), false, name);
+    const live = JSON.stringify(x.json);
+    assertListingMatches(rules, live);
+    assertEquals(
+      await managedSha256(normalizeListing(live)),
+      await expectedManagedSha256(rules),
+      name,
+    );
+  }
+});
+
+Deno.test("real nft output shapes: the properties the old hash tripped on are really there", () => {
   assertEquals(
-    await rulesetSha256(rendered) === await managedTableSha256(rendered),
+    REAL.single_cidr.text.includes("ip saddr 198.51.100.0/24 tcp"),
+    true,
+  );
+  assertEquals(REAL.single_cidr.text.includes("{ 198.51.100"), false);
+  assertEquals(REAL.slash32.text.includes("ip saddr 198.51.100.3 tcp"), true);
+  assertEquals(REAL.slash32.text.includes("198.51.100.3/32"), false);
+  // Numeric order (.64 before .128) where the renderer sorts text (.128 first).
+  assertEquals(
+    REAL.numeric_vs_lexical.text.includes(
+      "{ 198.51.100.64/26, 198.51.100.128/25 }",
+    ),
+    true,
+  );
+  assertEquals(
+    renderRuleset(rulesOf(REAL.numeric_vs_lexical)).includes(
+      "{ 198.51.100.128/25, 198.51.100.64/26 }",
+    ),
+    true,
+  );
+  assertEquals(
+    REAL.numeric_vs_lexical.text.includes("tcp dport { 80, 443 }"),
+    true,
+  );
+});
+
+Deno.test("a wrong apply is still caught: extra, missing, reordered or altered rules", () => {
+  const x = REAL.numeric_vs_lexical;
+  const rules = rulesOf(x);
+  const doc = () =>
+    JSON.parse(JSON.stringify(x.json)) as {
+      nftables: Record<string, Record<string, unknown>>[];
+    };
+  const bad = (edit: (d: ReturnType<typeof doc>) => void, text: string) => {
+    const d = doc();
+    edit(d);
+    assertThrows(
+      () => assertListingMatches(rules, JSON.stringify(d)),
+      HostConfigError,
+      text,
+    );
+  };
+  // An extra accept rule.
+  bad((d) => {
+    const r = d.nftables.find((o) => o.rule)!;
+    d.nftables.push({
+      rule: { ...r.rule, handle: 99, expr: [{ accept: null }] },
+    });
+  }, "extra or reordered");
+  // The SSH rule lost one allowed network.
+  bad((d) => {
+    for (const o of d.nftables) {
+      const e = (o.rule?.expr as
+        | { match?: { right?: { set?: unknown[] } } }[]
+        | undefined)?.[0];
+      if (e?.match?.right?.set && e.match.right.set.length === 2) {
+        e.match.right.set.pop();
+      }
+    }
+  }, "missing");
+  // A changed policy.
+  bad((d) => {
+    const c = d.nftables.find((o) => o.chain?.name === "input")!;
+    (c.chain as Record<string, unknown>).policy = "accept";
+  }, "policy");
+  // Table gone.
+  assertThrows(
+    () => assertListingMatches(rules, JSON.stringify({ nftables: [] })),
+    HostConfigError,
+    "not present",
+  );
+});
+
+Deno.test("normalize: addresses compare numerically and other tables are ignored", async () => {
+  const rules = rulesOf(REAL.single_cidr);
+  const other = {
+    nftables: [
+      { table: { family: "inet", name: "k0s", handle: 1 } },
+      { chain: { family: "inet", table: "k0s", name: "input", handle: 1 } },
+      ...(JSON.parse(JSON.stringify(REAL.single_cidr.json))
+        .nftables as unknown[]),
+    ],
+  };
+  assertListingMatches(rules, JSON.stringify(other));
+  assertEquals(normalizeListing(JSON.stringify({ nftables: [] })), null);
+  // A different network changes the hash.
+  assertEquals(
+    await expectedManagedSha256(rules) ===
+      await expectedManagedSha256({
+        ...rules,
+        managementCidrs: ["203.0.113.0/24"],
+      }),
     false,
   );
+  // IPv6 forms of one address agree.
+  const v6a = { ...rules, managementCidrs: ["2001:db8:0:0:0:0:0:1/128"] };
+  const v6b = { ...rules, managementCidrs: ["2001:db8::1/128"] };
+  assertEquals(
+    await expectedManagedSha256(v6a),
+    await expectedManagedSha256(v6b),
+  );
+});
+
+Deno.test("listing sha ignores handles and metainfo", async () => {
+  const a = JSON.stringify(REAL.single_cidr.json);
+  const b = a.replace(
+    /"handle":(\d+)/g,
+    (_m, n) => `"handle":${Number(n) + 100}`,
+  )
+    .replace("1.0.9", "1.0.10");
+  assertEquals(await listingSha256(a), await listingSha256(b));
 });
 
 Deno.test("assertFirewallRules: a /0 needs the acknowledgement", () => {

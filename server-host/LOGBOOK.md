@@ -225,3 +225,29 @@ Fixed to use the object directly. New tests drive the method with a context
 whose `vaultService` is a plain `{get, put}` object and no injected resolver,
 and reject the old factory shape, a missing service, a service without `get` and
 an empty secret without echoing any secret.
+
+Round 9: second live blocker. The expected managed-table hash came from the
+RENDERED text but was compared with the hash of nft's own listing, and nft
+normalizes: one-element sets lose their braces, a /32 prints as the bare
+address, and set elements and port lists are ordered numerically. So every real
+commit and every identical re-apply saw "the live ruleset no longer matches".
+Unit tests passed because they compared render to render.
+
+Fixed by comparing structures read back from nft, not text:
+
+- The probe and the verify step now use `nft -j list ...`. The managed table is
+  normalized (handles and metainfo dropped, sets and single values read the
+  same, addresses compared numerically, sets ordered numerically) and hashed;
+  the host marker, the revert record and the no-op check all carry that
+  structural hash, which `expectedManagedSha256(rules)` also computes from the
+  inputs alone.
+- After `nft -f`, the verify step requires the live table to equal the rendered
+  rules as a structure (chains, hooks, policies, every rule, in order), so a
+  wrong apply is still caught. On a mismatch the revert stays armed.
+- The fixtures `_lib/fixtures/nft-real-listings.json` are real nftables 1.0.9
+  listings (single CIDR, /32, numeric versus lexical order) with the addresses
+  mapped to RFC 5737. Tests assert that the live text differs from the render
+  and that apply, commit and an identical re-apply still succeed.
+- The revert path is unchanged (it never hashes). Not covered: IPv6 sets, ranges
+  and rule shapes nft might print differently on other versions; an unfamiliar
+  shape fails the verify rather than passing.

@@ -3,8 +3,10 @@ import { createModelTestContext } from "jsr:@swamp-club/swamp-testing@0.20261014
 import { createModel, type HostDeps, hostInstance } from "./server_host.ts";
 import { type CommandRunner } from "./_lib/ssh.ts";
 import {
+  expectedListing,
+  expectedManagedSha256,
   type FirewallRules,
-  managedTableSha256,
+  managedSha256,
   renderRuleset,
   rulesetSha256,
 } from "./_lib/nftables.ts";
@@ -102,7 +104,15 @@ function fakeTransport(
     const command = args[args.length - 1];
     commands.push(command);
     const r = respond(command);
-    return { code: r.code, stdout: r.stdout ?? "", stderr: "" };
+    // Unscripted nft reads answer like a host: no managed table in the
+    // ruleset, and the rendered table when it is read back after an apply.
+    const stdout = r.stdout ??
+      (command.includes("'nft' '-j' 'list' 'ruleset'")
+        ? '{"nftables":[]}'
+        : command.includes("'nft' '-j' 'list' 'table'")
+        ? expectedListing(FIREWALL)
+        : "");
+    return { code: r.code, stdout, stderr: "" };
   };
   const deps: Partial<HostDeps> = {
     run,
@@ -133,10 +143,10 @@ function modelWith(f: Fake) {
   return createModel(f.deps);
 }
 
-function liveResponse(rendered: string) {
+function liveResponse() {
   return (command: string): { code: number; stdout?: string } => {
-    if (command.includes("'nft' 'list' 'ruleset'")) {
-      return { code: 0, stdout: rendered };
+    if (command.includes("'nft' '-j' 'list' 'ruleset'")) {
+      return { code: 0, stdout: expectedListing(FIREWALL) };
     }
     return { code: 0 };
   };
@@ -381,7 +391,10 @@ Deno.test("render_firewall: also returns the canonical managed-table hash", asyn
   );
   assertEquals(out.result.ruleset, rendered);
   assertEquals(out.result.ruleset_sha256, await rulesetSha256(rendered));
-  assertEquals(out.result.managed_sha256, await managedTableSha256(rendered));
+  assertEquals(
+    out.result.managed_sha256,
+    await expectedManagedSha256(FIREWALL),
+  );
 });
 
 Deno.test("apply_firewall: the ssh command stream arms before it applies", async () => {
@@ -412,9 +425,9 @@ Deno.test("apply_firewall: the ssh command stream arms before it applies", async
 Deno.test("apply_firewall: a matching ruleset that is still live is a no-op", async () => {
   const rendered = renderRuleset(FIREWALL);
   const ruleset_sha256 = await rulesetSha256(rendered);
-  const managed_sha256 = await managedTableSha256(rendered);
+  const managed_sha256 = await expectedManagedSha256(FIREWALL);
   const name = `state-${hostInstance(SSH.host)}`;
-  const f = fakeTransport(liveResponse(rendered));
+  const f = fakeTransport(liveResponse());
   const m = modelWith(f);
   const { context } = createModelTestContext({
     globalArgs: {},
@@ -448,11 +461,13 @@ Deno.test("apply_firewall: a matching ruleset that is still live is a no-op", as
 Deno.test("apply_firewall: a stale record re-applies instead of trusting the sha", async () => {
   const rendered = renderRuleset(FIREWALL);
   const ruleset_sha256 = await rulesetSha256(rendered);
-  const managed_sha256 = await managedTableSha256(rendered);
+  const managed_sha256 = await expectedManagedSha256(FIREWALL);
   const name = `state-${hostInstance(SSH.host)}`;
   // Live output has no managed table, as after a fired revert.
   const f = fakeTransport((c) =>
-    c.includes("'nft' 'list' 'ruleset'") ? { code: 0, stdout: "" } : { code: 0 }
+    c.includes("'nft' '-j' 'list' 'ruleset'")
+      ? { code: 0, stdout: '{"nftables":[]}' }
+      : { code: 0 }
   );
   const m = modelWith(f);
   const { context } = createModelTestContext({
@@ -503,10 +518,10 @@ Deno.test("apply_firewall: the host refusing to arm (earlier revert busy) is a c
 Deno.test("lockdown: an identical live ruleset with an armed revert is a no-op, not a stack", async () => {
   const rendered = renderRuleset(FIREWALL);
   const ruleset_sha256 = await rulesetSha256(rendered);
-  const managed_sha256 = await managedTableSha256(rendered);
+  const managed_sha256 = await expectedManagedSha256(FIREWALL);
   const f = fakeTransport((c) => {
-    if (c.includes("'nft' 'list' 'ruleset'")) {
-      return { code: 0, stdout: rendered };
+    if (c.includes("'nft' '-j' 'list' 'ruleset'")) {
+      return { code: 0, stdout: expectedListing(FIREWALL) };
     }
     if (c.includes("'systemctl' 'is-active'")) {
       return { code: 0, stdout: "active\n" };
@@ -595,13 +610,12 @@ Deno.test("lockdown: never allows SSH from anywhere and arms before applying", a
 });
 
 Deno.test("commit: probes the timer and rules, then records a verified cancel", async () => {
-  const rendered = renderRuleset(FIREWALL);
-  const managed_sha256 = await managedTableSha256(rendered);
+  const managed_sha256 = await expectedManagedSha256(FIREWALL);
   const name = `revert-${hostInstance(SSH.host)}`;
   const active = [true, false];
   const f = fakeTransport((c) => {
-    if (c.includes("'nft' 'list' 'ruleset'")) {
-      return { code: 0, stdout: rendered };
+    if (c.includes("'nft' '-j' 'list' 'ruleset'")) {
+      return { code: 0, stdout: expectedListing(FIREWALL) };
     }
     if (c.includes("'systemctl' 'is-active'")) {
       return { code: 0, stdout: active.shift() ? "active\n" : "inactive\n" };
@@ -635,12 +649,11 @@ Deno.test("commit: probes the timer and rules, then records a verified cancel", 
 });
 
 Deno.test("commit: a failed cancellation is fatal and records nothing", async () => {
-  const rendered = renderRuleset(FIREWALL);
-  const managed_sha256 = await managedTableSha256(rendered);
+  const managed_sha256 = await expectedManagedSha256(FIREWALL);
   const name = `revert-${hostInstance(SSH.host)}`;
   const f = fakeTransport((c) => {
-    if (c.includes("'nft' 'list' 'ruleset'")) {
-      return { code: 0, stdout: rendered };
+    if (c.includes("'nft' '-j' 'list' 'ruleset'")) {
+      return { code: 0, stdout: expectedListing(FIREWALL) };
     }
     if (c.includes("'systemctl' 'is-active'")) {
       return { code: 0, stdout: "active\n" };
@@ -713,7 +726,7 @@ Deno.test("commit: refuses nothing armed, expired, not active, and mismatched ru
   );
   // Timer not active.
   const inactive = fakeTransport((c) => {
-    if (c.includes("'nft' 'list' 'ruleset'")) {
+    if (c.includes("'nft' '-j' 'list' 'ruleset'")) {
       return { code: 0, stdout: renderRuleset(FIREWALL) };
     }
     if (c.includes("'systemctl' 'is-active'")) {
@@ -735,7 +748,7 @@ Deno.test("commit: refuses nothing armed, expired, not active, and mismatched ru
   );
   // Live rules no longer match the armed revert.
   const mismatch = fakeTransport((c) => {
-    if (c.includes("'nft' 'list' 'ruleset'")) {
+    if (c.includes("'nft' '-j' 'list' 'ruleset'")) {
       return { code: 0, stdout: renderRuleset(FIREWALL) };
     }
     if (c.includes("'systemctl' 'is-active'")) {
@@ -758,10 +771,9 @@ Deno.test("commit: refuses nothing armed, expired, not active, and mismatched ru
 });
 
 Deno.test("get and sync: probe the host and report phase state and drift", async () => {
-  const rendered = renderRuleset(FIREWALL);
   const f = fakeTransport((c) => {
-    if (c.includes("'nft' 'list' 'ruleset'")) {
-      return { code: 0, stdout: rendered };
+    if (c.includes("'nft' '-j' 'list' 'ruleset'")) {
+      return { code: 0, stdout: expectedListing(FIREWALL) };
     }
     if (c.includes("'systemctl' 'is-active'")) {
       return { code: 3, stdout: "inactive\n" };
@@ -787,7 +799,7 @@ Deno.test("get and sync: probe the host and report phase state and drift", async
 
 Deno.test("get: a failed probe is an error and writes no state", async () => {
   const f = fakeTransport((c) =>
-    c.includes("'nft' 'list' 'ruleset'") ? { code: 1 } : { code: 0 }
+    c.includes("'nft' '-j' 'list' 'ruleset'") ? { code: 1 } : { code: 0 }
   );
   const m = modelWith(f);
   const ctx = createModelTestContext({ globalArgs: {} });
@@ -999,7 +1011,7 @@ Deno.test("strict: pinned keys are used as given and nothing is scanned", async 
 });
 
 Deno.test("commit: an armed revert the model never recorded is found through the host's marker", async () => {
-  const liveHash = await managedTableSha256("");
+  const liveHash = await managedSha256(null);
   const f = fakeTransport((c) => {
     if (c.includes("/var/lib/server-host/current") && c.includes("cat")) {
       return {
@@ -1183,13 +1195,20 @@ Deno.test("apply_base: an account change with an empty key list still rewrites t
 Deno.test("lockdown: a re-run with identical inputs after commit is a no-op, with other tables present", async () => {
   const rendered = renderRuleset(FIREWALL);
   const ruleset_sha256 = await rulesetSha256(rendered);
-  const managed_sha256 = await managedTableSha256(rendered);
-  // What `nft list ruleset` prints once other software has added its own
-  // tables around ours.
-  const live =
-    `table inet k0s {\n\tchain forward {\n\t}\n}\n${rendered}table ip nat {\n}\n`;
+  const managed_sha256 = await expectedManagedSha256(FIREWALL);
+  // What `nft -j list ruleset` prints once other software has added its own
+  // tables around ours (and nft has numbered everything with handles).
+  const live = JSON.stringify({
+    nftables: [
+      { metainfo: { version: "1.0.9", json_schema_version: 1 } },
+      { table: { family: "inet", name: "k0s", handle: 1 } },
+      { chain: { family: "inet", table: "k0s", name: "forward", handle: 1 } },
+      ...(JSON.parse(expectedListing(FIREWALL)).nftables as unknown[]),
+      { table: { family: "ip", name: "nat", handle: 3 } },
+    ],
+  });
   const f = fakeTransport((c) =>
-    c.includes("'nft' 'list' 'ruleset'")
+    c.includes("'nft' '-j' 'list' 'ruleset'")
       ? { code: 0, stdout: live }
       : { code: 0 }
   );
@@ -1294,4 +1313,59 @@ Deno.test("vault: a missing, malformed or empty vault service is a clear error t
     assertEquals(e.message.includes("PRIVATE KEY"), false, name);
   }
   assertEquals(f.commands.length, 0);
+});
+
+Deno.test("real nft output: apply verifies, then commit and an identical re-apply succeed although the live text differs from the render", async () => {
+  const samples = JSON.parse(
+    await Deno.readTextFile(
+      new URL("./_lib/fixtures/nft-real-listings.json", import.meta.url),
+    ),
+  ) as Record<
+    string,
+    {
+      management_cidrs: string[];
+      allow_tcp: number[];
+      json: unknown;
+    }
+  >;
+  for (const [name, x] of Object.entries(samples)) {
+    const live = JSON.stringify(x.json);
+    let cancelled = false;
+    let applied = false;
+    const f = fakeTransport((c) => {
+      if (isGuardedApply(c)) applied = true;
+      if (c.includes('systemctl stop "$unit.timer"')) cancelled = true;
+      if (c.includes("'nft' '-j' 'list'")) {
+        return { code: 0, stdout: applied ? live : '{"nftables":[]}' };
+      }
+      if (c.includes("'systemctl' 'is-active'")) {
+        return cancelled
+          ? { code: 3, stdout: "inactive\n" }
+          : { code: 0, stdout: "active\n" };
+      }
+      return { code: 0 };
+    });
+    const m = modelWith(f);
+    const args = m.methods.apply_firewall.arguments.parse({
+      ...FIREWALL_ARGS,
+      management_cidrs: x.management_cidrs,
+      allow_tcp: x.allow_tcp,
+      allow_udp: [],
+    });
+    const ctx = createModelTestContext({ globalArgs: {} });
+    const out = await m.methods.apply_firewall.execute(args, ctx.context);
+    assertEquals(out.result.changed, true, name);
+    // The host marker carries the structural hash, not a hash of the text.
+    const arm = f.commands.find(isArm)!;
+    assertEquals(arm.includes(String(out.result.managed_sha256)), true, name);
+    // commit: same live listing hashes to the stored value.
+    const committed = await m.methods.commit.execute(
+      m.methods.commit.arguments.parse({ ...SSH }),
+      ctx.context,
+    );
+    assertEquals(committed.result.committed, true, name);
+    // An identical re-apply is a no-op against the same real listing.
+    const again = await m.methods.apply_firewall.execute(args, ctx.context);
+    assertEquals(again.result.changed, false, name);
+  }
 });

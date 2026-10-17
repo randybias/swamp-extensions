@@ -10,7 +10,11 @@
  * @module
  */
 
-import { HostConfigError, isEffectivelyAnywhere } from "./validate.ts";
+import {
+  HostConfigError,
+  isEffectivelyAnywhere,
+  parseCidr,
+} from "./validate.ts";
 
 /** Everything that determines the rendered ruleset. */
 export interface FirewallRules {
@@ -114,34 +118,299 @@ export async function rulesetSha256(text: string): Promise<string> {
     .join("");
 }
 
-/**
- * Extracts the managed table (header line through the matching column-zero
- * closing brace) from a rendered script or `nft list ruleset` output, so the
- * two representations can be compared without their comments or wrappers.
- */
-export function managedTableText(text: string): string {
-  const lines = text.split("\n");
-  const start = lines.findIndex((l) =>
-    l.trimStart().startsWith(`table inet ${TABLE} {`)
+/** A rule, a chain or a table in nftables' JSON form (`nft -j list ...`). */
+type Json = Record<string, unknown>;
+
+/** One chain of the managed table in normalized form. */
+export interface NormChain {
+  /** Chain name. */
+  name: string;
+  /** Base-chain type, hook and priority, and policy. */
+  base: string;
+  /** Rules in order, each as a normalized string. */
+  rules: string[];
+}
+
+/** The managed table in a form that does not depend on how nft prints it. */
+export interface NormTable {
+  /** Chains sorted by name. */
+  chains: NormChain[];
+}
+
+const bitsOf = (family: 4 | 6) => (family === 4 ? 32 : 128);
+
+/** `family:network/prefix` as numbers; a bare address is a full-length prefix. */
+function normAddr(family: 4 | 6, text: string, len?: number): string {
+  const cidr = parseCidr(
+    text.includes("/") ? text : `${text}/${len ?? bitsOf(family)}`,
   );
-  if (start < 0) return "";
-  const end = lines.findIndex((l, i) => i > start && l === "}");
-  return lines.slice(start, end < 0 ? lines.length : end + 1).join("\n");
+  if (!cidr) return `raw:${text}${len === undefined ? "" : `/${len}`}`;
+  return `${cidr.family}:${cidr.network.toString(16)}/${cidr.prefix}`;
+}
+
+/** Sorts normalized elements: numbers first by value, then everything else. */
+function sortElems(elems: string[]): string[] {
+  const num = (e: string) => (e.startsWith("n:") ? Number(e.slice(2)) : NaN);
+  return [...elems].sort((a, b) => {
+    const x = num(a);
+    const y = num(b);
+    if (!Number.isNaN(x) && !Number.isNaN(y)) return x - y;
+    if (!Number.isNaN(x)) return -1;
+    if (!Number.isNaN(y)) return 1;
+    // `family:hexnetwork/prefix`: order by family, then numerically.
+    const m = /^([46]):([0-9a-f]+)\/(\d+)$/;
+    const pa = m.exec(a);
+    const pb = m.exec(b);
+    if (pa && pb) {
+      if (pa[1] !== pb[1]) return Number(pa[1]) - Number(pb[1]);
+      const na = BigInt(`0x${pa[2]}`);
+      const nb = BigInt(`0x${pb[2]}`);
+      if (na !== nb) return na < nb ? -1 : 1;
+      return Number(pa[3]) - Number(pb[3]);
+    }
+    return a < b ? -1 : a > b ? 1 : 0;
+  });
+}
+
+function stable(v: unknown): string {
+  if (Array.isArray(v)) return `[${v.map(stable).join(",")}]`;
+  if (v && typeof v === "object") {
+    const o = v as Json;
+    return `{${
+      Object.keys(o).sort().map((k) => `${JSON.stringify(k)}:${stable(o[k])}`)
+        .join(",")
+    }}`;
+  }
+  return JSON.stringify(v);
+}
+
+function leftKey(left: unknown): { key: string; family?: 4 | 6 } {
+  const l = left as Json;
+  if (l?.ct) return { key: `ct.${(l.ct as Json).key}` };
+  if (l?.meta) return { key: `meta.${(l.meta as Json).key}` };
+  if (l?.payload) {
+    const pl = l.payload as Json;
+    const fam = pl.protocol === "ip"
+      ? 4
+      : pl.protocol === "ip6"
+      ? 6
+      : undefined;
+    return { key: `${pl.protocol}.${pl.field}`, family: fam };
+  }
+  return { key: `raw:${stable(left)}` };
+}
+
+function elem(v: unknown, family?: 4 | 6): string {
+  if (typeof v === "number") return `n:${v}`;
+  if (typeof v === "string") {
+    return family && /^[0-9a-fA-F:.]+$/.test(v) && /[.:]/.test(v)
+      ? normAddr(family, v)
+      : `s:${v}`;
+  }
+  const o = v as Json;
+  if (o?.prefix && family) {
+    const p = o.prefix as Json;
+    return normAddr(family, String(p.addr), Number(p.len));
+  }
+  return `raw:${stable(v)}`;
+}
+
+/** One rule's expressions as a normalized string. */
+function normRule(expr: Json[]): string {
+  return expr.map((e) => {
+    if (e.match) {
+      const m = e.match as Json;
+      const { key, family } = leftKey(m.left);
+      const r = m.right;
+      const set = Array.isArray(r)
+        ? r
+        : r && typeof r === "object" && (r as Json).set
+        ? (r as Json).set as unknown[]
+        : [r];
+      const op = m.op === "==" || m.op === "in" ? "in" : String(m.op);
+      return `${key} ${op} ${
+        sortElems(set.map((x) => elem(x, family))).join(",")
+      }`;
+    }
+    if ("accept" in e) return "accept";
+    if ("drop" in e) return "drop";
+    return `raw:${stable(e)}`;
+  }).join(" ; ");
 }
 
 /**
- * The canonical form of a table for comparison: whitespace removed, comments
- * and the `destroy table` wrapper already excluded by
- * {@link managedTableText}. Two representations of the same ruleset have the
- * same canonical form even when nft reformats them.
+ * Normalizes the managed table out of `nft -j list ruleset` (or `list table`)
+ * output. Handles, ids and the metainfo are dropped, one-element sets read the
+ * same as bare values, a /32 or /128 reads the same as the address, and set
+ * elements are ordered numerically. Returns null when the table is absent.
  */
-export function canonicalTable(text: string): string {
-  return managedTableText(text).replace(/\s+/g, "");
+export function normalizeListing(jsonText: string): NormTable | null {
+  const doc = JSON.parse(jsonText) as { nftables?: Json[] };
+  const objs = doc.nftables ?? [];
+  const mine = (o: Json) => o.family === "inet" && o.table === TABLE;
+  const hasTable = objs.some((o) => {
+    const t = o.table as Json | undefined;
+    return t && t.family === "inet" && t.name === TABLE;
+  });
+  if (!hasTable) return null;
+  const chains = new Map<string, NormChain>();
+  for (const o of objs) {
+    const c = o.chain as Json | undefined;
+    if (c && mine(c)) {
+      chains.set(String(c.name), {
+        name: String(c.name),
+        base: c.type ? `${c.type} ${c.hook} ${c.prio} ${c.policy}` : "regular",
+        rules: [],
+      });
+    }
+  }
+  for (const o of objs) {
+    const r = o.rule as Json | undefined;
+    if (r && mine(r)) {
+      chains.get(String(r.chain))?.rules.push(normRule(r.expr as Json[]));
+    }
+  }
+  return {
+    chains: [...chains.values()].sort((a, b) => a.name < b.name ? -1 : 1),
+  };
 }
 
-/** The SHA-256 of the canonical managed table, the value drift compares. */
-export async function managedTableSha256(text: string): Promise<string> {
-  return await rulesetSha256(canonicalTable(text));
+const match = (left: Json, right: unknown, op = "==") => ({
+  match: { op, left, right },
+});
+const payload = (protocol: string, field: string) => ({
+  payload: { protocol, field },
+});
+
+/** The managed table as nftables would list it for `rules` (JSON shape, no handles). */
+export function expectedListing(rules: FirewallRules): string {
+  const out: Json[] = [{ table: { family: "inet", name: TABLE } }];
+  const chain = (name: string, hook: string, policy: string) =>
+    out.push({
+      chain: {
+        family: "inet",
+        table: TABLE,
+        name,
+        type: "filter",
+        hook,
+        prio: 0,
+        policy,
+      },
+    });
+  const rule = (...expr: Json[]) =>
+    out.push({ rule: { family: "inet", table: TABLE, chain: "input", expr } });
+  chain("input", "input", rules.defaultPolicy);
+  chain("forward", "forward", "drop");
+  chain("output", "output", "accept");
+  rule(
+    match({ ct: { key: "state" } }, ["established", "related"], "in"),
+    { accept: null },
+  );
+  rule(match({ meta: { key: "iifname" } }, "lo"), { accept: null });
+  rule(match(payload("ip", "protocol"), "icmp"), { accept: null });
+  rule(match(payload("ip6", "nexthdr"), "ipv6-icmp"), { accept: null });
+  const ssh = match(payload("tcp", "dport"), rules.sshPort);
+  const prefix = (c: string) => {
+    const [addr, len] = c.split("/");
+    return { prefix: { addr, len: Number(len) } };
+  };
+  if (rules.allowSshFromAnywhere) {
+    rule(ssh, { accept: null });
+  } else {
+    const { v4, v6 } = splitCidrs(rules.managementCidrs);
+    if (v4.length > 0) {
+      rule(match(payload("ip", "saddr"), { set: v4.map(prefix) }), ssh, {
+        accept: null,
+      });
+    }
+    if (v6.length > 0) {
+      rule(match(payload("ip6", "saddr"), { set: v6.map(prefix) }), ssh, {
+        accept: null,
+      });
+    }
+  }
+  const ports = (list: number[]) =>
+    [...new Set(list)].filter((p) => p !== rules.sshPort);
+  for (
+    const [proto, list] of [["tcp", rules.allowTcp], [
+      "udp",
+      rules.allowUdp,
+    ]] as const
+  ) {
+    const p = ports(list);
+    if (p.length > 0) {
+      rule(match(payload(proto, "dport"), { set: p }), { accept: null });
+    }
+  }
+  return JSON.stringify({ nftables: out });
+}
+
+/** SHA-256 of an `nft -j list ruleset` document with handles and metainfo removed. */
+export async function listingSha256(jsonText: string): Promise<string> {
+  const strip = (v: unknown): unknown => {
+    if (Array.isArray(v)) {
+      return v.filter((x) => !(x && typeof x === "object" && "metainfo" in x))
+        .map(strip);
+    }
+    if (v && typeof v === "object") {
+      return Object.fromEntries(
+        Object.entries(v as Json).filter(([k]) => k !== "handle").map((
+          [k, x],
+        ) => [k, strip(x)]),
+      );
+    }
+    return v;
+  };
+  return await rulesetSha256(stable(strip(JSON.parse(jsonText))));
+}
+
+/** The managed-table hash `rules` should produce once applied. */
+export async function expectedManagedSha256(
+  rules: FirewallRules,
+): Promise<string> {
+  return await managedSha256(normalizeListing(expectedListing(rules)));
+}
+
+/** The hash of a normalized table; an absent table hashes as the empty string. */
+export async function managedSha256(t: NormTable | null): Promise<string> {
+  return await rulesetSha256(t ? stable(t) : "");
+}
+
+/**
+ * Throws unless the live table equals what `rules` should produce: same
+ * chains, same policies, and every rule present in the same order, compared as
+ * normalized structures rather than text.
+ */
+export function assertListingMatches(
+  rules: FirewallRules,
+  liveJson: string,
+): void {
+  const live = normalizeListing(liveJson);
+  const want = normalizeListing(expectedListing(rules))!;
+  if (!live) throw new HostConfigError(`table inet ${TABLE} is not present`);
+  const names = new Set([
+    ...live.chains.map((c) => c.name),
+    ...want.chains.map((c) => c.name),
+  ]);
+  for (const n of [...names].sort()) {
+    const a = live.chains.find((c) => c.name === n);
+    const b = want.chains.find((c) => c.name === n);
+    if (!a || !b) {
+      throw new HostConfigError(`chain ${n} differs from the rendered ruleset`);
+    }
+    if (a.base !== b.base) {
+      throw new HostConfigError(`chain ${n} has a different type or policy`);
+    }
+    const missing = b.rules.find((r) => !a.rules.includes(r));
+    if (missing !== undefined) {
+      throw new HostConfigError(
+        `rendered rule is missing from chain ${n}: ${missing}`,
+      );
+    }
+    if (stable(a.rules) !== stable(b.rules)) {
+      throw new HostConfigError(`chain ${n} has extra or reordered rules`);
+    }
+  }
 }
 
 /**

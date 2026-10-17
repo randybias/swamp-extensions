@@ -41,8 +41,9 @@ import {
 } from "./_lib/validate.ts";
 import {
   assertFirewallRules,
+  assertListingMatches,
+  expectedManagedSha256,
   type FirewallRules,
-  managedTableSha256,
   renderRuleset,
   rulesetSha256,
 } from "./_lib/nftables.ts";
@@ -409,7 +410,7 @@ export function createModel(overrides: Partial<HostDeps> = {}) {
     const t = await openTarget(context, args);
     const ruleset = renderRuleset(rules);
     const ruleset_sha256 = await rulesetSha256(ruleset);
-    const managed_sha256 = await managedTableSha256(ruleset);
+    const managed_sha256 = await expectedManagedSha256(rules);
     const stored = await context.readResource(stateName(args.host)) as
       | HostState
       | null;
@@ -455,7 +456,14 @@ export function createModel(overrides: Partial<HostDeps> = {}) {
       for (const step of steps) {
         // The syntax check changes nothing, so a failure there needs no cleanup.
         if (step.kind !== "precheck") attempted = true;
-        emitted.push(...await executePlan(deps, t, [step]));
+        emitted.push(
+          ...await executePlan(deps, t, [step], (done, res) => {
+            // The read-back is nft's own JSON: compare it as a structure to
+            // what was rendered, so a wrong apply is caught however nft prints it.
+            if (done.kind === "verify") assertListingMatches(rules, res.stdout);
+            return Promise.resolve();
+          }),
+        );
         if (step.kind !== "arm") continue;
         revertHandle = await context.writeResource(
           "revert",
@@ -694,9 +702,10 @@ export function createModel(overrides: Partial<HostDeps> = {}) {
           context: Ctx,
         ) => {
           for (const c of args.management_cidrs) assertCidr(c);
-          const ruleset = renderRuleset(rulesFrom(args));
+          const rules = rulesFrom(args);
+          const ruleset = renderRuleset(rules);
           const ruleset_sha256 = await rulesetSha256(ruleset);
-          const managed_sha256 = await managedTableSha256(ruleset);
+          const managed_sha256 = await expectedManagedSha256(rules);
           const handle = await context.writeResource(
             "firewall_render",
             renderName(args.host),

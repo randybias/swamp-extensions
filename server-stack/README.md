@@ -51,7 +51,7 @@ never values. The example uses documentation addresses and `example.com`.
 
 ```yaml
 # provision-host.yaml
-hostname: host-1.example.com
+hostname: host-1
 ownership_tag: swamp-e2e=sp-20261017
 server_model: cherry-server
 project_id: 1001
@@ -59,6 +59,7 @@ plan: example-plan
 region: example-region
 image: example-image
 cycle: hourly
+tags: { swamp-e2e: sp-20261017 }
 ssh_private_key_key: host-1-ssh-key
 user_data_key: host-1-user-data
 cloudflare_token_key: dns-edit-token
@@ -74,7 +75,7 @@ mesh_node: { name: host-1, address: 192.0.2.10/32, listen_port: 51820 }
 mesh_peers: []
 mesh_peers_allowlist: []
 k0s_version: v1.31.2+k0s.0
-k0s_binary_sha256: 0000000000000000000000000000000000000000000000000000000000000000
+k0s_binary_sha256: "0000000000000000000000000000000000000000000000000000000000000000"
 k0s_api_sans: ["192.0.2.10"]
 k0s_pod_cidr: 198.51.100.0/24
 k0s_service_cidr: 203.0.113.0/24
@@ -90,9 +91,9 @@ dns_record_target: public
 ```
 
 ```bash
-swamp workflow run server-stack-provision-host --input-file provision-host.yaml
-swamp workflow run server-stack-teardown-host \
-  --input hostname=host-1.example.com --input confirm_hostname=host-1.example.com \
+swamp workflow run @randybias/server-stack-provision-host --input-file provision-host.yaml
+swamp workflow run @randybias/server-stack-teardown-host \
+  --input hostname=host-1 --input confirm_hostname=host-1 \
   --input server_model=cherry-server --input project_id=1001 \
   --input ownership_tag=swamp-e2e=sp-20261017 \
   --input ssh_private_key_key=host-1-ssh-key --input ssh_user=root \

@@ -62,7 +62,7 @@ inputs:
       enum: [strict, accept-new]
     known_hosts:
       type: array
-      description: Expected host keys in ssh-keyscan format; each line must match the mesh address or carry no host field
+      description: Expected host keys in ssh-keyscan format; each line must be in 'host type key' ssh-keyscan form, with the host field matching the mesh address
       default: []
       items:
         type: string
@@ -100,19 +100,16 @@ jobs:
           - step: check-inputs
             condition:
               type: succeeded
-        allowFailure: true
         task:
           type: model_method
           modelIdOrName: ${{ inputs.server_model }}
-          methodName: sync
-          inputs:
-            hostname: ${{ inputs.hostname }}
+          methodName: list
       - name: check-ownership
         description: Refuse a server that lacks the ownership tag
         dependsOn:
           - step: sync-server
             condition:
-              type: completed
+              type: succeeded
         task:
           type: assert
           expr: >-
@@ -174,15 +171,21 @@ jobs:
       - name: reset-k0s
         description: Stop and reset k0s over the mesh via SSH
         dependsOn:
+          - step: check-ownership
+            condition:
+              type: succeeded
+          - step: find-record
+            condition:
+              type: succeeded
+          - step: check-record
+            condition:
+              type: succeeded
           - step: delete-record
             condition:
               type: or
               conditions:
                 - type: succeeded
                 - type: skipped
-          - step: check-ownership
-            condition:
-              type: succeeded
         allowFailure: true
         guard: >-
           ${{ data.latest(inputs.server_model, inputs.hostname) == null ||
@@ -204,12 +207,24 @@ jobs:
       - name: delete-server
         description: Delete the server after hostname and project checks
         dependsOn:
-          - step: reset-k0s
-            condition:
-              type: always
-          - step: check-ownership
+          - step: find-record
             condition:
               type: succeeded
+          - step: check-record
+            condition:
+              type: succeeded
+          - step: delete-record
+            condition:
+              type: or
+              conditions:
+                - type: succeeded
+                - type: skipped
+          - step: reset-k0s
+            condition:
+              type: or
+              conditions:
+                - type: succeeded
+                - type: skipped
         guard: >-
           ${{ data.latest(inputs.server_model, inputs.hostname) == null ||
               data.latest(inputs.server_model, inputs.hostname).attributes.status in ["deleted", "not_found"] }}

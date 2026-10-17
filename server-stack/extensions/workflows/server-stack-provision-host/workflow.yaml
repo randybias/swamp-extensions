@@ -133,7 +133,7 @@ inputs:
       enum: [strict, accept-new]
     known_hosts:
       type: array
-      description: Expected host keys in ssh-keyscan format; each line must match the public and the mesh address or carry no host field
+      description: Expected host keys in ssh-keyscan format; each line must be in 'host type key' ssh-keyscan form, with the host field matching the address used
       default: []
       items:
         type: string
@@ -251,7 +251,7 @@ inputs:
             maxLength: 63
     mesh_handshake_max_age_s:
       type: integer
-      description: A handshake older than this many seconds fails verification
+      description: Reserved; not evaluated because swamp CEL has no clock function
       minimum: 10
       maximum: 3600
       default: 180
@@ -410,7 +410,8 @@ jobs:
             inputs.allow_udp.exists(p, p == inputs.mesh_node.listen_port) &&
             size(inputs.management_cidrs) > 0 &&
             (inputs.host_key_policy != "strict" || size(inputs.known_hosts) > 0) &&
-            inputs.tags[inputs.ownership_tag.split("=")[0]] == inputs.ownership_tag.split("=")[1]
+            inputs.tags[inputs.ownership_tag.split("=")[0]] == inputs.ownership_tag.split("=")[1] &&
+            size(inputs.cluster_secrets) == 0
           message: Cross-input invariants failed
           severity: high
       - name: probe-server
@@ -468,7 +469,8 @@ jobs:
           type: assert
           expr: >-
             inputs.adopt ||
-            (data.latest(inputs.server_model, inputs.hostname) == null &&
+            ((data.latest(inputs.server_model, inputs.hostname) == null ||
+            data.latest(inputs.server_model, inputs.hostname).attributes.status in ["deleted", "not_found"]) &&
             data.latest("host-dns", "main").attributes.records.size() == 0)
           message: A server or record already exists; set adopt to true to own it
           severity: high
@@ -537,7 +539,7 @@ jobs:
               conditions:
                 - type: succeeded
                 - type: skipped
-          - step: create
+          - step: check-adopt-ownership
             condition:
               type: succeeded
         task:
@@ -656,6 +658,7 @@ jobs:
             allow_tcp: ${{ inputs.allow_tcp }}
             allow_udp: ${{ inputs.allow_udp }}
             ssh_port: ${{ inputs.ssh_port }}
+            allow_ssh_from_anywhere: true
             revert_after_s: ${{ inputs.revert_after_s }}
       - name: verify-firewall
         description: Verify SSH answers over the mesh after the firewall
@@ -682,8 +685,9 @@ jobs:
             condition:
               type: succeeded
         guard: >-
-          ${{ data.latest("server-host", "revert-" +
-              inputs.mesh_node.address.split("/")[0]) == null }}
+          ${{ data.latest("server-host", "revert-" + inputs.mesh_node.address.split("/")[0]) == null ||
+              has(data.latest("server-host", "revert-" + inputs.mesh_node.address.split("/")[0]).attributes.committed_at) ||
+              has(data.latest("server-host", "revert-" + inputs.mesh_node.address.split("/")[0]).attributes.cancelled_at) }}
         task:
           type: model_method
           modelType: "@randybias/server-host"
@@ -707,6 +711,9 @@ jobs:
               conditions:
                 - type: succeeded
                 - type: skipped
+          - step: verify-firewall
+            condition:
+              type: succeeded
           - step: apply-firewall
             condition:
               type: succeeded
@@ -788,8 +795,9 @@ jobs:
             condition:
               type: succeeded
         guard: >-
-          ${{ data.latest("server-host", "revert-" +
-              inputs.mesh_node.address.split("/")[0]) == null }}
+          ${{ data.latest("server-host", "revert-" + inputs.mesh_node.address.split("/")[0]) == null ||
+              has(data.latest("server-host", "revert-" + inputs.mesh_node.address.split("/")[0]).attributes.committed_at) ||
+              has(data.latest("server-host", "revert-" + inputs.mesh_node.address.split("/")[0]).attributes.cancelled_at) }}
         task:
           type: model_method
           modelType: "@randybias/server-host"
@@ -866,7 +874,7 @@ jobs:
         task:
           type: assert
           expr: >-
-            data.latest("k0s-cluster", inputs.mesh_node.address.split("/")[0] + "~readiness")
+            data.latest("k0s-cluster", inputs.ssh_user + "~" + inputs.mesh_node.address.split("/")[0] + "~" + string(inputs.ssh_port) + "~readiness")
               .attributes.ready == true
           message: k0s node or system pods are not Ready
           severity: high
@@ -901,9 +909,11 @@ jobs:
         task:
           type: assert
           expr: >-
-            data.latest("k0s-cluster", inputs.mesh_node.address.split("/")[0] + "~kubeconfig")
-              .attributes.server != null
-          message: The kubeconfig server URL is missing
+            data.latest("k0s-cluster", inputs.ssh_user + "~" + inputs.mesh_node.address.split("/")[0] + "~" + string(inputs.ssh_port) + "~kubeconfig")
+              .attributes.server != null &&
+            data.latest("k0s-cluster", inputs.ssh_user + "~" + inputs.mesh_node.address.split("/")[0] + "~" + string(inputs.ssh_port) + "~kubeconfig")
+              .attributes.server != "unknown"
+          message: The kubeconfig server URL is missing or unknown
           severity: high
       - name: apply-namespaces
         description: Create the cluster namespaces via the k0s manifest deployer
@@ -964,6 +974,12 @@ jobs:
         description: Reconcile the NATS chart via the k0s Helm extension
         dependsOn:
           - step: apply-secrets
+            condition:
+              type: or
+              conditions:
+                - type: succeeded
+                - type: skipped
+          - step: apply-namespaces
             condition:
               type: or
               conditions:

@@ -25,12 +25,13 @@ references another extension's model type: `@randybias/cherry-servers/servers`
   lockdown -> fresh-connection verify -> commit`.
   A commit is never reached before the fresh reachability check; a failure lets
   the armed revert fire.
-- DNS: a cheap authenticated Cloudflare read (`@webframp/cloudflare/zone` `get`)
-  runs before the record lookup, so a token failure is distinguishable from an
-  absent record. `lookup` first; an existing record with the same content is
-  adopted, different content is refused unless `adopt_dns` is true; DNS is never
-  created before the host passes its verify steps.
-- Teardown removes DNS first, resets k0s, deletes the server, then proves via
+- DNS: `@webframp/cloudflare/zone` `get` proves the token, then
+  `@webframp/cloudflare/dns` `list` returns the matching records (empty means
+  absent, never an error). The first-party dns-records `lookup` throws
+  identically on absence and on errors, so it is not used. DNS is created only
+  after the host passes its verify steps, and only when the list was empty.
+- Teardown lists the project (no allowFailure: an auth or network error fails
+  closed), removes DNS first, resets k0s, deletes the server, then proves via
   the Cherry and Cloudflare APIs that nothing remains. It does not edit peer
   entries on other mesh members; pre-registering the node's public key is a
   precondition outside this workflow.

@@ -1,0 +1,11 @@
+manifestVersion: 1
+name: "@randybias/k0s-cluster"
+version: "2026.10.17.1"
+description: "Install and operate a SHA-pinned k0s Kubernetes cluster on a Linux host over SSH, with a rendered k0s.yaml, readiness waits, kubeconfig capture, manifest stacks and Helm reconciliation. One model type serves any host: the SSH target and cluster inputs arrive per call, and state is keyed by the target host."
+license: Apache-2.0
+repository: https://github.com/randybias/swamp-extensions
+platforms: [darwin-aarch64, darwin-x86_64, linux-x86_64, linux-aarch64]
+labels: [k0s, kubernetes, cluster, ssh, helm, infrastructure, provisioning]
+additionalFiles: [README.md, LICENSE.txt]
+models:
+  - k0s_cluster.ts

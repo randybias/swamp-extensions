@@ -1,0 +1,3 @@
+stack example-stack
+  configmap.yaml
+  namespace.yaml

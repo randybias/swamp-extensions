@@ -1,0 +1,12 @@
+manifestVersion: 1
+name: "@randybias/kea-dhcp"
+version: "2026.10.17.1"
+description: "Install and configure an ISC Kea DHCPv4 server on one Linux host over SSH, with subnets, pools, host reservations and typed DHCP options. Every change is validated by Kea itself, written atomically and applied with config-set under an armed host-side revert that restores the previous configuration unless it is committed."
+license: Apache-2.0
+repository: https://github.com/randybias/swamp-extensions
+platforms: [darwin-aarch64, darwin-x86_64, linux-x86_64, linux-aarch64]
+labels: [kea, dhcp, dhcpv4, isc-kea, networking, infrastructure]
+additionalFiles: [README.md, LICENSE.txt]
+models:
+  - kea_dhcp.ts
+workflows: []

@@ -353,6 +353,31 @@ Deno.test("define_network: raw xml must name the requested network", async () =>
   assertEquals(has(f, "'net-define'"), false);
 });
 
+Deno.test("define_network: a commented-out <name> cannot spoof the raw xml check", async () => {
+  const f = fakeLibvirt(seq([
+    [
+      "'net-info'",
+      () => ({ code: 1, stderr: "error: failed to get network" }),
+    ],
+  ]));
+  const m = modelWith(f);
+  const { context } = createModelTestContext({ globalArgs: {} });
+  await assertRejects(
+    () =>
+      m.methods.define_network.execute(
+        m.methods.define_network.arguments.parse({
+          ...NET,
+          xml:
+            "<!-- <name>net-a</name> --><network><name>other</name></network>",
+        }),
+        context,
+      ),
+    Error,
+    "names the network",
+  );
+  assertEquals(has(f, "'net-define'"), false);
+});
+
 Deno.test("schema: devname uses the name grammar; arch is enum-bound", () => {
   const m = createModel();
   assertEquals(

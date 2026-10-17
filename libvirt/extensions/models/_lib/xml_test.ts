@@ -171,6 +171,33 @@ Deno.test("network xml: a dns domain with a quote is refused", () => {
   );
 });
 
+Deno.test("network xml: the dns domain is a top-level <network> child", () => {
+  const xml = renderNetworkXml({
+    name: "net-a",
+    mode: "nat",
+    gateway: "192.0.2.1",
+    prefix: 24,
+    dhcpStart: "192.0.2.10",
+    dhcpEnd: "192.0.2.99",
+    domain: "example.test",
+  });
+  assertEquals(
+    xml.includes("<domain name='example.test' localOnly='yes'/>"),
+    true,
+  );
+  assertEquals(/<dhcp>[\s\S]*?<domain /.test(xml), false);
+  assertEquals(xml.includes("<bootp/>"), false);
+});
+
+Deno.test("projection: a commented-out <name> does not win", () => {
+  const xml =
+    `<!-- <name>wrong</name> -->\n<network><name>net-a</name></network>`;
+  assertEquals(
+    JSON.parse(networkProjection(xml)).name,
+    "net-a",
+  );
+});
+
 Deno.test("state helpers: running, paused and off", () => {
   assertEquals(domainState({ state: "Running" }), "running");
   assertEquals(isRunningState("running"), true);

@@ -78,6 +78,7 @@ function indent(depth: number): string {
 export function renderNetworkXml(spec: NetworkSpec): string {
   assertName(spec.name, "network name");
   if (spec.bridge !== undefined) assertName(spec.bridge, "bridge name");
+  if (spec.domain !== undefined) assertDnsName(spec.domain);
   const lines: string[] = ["<network>"];
   lines.push(`${indent(1)}<name>${escapeXmlAttribute(spec.name)}</name>`);
   if (spec.mode !== "none") {
@@ -89,6 +90,14 @@ export function renderNetworkXml(spec: NetworkSpec): string {
       : undefined);
   if (bridge !== undefined) {
     lines.push(`${indent(1)}<bridge name='${bridge}'/>`);
+  }
+  // `<domain>` is a direct child of `<network>`, not a child of `<dhcp>`.
+  if (spec.domain !== undefined) {
+    lines.push(
+      `${indent(1)}<domain name='${
+        escapeXmlAttribute(spec.domain)
+      }' localOnly='yes'/>`,
+    );
   }
   if (spec.gateway !== undefined) {
     assertIpv4(spec.gateway);
@@ -104,15 +113,6 @@ export function renderNetworkXml(spec: NetworkSpec): string {
       lines.push(
         `${indent(3)}<range start='${spec.dhcpStart}' end='${spec.dhcpEnd}'/>`,
       );
-      if (spec.domain !== undefined) {
-        assertDnsName(spec.domain);
-        lines.push(`${indent(3)}<bootp/>`);
-        lines.push(
-          `${indent(3)}<domain name='${
-            escapeXmlAttribute(spec.domain)
-          }' localOnly='yes'/>`,
-        );
-      }
       lines.push(`${indent(2)}</dhcp>`);
     }
     lines.push(`${indent(1)}</ip>`);
@@ -180,15 +180,23 @@ export function renderDomainXml(spec: DomainSpec): string {
   return lines.join("\n") + "\n";
 }
 
+/** Removes XML comments so a commented-out tag cannot satisfy a lookup. */
+function stripXmlComments(xml: string): string {
+  return xml.replace(/<!--[\s\S]*?-->/g, "");
+}
+
 export function firstTagText(xml: string, tag: string): string {
-  const m = new RegExp(`<${tag}(?:\\s[^>]*)?>([^<]*)</${tag}>`).exec(xml);
+  const m = new RegExp(`<${tag}(?:\\s[^>]*)?>([^<]*)</${tag}>`).exec(
+    stripXmlComments(xml),
+  );
   return m ? m[1].trim() : "";
 }
 
 function firstTagAttr(xml: string, tag: string, attr: string): string {
-  const m = new RegExp(`<${tag}\\b[^>]*\\b${attr}='([^']*)'`).exec(xml);
+  const clean = stripXmlComments(xml);
+  const m = new RegExp(`<${tag}\\b[^>]*\\b${attr}='([^']*)'`).exec(clean);
   if (m) return m[1];
-  const d = new RegExp(`<${tag}\\b[^>]*\\b${attr}="([^"]*)"`).exec(xml);
+  const d = new RegExp(`<${tag}\\b[^>]*\\b${attr}="([^"]*)"`).exec(clean);
   return d ? d[1] : "";
 }
 
@@ -202,6 +210,7 @@ export function networkProjection(xml: string): string {
     name: firstTagText(xml, "name"),
     forward: firstTagAttr(xml, "forward", "mode") || "none",
     bridge: firstTagAttr(xml, "bridge", "name"),
+    domain: firstTagAttr(xml, "domain", "name"),
     ip: firstTagAttr(xml, "ip", "address"),
     prefix: firstTagAttr(xml, "ip", "prefix") ||
       firstTagAttr(xml, "ip", "netmask"),

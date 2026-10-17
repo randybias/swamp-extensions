@@ -86,7 +86,8 @@ exist, so it always follows a successful clone.
   channel; read the text from the sensitive resource. Capture is bounded by a
   remote `timeout -s KILL` around `script -qec` (a pty, since `virsh console`
   needs one and has no `--timeout`), with a local deadline as a backstop, and
-  `max_output_bytes` caps the bytes the transport returns.
+  `max_output_bytes` caps the bytes the transport returns. It passes `--force`,
+  so a capture takes over the console from any operator already attached to it.
 
 ## Install
 

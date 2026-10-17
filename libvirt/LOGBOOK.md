@@ -133,3 +133,17 @@ release.yaml).
 - **MEDIUM** — method descriptions: `define_network`, `define_domain` and
   `power` now start with the exact `DESTRUCTIVE.` prefix, and `define_domain`
   was trimmed to three sentences.
+
+## Round-1 residuals (triage)
+
+- `dns_domain` is a direct child of `<network>`
+  (`<domain name='...'
+  localOnly='yes'/>`), not a child of `<dhcp>`; confirmed
+  against the public libvirt formatnetwork docs. `<bootp/>` was only a
+  placeholder and is gone, and `domain` is now part of `networkProjection` so a
+  changed DNS domain is detected as drift.
+- XML comments are stripped before `firstTagText`/`firstTagAttr`, so a
+  commented-out `<name>` cannot satisfy the raw-XML name check or a projection
+  read.
+- The README documents that `console` passes `--force`, taking the console over
+  from any operator already attached.

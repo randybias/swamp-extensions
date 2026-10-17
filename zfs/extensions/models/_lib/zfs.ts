@@ -510,14 +510,27 @@ export function parseFindmnt(text: string): MountInfo[] {
   return out;
 }
 
-/** Parses `/proc/swaps`, returning the device of each active swap area. */
-export function parseSwaps(text: string): string[] {
+/** One active swap area from `/proc/swaps`. */
+export interface SwapArea {
+  /** The Filename column: a device path or a file path. */
+  device: string;
+  /** The Type column as the kernel reports it, e.g. `file` or `partition`. */
+  type: string;
+}
+
+/**
+ * Parses `/proc/swaps`, returning each active swap area's device and type. The
+ * type decides how the backing storage is resolved: a `partition` is a block
+ * device (`lsblk -s`), a `file` sits on a filesystem (`findmnt -T`).
+ */
+export function parseSwaps(text: string): SwapArea[] {
   const lines = text.split(/\r?\n/);
-  const out: string[] = [];
+  const out: SwapArea[] = [];
   for (let i = 1; i < lines.length; i++) {
     const line = lines[i].trim();
     if (line === "") continue;
-    out.push(line.split(/\s+/)[0]);
+    const cols = line.split(/\s+/);
+    out.push({ device: cols[0] ?? "", type: cols[1] ?? "" });
   }
   return out;
 }

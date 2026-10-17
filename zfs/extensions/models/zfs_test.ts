@@ -1283,7 +1283,7 @@ function systemPoolRoute(
     findmntCode?: number;
     zvols?: string[];
     devices?: Record<string, string>;
-    swaps?: string[];
+    swaps?: (string | { device: string; type?: string; source?: string })[];
     readlinkCode?: number;
     lsblkCode?: number;
     ancestors?: Record<string, string[]>;
@@ -1300,12 +1300,24 @@ function systemPoolRoute(
       return { code: opts.findmntCode ?? 0, stdout: findmnt };
     }
     if (has(remote, "/proc/swaps")) {
-      const swaps = opts.swaps ?? [];
+      const swaps = (opts.swaps ?? []).map((s) =>
+        typeof s === "string" ? { device: s, type: "partition" } : s
+      );
       const body = [
         "Filename Type Size Used Priority",
-        ...swaps.map((d) => `${d} partition 0 0 -2`),
+        ...swaps.map((s) => `${s.device} ${s.type ?? "partition"} 0 0 -2`),
       ].join("\n");
       return { code: 0, stdout: `${body}\n` };
+    }
+    if (has(remote, "'findmnt' '-n' '-o' 'SOURCE' '-T'")) {
+      const file =
+        /'findmnt' '-n' '-o' 'SOURCE' '-T' '([^']+)'/.exec(remote)?.[1] ?? "";
+      for (const s of opts.swaps ?? []) {
+        if (typeof s !== "string" && s.device === file && s.source) {
+          return { code: 0, stdout: `${s.source}\n` };
+        }
+      }
+      return { code: 1, stdout: "", stderr: "findmnt: no such file" };
     }
     if (has(remote, P.poolVolumes)) {
       const zvols = opts.zvols ?? [];
@@ -1500,5 +1512,109 @@ Deno.test("a failing ancestry probe fails closed; a stacked swap is refused", as
       ),
     SystemPoolError,
     "stacked on zvol",
+  );
+});
+
+Deno.test("a stock swap file does not refuse a pool on another disk", async () => {
+  // The Ubuntu default is a swap file, not a partition; lsblk cannot read it,
+  // so the backing filesystem is judged instead.
+  const m = model(
+    systemPoolRoute({ target: "/", source: "/dev/sda1" }, {
+      swaps: [{ device: "/swap.img", type: "file", source: "/dev/sda1" }],
+    }),
+  );
+  const out = await m.methods.export_pool.execute(
+    m.methods.export_pool.arguments.parse({ ssh: SSH, pool: "tank" }),
+    createModelTestContext().context,
+  ) as { result: { exported: boolean } };
+  assertEquals(out.result.exported, true);
+});
+
+Deno.test("a swap file on a pool dataset is refused", async () => {
+  const destroy = model(
+    systemPoolRoute({ target: "/", source: "/dev/sda1" }, {
+      swaps: [{ device: "/swap.img", type: "file", source: "tank/swapfs" }],
+    }),
+  );
+  await assertRejects(
+    () =>
+      destroy.methods.destroy_pool.execute(
+        destroy.methods.destroy_pool.arguments.parse({
+          ssh: SSH,
+          pool: "tank",
+          recursive: true,
+        }),
+        createModelTestContext().context,
+      ),
+    SystemPoolError,
+    "backed by this pool",
+  );
+  const exp = model(
+    systemPoolRoute({ target: "/", source: "/dev/sda1" }, {
+      swaps: [{ device: "/swap.img", type: "file", source: "tank/swapfs" }],
+    }),
+  );
+  await assertRejects(
+    () =>
+      exp.methods.export_pool.execute(
+        exp.methods.export_pool.arguments.parse({ ssh: SSH, pool: "tank" }),
+        createModelTestContext().context,
+      ),
+    SystemPoolError,
+    "backed by this pool",
+  );
+});
+
+Deno.test("a swap file on a device stacked on a pool zvol is refused", async () => {
+  const m = model(
+    systemPoolRoute({ target: "/", source: "/dev/sda1" }, {
+      zvols: ["tank/swap"],
+      devices: { "tank/swap": "/dev/zd0" },
+      swaps: [{ device: "/swap.img", type: "file", source: "/dev/dm-0" }],
+      ancestors: { "/dev/dm-0": ["/dev/dm-0", "/dev/zd0"] },
+    }),
+  );
+  await assertRejects(
+    () =>
+      m.methods.export_pool.execute(
+        m.methods.export_pool.arguments.parse({ ssh: SSH, pool: "tank" }),
+        createModelTestContext().context,
+      ),
+    SystemPoolError,
+    "stacked on zvol",
+  );
+});
+
+Deno.test("an unresolvable swap file and an unknown swap type fail closed", async () => {
+  const unresolvable = model(
+    systemPoolRoute({ target: "/", source: "/dev/sda1" }, {
+      swaps: [{ device: "/swap.img", type: "file" }],
+    }),
+  );
+  await assertRejects(
+    () =>
+      unresolvable.methods.export_pool.execute(
+        unresolvable.methods.export_pool.arguments.parse({
+          ssh: SSH,
+          pool: "tank",
+        }),
+        createModelTestContext().context,
+      ),
+    SystemPoolError,
+    "could not resolve the filesystem backing swap file",
+  );
+  const unknown = model(
+    systemPoolRoute({ target: "/", source: "/dev/sda1" }, {
+      swaps: [{ device: "/dev/sdz", type: "raid" }],
+    }),
+  );
+  await assertRejects(
+    () =>
+      unknown.methods.export_pool.execute(
+        unknown.methods.export_pool.arguments.parse({ ssh: SSH, pool: "tank" }),
+        createModelTestContext().context,
+      ),
+    SystemPoolError,
+    "unsupported swap type",
   );
 });

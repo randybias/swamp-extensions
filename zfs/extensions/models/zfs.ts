@@ -469,6 +469,44 @@ async function assertNoZvolAncestor(
   }
 }
 
+/**
+ * Refuses when a swap *file* sits on storage this pool backs. A file can never
+ * be a zvol, but its filesystem can: `findmnt -T` resolves the backing source,
+ * which is then judged like any other mount source (a dataset of the pool, a
+ * pool zvol, or a block device stacked on one). A failed or empty probe fails
+ * closed.
+ */
+async function assertSwapFileNotFromPool(
+  deps: ZfsDeps,
+  target: SshTarget,
+  pool: string,
+  file: string,
+  zvolDevices: ReadonlySet<string>,
+): Promise<void> {
+  const res = await exec(deps.ssh, target, [
+    "findmnt",
+    "-n",
+    "-o",
+    "SOURCE",
+    "-T",
+    file,
+  ]);
+  const source = canonicalMountSource(res.stdout.trim());
+  if (res.exit_code !== 0 || source === "") {
+    throw new SystemPoolError(
+      `refusing to touch pool ${pool}: could not resolve the filesystem backing swap file ${file} (exit ${res.exit_code})`,
+    );
+  }
+  if (mountFromPool(source, pool, zvolDevices)) {
+    throw new SystemPoolError(
+      `refusing to touch pool ${pool}: swap file ${file} lives on ${source}, backed by this pool`,
+    );
+  }
+  if (source.startsWith("/dev/")) {
+    await assertNoZvolAncestor(deps, target, pool, source, zvolDevices);
+  }
+}
+
 async function assertNotSystemPool(
   deps: ZfsDeps,
   target: SshTarget,
@@ -523,16 +561,38 @@ async function assertNotSystemPool(
       `refusing to touch pool ${pool}: could not read /proc/swaps (exit ${swaps.exit_code})`,
     );
   }
-  for (const device of parseSwaps(swaps.stdout)) {
-    if (
-      isZvolDevice(device, zvolDevices) ||
-      device.startsWith(`/dev/zvol/${pool}/`)
-    ) {
-      throw new SystemPoolError(
-        `refusing to touch pool ${pool}: ${device} is active swap backed by this pool`,
+  for (const swap of parseSwaps(swaps.stdout)) {
+    // `/swap.img` and similar files are the stock Ubuntu default; lsblk cannot
+    // read a file, so a swap file is judged through its backing filesystem.
+    if (swap.type === "file") {
+      await assertSwapFileNotFromPool(
+        deps,
+        target,
+        pool,
+        swap.device,
+        zvolDevices,
       );
+      continue;
     }
-    await assertNoZvolAncestor(deps, target, pool, device, zvolDevices);
+    // A partition is a block device; judge it and its ancestry directly.
+    if (swap.type === "partition") {
+      if (
+        isZvolDevice(swap.device, zvolDevices) ||
+        swap.device.startsWith(`/dev/zvol/${pool}/`)
+      ) {
+        throw new SystemPoolError(
+          `refusing to touch pool ${pool}: ${swap.device} is active swap backed by this pool`,
+        );
+      }
+      await assertNoZvolAncestor(deps, target, pool, swap.device, zvolDevices);
+      continue;
+    }
+    // Any other swap type is not understood, so it fails closed.
+    throw new SystemPoolError(
+      `refusing to touch pool ${pool}: unsupported swap type ${
+        JSON.stringify(swap.type)
+      } for ${swap.device}`,
+    );
   }
 }
 

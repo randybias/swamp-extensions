@@ -20,6 +20,7 @@ import {
   parsePoolVdevs,
   parseSize,
   parseSnapshots,
+  parseSwaps,
   parseTabbed,
   poolCreateArgv,
   poolDescendantsArgv,
@@ -388,4 +389,18 @@ Deno.test("parseFindmnt rejects a malformed node instead of skipping it", () => 
   ) {
     assertThrows(() => parseFindmnt(bad), Error, undefined, bad);
   }
+});
+
+Deno.test("parseSwaps reads the real /proc/swaps shapes for a file and a partition", () => {
+  const text = [
+    "Filename                                Type            Size            Used            Priority",
+    "/swap.img                               file            2097148         0               -2",
+    "/dev/sda2                               partition       4194300         0               -3",
+    "",
+  ].join("\n");
+  assertEquals(parseSwaps(text), [
+    { device: "/swap.img", type: "file" },
+    { device: "/dev/sda2", type: "partition" },
+  ]);
+  assertEquals(parseSwaps("Filename Type Size Used Priority\n"), []);
 });

@@ -245,3 +245,25 @@ and only the probe-running code kept. The guard was NOT rewritten here.
   exactly `/dev/zd<digits>`; anything else refuses.
 - **Nested bind suffix (MEDIUM).** The findmnt `[...]` suffix is stripped from
   the first `[` (dataset names cannot contain one), so `tank[/a[b]]` is refused.
+
+## Live bug: swap check refused every pool on a stock Ubuntu host
+
+`/proc/swaps` was parsed for the device only, and every entry went through
+`lsblk -s`. The Ubuntu default swap is a **file** (`/swap.img`); `lsblk` exits
+32 ("not a block device") on it, and the fail-closed rule then refused
+`destroy_pool` and `export_pool` on every pool.
+
+Fix: `parseSwaps` now returns `{device, type}` and the swap loop branches.
+
+- **`file`**: a swap file is never a zvol, but its filesystem can be backed by
+  one. `findmnt -n -o SOURCE -T <file>` resolves the backing source, which is
+  then judged like any mount source — a dataset of the pool, a pool zvol, or a
+  block device whose `lsblk -s` ancestry includes a `/dev/zdN` of the pool.
+- **`partition`**: unchanged `lsblk -s` ancestry path.
+- **anything else, or a failed/empty `findmnt`**: refuses.
+
+Tests added: `parseSwaps` on the real `/proc/swaps` shapes (file and partition);
+a stock `/swap.img` on `/dev/sda1` does not refuse a pool on another disk; a
+swap file on a pool dataset refuses (destroy_pool and export_pool); a swap file
+on `/dev/dm-0` stacked on a pool zvol refuses; an unresolvable swap file and an
+unknown swap type fail closed. 157 tests.

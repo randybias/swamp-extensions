@@ -2,6 +2,7 @@
 # is-active U / stop U
 case "$1" in
   is-active) if [ -e "$SIMROOT/state/units/$2" ]; then echo active; exit 0; else echo inactive; exit 3; fi;;
+  reset-failed|disable) exit 0;;
   stop) rm -f "$SIMROOT/state/units/$2"; exit 0;;
 esac
 exit 0

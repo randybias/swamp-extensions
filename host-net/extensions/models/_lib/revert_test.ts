@@ -73,6 +73,24 @@ Deno.test("the clear script gates on a fail marker and passing checks, then stop
   );
 });
 
+Deno.test("restore stops its own timer when it has run, and the disarm resets failed state", () => {
+  const script = renderRestoreScript(CTX);
+  const timer = 'systemctl stop "host-net-revert-0000000000000000.timer"';
+  assertEquals(script.split(timer).length - 1, 2, "ran and superseded paths");
+  assertEquals(script.includes("reset-failed"), true);
+  // Never stop the service: the restore may be running inside it.
+  assertEquals(
+    script.includes(
+      'systemctl stop "host-net-revert-0000000000000000.service"',
+    ),
+    false,
+  );
+  assertEquals(
+    renderDisarmScript(CTX.token, true).includes("reset-failed"),
+    true,
+  );
+});
+
 Deno.test("restore exits non-zero when invoked with the wrong token", () => {
   const script = renderRestoreScript(CTX);
   assertEquals(script.includes('[ "${1-}" = "$TOKEN" ]'), true);

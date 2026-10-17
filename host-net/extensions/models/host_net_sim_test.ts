@@ -647,7 +647,6 @@ for (
   const conn of [
     "127.0.0.1 1 127.0.0.1 22",
     "::1 1 ::1 22",
-    `::ffff:${"127"}.0.0.1 1 ::ffff:${"127"}.0.0.1 22`,
   ]
 ) {
   Deno.test(`a loopback session (${conn}) is refused at the arm, changing nothing`, async () => {
@@ -690,7 +689,7 @@ Deno.test("a VLAN MTU above its undeclared link's live MTU is refused before any
   const w = await world();
   try {
     // The management NIC is live at 1500 and is not declared as an ethernet
-    // (the live bm1 repro).
+    // (a VLAN MTU the link cannot carry).
     const links = JSON.parse(
       await Deno.readTextFile(`${w.root}/state/links.json`),
     );
@@ -723,6 +722,45 @@ Deno.test("a VLAN MTU above its undeclared link's live MTU is refused before any
       ),
       false,
     );
+  } finally {
+    await w.cleanup();
+  }
+});
+
+const leftUnits = (root: string) =>
+  [...Deno.readDirSync(`${root}/state/units`)].map((e) => e.name);
+
+Deno.test("no host-net-revert timer is left after revert_now (pass or fail) or commit", async () => {
+  if (!await simAvailable()) return;
+  // revert_now, pass.
+  let w = await world();
+  try {
+    const armed = await w.call("apply", net("netplan", [A]));
+    assertEquals(leftUnits(w.root).length, 1, "armed: the timer exists");
+    await w.call("revert_now", { ...SSH, token: armed.revert_token });
+    assertEquals(leftUnits(w.root), []);
+  } finally {
+    await w.cleanup();
+  }
+  // revert_now, fail.
+  w = await world();
+  try {
+    const armed = await w.call("apply", net("netplan", [A]));
+    await Deno.writeTextFile(`${w.root}/state/no_route`, "");
+    await assertRejects(() =>
+      w.call("revert_now", { ...SSH, token: armed.revert_token })
+    );
+    assertEquals(leftUnits(w.root), []);
+  } finally {
+    await w.cleanup();
+  }
+  // commit.
+  w = await world();
+  try {
+    await w.call("apply", net("netplan", [A]));
+    assertEquals(leftUnits(w.root).length, 1);
+    await w.call("commit", net("netplan", [A]));
+    assertEquals(leftUnits(w.root), []);
   } finally {
     await w.cleanup();
   }

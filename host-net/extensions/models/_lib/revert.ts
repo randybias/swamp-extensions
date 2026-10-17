@@ -198,6 +198,10 @@ cur=
 if [ -f "${CURRENT_PATH}" ]; then read cur _ < "${CURRENT_PATH}" || true; fi
 if [ "$cur" != "$TOKEN" ]; then
   rm -rf "$DIR"
+systemctl stop "${unitName(ctx.token)}.timer" 2>/dev/null || true
+systemctl reset-failed "${unitName(ctx.token)}.timer" "${
+    unitName(ctx.token)
+  }.service" 2>/dev/null || true
   exit 0
 fi
 # Only a restore that is really running records an outcome: a refused call
@@ -234,6 +238,12 @@ ${RUN_CHECKS}
 RESULT=$CHECK
 write_result
 if [ "$RESULT" = pass ]; then rm -f "${CURRENT_PATH}"; fi
+# The revert has run, however it ended: its timer is residue. (Only the timer:
+# this may be the service the timer started.)
+systemctl stop "${unitName(ctx.token)}.timer" 2>/dev/null || true
+systemctl reset-failed "${unitName(ctx.token)}.timer" "${
+    unitName(ctx.token)
+  }.service" 2>/dev/null || true
 trap - EXIT
 exit 0
 `;
@@ -362,6 +372,7 @@ systemctl stop "${unit}.timer"
 exec 9>"${LOCK_PATH}"
 flock -w 30 9 || { echo 'host-net: lock busy' >&2; exit 75; }
 ${active}systemctl stop "${unit}.service" 2>/dev/null || true
+systemctl reset-failed "${unit}.timer" "${unit}.service" 2>/dev/null || true
 cur=
 if [ -f "${CURRENT_PATH}" ]; then read cur _ < "${CURRENT_PATH}" || true; fi
 if [ "$cur" = ${shq(token)} ]; then rm -f "${CURRENT_PATH}"; fi

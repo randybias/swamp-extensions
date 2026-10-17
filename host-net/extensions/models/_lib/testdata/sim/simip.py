@@ -40,11 +40,14 @@ def main():
             out = {"dst": a[3], **path()}
             if "from" in a:
                 # Like the kernel: with a source given there is no prefsrc, and
-                # a source that is not configured locally is refused.
+                # any locally configured source is accepted, whatever device it
+                # is on; a loopback source routes through lo.
                 frm = a[a.index("from") + 1]
-                if frm != devaddr()[0] or flag("no_addr"):
+                if flag("no_addr"):
                     print("RTNETLINK answers: Invalid argument", file=sys.stderr); return 2
                 out["from"] = frm
+                if frm.startswith("127.") or frm == "::1":
+                    out["dev"] = "lo"
             else:
                 out["prefsrc"] = devaddr()[0]
             print(json.dumps([out])); return 0

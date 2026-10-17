@@ -501,6 +501,35 @@ async function exists(
   return false;
 }
 
+/**
+ * Refuses a destination that is a symlink or a directory, tested with no-follow
+ * so nothing is ever written through a link or into a directory.
+ */
+async function assertReplaceable(
+  deps: SshDeps,
+  target: SshTarget,
+  path: string,
+): Promise<void> {
+  const link = await sshExec(deps, target, ["test", "-L", path]);
+  if (link.exit_code === 0) {
+    throw new SshError(
+      `secret file destination ${path} is a symlink; refusing to replace it`,
+    );
+  }
+  if (link.exit_code !== 1) {
+    throw new SshError(`could not test ${path} (exit ${link.exit_code})`);
+  }
+  const dir = await sshExec(deps, target, ["test", "-d", path]);
+  if (dir.exit_code === 0) {
+    throw new SshError(
+      `secret file destination ${path} is a directory; refusing to replace it`,
+    );
+  }
+  if (dir.exit_code !== 1) {
+    throw new SshError(`could not test ${path} (exit ${dir.exit_code})`);
+  }
+}
+
 /** Writes one stored-state record. */
 async function writeState(
   context: MethodContext,
@@ -560,6 +589,7 @@ export function createModel(deps: SshDeps = denoDeps): SecretFileModel {
           const args = rawArgs as WriteArgs;
           assertRemotePath(args.path);
           const target = toTarget(args);
+          await assertReplaceable(deps, target, args.path);
           const bytes = resolveContent(args);
           const localSha = await sha256Hex(bytes);
           const spec = chownSpec(args.owner, args.group);
@@ -593,6 +623,9 @@ export function createModel(deps: SshDeps = denoDeps): SecretFileModel {
                   `chown ${stage}`,
                 );
               }
+              // Re-check the destination immediately before the rename, so a
+              // symlink or directory swapped in during staging is still caught.
+              await assertReplaceable(deps, target, args.path);
               requireOk(
                 await sshExec(deps, target, ["mv", "-T", stage, args.path]),
                 `mv ${args.path}`,

@@ -12,6 +12,7 @@ import {
   sha256Hex,
   SshConfigError,
   type SshDeps,
+  SshError,
 } from "./_lib/ssh.ts";
 import {
   chownSpec,
@@ -79,6 +80,9 @@ function stagedRunner(options: {
       return { code: 0, stdout: "MISSING\n", stderr: "" };
     }
     if (command.includes("'test'")) {
+      if (command.includes("'-L'") || command.includes("'-d'")) {
+        return { code: 1, stdout: "", stderr: "" };
+      }
       return { code: options.present ? 0 : 1, stdout: "", stderr: "" };
     }
     if (command.includes("mktemp")) {
@@ -319,7 +323,13 @@ Deno.test("write re-chowns only when the live owner differs", async () => {
     if (command.includes("DIRECTORY") || command.includes("MISSING")) {
       return { code: 0, stdout: "MISSING\n", stderr: "" };
     }
-    if (command.includes("'test'")) return { code: 0, stdout: "", stderr: "" };
+    if (command.includes("'test'")) {
+      return {
+        code: command.includes("'-L'") || command.includes("'-d'") ? 1 : 0,
+        stdout: "",
+        stderr: "",
+      };
+    }
     if (command.includes("mktemp")) {
       return { code: 0, stdout: `${sha} 600\n`, stderr: "" };
     }
@@ -481,4 +491,42 @@ Deno.test("the factory returns an independent model", () => {
   assertEquals(m.type, model.type);
   assert(m !== model);
   assertEquals(typeof m.methods.write.execute, "function");
+});
+
+Deno.test("write refuses a symlink destination without following it", async () => {
+  const { run, calls } = fakeRun((command) =>
+    command.includes("'test'") && command.includes("'-L'")
+      ? { code: 0, stdout: "", stderr: "" }
+      : { code: 0, stdout: "", stderr: "" }
+  );
+  const m = createModel(deps(run));
+  const { context, written } = testContext();
+  await assertRejects(
+    () => m.methods.write.execute(WRITE, context),
+    SshError,
+    "symlink",
+  );
+  assertEquals(calls.some((c) => c.command.includes("mktemp")), false);
+  assertEquals(written.length, 0);
+});
+
+Deno.test("write refuses a directory destination", async () => {
+  const { run, calls } = fakeRun((command) => {
+    if (command.includes("'test'") && command.includes("'-L'")) {
+      return { code: 1, stdout: "", stderr: "" };
+    }
+    if (command.includes("'test'") && command.includes("'-d'")) {
+      return { code: 0, stdout: "", stderr: "" };
+    }
+    return { code: 0, stdout: "", stderr: "" };
+  });
+  const m = createModel(deps(run));
+  const { context, written } = testContext();
+  await assertRejects(
+    () => m.methods.write.execute(WRITE, context),
+    SshError,
+    "directory",
+  );
+  assertEquals(calls.some((c) => c.command.includes("mktemp")), false);
+  assertEquals(written.length, 0);
 });

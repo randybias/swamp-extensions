@@ -59,3 +59,11 @@ reviewed once and shared.
 - LOW: README dotenv example uses vault references only and documents the real
   `secret-<32 hex>` key; `verify` no longer accepts `hmac_key`; the `write`
   description is three sentences.
+
+- 2026-10-17 live cell 8 (symlink destination): `write` staged to
+  `<path>.secret-stage-<uuid>` and renamed with `mv -T`, so the canonical
+  upload's symlink/directory guard only ever saw the stage path and a symlink
+  destination was replaced. `write` now checks the destination with no-follow
+  (`test -L`, then `test -d`) before staging and again immediately before the
+  rename, refusing a symlink or directory with a typed `SshError`. Tests cover
+  both. The rest of the live matrix passed 12/13; the process scan was clean.

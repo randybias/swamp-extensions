@@ -152,6 +152,12 @@ const NON_BLOCK_FS = new Set([
   "swap",
 ]);
 
+/** Filesystems that can span several block devices under one UUID. */
+const MULTI_DEVICE_FS = new Set(["btrfs", "bcachefs"]);
+
+/** mdadm's own answers for a device that is simply not an array member. */
+const NOT_A_MEMBER = /No md superblock|not an md|does not appear to be an md/i;
+
 /** A refusal builder. */
 function refuse(
   code: RefusalCode,
@@ -298,7 +304,9 @@ class Resolver {
   private readonly aliases = new Map<string, string>();
 
   constructor(private readonly graph: Graph, links: CommandProbe) {
-    if (links.code !== 0) unverifiable("link probe failed", { exit: links.code });
+    if (links.code !== 0) {
+      unverifiable("link probe failed", { exit: links.code });
+    }
     for (const line of links.stdout.split("\n")) {
       const at = line.indexOf(" ");
       if (at < 1) continue;
@@ -405,7 +413,9 @@ function parseFstab(text: string): FstabEntry[] {
     const line = raw.trim();
     if (line === "" || line.startsWith("#")) continue;
     const f = line.split(/\s+/);
-    if (f.length < 3) unverifiable("an /etc/fstab line cannot be parsed", { line });
+    if (f.length < 3) {
+      unverifiable("an /etc/fstab line cannot be parsed", { line });
+    }
     out.push({ spec: f[0], target: f[1], fstype: f[2], options: f[3] ?? "" });
   }
   return out;
@@ -436,7 +446,7 @@ function parseFindmnt(probe: CommandProbe): Mount[] {
       source: str(raw.source),
       fstype: str(raw.fstype),
     });
-    if (Array.isArray(raw.children)) for (const c of raw.children) visit(c);
+    if (Array.isArray(raw.children)) { for (const c of raw.children) visit(c); }
   };
   for (const r of roots) visit(r);
   return mounts;
@@ -509,7 +519,9 @@ class Collector {
   protect(path: string, reason: string): void {
     for (const p of component(this.graph, path)) {
       const list = (this.devices[p] ??= []);
-      const why = p === path ? reason : `part of the stack of ${path}: ${reason}`;
+      const why = p === path
+        ? reason
+        : `part of the stack of ${path}: ${reason}`;
       if (!list.includes(why)) list.push(why);
     }
   }
@@ -539,7 +551,9 @@ function resolveSpec(
   const matches: string[] = [];
   const test = field[key];
   if (test) {
-    for (const node of graph.nodes.values()) if (test(node)) matches.push(node.path);
+    for (const node of graph.nodes.values()) {
+      if (test(node)) matches.push(node.path);
+    }
   }
   if (matches.length > 0) return matches;
   // Udev-less host: lsblk could not label it, blkid may still know the device.
@@ -599,7 +613,9 @@ function compute(input: ProbeInputs): ProtectedSet {
 
   let fstab: FstabEntry[] = [];
   if (input.fstab.state === "error") {
-    unverifiable("/etc/fstab could not be read", { detail: input.fstab.detail });
+    unverifiable("/etc/fstab could not be read", {
+      detail: input.fstab.detail,
+    });
   } else if (input.fstab.state === "ok") {
     fstab = parseFstab(input.fstab.text);
   }
@@ -618,9 +634,10 @@ function compute(input: ProbeInputs): ProtectedSet {
       return;
     }
     // An md array that is not assembled has no lsblk row but is in mdstat.
-    const mdName = /^\/dev\/(md[A-Za-z0-9_]*)$/.exec(source.replace(/\[[^\]]*\]$/, ""))
-      ?.[1] ??
-      /^\/dev\/md\/(.+)$/.exec(source)?.[1];
+    const mdName =
+      /^\/dev\/(md[A-Za-z0-9_]*)$/.exec(source.replace(/\[[^\]]*\]$/, ""))
+        ?.[1] ??
+        /^\/dev\/md\/(.+)$/.exec(source)?.[1];
     const array = mdArrays.find((a) => a.name === mdName);
     if (array && array.members.length > 0) {
       for (const member of array.members) {
@@ -721,6 +738,24 @@ function compute(input: ProbeInputs): ProtectedSet {
     }
   }
 
+  // 3b. A multi-device filesystem is reported under one device in the mount
+  // table but lives on every device carrying its UUID.
+  for (const path of Object.keys(collector.devices)) {
+    const node = graph.nodes.get(path);
+    if (!node || !node.uuid || !MULTI_DEVICE_FS.has(node.fstype)) continue;
+    for (const other of graph.nodes.values()) {
+      if (
+        other.path !== path && other.fstype === node.fstype &&
+        other.uuid === node.uuid
+      ) {
+        collector.protect(
+          other.path,
+          `shares ${node.fstype} filesystem ${node.uuid} with ${path}`,
+        );
+      }
+    }
+  }
+
   // 4. md arrays: members from mdstat (any flag), and by array UUID.
   const protectedNow = (): string[] => Object.keys(collector.devices);
   for (const array of mdArrays) {
@@ -740,6 +775,17 @@ function compute(input: ProbeInputs): ProtectedSet {
         });
       }
       collector.protect(p, `member of protected array ${array.name}`);
+    }
+  }
+  for (const [path, probe] of Object.entries(input.mdExamine)) {
+    if (probe.code === 0) continue;
+    // Only mdadm's explicit "not a member" answer is a clean negative. A
+    // missing binary, a permission or I/O error says nothing about the device.
+    if (probe.code === 127 || !NOT_A_MEMBER.test(probe.stdout)) {
+      unverifiable("mdadm could not examine a device", {
+        device: path,
+        exit: probe.code,
+      });
     }
   }
   const examineFor = (path: string): string | null => {
@@ -803,12 +849,18 @@ function compute(input: ProbeInputs): ProtectedSet {
       if (f.length < 2 || !collector.volumeGroups.has(f[1])) continue;
       const pv = resolver.resolve(f[0]);
       if (!pv) {
-        unverifiable("a physical volume of a protected group cannot be resolved", {
-          volumeGroup: f[1],
-          device: f[0],
-        });
+        unverifiable(
+          "a physical volume of a protected group cannot be resolved",
+          {
+            volumeGroup: f[1],
+            device: f[0],
+          },
+        );
       }
-      collector.protect(pv, `physical volume of protected volume group ${f[1]}`);
+      collector.protect(
+        pv,
+        `physical volume of protected volume group ${f[1]}`,
+      );
     }
   }
 
@@ -835,7 +887,9 @@ function compute(input: ProbeInputs): ProtectedSet {
         }
         collector.pools.add(pool);
         for (const vdev of vdevs) {
-          const path = resolver.resolve(vdev.startsWith("/") ? vdev : `/dev/${vdev}`);
+          const path = resolver.resolve(
+            vdev.startsWith("/") ? vdev : `/dev/${vdev}`,
+          );
           if (!path) {
             unverifiable("a ZFS vdev cannot be resolved to a device", {
               pool,
@@ -957,7 +1011,8 @@ function conflict(
         if (uuid && uuids.has(uuid)) {
           return {
             code: "protected",
-            message: "the device is a member of an md array that backs the system",
+            message:
+              "the device is a member of an md array that backs the system",
             detail: { device: path, member: p, arrayUuid: uuid },
           };
         }
@@ -966,7 +1021,8 @@ function conflict(
         if (uuids.has(normalizeUuid(node.uuid))) {
           return {
             code: "protected",
-            message: "the device is a member of an md array that backs the system",
+            message:
+              "the device is a member of an md array that backs the system",
             detail: { device: path, member: p },
           };
         }
@@ -975,7 +1031,8 @@ function conflict(
       if (vg && vgs.has(vg)) {
         return {
           code: "protected",
-          message: "the device is a physical volume of a protected volume group",
+          message:
+            "the device is a physical volume of a protected volume group",
           detail: { device: path, member: p, volumeGroup: vg },
         };
       }
@@ -1002,7 +1059,9 @@ export function assess(
   previous?: ProtectedSet,
 ): Assessment {
   try {
-    if (candidates.length === 0) unverifiable("no candidate devices were given");
+    if (candidates.length === 0) {
+      unverifiable("no candidate devices were given");
+    }
     let set = compute(input);
     if (previous) set = unionProtected(previous, set);
     const hit = conflict(set, input, candidates);

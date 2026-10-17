@@ -3,6 +3,7 @@ import { createModelTestContext } from "jsr:@swamp-club/swamp-testing@0.20261014
 import { model } from "./kubevirt.ts";
 import {
   clusterFingerprint16,
+  fieldManager,
   type KubectlResult,
   KubevirtError,
   operatorStateKey,
@@ -926,4 +927,383 @@ async function fingerprint(): Promise<string> {
 // The operator state key is derived from the fingerprint; assert the shape.
 Deno.test("the uninstall state key is the fingerprint plus kubevirt", async () => {
   assertEquals(await operatorStateKey(KC), `${await fingerprint()}/kubevirt`);
+});
+
+// --- A cluster that serves a kind only once its CRD exists -------------------
+
+const NO_TYPE = (kind: string) => ({
+  code: 1,
+  stderr: `error: the server doesn't have a resource type "${kind}"`,
+});
+const CDI_NS = "apiVersion: v1\nkind: Namespace\nmetadata: {name: cdi}\n";
+
+/**
+ * A fake API server that answers `get kubevirt` / `get cdi` with "the server
+ * doesn't have a resource type" until the matching operator manifest has been
+ * applied, like a real cluster without the CRDs.
+ */
+function crdCluster(
+  o: { kvCrd?: boolean; cdiCrd?: boolean; crApplyFailures?: number } = {},
+) {
+  const s = {
+    kvCrd: o.kvCrd ?? false,
+    cdiCrd: o.cdiCrd ?? false,
+    kv: null as string | null,
+    cdi: null as string | null,
+    crFailures: o.crApplyFailures ?? 0,
+    cdiNamespace: false,
+  };
+  const route = (c: Call): Partial<KubectlResult> => {
+    if (verb(c) === "get" && sub(c) === "kubevirt") {
+      return s.kvCrd ? { stdout: s.kv ?? "" } : NO_TYPE("kubevirt");
+    }
+    if (verb(c) === "get" && sub(c) === "cdi") {
+      return s.cdiCrd ? { stdout: s.cdi ?? "" } : NO_TYPE("cdi");
+    }
+    if (verb(c) === "get" && sub(c) === "nodes") return { stdout: nodeList };
+    if (verb(c) === "get" && sub(c) === "namespace") {
+      return {
+        stdout: s.cdiNamespace && c.args.includes("cdi")
+          ? JSON.stringify({ kind: "Namespace", metadata: { name: "cdi" } })
+          : "",
+      };
+    }
+    if (verb(c) === "apply") {
+      const body = c.stdin ?? "";
+      if (body === MANIFEST) s.kvCrd = true;
+      else if (body === CDI_NS) {
+        s.cdiCrd = true;
+        s.cdiNamespace = true;
+      } else if (body.includes("kind: KubeVirt")) {
+        if (s.crFailures > 0) {
+          s.crFailures--;
+          return {
+            code: 1,
+            stderr:
+              'no matches for kind "KubeVirt" in version "kubevirt.io/v1"',
+          };
+        }
+        s.kv = crJson();
+      } else if (body.includes("kind: CDI")) {
+        s.cdi = JSON.stringify({
+          kind: "CDI",
+          status: {
+            phase: "Deployed",
+            conditions: [{ type: "Available", status: "True" }],
+          },
+        });
+      }
+    }
+    return {};
+  };
+  return { s, route };
+}
+
+const kvFetch = (extra?: { cdi: string }) => (url: string) =>
+  url.includes("kubevirt-operator")
+    ? { status: 200, body: MANIFEST }
+    : extra && url.includes("containerized-data-importer")
+    ? { status: 200, body: extra.cdi }
+    : { status: 404, body: "" };
+
+Deno.test("a fresh cluster without the CRDs: install works, KubeVirt then CDI", async () => {
+  const cdiSha = await sha256(CDI_NS);
+  const k = crdCluster();
+  const h = harness(k.route, { fetch: kvFetch({ cdi: CDI_NS }) });
+  try {
+    const ctx = testCtx();
+    const out = await model.methods.install.execute({
+      ...INSTALL,
+      install_cdi: true,
+      cdi_version: "v1.2.3",
+      cdi_operator_manifest_sha256: cdiSha,
+    }, ctx.context) as { result: Record<string, unknown> };
+    assertEquals(out.result.kubevirt_version, "v1.2.3");
+    assertEquals(h.calls.filter((c) => verb(c) === "apply").length, 4);
+    assertEquals(
+      (ctx.getWrittenResources()[0].data as { cdi_installed_by_model: boolean })
+        .cdi_installed_by_model,
+      true,
+    );
+  } finally {
+    h.restore();
+  }
+});
+
+Deno.test("applying the CR retries while its CRD is not yet served", async () => {
+  const k = crdCluster({ crApplyFailures: 2 });
+  const h = harness(k.route, { fetch: kvFetch() });
+  try {
+    const ctx = testCtx();
+    await model.methods.install.execute(INSTALL, ctx.context);
+    // The CR apply failed twice, then succeeded: 1 operator + 3 CR applies.
+    assertEquals(h.calls.filter((c) => verb(c) === "apply").length, 4);
+  } finally {
+    h.restore();
+  }
+});
+
+Deno.test("install_cdi on a cluster with KubeVirt but no CDI CRD works", async () => {
+  const cdiSha = await sha256(CDI_NS);
+  const k = crdCluster({ kvCrd: true });
+  k.s.kv = crJson();
+  const h = harness(k.route, { fetch: kvFetch({ cdi: CDI_NS }) });
+  try {
+    const ctx = testCtx();
+    await model.methods.install.execute({
+      ...INSTALL,
+      install_cdi: true,
+      cdi_version: "v1.2.3",
+      cdi_operator_manifest_sha256: cdiSha,
+    }, ctx.context);
+    assertEquals(k.s.cdiCrd, true);
+  } finally {
+    h.restore();
+  }
+});
+
+Deno.test("get and sync on a cluster with KubeVirt but no CDI CRD work", async () => {
+  const k = crdCluster({ kvCrd: true });
+  k.s.kv = crJson();
+  const h = harness(k.route);
+  try {
+    const ctx = testCtx();
+    const got = await model.methods.get.execute(
+      { kubeconfig: KC },
+      ctx.context,
+    ) as {
+      result: Record<string, unknown>;
+    };
+    assertEquals(got.result.kubevirt_version, "v1.2.3");
+    const synced = await model.methods.sync.execute(
+      { kubeconfig: KC },
+      ctx.context,
+    ) as { result: { status: string } };
+    assertEquals(synced.result.status, "present");
+  } finally {
+    h.restore();
+  }
+});
+
+Deno.test("get is not_found and sync records not_found when the KubeVirt CRD is absent", async () => {
+  const k = crdCluster();
+  const h = harness(k.route);
+  try {
+    const ctx = testCtx();
+    const e = await assertRejects(
+      () => model.methods.get.execute({ kubeconfig: KC }, ctx.context),
+      KubevirtError,
+    );
+    assertEquals((e as KubevirtError).code, "not_found");
+    const synced = await model.methods.sync.execute(
+      { kubeconfig: KC },
+      ctx.context,
+    ) as { result: { status: string } };
+    assertEquals(synced.result.status, "not_found");
+  } finally {
+    h.restore();
+  }
+});
+
+Deno.test("wait_ready on a cluster without the CDI CRD does not throw", async () => {
+  const k = crdCluster({ kvCrd: true });
+  k.s.kv = crJson();
+  const h = harness(k.route);
+  try {
+    const ctx = testCtx();
+    const out = await model.methods.wait_ready.execute({
+      kubeconfig: KC,
+      kubevirt_version: "v1.2.3",
+      install_cdi: true,
+      timeout_s: 10,
+    }, ctx.context) as { result: { ready: boolean } };
+    // KubeVirt is ready but CDI is not installed: not ready, and no error.
+    assertEquals(out.result.ready, false);
+    const plain = await model.methods.wait_ready.execute({
+      kubeconfig: KC,
+      kubevirt_version: "v1.2.3",
+      timeout_s: 10,
+    }, ctx.context) as { result: { ready: boolean } };
+    assertEquals(plain.result.ready, true);
+  } finally {
+    h.restore();
+  }
+});
+
+Deno.test("uninstall on a cluster with no KubeVirt or CDI CRD is a clean no-op", async () => {
+  const k = crdCluster();
+  const h = harness(k.route);
+  try {
+    const fp = await fingerprint();
+    const ctx = testCtx();
+    const out = await model.methods.uninstall.execute({
+      ...INSTALL,
+      confirm: fp,
+    }, ctx.context) as { result: { status: string } };
+    assertEquals(out.result.status, "not_found");
+    assertEquals(h.calls.some((c) => verb(c) === "delete"), false);
+    assertEquals(h.fetched.length, 0);
+  } finally {
+    h.restore();
+  }
+});
+
+Deno.test("uninstall of a CDI this model owns on a cluster without the CDI CRD fetches nothing and deletes nothing", async () => {
+  const key = await operatorStateKey(KC);
+  const ctx = testCtx({
+    storedResources: {
+      [key]: {
+        cluster_fp: await fingerprint(),
+        context: "current-context",
+        cdi_version: "v1.2.3",
+        cdi_installed_by_model: true,
+        cdi_operator_sha256: "a".repeat(64),
+        status: "present",
+        observed_at: "2026-10-17T00:00:00.000Z",
+      },
+    },
+  });
+  const k = crdCluster();
+  const h = harness(k.route);
+  try {
+    const out = await model.methods.uninstall.execute({
+      ...INSTALL,
+      confirm: await fingerprint(),
+      cdi_version: "v1.2.3",
+      cdi_operator_manifest_sha256: "a".repeat(64),
+    }, ctx.context) as { result: { status: string } };
+    assertEquals(out.result.status, "deleted");
+    assertEquals(h.calls.some((c) => verb(c) === "delete"), false);
+    assertEquals(
+      (ctx.getWrittenResources()[0].data as { cdi_installed_by_model: boolean })
+        .cdi_installed_by_model,
+      false,
+    );
+  } finally {
+    h.restore();
+  }
+});
+
+Deno.test("uninstall fetches and verifies every manifest before the first delete", async () => {
+  const key = await operatorStateKey(KC);
+  const cdiSha = await sha256(CDI_NS);
+  const ctx = testCtx({
+    storedResources: {
+      [key]: {
+        cluster_fp: await fingerprint(),
+        context: "current-context",
+        cdi_version: "v1.2.3",
+        cdi_installed_by_model: true,
+        cdi_operator_sha256: cdiSha,
+        status: "present",
+        observed_at: "2026-10-17T00:00:00.000Z",
+      },
+    },
+  });
+  const k = crdCluster({ kvCrd: true, cdiCrd: true });
+  k.s.kv = crJson();
+  k.s.cdi = JSON.stringify({ kind: "CDI" });
+  // The CDI manifest is wrong: the digest check must fail with nothing deleted.
+  const h = harness(k.route, { fetch: kvFetch({ cdi: "tampered" }) });
+  try {
+    const fp = await fingerprint();
+    const e = await assertRejects(
+      () =>
+        model.methods.uninstall.execute({
+          ...INSTALL,
+          confirm: fp,
+          cdi_version: "v1.2.3",
+          cdi_operator_manifest_sha256: cdiSha,
+        }, ctx.context),
+      KubevirtError,
+    );
+    assertEquals((e as KubevirtError).code, "manifest_mismatch");
+    assertEquals(h.calls.some((c) => verb(c) === "delete"), false);
+  } finally {
+    h.restore();
+  }
+});
+
+Deno.test("a CDI namespace left by this definition's failed install is owned and re-applied", async () => {
+  const cdiSha = await sha256(CDI_NS);
+  const mine = await fieldManager("test-kubevirt");
+  const k = crdCluster({ kvCrd: true });
+  k.s.kv = crJson();
+  k.s.cdiNamespace = true; // the CDI operator applied, the CDI CR never did
+  const h = harness((c) => {
+    if (
+      verb(c) === "get" && sub(c) === "namespace" &&
+      c.args.includes("--show-managed-fields")
+    ) {
+      return {
+        stdout: JSON.stringify({
+          kind: "Namespace",
+          metadata: { managedFields: [{ manager: mine }] },
+        }),
+      };
+    }
+    return k.route(c);
+  }, { fetch: kvFetch({ cdi: CDI_NS }) });
+  try {
+    const ctx = testCtx();
+    await model.methods.install.execute({
+      ...INSTALL,
+      install_cdi: true,
+      cdi_version: "v1.2.3",
+      cdi_operator_manifest_sha256: cdiSha,
+    }, ctx.context);
+    assertEquals(
+      (ctx.getWrittenResources()[0].data as { cdi_installed_by_model: boolean })
+        .cdi_installed_by_model,
+      true,
+    );
+    assertEquals(
+      h.calls.filter((c) => verb(c) === "apply" && nsOf(c) === "cdi").length,
+      2,
+    );
+  } finally {
+    h.restore();
+  }
+});
+
+Deno.test("a CDI namespace or CRD that someone else owns, with no CDI resource, is refused", async () => {
+  const cdiSha = await sha256(CDI_NS);
+  const k = crdCluster({ kvCrd: true });
+  k.s.kv = crJson();
+  k.s.cdiNamespace = true;
+  k.s.cdiCrd = false;
+  const h = harness((c) => {
+    if (
+      verb(c) === "get" && sub(c) === "namespace" &&
+      c.args.includes("--show-managed-fields")
+    ) {
+      return {
+        stdout: JSON.stringify({
+          kind: "Namespace",
+          metadata: { managedFields: [{ manager: "someone-else" }] },
+        }),
+      };
+    }
+    return k.route(c);
+  }, { fetch: kvFetch({ cdi: CDI_NS }) });
+  try {
+    const e = await assertRejects(
+      () =>
+        model.methods.install.execute({
+          ...INSTALL,
+          install_cdi: true,
+          cdi_version: "v1.2.3",
+          cdi_operator_manifest_sha256: cdiSha,
+        }, testCtx().context),
+      KubevirtError,
+    );
+    assertEquals((e as KubevirtError).code, "invalid_input");
+    // Nothing of CDI was applied, and the CDI manifest was never trusted.
+    assertEquals(
+      h.calls.filter((c) => verb(c) === "apply" && nsOf(c) === "cdi").length,
+      0,
+    );
+  } finally {
+    h.restore();
+  }
 });

@@ -225,8 +225,8 @@ Deno.test("schema: exactly one source, digest-pinned image, bounded memory", () 
     "https://user%40example.com@images.test/d.img",
     "http://images.test/d.img?tok=1",
     "http://images.test/d.img#frag",
-    "http://a\\:secret@host/x",
-    "http://h/a@b",
+    "http://a\\:secret@host.test/x",
+    "http://h.test/a@b",
     "https://images.test/d img",
     "https://images.test/d\timg",
   ];

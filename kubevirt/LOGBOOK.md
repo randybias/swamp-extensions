@@ -177,3 +177,24 @@ schema/secret checks, and the failure-mode table above.
 - **LOW.** `renderCdiCr` no longer sets `metadata.namespace` on the
   cluster-scoped CR; uninstall persists `status: "not_found"` after a successful
   delete; the unused `installed_by_model` state field is removed.
+
+## Round 4 (r3 review, lane/b2-kubevirt)
+
+- HIGH: on a real cluster `get <kind> --ignore-not-found` for a kind whose CRD
+  is not installed exits 1 with "the server doesn't have a resource type", which
+  classified as `crd_missing` and failed install on a fresh cluster, install_cdi
+  without CDI, get/sync without a CDI CRD and a clean-no-op uninstall. The
+  KubeVirt and CDI reads now treat `crd_missing` as absent. The CR applied right
+  after its operator manifest is retried while the CRD is not yet served.
+  Checked with real kubectl against a fake API server that serves a group only
+  once its CRD exists (fresh install with CDI, get/sync without CDI, owned CDI
+  uninstall with KubeVirt gone).
+- MEDIUM: uninstall plans both cleanups and fetches and verifies every manifest
+  before the first delete.
+- MEDIUM: CDI ownership no longer treats a bare namespace or CRD as an existing
+  CDI. A real CDI resource is adopted (flag false); a namespace or CRD carrying
+  this definition's field manager is its own partial install (owned,
+  re-applied); a namespace or CRD with no CDI resource that someone else owns is
+  refused.
+- LOW: uninstall description shortened; `.test` host names in URL fixtures; the
+  recorded flag is false after an uninstall.

@@ -267,8 +267,27 @@ type Kubectl = (
   stdin?: string,
 ) => Promise<{ code: number; stdout: string; stderr: string }>;
 
+/**
+ * Reads a custom resource, treating a kind whose CRD is not installed as
+ * absent. A real API server answers `get <kind>` for an uninstalled CRD with
+ * "the server doesn't have a resource type" (exit 1) even with
+ * --ignore-not-found, which classifies as `crd_missing`; for a READ that means
+ * "not installed", not an error. Anything else is rethrown.
+ */
+async function kubectlJsonIfInstalled<T>(
+  kubectl: Kubectl,
+  args: string[],
+): Promise<T | null> {
+  try {
+    return await kubectlJson<T>(kubectl, args);
+  } catch (e) {
+    if (e instanceof KubevirtError && e.code === "crd_missing") return null;
+    throw e;
+  }
+}
+
 async function readCr(kubectl: Kubectl): Promise<KubeVirtCr | null> {
-  return await kubectlJson<KubeVirtCr>(kubectl, [
+  return await kubectlJsonIfInstalled<KubeVirtCr>(kubectl, [
     "get",
     "kubevirt",
     KUBEVIRT_CR_NAME,
@@ -276,8 +295,38 @@ async function readCr(kubectl: Kubectl): Promise<KubeVirtCr | null> {
 }
 
 async function readCdi(kubectl: Kubectl): Promise<CdiCr | null> {
-  return await kubectlJson<CdiCr>(kubectl, ["get", "cdi", CDI_CR_NAME]);
+  return await kubectlJsonIfInstalled<CdiCr>(kubectl, [
+    "get",
+    "cdi",
+    CDI_CR_NAME,
+  ]);
 }
+
+/**
+ * Applies a custom resource, retrying while the CRD that was applied a moment
+ * ago is not yet served ("no matches for kind"): a CRD is established
+ * asynchronously after its manifest is applied.
+ */
+async function applyWhenServed(
+  d: Deps,
+  apply: (body: string) => Promise<string>,
+  body: string,
+): Promise<void> {
+  for (let attempt = 0;; attempt++) {
+    try {
+      await apply(body);
+      return;
+    } catch (e) {
+      const retry = e instanceof KubevirtError && e.code === "crd_missing" &&
+        attempt < CRD_SERVED_ATTEMPTS - 1;
+      if (!retry) throw e;
+      await d.sleep(CRD_SERVED_INTERVAL_MS);
+    }
+  }
+}
+
+const CRD_SERVED_ATTEMPTS = 20;
+const CRD_SERVED_INTERVAL_MS = 3_000;
 
 /** True for a node whose allocatable KVM device count is greater than zero. */
 function nodeHasKvm(n: Node): boolean {
@@ -332,7 +381,11 @@ async function operatorObjectsRemain(kubectl: Kubectl): Promise<boolean> {
  * CRD. Used so CDI cleanup runs even when KubeVirt is already gone.
  */
 async function cdiObjectsRemain(kubectl: Kubectl): Promise<boolean> {
-  const cr = await kubectlJson<unknown>(kubectl, ["get", "cdi", CDI_CR_NAME]);
+  const cr = await kubectlJsonIfInstalled<unknown>(kubectl, [
+    "get",
+    "cdi",
+    CDI_CR_NAME,
+  ]);
   if (cr) return true;
   const ns = await kubectlJson<unknown>(kubectl, [
     "get",
@@ -346,6 +399,30 @@ async function cdiObjectsRemain(kubectl: Kubectl): Promise<boolean> {
     "cdis.cdi.kubevirt.io",
   ]);
   return crd !== null;
+}
+
+/**
+ * What exists of CDI: `cr` (a real CDI custom resource), `ours` (a namespace or
+ * CRD this definition's field manager created, from an install that stopped
+ * before the custom resource), `foreign` (a namespace or CRD someone else
+ * owns, with no CDI resource) or `none`.
+ */
+async function cdiExistence(
+  kubectl: Kubectl,
+  fieldMgr: string,
+): Promise<"cr" | "ours" | "foreign" | "none"> {
+  if (await readCdi(kubectl)) return "cr";
+  const withManagers = async (kind: string, name: string) =>
+    await kubectlJson<
+      { metadata?: { managedFields?: { manager?: string }[] } }
+    >(kubectl, ["get", kind, name, "--show-managed-fields"]);
+  const ns = await withManagers("namespace", CDI_NAMESPACE);
+  const crd = await withManagers("crd", "cdis.cdi.kubevirt.io");
+  if (!ns && !crd) return "none";
+  const ours = [ns, crd].some((o) =>
+    o?.metadata?.managedFields?.some((m) => m.manager === fieldMgr)
+  );
+  return ours ? "ours" : "foreign";
 }
 
 function cdiReady(cdi: CdiCr | null): boolean {
@@ -597,8 +674,16 @@ export const model = {
             a.context,
             CDI_NAMESPACE,
             async (kubectl) => {
-              const exists = await cdiObjectsRemain(kubectl);
-              if (exists && prior?.cdi_installed_by_model !== true) {
+              const found = await cdiExistence(kubectl, fm);
+              if (
+                found === "foreign" && prior?.cdi_installed_by_model !== true
+              ) {
+                throw new KubevirtError(
+                  "invalid_input",
+                  "a cdi namespace or CRD exists without a CDI resource and was not created by this definition; remove it or install CDI separately",
+                );
+              }
+              if (found === "cr" && prior?.cdi_installed_by_model !== true) {
                 context.logger.info(
                   "CDI exists and is not owned by this model; adopting it",
                   {},
@@ -659,7 +744,7 @@ export const model = {
               workload_update_methods: a.workload_update_methods,
               uninstall_strategy: a.uninstall_strategy,
             });
-            await apply(crYaml);
+            await applyWhenServed(d, apply, crYaml);
             const cr = await readCr(kubectl);
             const nodes = await readNodes(kubectl);
             context.logger.info("KubeVirt {version} installed", {
@@ -691,7 +776,7 @@ export const model = {
                   text,
                 );
               await apply(body);
-              await apply(renderCdiCr());
+              await applyWhenServed(d, apply, renderCdiCr());
             },
           );
         }
@@ -990,7 +1075,7 @@ export const model = {
     uninstall: {
       kind: "action" as const,
       description:
-        "DESTRUCTIVE. Delete the KubeVirt custom resource with --wait, then the operator manifest's objects, then CDI when this definition installed it. The CDI version and digest must match the record. With the default BlockUninstallIfWorkloadsExist strategy a running workload blocks the delete (typed error); with RemoveWorkloads upstream deletes the running VMs. Requires confirm equal to the cluster fingerprint; an absent install is a clean no-op.",
+        "DESTRUCTIVE. Verify every needed manifest first, then delete the KubeVirt custom resource with --wait, the operator manifest's objects and, when this definition installed it, CDI. A running workload blocks the delete under the default BlockUninstallIfWorkloadsExist strategy. Requires confirm equal to the cluster fingerprint; an absent install is a clean no-op.",
       arguments: UninstallArgs,
       execute: async (args: z.input<typeof UninstallArgs>, context: Ctx) => {
         const a = UninstallArgs.parse(args);
@@ -1034,24 +1119,61 @@ export const model = {
           a.kubevirt_version,
           KUBEVIRT_OPERATOR_ASSET,
         );
-        const kvDeleted = await withCluster(
+        // Plan both cleanups and fetch and verify every manifest they need
+        // BEFORE the first delete, so a fetch or digest failure never leaves a
+        // half-removed cluster.
+        const kvPlan = await withCluster(
           d,
           a.kubeconfig,
           a.context,
           KUBEVIRT_NAMESPACE,
           async (kubectl) => {
             const cr = await readCr(kubectl);
-            if (!cr && !(await operatorObjectsRemain(kubectl))) return false;
-            const opManifest = await fetchVerifiedManifest(
-              d,
-              opUrl,
-              a.operator_manifest_sha256,
-            );
-            if (cr) {
+            return {
+              cr: cr !== null,
+              remains: cr !== null || await operatorObjectsRemain(kubectl),
+            };
+          },
+        );
+        const cdiRemains = cdiInstalled && cdiVersion && cdiSha
+          ? await withCluster(
+            d,
+            a.kubeconfig,
+            a.context,
+            CDI_NAMESPACE,
+            (kubectl) => cdiObjectsRemain(kubectl),
+          )
+          : false;
+        const opManifest = kvPlan.remains
+          ? await fetchVerifiedManifest(d, opUrl, a.operator_manifest_sha256)
+          : undefined;
+        const cdiManifest = cdiRemains && cdiVersion && cdiSha
+          ? await fetchVerifiedManifest(
+            d,
+            manifestUrl(
+              a.manifest_base_url,
+              CDI_REPO.org,
+              CDI_REPO.repo,
+              cdiVersion,
+              CDI_OPERATOR_ASSET,
+            ),
+            cdiSha,
+          )
+          : undefined;
+        // KubeVirt cleanup. A missing CR with the namespace or CRD gone is a
+        // clean no-op; anything else is deleted.
+        const kvDeleted = opManifest === undefined ? false : await withCluster(
+          d,
+          a.kubeconfig,
+          a.context,
+          KUBEVIRT_NAMESPACE,
+          async (kubectl) => {
+            if (kvPlan.cr) {
               const del = await kubectl([
                 "delete",
                 "kubevirt",
                 KUBEVIRT_CR_NAME,
+                "--ignore-not-found",
                 "--wait=true",
                 `--timeout=${a.timeout_s}s`,
               ]);
@@ -1080,39 +1202,33 @@ export const model = {
         // or a failed retry never orphans the CDI this model installed.
         let cdiDeleted = false;
         if (cdiInstalled && cdiVersion && cdiSha) {
-          const version = cdiVersion;
-          const sha = cdiSha;
-          cdiDeleted = await withCluster(
-            d,
-            a.kubeconfig,
-            a.context,
-            CDI_NAMESPACE,
-            async (kubectl) => {
-              if (!(await cdiObjectsRemain(kubectl))) return true;
-              const cdiUrl = manifestUrl(
-                a.manifest_base_url,
-                CDI_REPO.org,
-                CDI_REPO.repo,
-                version,
-                CDI_OPERATOR_ASSET,
-              );
-              const cdiManifest = await fetchVerifiedManifest(d, cdiUrl, sha);
-              await kubectlText(kubectl, [
-                "delete",
-                "cdi",
-                CDI_CR_NAME,
-                "--ignore-not-found",
-                "--wait=true",
-                `--timeout=${a.timeout_s}s`,
-              ]);
-              await kubectlText(
-                kubectl,
-                ["delete", "-f", "-", "--ignore-not-found"],
-                cdiManifest,
-              );
-              return true;
-            },
-          );
+          if (cdiManifest === undefined) {
+            cdiDeleted = true; // nothing of CDI remains
+          } else {
+            const body = cdiManifest;
+            cdiDeleted = await withCluster(
+              d,
+              a.kubeconfig,
+              a.context,
+              CDI_NAMESPACE,
+              async (kubectl) => {
+                await kubectlText(kubectl, [
+                  "delete",
+                  "cdi",
+                  CDI_CR_NAME,
+                  "--ignore-not-found",
+                  "--wait=true",
+                  `--timeout=${a.timeout_s}s`,
+                ]);
+                await kubectlText(
+                  kubectl,
+                  ["delete", "-f", "-", "--ignore-not-found"],
+                  body,
+                );
+                return true;
+              },
+            );
+          }
         }
         const status = kvDeleted || cdiDeleted ? "deleted" : "not_found";
         context.logger.info("KubeVirt {status}", { status });
@@ -1128,7 +1244,7 @@ export const model = {
           {
             cdi_version: prior?.cdi_version,
             cdi_operator_sha256: prior?.cdi_operator_sha256,
-            cdi_installed_by_model: cdiInstalled ? !cdiDeleted : false,
+            cdi_installed_by_model: false,
           },
         );
         const handle = await persist(context, a, state);

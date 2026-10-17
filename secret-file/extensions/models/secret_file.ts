@@ -23,12 +23,12 @@ import {
   HOST_RE,
   type HostKeyPolicy,
   MODE_RE,
+  posixQuote,
   sha256Hex,
   SshConfigError,
   type SshDeps,
   SshError,
   type SshTarget,
-  upload as sshUpload,
   USER_RE,
 } from "./_lib/ssh.ts";
 
@@ -97,6 +97,18 @@ export interface SecretFileMethod {
   execute: (args: unknown, context: MethodContext) => Promise<MethodResult>;
 }
 
+/** One attribute migration. */
+export interface Upgrade {
+  /** Version this entry migrates to. */
+  toVersion: string;
+  /** What changed. */
+  description: string;
+  /** Identity unless stored attributes changed. */
+  upgradeAttributes: (
+    old: Record<string, unknown>,
+  ) => Record<string, unknown>;
+}
+
 /** The model definition returned by {@link createModel}. */
 export interface SecretFileModel {
   /** Model type. */
@@ -105,6 +117,8 @@ export interface SecretFileModel {
   version: string;
   /** One-line summary. */
   description: string;
+  /** Version migrations. */
+  upgrades: Upgrade[];
   /** Empty globals. */
   globalArguments: z.ZodType;
   /** Resource specs. */
@@ -285,6 +299,47 @@ export function renderEntries(entries: Record<string, string>): string {
     throw new SshConfigError("rendered entries must be at most 1048576 bytes");
   }
   return rendered;
+}
+
+/** Budget for the one stdin-fed write step, in milliseconds. */
+export const WRITE_TIMEOUT_MS = 120_000;
+/** Budget for hashing the destination file, in milliseconds. */
+export const SHA_TIMEOUT_MS = 60_000;
+
+/**
+ * The remote script that turns the secret streamed on stdin into the
+ * destination. An atomic publish needs a temp in the destination directory; the
+ * temp and its cleanup stay on the remote, and the script refuses a short read
+ * or a symlink/directory destination before the rename.
+ */
+export function stageWriteScript(
+  path: string,
+  mode: string,
+  expectedBytes: number,
+  spec?: string,
+): string {
+  const f = posixQuote(path);
+  const dir = path.slice(0, path.lastIndexOf("/")) || "/";
+  const lines = [
+    "set -eu",
+    `f=${f}`,
+    `d=${posixQuote(dir)}`,
+    't=$(mktemp "$d/.secret-stage-XXXXXXXX")',
+    "trap 'rm -f \"$t\"' EXIT",
+    "trap 'exit 1' HUP INT TERM",
+    'cat > "$t"',
+    `[ "$(wc -c < "$t" | tr -d '[:space:]')" -eq ${expectedBytes} ]`,
+    `chmod ${posixQuote(mode)} "$t"`,
+  ];
+  if (spec !== undefined) lines.push(`chown -h ${posixQuote(spec)} "$t"`);
+  lines.push(
+    // Re-check the destination with no-follow immediately before the rename.
+    '[ ! -L "$f" ]',
+    '[ ! -d "$f" ]',
+    'mv -T "$t" "$f"',
+    "trap - EXIT",
+  );
+  return lines.join("\n");
 }
 
 /** The content-bearing fields, shared by write and verify. */
@@ -470,7 +525,9 @@ async function remoteSha256(
   target: SshTarget,
   path: string,
 ): Promise<string> {
-  const result = await sshExec(deps, target, ["sha256sum", path]);
+  const result = await sshExec(deps, target, ["sha256sum", path], {
+    timeoutMs: SHA_TIMEOUT_MS,
+  });
   requireOk(result, `sha256sum ${path}`);
   const sha = result.stdout.trim().split(/\s+/)[0] ?? "";
   if (!/^[0-9a-f]{64}$/.test(sha)) {
@@ -555,6 +612,16 @@ async function writeState(
   );
 }
 
+/** Attribute migrations; identity because the method inputs are unchanged. */
+const UPGRADES: Upgrade[] = [
+  {
+    toVersion: "2026.10.17.2",
+    description:
+      "Re-vendored the canonical ssh transport and stream the secret straight on stdin into one remote write script instead of the transport upload temp file; no stored-attribute changes",
+    upgradeAttributes: (old: Record<string, unknown>) => old,
+  },
+];
+
 /**
  * Builds the model with injectable dependencies. The production export is
  * `createModel()`; tests pass a fake runner, clock and sleep so no process is
@@ -563,9 +630,10 @@ async function writeState(
 export function createModel(deps: SshDeps = denoDeps): SecretFileModel {
   return {
     type: "@randybias/secret-file",
-    version: "2026.10.17.1",
+    version: "2026.10.17.2",
     description:
       "Write a secret file onto one host over SSH from vault values delivered over stdin, atomically and idempotently by content hash, with settable owner and group and a remove action. State holds metadata and at most a keyed HMAC of the content, never the value.",
+    upgrades: UPGRADES,
     globalArguments: z.strictObject({}),
     resources: {
       secretFile: {
@@ -607,35 +675,19 @@ export function createModel(deps: SshDeps = denoDeps): SecretFileModel {
             }
           }
           if (changed) {
-            // Stage the bytes, chown the staged file, then rename it into place;
-            // the value still travels only over stdin, and the published file is
-            // never briefly owned by the wrong account.
-            const stage = `${args.path}.secret-stage-${crypto.randomUUID()}`;
-            try {
-              await sshUpload(deps, target, {
-                path: stage,
-                content: bytes,
-                mode: args.mode,
-              });
-              if (spec !== undefined) {
-                requireOk(
-                  await sshExec(deps, target, ["chown", "-h", spec, stage]),
-                  `chown ${stage}`,
-                );
-              }
-              // Re-check the destination immediately before the rename, so a
-              // symlink or directory swapped in during staging is still caught.
-              await assertReplaceable(deps, target, args.path);
-              requireOk(
-                await sshExec(deps, target, ["mv", "-T", stage, args.path]),
-                `mv ${args.path}`,
-              );
-            } catch (error) {
-              await sshExec(deps, target, ["rm", "-f", stage]).catch(
-                () => undefined,
-              );
-              throw error;
-            }
+            requireOk(
+              await sshExec(
+                deps,
+                target,
+                [
+                  "sh",
+                  "-c",
+                  stageWriteScript(args.path, args.mode, bytes.length, spec),
+                ],
+                { stdin: bytes, timeoutMs: WRITE_TIMEOUT_MS },
+              ),
+              `write ${args.path}`,
+            );
             const stat = await statFile(deps, target, args.path);
             const remote = await remoteSha256(deps, target, args.path);
             if (
@@ -810,5 +862,6 @@ export function createModel(deps: SshDeps = denoDeps): SecretFileModel {
 export const model = {
   ...createModel(),
   type: "@randybias/secret-file",
-  version: "2026.10.17.1",
+  version: "2026.10.17.2",
+  upgrades: UPGRADES,
 } satisfies SecretFileModel;

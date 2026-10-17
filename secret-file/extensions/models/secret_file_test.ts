@@ -22,6 +22,7 @@ import {
   renderEntries,
   resolveContent,
   secretInstanceName,
+  stageWriteScript,
 } from "./secret_file.ts";
 
 const HOST = "192.0.2.10";
@@ -297,6 +298,144 @@ Deno.test("write uploads over stdin, never on argv, and stores no value", async 
   );
 });
 
+Deno.test("stageWriteScript writes, chmods, chowns and renames atomically", () => {
+  const script = stageWriteScript(PATH, "0600", 18, "1000:svc");
+  assert(script.includes("set -eu"));
+  assertEquals(script.includes("pipefail"), false, "dash rejects pipefail");
+  assert(script.includes("mktemp"));
+  assert(script.includes("trap 'rm -f"));
+  assert(script.includes("trap 'exit 1' HUP INT TERM"));
+  assert(script.includes('cat > "$t"'));
+  assert(script.includes("wc -c"));
+  assert(script.includes("-eq 18"));
+  assert(script.includes(`chmod '0600' "$t"`));
+  assert(script.includes(`chown -h '1000:svc' "$t"`));
+  assert(script.includes('mv -T "$t"'));
+  assert(script.includes("trap - EXIT"));
+  assertEquals(stageWriteScript(PATH, "0640", 18).includes("chown"), false);
+});
+
+/** The first POSIX shell available, preferring dash. */
+async function posixShell(): Promise<string> {
+  for (const candidate of ["dash", "sh"]) {
+    try {
+      const out = await new Deno.Command(candidate, { args: ["-c", "true"] })
+        .output();
+      if (out.code === 0) return candidate;
+    } catch {
+      // not installed
+    }
+  }
+  return "sh";
+}
+
+/** Runs one generated script under a real shell with `stdin`. */
+async function runScript(
+  shell: string,
+  script: string,
+  stdin: Uint8Array,
+): Promise<{ code: number; stderr: string }> {
+  const child = new Deno.Command(shell, {
+    args: ["-c", script],
+    stdin: "piped",
+    stdout: "piped",
+    stderr: "piped",
+  }).spawn();
+  const writer = child.stdin.getWriter();
+  await writer.write(stdin);
+  await writer.close();
+  const out = await child.output();
+  return { code: out.code, stderr: new TextDecoder().decode(out.stderr) };
+}
+
+async function localExists(path: string): Promise<boolean> {
+  return await Deno.lstat(path).then(() => true).catch(() => false);
+}
+
+Deno.test("stageWriteScript runs under a real POSIX sh", async () => {
+  const shell = await posixShell();
+  const dir = await Deno.makeTempDir({ prefix: "sf-stage-" });
+  const bytes = new TextEncoder().encode("HELLO-SECRET\n");
+  try {
+    const dest = `${dir}/secret.env`;
+    const ok = await runScript(
+      shell,
+      stageWriteScript(dest, "0600", bytes.length),
+      bytes,
+    );
+    assertEquals(ok.code, 0, ok.stderr);
+    assertEquals(await Deno.readTextFile(dest), "HELLO-SECRET\n");
+    assertEquals((await Deno.stat(dest)).mode! & 0o777, 0o600);
+
+    const short = `${dir}/short.env`;
+    const shortRes = await runScript(
+      shell,
+      stageWriteScript(short, "0600", 100),
+      new TextEncoder().encode("PART"),
+    );
+    assert(shortRes.code !== 0, "a short read must fail before the rename");
+    assertEquals(await localExists(short), false);
+
+    const target = `${dir}/real.env`;
+    await Deno.writeTextFile(target, "ORIGINAL\n");
+    const link = `${dir}/link.env`;
+    await Deno.symlink(target, link);
+    const symRes = await runScript(
+      shell,
+      stageWriteScript(link, "0600", bytes.length),
+      bytes,
+    );
+    assert(symRes.code !== 0, "a symlink destination must be refused");
+    assertEquals(await Deno.readTextFile(target), "ORIGINAL\n");
+    assertEquals((await Deno.lstat(link)).isSymlink, true);
+
+    const asDir = `${dir}/asdir`;
+    await Deno.mkdir(asDir);
+    const dirRes = await runScript(
+      shell,
+      stageWriteScript(asDir, "0600", bytes.length),
+      bytes,
+    );
+    assert(dirRes.code !== 0, "a directory destination must be refused");
+    assertEquals((await Deno.stat(asDir)).isDirectory, true);
+  } finally {
+    await Deno.remove(dir, { recursive: true });
+  }
+});
+
+Deno.test("write streams the secret into one sh -c script, not upload commands", async () => {
+  const sha = await sha256Hex(SECRET);
+  const { run, calls } = fakeRun(stagedRunner({
+    sha,
+    present: false,
+    statLine: "600 svc svc 1000 1000 18\n",
+  }));
+  const m = createModel(deps(run));
+  const { context } = testContext();
+  await m.methods.write.execute(
+    { ...WRITE, owner: "1000", group: "svc" },
+    context,
+  );
+  const write = calls.find((c) => c.command.includes("mktemp"));
+  assert(write, "the write stage ran");
+  assertEquals(write.command.includes("'sh' '-c'"), true, "one sh -c command");
+  assertEquals(write.command.includes("chown -h"), true);
+  assertEquals(write.command.includes("1000:svc"), true);
+  assertEquals(write.command.includes("trap"), true);
+  assertEquals(
+    new TextDecoder().decode(write.stdin as Uint8Array),
+    SECRET,
+    "the secret rides on stdin",
+  );
+  // No separate argv chown/mv commands remain.
+  assertEquals(
+    calls.filter((c) =>
+      c.command.includes("'chown'") || c.command.includes("'mv'")
+    ).length,
+    0,
+  );
+});
+
 Deno.test("write is idempotent when the remote bytes, mode and owner match", async () => {
   const sha = await sha256Hex(SECRET);
   const { run, calls } = fakeRun(stagedRunner({
@@ -331,13 +470,10 @@ Deno.test("write re-chowns only when the live owner differs", async () => {
       };
     }
     if (command.includes("mktemp")) {
+      // The write is now one sh -c script that chowns inside it.
+      chowned = command.includes("chown -h");
       return { code: 0, stdout: `${sha} 600\n`, stderr: "" };
     }
-    if (command.includes("'chown'")) {
-      chowned = true;
-      return { code: 0, stdout: "", stderr: "" };
-    }
-    if (command.includes("'mv'")) return { code: 0, stdout: "", stderr: "" };
     if (command.includes("'stat'")) {
       return {
         code: 0,
@@ -358,7 +494,7 @@ Deno.test("write re-chowns only when the live owner differs", async () => {
     { ...WRITE, owner: "1000", group: "svc" },
     context,
   );
-  const chown = calls.find((c) => c.command.includes("'chown'"));
+  const chown = calls.find((c) => c.command.includes("chown -h"));
   assert(chown, "chown must run");
   assert(chown.command.includes("-h"), "chown must not follow a symlink");
   assertEquals((result.result as { changed: boolean }).changed, true);

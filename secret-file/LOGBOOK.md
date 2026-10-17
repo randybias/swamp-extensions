@@ -122,3 +122,40 @@ Delta review of 34dd922 over 770114a: 0 Critical/High. Residuals carried:
   that changes during staging.
 - LOW (astra): the symlink test's fake runner returns the same result on both
   branches of its condition (dead code).
+
+## 2026.10.17.2 transport and delivery hardening
+
+- Re-vendored the canonical `_lib/ssh.ts` byte-identical from `ssh-host` on
+  `origin/main` (blob `8f132c4329c9e64bed686731cd5a0e02980194ea`) plus its
+  `ssh_test.ts` (`4e8ac15f`); the test task now allows `--allow-run=sh` for the
+  canonical runner tests.
+- Dropped the transport upload temp file for the secret. `write` now streams the
+  value on `exec` stdin straight into one remote `sh -c` script
+  (`stageWriteScript`) that creates a 0600 temp with `mktemp`, `cat`s stdin into
+  it, `chmod`s and `chown -h`s it, re-checks the destination with no-follow and
+  renames with `mv -T`; the `trap` removes the temp on any failure. No
+  transport-level temp file is created. A file destination needs a temp in its
+  own directory for the atomic rename, so the verified `mktemp` + `trap` path is
+  kept and this is why.
+- The write and the `sha256sum` read now carry `timeoutMs` (120s and 60s).
+- Version `2026.10.17.2`; inputs unchanged, so the `upgrades[]` entry (literal
+  on the export) is a no-op identity.
+
+### Old vs new command recording
+
+A recording `CommandRunner` drove `write`, `verify` and `remove` against the
+pre-change tree and the new tree. The write stage went from the transport upload
+flow to one stdin-fed script:
+
+- OLD (19 commands): `assertReplaceable` (`test -L`, `test -d`), the `sshUpload`
+  probe and its write to `<path>.secret-stage-<uuid>`, a separate `chown -h`, a
+  second `test -L`/`test -d` before the rename, `mv -T`, then `stat` and
+  `sha256sum`.
+- NEW (14 commands): the same pre-staging `test -L`/`test -d`, ONE `sh -c`
+  script carrying the secret on stdin (its own `mktemp`/`trap`, `chmod`,
+  `chown -h`, no-follow checks, `mv -T`), then the same `stat` and `sha256sum`.
+
+Every non-secret external command that remains external is byte-identical
+(`test`, `stat`, `sha256sum`, `rm`); only the pre-rename `test -L`/`test -d`
+pair moved inside the write script, and the upload/chown/mv argv are now in it.
+The value is on stdin in both, never on argv, and never in state.

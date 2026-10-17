@@ -1,0 +1,99 @@
+import { assert, assertEquals } from "jsr:@std/assert@1.0.19";
+import {
+  CidrSchema,
+  ForwardSchema,
+  ListenAddressSchema,
+  renderResolverYaml,
+  ResolverSchema,
+  splitListen,
+} from "./resolver.ts";
+
+Deno.test("listen and CIDR grammars", () => {
+  assertEquals(ListenAddressSchema.safeParse("127.0.0.1@53").success, true);
+  assertEquals(ListenAddressSchema.safeParse("2001:db8::1").success, true);
+  assertEquals(ListenAddressSchema.safeParse("not-an-address").success, false);
+  assertEquals(ListenAddressSchema.safeParse("127.0.0.1@0").success, false);
+  assertEquals(CidrSchema.safeParse("192.0.2.0/24").success, true);
+  assertEquals(CidrSchema.safeParse("192.0.2.0/33").success, false);
+  assertEquals(splitListen("127.0.0.1@5353"), {
+    host: "127.0.0.1",
+    port: 5353,
+  });
+  assertEquals(splitListen("127.0.0.1"), { host: "127.0.0.1", port: 53 });
+});
+
+Deno.test("an authoritative upstream cannot use TLS", () => {
+  assertEquals(
+    ForwardSchema.safeParse({
+      subtree: "internal.example.",
+      servers: ["192.0.2.53"],
+      authoritative: true,
+      transport: "tls",
+    }).success,
+    false,
+  );
+});
+
+Deno.test("golden resolver config.yaml", () => {
+  const input = ResolverSchema.parse({
+    listen: ["127.0.0.1@53"],
+    cache_size_mb: 256,
+    forwards: [
+      {
+        subtree: "internal.example.",
+        servers: ["192.0.2.53"],
+        authoritative: false,
+      },
+      {
+        subtree: ".",
+        servers: ["203.0.113.53"],
+        transport: "tls",
+        tls_hostname: "dns.example",
+        dnssec: true,
+      },
+    ],
+    allow_query_from: ["127.0.0.0/8", "2001:db8::/32"],
+  });
+  assertEquals(
+    renderResolverYaml(input),
+    [
+      "---",
+      "listen:",
+      '  - "127.0.0.1@53"',
+      "cache:",
+      "  size: 256MB",
+      "forward:",
+      '  - subtree: "internal.example."',
+      "    servers:",
+      '      - "192.0.2.53"',
+      '  - subtree: "."',
+      "    servers:",
+      '      - "203.0.113.53"',
+      "    transport: tls",
+      '    tls_hostname: "dns.example"',
+      "    dnssec: true",
+      "view:",
+      '  - address: "127.0.0.0/8"',
+      "    action: allow",
+      '  - address: "2001:db8::/32"',
+      "    action: allow",
+      '  - address: "0.0.0.0/0"',
+      "    action: deny",
+      '  - address: "::/0"',
+      "    action: deny",
+      "",
+    ].join("\n"),
+  );
+});
+
+Deno.test("resolver YAML escapes scalar content", () => {
+  const input = ResolverSchema.parse({
+    listen: ["127.0.0.1@53"],
+    forwards: [{
+      subtree: 'a"b',
+      servers: ["192.0.2.1"],
+    }],
+  });
+  const yaml = renderResolverYaml(input);
+  assert(yaml.includes('"a\\"b"'));
+});

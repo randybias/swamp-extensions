@@ -1,0 +1,611 @@
+/**
+ * Knot DNS zone model: grammars, schemas, semantic rules and the canonical
+ * zone-file renderer.
+ *
+ * Everything here is pure and deterministic: the same declaration always
+ * produces the same bytes, so the rendered file's sha256 is a stable identity
+ * for idempotency. Owner names are rendered absolute (no `$ORIGIN`) and every
+ * record type is rendered from validated, typed data, so nothing in a name,
+ * rdata or TTL can smuggle a zone-file directive.
+ *
+ * @module
+ */
+
+import { z } from "npm:zod@4.3.6";
+
+/** A DNS label: LDH, lowercased, 1-63 octets. */
+const LABEL_RE = /^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$/;
+/** A service-owner label (`_sip._tcp`) is the only place a leading `_` is allowed. */
+const SERVICE_LABEL_RE = /^_[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$/;
+/** A single label of an apex owner, with `_` allowed. */
+const APEX_LABEL_RE = /^[a-z0-9_]([a-z0-9_-]{0,61}[a-z0-9_])?$/;
+
+/** True for a valid DNS label (no underscore). */
+export const isLabel = (s: string): boolean => LABEL_RE.test(s);
+/** True for a valid service-owner label (one leading underscore). */
+export const isServiceLabel = (s: string): boolean => SERVICE_LABEL_RE.test(s);
+
+/** Lowercases and strips one trailing dot. */
+export function stripDot(s: string): string {
+  return s.replace(/\.$/, "").toLowerCase();
+}
+
+/** True for a valid (lowercased) zone apex, at most 253 octets. */
+export function isApex(s: string): boolean {
+  const name = stripDot(s);
+  if (name.length === 0 || name.length > 253) return false;
+  return name.split(".").every((l) => APEX_LABEL_RE.test(l));
+}
+
+/** Normalizes an apex to lowercased, fully-qualified form with a trailing dot. */
+export function normalizeApex(s: string): string {
+  const name = stripDot(s);
+  if (!isApex(name)) {
+    throw new Error("invalid zone apex");
+  }
+  return `${name}.`;
+}
+
+/** True for a valid (lowercased) fully-qualified domain name. */
+export function isFqdn(s: string): boolean {
+  const name = stripDot(s);
+  if (name.length === 0 || name.length > 253) return false;
+  return !name.split(".").some((l) => !isLabel(l));
+}
+
+/**
+ * Resolves an owner (`@`, a relative name, a `*` wildcard, or an in-zone FQDN)
+ * to an absolute owner inside `apex`, or throws when it is outside the zone.
+ */
+export function ownerFqdn(apex: string, name: string): string {
+  const zone = normalizeApex(apex);
+  const zoneNoDot = stripDot(zone);
+  if (name === "@") return zone;
+  const raw = stripDot(name);
+  if (raw === "") throw new Error("owner name must not be empty");
+  const labels = raw.split(".");
+  labels.forEach((l, i) => {
+    if (i === 0 && l === "*") return;
+    if (i === 0 && isServiceLabel(l)) return;
+    if (!isLabel(l)) throw new Error("invalid owner label");
+  });
+  let fqdn: string;
+  const absolute = name.endsWith(".") && name !== ".";
+  if (absolute) {
+    if (raw !== zoneNoDot && !raw.endsWith(`.${zoneNoDot}`)) {
+      throw new Error("owner name is outside the zone");
+    }
+    fqdn = `${raw}.`;
+  } else {
+    fqdn = `${raw}.${zone}`;
+  }
+  return fqdn;
+}
+
+/** True for an IPv4 dotted quad. */
+export function isIpv4(s: string): boolean {
+  const parts = s.split(".");
+  if (parts.length !== 4) return false;
+  return parts.every((p) =>
+    /^\d{1,3}$/.test(p) && Number(p) >= 0 && Number(p) <= 255 &&
+    !(p.length > 1 && p.startsWith("0"))
+  );
+}
+
+/** True for an IPv6 literal (no zone id). */
+export function isIpv6(s: string): boolean {
+  if (!/^[0-9a-fA-F:]+$/.test(s) || !s.includes(":")) return false;
+  const double = s.indexOf("::");
+  if (double !== -1 && s.indexOf("::", double + 1) !== -1) return false;
+  const groups = double === -1 ? s.split(":") : [
+    ...s.slice(0, double).split(":"),
+    ...s.slice(double + 2).split(":"),
+  ];
+  const nonEmpty = groups.filter((g) => g !== "");
+  if (nonEmpty.some((g) => !/^[0-9a-fA-F]{1,4}$/.test(g))) return false;
+  return double === -1 ? nonEmpty.length === 8 : nonEmpty.length < 8;
+}
+
+/** Printable-ASCII TXT chunk, at most 255 octets. */
+const TXT_CHUNK = z.string().min(1).max(255).regex(
+  /^[\u0020-\u007e]+$/,
+  "TXT strings must be printable ASCII",
+);
+
+const Owner = z.string().min(1).max(253);
+const Ttl = z.number().int().min(1).max(604800);
+
+const ARecord = z.object({
+  name: Owner,
+  ttl: Ttl.optional(),
+  type: z.literal("A"),
+  data: z.string().refine(isIpv4, "not an IPv4 address"),
+});
+const AaaaRecord = z.object({
+  name: Owner,
+  ttl: Ttl.optional(),
+  type: z.literal("AAAA"),
+  data: z.string().refine(isIpv6, "not an IPv6 address"),
+});
+const CnameRecord = z.object({
+  name: Owner,
+  ttl: Ttl.optional(),
+  type: z.literal("CNAME"),
+  data: z.string().min(1).max(253),
+});
+const MxRecord = z.object({
+  name: Owner,
+  ttl: Ttl.optional(),
+  type: z.literal("MX"),
+  data: z.object({
+    preference: z.number().int().min(0).max(65535),
+    exchange: z.string().min(1).max(253),
+  }),
+});
+const TxtRecord = z.object({
+  name: Owner,
+  ttl: Ttl.optional(),
+  type: z.literal("TXT"),
+  data: z.array(TXT_CHUNK).min(1).max(255),
+});
+const SrvRecord = z.object({
+  name: Owner,
+  ttl: Ttl.optional(),
+  type: z.literal("SRV"),
+  data: z.object({
+    priority: z.number().int().min(0).max(65535),
+    weight: z.number().int().min(0).max(65535),
+    port: z.number().int().min(0).max(65535),
+    target: z.string().min(1).max(253),
+  }),
+});
+const CaaRecord = z.object({
+  name: Owner,
+  ttl: Ttl.optional(),
+  type: z.literal("CAA"),
+  data: z.object({
+    flags: z.number().int().min(0).max(255),
+    tag: z.enum(["issue", "issuewild", "iodef"]),
+    value: z.string().min(1).max(255).regex(
+      /^[\u0020-\u007e]+$/,
+      "CAA value must be printable ASCII",
+    ),
+  }),
+});
+const NsRecord = z.object({
+  name: Owner,
+  ttl: Ttl.optional(),
+  type: z.literal("NS"),
+  data: z.string().min(1).max(253),
+});
+const DsRecord = z.object({
+  name: Owner,
+  ttl: Ttl.optional(),
+  type: z.literal("DS"),
+  data: z.object({
+    key_tag: z.number().int().min(0).max(65535),
+    algorithm: z.number().int().min(0).max(255),
+    digest_type: z.number().int().min(0).max(255),
+    digest: z.string().regex(/^[0-9a-fA-F]{40,96}$/, "invalid DS digest"),
+  }).refine((d) => d.digest.length % 2 === 0, "digest must be even-length hex"),
+});
+const PtrRecord = z.object({
+  name: Owner,
+  ttl: Ttl.optional(),
+  type: z.literal("PTR"),
+  data: z.string().min(1).max(253),
+});
+const SshfpRecord = z.object({
+  name: Owner,
+  ttl: Ttl.optional(),
+  type: z.literal("SSHFP"),
+  data: z.object({
+    algorithm: z.number().int().min(0).max(255),
+    fp_type: z.number().int().min(0).max(255),
+    fingerprint: z.string().min(8).max(128).regex(
+      /^[0-9a-fA-F]+$/,
+      "SSHFP fingerprint must be hex",
+    ),
+  }),
+});
+const TlsaRecord = z.object({
+  name: Owner,
+  ttl: Ttl.optional(),
+  type: z.literal("TLSA"),
+  data: z.object({
+    usage: z.number().int().min(0).max(3),
+    selector: z.number().int().min(0).max(1),
+    matching_type: z.number().int().min(0).max(2),
+    certificate: z.string().min(2).max(4096).regex(
+      /^[0-9a-fA-F]+$/,
+      "TLSA certificate association data must be hex",
+    ),
+  }),
+});
+
+/** Record types the signer owns; refused as input. */
+export const REFUSED_TYPES = [
+  "DNSKEY",
+  "RRSIG",
+  "NSEC",
+  "NSEC3",
+  "NSEC3PARAM",
+  "CDS",
+  "CDNSKEY",
+  "SOA",
+] as const;
+
+/** One zone record; discriminated on `type`, strict in every branch. */
+export const RecordSchema = z.discriminatedUnion("type", [
+  ARecord,
+  AaaaRecord,
+  CnameRecord,
+  MxRecord,
+  TxtRecord,
+  SrvRecord,
+  CaaRecord,
+  NsRecord,
+  DsRecord,
+  PtrRecord,
+  SshfpRecord,
+  TlsaRecord,
+]);
+
+/** A parsed zone record. */
+export type ZoneRecord = z.infer<typeof RecordSchema>;
+
+/** A record whose type the signer owns; accepted only so it can be refused. */
+export const RefusedRecordSchema = z.union([
+  RecordSchema,
+  z.strictObject({
+    name: Owner,
+    ttl: Ttl.optional(),
+    type: z.enum(REFUSED_TYPES),
+    data: z.unknown().optional(),
+  }),
+]);
+
+/** True when no record uses a signer-owned type. */
+export function noSignerOwned(
+  records: { type: string }[],
+): boolean {
+  const refused = new Set<string>(REFUSED_TYPES);
+  return !records.some((r) => refused.has(r.type));
+}
+
+const DNSSEC_ALGORITHMS = [
+  "ecdsap256sha256",
+  "ecdsap384sha384",
+  "ed25519",
+] as const;
+
+/** DNSSEC signing policy for one zone. */
+export const DnssecSchema = z.strictObject({
+  algorithm: z.enum(DNSSEC_ALGORITHMS).default("ecdsap256sha256").describe(
+    "Signing algorithm.",
+  ),
+  nsec3: z.boolean().default(false).describe("Use NSEC3 instead of NSEC."),
+  ksk_lifetime: z.string().regex(/^\d+[dhwmy]$/).optional().describe(
+    "KSK lifetime, e.g. 365d.",
+  ),
+  zsk_lifetime: z.string().regex(/^\d+[dhwmy]$/).optional().describe(
+    "ZSK lifetime, e.g. 90d.",
+  ),
+  parent_ds_check: z.array(z.enum(["ipv4", "ipv6"])).max(2).optional()
+    .describe("Families to check the parent DS over."),
+});
+
+/** SOA fields; the serial is Knot's. */
+export const SoaSchema = z.strictObject({
+  primary_ns: z.string().min(1).max(253),
+  contact: z.string().min(1).max(253).describe(
+    "RNAME form, e.g. hostmaster.example.com.",
+  ),
+  refresh: z.number().int().min(1).max(2147483647),
+  retry: z.number().int().min(1).max(2147483647),
+  expire: z.number().int().min(1).max(2147483647),
+  minimum: z.number().int().min(1).max(2147483647),
+});
+
+function recordKey(r: ZoneRecord): string {
+  return `${r.name}|${r.type}|${renderRdata(r)}`;
+}
+
+/** True when the rdata names a domain (kept for reference by callers). */
+export function targetOf(r: ZoneRecord): string | undefined {
+  switch (r.type) {
+    case "CNAME":
+    case "NS":
+    case "PTR":
+      return r.data;
+    case "MX":
+      return r.data.exchange;
+    case "SRV":
+      return r.data.target;
+    default:
+      return undefined;
+  }
+}
+
+/** Renders one record's rdata in canonical zone-file syntax. */
+export function renderRdata(r: ZoneRecord): string {
+  switch (r.type) {
+    case "A":
+    case "AAAA":
+      return r.data;
+    case "CNAME":
+    case "NS":
+    case "PTR":
+      return `${stripDot(r.data)}.`;
+    case "MX":
+      return `${r.data.preference} ${stripDot(r.data.exchange)}.`;
+    case "TXT":
+      return r.data.map(quoteTxt).join(" ");
+    case "SRV":
+      return `${r.data.priority} ${r.data.weight} ${r.data.port} ${
+        stripDot(r.data.target)
+      }.`;
+    case "CAA":
+      return `${r.data.flags} ${r.data.tag} ${quoteTxt(r.data.value)}`;
+    case "DS":
+      return `${r.data.key_tag} ${r.data.algorithm} ${r.data.digest_type} ${r.data.digest.toUpperCase()}`;
+    case "SSHFP":
+      return `${r.data.algorithm} ${r.data.fp_type} ${r.data.fingerprint.toUpperCase()}`;
+    case "TLSA":
+      return `${r.data.usage} ${r.data.selector} ${r.data.matching_type} ${r.data.certificate.toUpperCase()}`;
+  }
+}
+
+/** Quotes and escapes one character string for a zone file. */
+export function quoteTxt(s: string): string {
+  return `"${s.replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"`;
+}
+
+const TYPE_ORDER: Record<string, number> = {
+  A: 1,
+  NS: 2,
+  CNAME: 5,
+  PTR: 12,
+  MX: 15,
+  TXT: 16,
+  AAAA: 28,
+  SRV: 33,
+  DS: 43,
+  SSHFP: 44,
+  TLSA: 52,
+  CAA: 257,
+};
+
+/** Canonical DNS name order (RFC 4034 section 6.1). */
+export function canonicalNameCompare(a: string, b: string): number {
+  const al = stripDot(a).split(".").reverse();
+  const bl = stripDot(b).split(".").reverse();
+  const n = Math.min(al.length, bl.length);
+  for (let i = 0; i < n; i++) {
+    if (al[i] !== bl[i]) return al[i] < bl[i] ? -1 : 1;
+  }
+  return al.length - bl.length;
+}
+
+/**
+ * Enforces every semantic rule the spec requires and returns the records
+ * deduplicated and in canonical order. Throws with a fixed reason otherwise.
+ */
+export function canonicalRecords(
+  apex: string,
+  soa: z.infer<typeof SoaSchema>,
+  records: ZoneRecord[],
+): ZoneRecord[] {
+  const zone = normalizeApex(apex);
+  const resolved = records.map((r) => ({
+    ...r,
+    name: ownerFqdn(zone, r.name),
+    ttl: r.ttl ?? soa.minimum,
+  }));
+  const seen = new Set<string>();
+  const unique: typeof resolved = [];
+  for (const r of resolved) {
+    const key = recordKey(r);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    unique.push(r);
+  }
+  // No CNAME at the apex; no other data at a CNAME owner.
+  for (const r of unique) {
+    if (r.type === "CNAME" && stripDot(r.name) === stripDot(zone)) {
+      throw new Error("CNAME is not allowed at the zone apex");
+    }
+  }
+  const cnameOwners = new Set(
+    unique.filter((r) => r.type === "CNAME").map((r) => r.name),
+  );
+  for (const r of unique) {
+    if (r.type !== "CNAME" && cnameOwners.has(r.name)) {
+      throw new Error("a CNAME owner may not hold other data");
+    }
+  }
+  // RRset TTLs must agree.
+  const ttlBySet = new Map<string, number>();
+  for (const r of unique) {
+    const setKey = `${r.name}|${r.type}`;
+    const existing = ttlBySet.get(setKey);
+    if (existing !== undefined && existing !== r.ttl) {
+      throw new Error("records in one RRset must share a TTL");
+    }
+    ttlBySet.set(setKey, r.ttl);
+  }
+  // In-zone glue is checked by kzonecheck, not here: NS/MX/SRV targets may
+  // legitimately point outside the zone (a reverse zone's NS, for example).
+  unique.sort((a, b) => {
+    const byName = canonicalNameCompare(a.name, b.name);
+    if (byName !== 0) return byName;
+    const byType = (TYPE_ORDER[a.type] ?? 999) - (TYPE_ORDER[b.type] ?? 999);
+    if (byType !== 0) return byType;
+    const ar = renderRdata(a);
+    const br = renderRdata(b);
+    return ar < br ? -1 : ar > br ? 1 : 0;
+  });
+  return unique;
+}
+
+/** SOA serial rendered into the file; Knot owns the live serial. */
+export const PLACEHOLDER_SERIAL = 1;
+
+/**
+ * Renders the whole zone file: absolute owner names, explicit TTLs, one
+ * `IN <type> <rdata>` line per record, canonical order. No `$ORIGIN`,
+ * `$TTL` or `$INCLUDE` directive is ever emitted.
+ */
+export function canonicalZoneFile(
+  apex: string,
+  soa: z.infer<typeof SoaSchema>,
+  records: ZoneRecord[],
+): string {
+  const zone = normalizeApex(apex);
+  const ordered = canonicalRecords(zone, soa, records);
+  const defaultTtl = soa.minimum;
+  const lines: string[] = [];
+  lines.push(
+    `${zone}\t${defaultTtl}\tIN\tSOA\t${stripDot(soa.primary_ns)}. ${
+      stripDot(soa.contact)
+    }. ( ${PLACEHOLDER_SERIAL} ${soa.refresh} ${soa.retry} ${soa.expire} ${soa.minimum} )`,
+  );
+  for (const r of ordered) {
+    lines.push(
+      `${r.name}\t${r.ttl}\tIN\t${r.type}\t${renderRdata(r)}`,
+    );
+  }
+  return `${lines.join("\n")}\n`;
+}
+
+/** The comment stamped at the top of every model-managed zone file. */
+export const MANAGED_HEADER =
+  "; managed by @randybias/knot-dns; edits are overwritten on the next apply\n";
+
+/** The full rendered bytes of a managed zone file. */
+export function renderZoneFile(
+  apex: string,
+  soa: z.infer<typeof SoaSchema>,
+  records: ZoneRecord[],
+): string {
+  return MANAGED_HEADER + canonicalZoneFile(apex, soa, records);
+}
+
+/** Inputs that decide the zone's config fragment. */
+export interface ZoneConfigInput {
+  apex: string;
+  file: string;
+  signed: boolean;
+  dnssec: z.infer<typeof DnssecSchema>;
+  notifySecondaries: string[];
+  allowTransfer: string[];
+  tsigKeyNames: string[];
+}
+
+/** Renders one `zone:` entry for `50-managed-zones.conf`. */
+export function renderZoneConfig(input: ZoneConfigInput): string {
+  const zone = normalizeApex(input.apex);
+  const lines = [
+    "zone:",
+    `  - domain: ${zone}`,
+    `    file: ${JSON.stringify(input.file)}`,
+    "    zonefile-sync: -1",
+    "    zonefile-load: difference-no-serial",
+    "    journal-content: all",
+    "    serial-policy: unixtime",
+    `    dnssec-signing: ${input.signed ? "on" : "off"}`,
+  ];
+  if (input.signed) {
+    lines.push(
+      `    dnssec-policy: ${input.dnssec.algorithm}${
+        input.dnssec.nsec3 ? "-nsec3" : ""
+      }`,
+    );
+  }
+  if (input.notifySecondaries.length > 0) {
+    lines.push("    notify:");
+    for (const addr of input.notifySecondaries) {
+      lines.push(`      - address: ${JSON.stringify(addr)}`);
+    }
+  }
+  if (input.allowTransfer.length > 0) {
+    lines.push("    acl:");
+    lines.push("      - id: transfer");
+    lines.push("        address:");
+    lines.push("          - action: transfer");
+    for (const addr of input.allowTransfer) {
+      lines.push(`            - ${JSON.stringify(addr)}`);
+    }
+    lines.push("        key: null");
+  }
+  if (input.tsigKeyNames.length > 0) {
+    lines.push("    acl:");
+    lines.push("      - id: transfer");
+    lines.push("        key: true");
+  }
+  lines.push("    disable-any: true");
+  return `${lines.join("\n")}\n`;
+}
+
+/** A `(name, type, rdata)` tuple from a served-vs-declared diff. */
+export interface DiffEntry {
+  name: string;
+  type: string;
+  data: string;
+}
+
+/** The three-way diff between a served zone and the declared set. */
+export interface ZoneDiff {
+  added: DiffEntry[];
+  removed: DiffEntry[];
+}
+
+/** A `(name, type, rdata)` tuple from a served-vs-declared diff. */
+export interface DiffEntry {
+  name: string;
+  type: string;
+  data: string;
+}
+
+/** The three-way diff between a served zone and the declared set. */
+export interface ZoneDiff {
+  added: DiffEntry[];
+  removed: DiffEntry[];
+}
+
+/** The declared records as canonical `(name, type, rdata)` tuples. */
+export function declaredTuples(
+  apex: string,
+  soa: z.infer<typeof SoaSchema>,
+  records: ZoneRecord[],
+): DiffEntry[] {
+  return canonicalRecords(apex, soa, records).map((r) => ({
+    name: r.name,
+    type: r.type,
+    data: renderRdata(r),
+  }));
+}
+
+function tupleKey(t: DiffEntry): string {
+  return `${t.name}|${t.type}|${t.data}`;
+}
+
+/**
+ * Compares the declared tuples with what `knotc zone-read` served. Only record
+ * classes the model owns are considered; the caller excludes the SOA and
+ * signer-owned types before calling.
+ */
+export function diffDeclared(
+  declared: DiffEntry[],
+  served: DiffEntry[],
+): ZoneDiff {
+  const want = new Set(declared.map(tupleKey));
+  const have = new Set(served.map(tupleKey));
+  const added = declared.filter((t) => !have.has(tupleKey(t)));
+  const removed = served.filter((t) => !want.has(tupleKey(t)));
+  const cmp = (a: DiffEntry, b: DiffEntry) =>
+    tupleKey(a) < tupleKey(b) ? -1 : tupleKey(a) > tupleKey(b) ? 1 : 0;
+  added.sort(cmp);
+  removed.sort(cmp);
+  return { added, removed };
+}

@@ -1,0 +1,11 @@
+manifestVersion: 1
+name: "@randybias/knot-dns"
+version: "2026.10.17.1"
+description: "Manage authoritative Knot DNS zones and a Knot Resolver 6 recursive resolver over SSH. Every candidate zone file, Knot config fragment and resolver config is rendered deterministically and validated by the vendor tools before it reaches the live service; secrets stay in the vault and reach the host over stdin."
+license: Apache-2.0
+repository: https://github.com/randybias/swamp-extensions
+platforms: [darwin-aarch64, darwin-x86_64, linux-x86_64, linux-aarch64]
+labels: [knot-dns, dns, dnssec, knot-resolver, recursion, ssh]
+additionalFiles: [README.md, LICENSE.txt]
+models:
+  - knot_dns.ts

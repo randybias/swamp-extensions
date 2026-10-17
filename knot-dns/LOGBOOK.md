@@ -1,0 +1,85 @@
+# Maintainer logbook
+
+Not packaged. Notes for whoever maintains this extension.
+
+- 2026-10-17 (lane/d2-knot-dns, base origin/main): built `@randybias/knot-dns`
+  from the approved clean-room spec only. Transport `_lib/ssh.ts` and its
+  `_lib/ssh_test.ts` are vendored byte-identical from `@randybias/ssh-host`
+  (blob `fe0139f08c42e3fdae0061b9688fb5c534174957`); implementers never read the
+  old source.
+- Design: managed zones are whole-file declarations rendered deterministically
+  and loaded with Knot's `zonefile-sync: -1`,
+  `zonefile-load:
+  difference-no-serial`, `journal-content: all`,
+  `serial-policy: unixtime`. Knot computes the diff on `zone-reload` and
+  re-signs only what changed; the file on disk is the zone and its sha256 is the
+  idempotency/drift identity. `apply_zone` validates the staged zone
+  (`kzonecheck`) and the merged config (`knotc -c <staged> conf-check`) before
+  swapping, and restores the backup on a reload or verify failure. No `knotc`
+  transaction is used, because an open transaction blocks signing.
+- Credentials: the SSH key and every TSIG secret are vault references resolved
+  in-model through `context.vaultService` (a plain `{get, put}` object) and
+  delivered to the host over stdin; no secret is rendered into the zone file or
+  the zone config fragment returned by `render_zone`, and none is stored.
+- Offline tests: schema/grammar/semantic rules, golden zone files for all record
+  types, wildcard, delegation with DS and glue and a reverse zone,
+  canonical-order stability, TXT escaping, golden zone config fragment and
+  resolver YAML, served-vs-declared diff, and `sh -n` syntax validation of every
+  host script. 72 tests.
+
+## Decisions for Randy's review
+
+Spec open questions are answered with the spec's own recommendation where it
+states one; the rest take the simplest safe option or a documented deviation.
+
+1. **Whole-zone ownership (spec §12 Q1).** Taken as specified: managed zones own
+   all their records and refuse DDNS; no journal-as-source design.
+2. **`zone:` across include files (spec §12 Q2).** The spec's open question is
+   avoided rather than guessed: each zone gets its **own** fragment
+   (`/etc/knot/knot.conf.d/50-managed-<apex>.conf`) with a complete `zone:`
+   section, so no `zone:` section must continue across files and removing one
+   zone never touches another. The include glob still pulls them all in. This
+   deviates from the spec's single `50-managed-zones.conf`; the live
+   include-split cell still proves the fragments load. If a shared file is
+   required, `remove_zone` would need to re-render the remaining zones.
+3. **Knot Resolver 5 vs 6 (spec §12 Q3).** Knot Resolver 6 only, from the
+   distro/vendor package; no 5.x Lua rendering.
+4. **Secondaries/transfers in v1 (spec §12 Q4).** Included as configuration:
+   `notify_secondaries`, `allow_transfer` and `tsig_keys` render into the zone
+   fragment, but the model is primary-focused and does not verify a secondary.
+5. **SSH policy.** `host_key_policy` is `strict` only, with required
+   `host_keys`; no `insecure_tofu`, per the lead's house rule (TOFU would
+   require persisting first-seen keys).
+6. **SOA serial.** The rendered SOA serial is a fixed placeholder `1`; Knot owns
+   the live serial (`serial-policy: unixtime`, `difference-no-serial`), so the
+   file stays byte-stable.
+7. **Default TTL.** A record that omits `ttl` takes `soa.minimum`, and every
+   record in one RRset must agree on TTL.
+8. **TXT.** Strings are restricted to printable ASCII and rendered quoted and
+   escaped; arbitrary bytes are refused rather than risk a zone-file injection.
+9. **Resolver config path.** `/etc/knot-resolver/config.yaml` (with a staged
+   sibling), and the resolver's own service unit `knot-resolver`.
+
+## Known gaps for the live run
+
+- The Knot tools (`kzonecheck`, `knotc`, `kresctl`, `kdig`) are not installed in
+  the build environment, so unit tests cannot run them; renders are checked by
+  golden files and the host scripts by `sh -n` only. The live matrix MUST
+  validate every render with the real tools (`kzonecheck`, `knotc conf-check`,
+  `kresctl validate`) before this is more than beta.
+- The Knot Resolver 6 `config.yaml` schema is rendered from the public docs;
+  `kresctl validate` on the live host is the authority.
+- The vendor repository line for Knot Resolver 6 in `install` is distro
+  dependent and must be confirmed live.
+
+## Live matrix (lead's slot; all blocked — no throwaway host yet)
+
+- install / again: blocked
+- include-split proof: blocked
+- apply_zone create / idempotent / record add-change-remove: blocked
+- kzonecheck rejection: blocked
+- DNSSEC on / ksk_submitted / DNSSEC off with ack: blocked
+- apply_resolver / internal zone via resolver / cache size: blocked
+- get / sync: blocked
+- remove_zone / again; remove_resolver: blocked
+- injection literal: blocked

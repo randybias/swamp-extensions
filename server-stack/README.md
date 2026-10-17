@@ -25,6 +25,12 @@ Build a hardened k0s host running NATS on the mesh, then publish its DNS.
 
 Remove a provisioned host's DNS record, k0s cluster and server.
 
+> **Teardown needs `@randybias/k0s-cluster` 2026.10.17.3 or later.** Its
+> `reset-k0s` step fails on the published k0s-cluster 2026.10.17.2, whose reset
+> rebuilds the vault key from the masked host in its stored record. Until
+> 2026.10.17.3 is published, teardown stops at `reset-k0s` and the server is not
+> deleted.
+
 | Job      | Steps                                                                                                                                                              |
 | -------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
 | teardown | check-inputs, sync-server, check-ownership, find-record, check-record, delete-record, reset-k0s, delete-server, verify-cherry, check-cherry, verify-dns, check-dns |
@@ -105,6 +111,43 @@ swamp workflow run @randybias/server-stack-teardown-host \
   --input cloudflare_token_key=dns-edit-token
 ```
 
+## NATS authentication (optional)
+
+Set `nats_auth_token_key` to a key in the `server-stack` vault that holds the
+token: 16-256 characters from `A-Z a-z 0-9 . _ ~ + = -` (for example
+`openssl rand -hex 24`). The workflow checks that shape, then writes the token
+to Secret `nats-auth` (key `token`, override with `nats_auth_secret`) in the
+chart namespace, which must be listed in `cluster_namespaces`, before installing
+the chart. The Secret is applied on the host through the k0s manifest deployer
+(sensitive input, only its hash is recorded), because the firewall opens no
+Kubernetes API port to the control host. The chart values must read it from
+there; they hold a reference, never the token:
+
+```yaml
+nats_chart:
+  values:
+    container:
+      env:
+        NATS_TOKEN:
+          valueFrom:
+            secretKeyRef: { name: nats-auth, key: token }
+    config:
+      merge:
+        authorization:
+          token: << $NATS_TOKEN >>
+```
+
+Write the reference as `<< $NATS_TOKEN >>`: the chart renders it unquoted, which
+NATS expands from the environment. A quoted `"$NATS_TOKEN"` is taken literally,
+so the literal string would become the password.
+
+The probe presents the token and then checks that an anonymous connection is
+refused; the run fails if NATS does not enforce authentication. With the key
+unset nothing changes: NATS stays unauthenticated and the original probe runs.
+
+`mesh_handshake_wait_s` (default 60) bounds the wait for the first WireGuard
+handshake after the node joins the mesh; `0` skips the wait.
+
 ## How it works
 
 - `known_hosts` lines may be `<type> <key>` or `<host> <type> <key>`. A line
@@ -148,6 +191,10 @@ swamp workflow run @randybias/server-stack-teardown-host \
   address and are overwritten by the next run.
 - The API server binds the mesh address (`api_address`), and the kubeconfig the
   workflow stores points at it; the step's log line shows it.
+- `cluster_secrets` is disabled: `check-inputs` requires it to be empty. Its
+  steps write Secrets with `@randybias/k8s-secret` from the control host, which
+  cannot reach the Kubernetes API (the firewall opens no 6443 to it). The NATS
+  auth Secret is applied on the host instead.
 
 ## License
 

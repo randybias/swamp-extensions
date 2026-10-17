@@ -176,3 +176,17 @@ Round 4 (escalation fixer, on d4 8b292f5; findings from codex astra + terra):
   and `systemd-run` (`armed_revert_shell_test.ts`); breaking the busy check or
   the snapshot-exists check makes those tests fail. Not exercised: real systemd
   timer behaviour, which needs the live matrix.
+
+Round 5 (review of 99871aa):
+
+- HIGH `/1` halves bypassed the anywhere check. Fixed: `isEffectivelyAnywhere`
+  asks for `allow_ssh_from_anywhere` when a CIDR is wider than /8 (IPv4) or /16
+  (IPv6), or when a family's CIDRs together cover the whole address space.
+- HIGH `isCidr` accepted `2001:db8::1]/x/64` through `new URL`. Fixed: a strict
+  IPv4/IPv6 parser (hex groups, one `::`, dotted tail only last); `]`, `/`, `#`,
+  `@`, `%` and whitespace are refused. Callers get the parsed network too.
+- MEDIUM commit fallback skipped the ruleset checks. Fixed: the arm step writes
+  the managed-table hash into the host marker, and the fallback uses it, or
+  refuses when it is absent.
+- MEDIUM marker read hid failures. Fixed: only an absent file reads as empty;
+  a read error, truncated output or an unparseable marker throws.

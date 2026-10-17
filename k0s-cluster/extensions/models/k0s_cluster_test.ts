@@ -1930,3 +1930,92 @@ Deno.test("a failed first-time restart removes the unverified k0s.yaml", async (
     true,
   );
 });
+
+Deno.test("api_address is validated and rendered into the uploaded config", async () => {
+  const model = createModel(makeDeps().deps);
+  for (const bad of ["example.com", "192.0.2.256", "192.0.2.1/24", "::::"]) {
+    assertThrows(() =>
+      model.methods.render_config.arguments.parse({
+        k0s_version: VERSION,
+        ...CLUSTER,
+        api_address: bad,
+      })
+    );
+  }
+  const fake = makeDeps({
+    exec: installRouter,
+    fetch: () => Promise.resolve(PAYLOAD),
+  });
+  const m = createModel(fake.deps);
+  const { context } = createModelTestContext();
+  await m.methods.install.execute(
+    installArgs({ api_address: "198.51.100.7" }),
+    context,
+  );
+  const config = fake.uploads.find((u) => u.path === K0S_CONFIG_PATH)!;
+  const text = new TextDecoder().decode(config.content);
+  assertEquals(
+    text.includes('    address: "198.51.100.7"\n    port: 6443'),
+    true,
+  );
+  assertEquals(text.includes('      - "198.51.100.7"\n'), true);
+  const rendered = await m.methods.render_config.execute(
+    m.methods.render_config.arguments.parse({
+      k0s_version: VERSION,
+      ...CLUSTER,
+      api_address: "198.51.100.7",
+    }),
+    createModelTestContext().context,
+  );
+  assertEquals(rendered.result.k0s_yaml.includes("address:"), true);
+});
+
+Deno.test("kubeconfig builds the server URL from api_address and stores that kubeconfig", async () => {
+  const fake = makeDeps({
+    exec: (argv) =>
+      argv.includes("kubeconfig")
+        ? { code: 0, stdout: FAKE_KUBECONFIG }
+        : undefined,
+  });
+  const model = createModel(fake.deps);
+  const puts: string[] = [];
+  const { context, getWrittenResources } = createModelTestContext();
+  // deno-lint-ignore no-explicit-any
+  (context as any).vaultService = {
+    put: (_v: string, _k: string, value: string) => {
+      puts.push(value);
+      return Promise.resolve();
+    },
+  };
+  const out = await model.methods.kubeconfig.execute(
+    model.methods.kubeconfig.arguments.parse({
+      ssh: SSH,
+      api_address: "198.51.100.7",
+      store_in_vault: { vault: "cluster", key: "kc" },
+    }),
+    context,
+  );
+  assertEquals(out.result.server, "https://198.51.100.7:6443");
+  assertEquals(puts[0].includes("server: https://198.51.100.7:6443"), true);
+  assertEquals(puts[0].includes("192.0.2.10"), false);
+  assertEquals(
+    JSON.stringify(getWrittenResources()).includes("client-key-data"),
+    false,
+  );
+  // Without api_address the kubeconfig is returned as k0s wrote it.
+  const plain = await model.methods.kubeconfig.execute(
+    model.methods.kubeconfig.arguments.parse({ ssh: SSH }),
+    createModelTestContext().context,
+  );
+  assertEquals(plain.result.server, "https://192.0.2.10:6443");
+  // An IPv6 address is bracketed.
+  const v6 = await model.methods.kubeconfig.execute(
+    model.methods.kubeconfig.arguments.parse({
+      ssh: SSH,
+      api_address: "2001:db8::7",
+      api_port: 6444,
+    }),
+    createModelTestContext().context,
+  );
+  assertEquals(v6.result.server, "https://[2001:db8::7]:6444");
+});

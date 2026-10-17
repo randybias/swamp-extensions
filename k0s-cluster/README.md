@@ -94,6 +94,11 @@ never from a captured `--json`. To choose the vault and key yourself, pass
 `store_in_vault` (`vault` and `key`); the kubeconfig is then written only there,
 and a later step reads it with a `vault.get(...)` reference.
 
+Set `api_address` to the private or mesh address to keep the API off the public
+one: it is written to `spec.api.address`, always added to the certificate SANs,
+and passing the same `api_address` (and `api_port`) to `kubeconfig` builds the
+returned and stored kubeconfig's server URL from it.
+
 A strict host-key policy pins the expected keys and requires them:
 
 ```yaml

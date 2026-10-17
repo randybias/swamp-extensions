@@ -163,3 +163,8 @@ Low findings fixed as noted.
   and the key lists afterwards); the method checks for it by shape and fails
   clearly if a swamp version drops it. The stored record then holds the vault
   and key names, not the value.
+- 2026-10-17: `api_address` (validated IP) renders into `spec.api.address` and
+  is always a SAN; `kubeconfig` takes `api_address` and `api_port` and rewrites
+  the server URL of the returned and vaulted kubeconfig from them. Whether k0s
+  itself writes the mesh address into its kubeconfig is unverified until a live
+  run, which is why the method sets it explicitly.

@@ -4,6 +4,7 @@ import {
   assertThrows,
 } from "jsr:@std/assert@1.0.19";
 import {
+  apiServerUrl,
   archFromUname,
   chartBaseName,
   ChecksumMismatchError,
@@ -28,9 +29,10 @@ import {
   systemPodsHealthy,
   toYaml,
   verifyBinary,
+  withServer,
   yamlScalar,
 } from "./k0s.ts";
-import { isCidr } from "./grammar.ts";
+import { isCidr, isIp } from "./grammar.ts";
 import { sha256Hex } from "./ssh.ts";
 
 const BASE: K0sConfigInput = {
@@ -378,4 +380,60 @@ Deno.test("isBoundedJsonValue caps depth, entries and size", () => {
   for (let i = 0; i < 200; i++) wide[`k${i}`] = i;
   assertEquals(isBoundedJsonValue(wide), false);
   assertEquals(isBoundedJsonValue(() => 1), false);
+});
+
+Deno.test("renderK0sConfig writes spec.api.address and always adds it to the SANs", () => {
+  const text = renderK0sConfig({ ...BASE, api_address: "198.51.100.7" });
+  assertEquals(
+    text.split("\n").slice(4, 12).join("\n"),
+    [
+      "spec:",
+      "  api:",
+      '    address: "198.51.100.7"',
+      "    port: 6443",
+      "    sans:",
+      '      - "198.51.100.7"',
+      '      - "192.0.2.10"',
+      "      - k0s.example.com",
+    ].join("\n"),
+  );
+  // Already listed: not repeated.
+  const again = renderK0sConfig({
+    ...BASE,
+    api_address: "192.0.2.10",
+  });
+  assertEquals(again.match(/192\.0\.2\.10/g)?.length, 2);
+  // Not given: nothing is written, matching the golden.
+  assertEquals(renderK0sConfig(BASE).includes("address:"), false);
+});
+
+Deno.test("isIp accepts only IP literals", () => {
+  for (const good of ["192.0.2.1", "2001:db8::1", "::1"]) {
+    assertEquals(isIp(good), true, good);
+  }
+  for (
+    const bad of [
+      "",
+      "example.com",
+      "192.0.2",
+      "192.0.2.256",
+      "2001:db8::2::3",
+      "::::",
+      "192.0.2.1/24",
+      "192.0.2.1 ",
+    ]
+  ) {
+    assertEquals(isIp(bad), false, bad);
+  }
+});
+
+Deno.test("apiServerUrl brackets IPv6 and withServer rewrites every server line", () => {
+  assertEquals(apiServerUrl("198.51.100.7", 6443), "https://198.51.100.7:6443");
+  assertEquals(apiServerUrl("2001:db8::7", 6443), "https://[2001:db8::7]:6443");
+  const text =
+    "clusters:\n- cluster:\n    server: https://192.0.2.10:6443\n  name: k\n";
+  assertEquals(
+    withServer(text, "https://198.51.100.7:6443"),
+    "clusters:\n- cluster:\n    server: https://198.51.100.7:6443\n  name: k\n",
+  );
 });

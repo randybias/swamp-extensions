@@ -67,6 +67,8 @@ export interface ManifestStackInput {
 export interface K0sConfigInput {
   /** Cluster name written to `metadata.name`. */
   cluster_name: string;
+  /** Address the API server binds and advertises; omitted keeps k0s's default. */
+  api_address?: string;
   /** API server port. */
   api_port: number;
   /** Subject alternative names for the API server certificate. */
@@ -368,10 +370,18 @@ export function renderK0sConfig(input: K0sConfigInput): string {
   lines.push(`  name: ${yamlScalar(input.cluster_name)}`);
   lines.push("spec:");
   lines.push("  api:");
+  if (input.api_address) {
+    lines.push(`    address: ${yamlScalar(input.api_address)}`);
+  }
   lines.push(`    port: ${input.api_port}`);
-  if (input.api_sans.length > 0) {
+  // The API address is always a SAN, or clients on that address would fail
+  // certificate verification.
+  const sans = input.api_address && !input.api_sans.includes(input.api_address)
+    ? [input.api_address, ...input.api_sans]
+    : input.api_sans;
+  if (sans.length > 0) {
     lines.push("    sans:");
-    for (const san of input.api_sans) {
+    for (const san of sans) {
       lines.push(`      - ${yamlScalar(san)}`);
     }
   }
@@ -652,4 +662,17 @@ export function instanceName(name: string): string {
 /** Convenience: true when the command exited zero. */
 export function ok(result: ExecResult): boolean {
   return result.exit_code === 0;
+}
+
+/** The API server URL for an address and port; IPv6 literals are bracketed. */
+export function apiServerUrl(address: string, port: number): string {
+  return `https://${address.includes(":") ? `[${address}]` : address}:${port}`;
+}
+
+/** Rewrites every `server:` value in a kubeconfig to `url`. */
+export function withServer(kubeconfig: string, url: string): string {
+  return kubeconfig.replace(
+    /^(\s*(?:-\s+)?server:\s*)\S+(\s*)$/gm,
+    (_m, head: string, tail: string) => `${head}${url}${tail}`,
+  );
 }

@@ -17,6 +17,7 @@ import {
   HOST_RE,
   isCidr,
   isConcreteManifestPath,
+  isIp,
   isSafeFilename,
   MANIFEST_PATH_RE,
   NAME_RE,
@@ -25,6 +26,7 @@ import {
   USER_RE,
 } from "./_lib/grammar.ts";
 import {
+  apiServerUrl,
   archFromUname,
   type BinaryFetcher,
   chartBaseName,
@@ -56,6 +58,7 @@ import {
   SHA256_RE,
   systemPodsHealthy,
   verifyBinary,
+  withServer,
 } from "./_lib/k0s.ts";
 import { assertRemotePath, sha256Hex, type SshTarget } from "./_lib/ssh.ts";
 import { createSshTransport, type SshTransport } from "./_lib/transport.ts";
@@ -165,6 +168,10 @@ const clusterFields = {
     .describe(
       "API server certificate SANs: hostnames or IP literals.",
     ),
+  api_address: z.string().max(45).refine(isIp, "must be an IP address")
+    .nullish().describe(
+      "Address the API server binds and advertises, written to spec.api.address and added to the SANs; the kubeconfig's server URL is built from it. Use the private or mesh address to keep the API off the public one.",
+    ),
   api_port: z.number().int().min(1).max(65535).default(6443).describe(
     "API server port.",
   ),
@@ -234,6 +241,13 @@ const WaitReadyArgs = z.strictObject({
 
 const KubeconfigArgs = z.strictObject({
   ssh: SSH,
+  api_address: z.string().max(45).refine(isIp, "must be an IP address")
+    .nullish().describe(
+      "The cluster's api_address. When given, the returned and stored kubeconfig's server URL is built from it (with api_port) instead of whatever address k0s wrote.",
+    ),
+  api_port: z.number().int().min(1).max(65535).default(6443).describe(
+    "API server port used with api_address.",
+  ),
   store_in_vault: z.strictObject({
     vault: z.string().regex(/^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/).describe(
       "Name of an existing swamp vault.",
@@ -562,6 +576,7 @@ async function restartAndVerify(
 
 function renderInput(args: {
   cluster_name: string;
+  api_address?: string | null;
   api_port: number;
   api_sans: string[];
   pod_cidr: string;
@@ -572,6 +587,7 @@ function renderInput(args: {
 }): K0sConfigInput {
   return {
     cluster_name: args.cluster_name,
+    ...(args.api_address ? { api_address: args.api_address } : {}),
     api_port: args.api_port,
     api_sans: args.api_sans,
     pod_cidr: args.pod_cidr,
@@ -1352,7 +1368,14 @@ function buildK0sModel(deps: K0sDeps) {
               `could not read the admin kubeconfig from ${target.host} (exit ${result.exit_code})`,
             );
           }
-          const kubeconfig = result.stdout;
+          // With an explicit API address the server URL is built from it, so
+          // callers reach the cluster on that address whatever k0s wrote.
+          const kubeconfig = args.api_address
+            ? withServer(
+              result.stdout,
+              apiServerUrl(args.api_address, args.api_port),
+            )
+            : result.stdout;
           const digest = await sha256Hex(encoder.encode(kubeconfig));
           const server = parseKubeconfigServer(kubeconfig);
           const vault = args.store_in_vault ?? null;

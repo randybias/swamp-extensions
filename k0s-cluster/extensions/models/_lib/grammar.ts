@@ -48,6 +48,18 @@ export function isIpv6(address: string): boolean {
   return doubles === 1 ? groups.length <= 7 : groups.length === 8;
 }
 
+/** True for a dotted-quad IPv4 address. */
+export function isIpv4(address: string): boolean {
+  const octets = address.split(".");
+  return octets.length === 4 &&
+    octets.every((o) => /^\d{1,3}$/.test(o) && Number(o) <= 255);
+}
+
+/** True for an IPv4 or IPv6 address literal. */
+export function isIp(address: string): boolean {
+  return address.includes(":") ? isIpv6(address) : isIpv4(address);
+}
+
 /** True for an IPv4 or IPv6 CIDR with an in-range prefix. */
 export function isCidr(value: string): boolean {
   const slash = value.indexOf("/");

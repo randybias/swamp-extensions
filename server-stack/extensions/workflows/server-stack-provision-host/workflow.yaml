@@ -383,9 +383,10 @@ inputs:
     nats_auth_token_key:
       type: string
       description: >-
-        Vault key (in server-stack) holding a NATS auth token. When set, the
-        token is written to the Secret named by nats_auth_secret (key `token`)
-        before the chart is installed, the chart values must read it from
+        Vault key (in server-stack) holding a NATS auth token of 16-256
+        characters from A-Z a-z 0-9 . _ ~ + = -. When set, the token is written
+        to the Secret named by nats_auth_secret (key `token`, in a namespace
+        listed in cluster_namespaces) before the chart is installed, the chart values must read it from
         there (see the README), and the probe must see authentication enforced.
         Unset leaves NATS unauthenticated.
       default: null
@@ -1071,10 +1072,35 @@ jobs:
             type: >-
               ${{ has(self.secret.type) ? self.secret.type : "Opaque" }}
             data: ${{ self.secret.data }}
-      - name: apply-nats-auth
-        description: Write the NATS auth token Secret from a vault value via kubectl stdin
+      - name: check-nats-token
+        description: Check the NATS auth token is YAML-safe before it is written into a manifest
         dependsOn:
-          - step: apply-namespaces
+          - step: check-kubeconfig
+            condition:
+              type: succeeded
+        guard: ${{ inputs.nats_auth_token_key == null }}
+        task:
+          type: model_method
+          modelType: command/shell
+          modelName: nats-token-check
+          methodName: execute
+          inputs:
+            # Asserts cannot read the vault, so the shape is checked in a shell
+            # that gets the token through its environment. Output is the verdict only.
+            run: |
+              bash -c '
+                [[ "$NATS_TOKEN" =~ ^[A-Za-z0-9._~+=-]{16,256}$ ]] ||
+                  { echo "token must be 16-256 characters from A-Z a-z 0-9 . _ ~ + = -"; exit 1; }
+                echo "token shape ok"
+              '
+            env:
+              NATS_TOKEN: ${{ vault.get("server-stack", inputs.nats_auth_token_key) }}
+            timeout: 10000
+            ignoreExitCode: false
+      - name: apply-nats-auth
+        description: Write the NATS auth token Secret on the host through the k0s manifest deployer
+        dependsOn:
+          - step: check-nats-token
             condition:
               type: or
               conditions:
@@ -1083,19 +1109,38 @@ jobs:
           - step: check-kubeconfig
             condition:
               type: succeeded
+          - step: apply-namespaces
+            condition:
+              type: or
+              conditions:
+                - type: succeeded
+                - type: skipped
         guard: ${{ inputs.nats_auth_token_key == null }}
         task:
           type: model_method
-          modelType: "@randybias/k8s-secret"
-          modelName: k8s-secret
-          methodName: apply
+          modelType: "@randybias/k0s-cluster"
+          modelName: k0s-cluster
+          methodName: apply_manifests
           inputs:
-            kubeconfig: ${{ vault.get("server-stack", inputs.kubeconfig_key) }}
-            namespace: ${{ inputs.nats_chart.namespace }}
-            name: ${{ inputs.nats_auth_secret }}
-            type: Opaque
-            data:
-              token: ${{ vault.get("server-stack", inputs.nats_auth_token_key) }}
+            ssh:
+              host: ${{ inputs.mesh_node.address.split("/")[0] }}
+              port: ${{ inputs.ssh_port }}
+              user: ${{ inputs.ssh_user }}
+              host_key_policy: strict
+              host_keys: ${{ inputs.known_hosts }}
+              private_key: ${{ vault.get("server-stack", inputs.ssh_private_key_key) }}
+            stack:
+              name: server-stack-nats-auth
+              files:
+                # The API is not reachable from the control host (the firewall
+                # opens no 6443), so the Secret is applied on the host. The
+                # content is a sensitive input and only its hash is recorded.
+                - path: nats-auth.yaml
+                  content: >-
+                    ${{ "apiVersion: v1\nkind: Secret\nmetadata:\n  name: " + inputs.nats_auth_secret +
+                    "\n  namespace: " + inputs.nats_chart.namespace +
+                    "\ntype: Opaque\nstringData:\n  token: \"" +
+                    vault.get("server-stack", inputs.nats_auth_token_key) + "\"\n" }}
       - name: apply-nats
         description: Reconcile the NATS chart via the k0s Helm extension
         guard: ${{ size(inputs.cluster_secrets) > 0 }}

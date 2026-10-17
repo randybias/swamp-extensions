@@ -233,3 +233,22 @@ Deno.test({
     }
   },
 });
+
+Deno.test("the token shape check accepts a generated token and rejects anything that could break the manifest", async () => {
+  const run = await script("cluster", "check-nats-token");
+  const verdict = async (token: string) =>
+    (await bash(run, { PATH: Deno.env.get("PATH") ?? "", NATS_TOKEN: token }))
+      .code;
+  assertEquals(await verdict("0123456789abcdef0123456789abcdef"), 0);
+  for (
+    const bad of [
+      "short",
+      'has"quote0123456789',
+      "new\nline0123456789abcdef",
+      "back\\slash0123456789abc",
+      "x".repeat(257),
+    ]
+  ) {
+    assertEquals(await verdict(bad), 1, JSON.stringify(bad));
+  }
+});

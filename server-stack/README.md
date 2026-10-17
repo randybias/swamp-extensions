@@ -108,9 +108,14 @@ swamp workflow run @randybias/server-stack-teardown-host \
 ## NATS authentication (optional)
 
 Set `nats_auth_token_key` to a key in the `server-stack` vault that holds the
-token. The workflow writes it to Secret `nats-auth` (key `token`, override with
-`nats_auth_secret`) in the chart namespace before installing the chart. The
-chart values must read it from there; they hold a reference, never the token:
+token: 16-256 characters from `A-Z a-z 0-9 . _ ~ + = -` (for example
+`openssl rand -hex 24`). The workflow checks that shape, then writes the token
+to Secret `nats-auth` (key `token`, override with `nats_auth_secret`) in the
+chart namespace, which must be listed in `cluster_namespaces`, before installing
+the chart. The Secret is applied on the host through the k0s manifest deployer
+(sensitive input, only its hash is recorded), because the firewall opens no
+Kubernetes API port to the control host. The chart values must read it from
+there; they hold a reference, never the token:
 
 ```yaml
 nats_chart:
@@ -128,8 +133,7 @@ nats_chart:
 
 Write the reference as `<< $NATS_TOKEN >>`: the chart renders it unquoted, which
 NATS expands from the environment. A quoted `"$NATS_TOKEN"` is taken literally,
-so the literal string would become the password. The token must be printable
-ASCII.
+so the literal string would become the password.
 
 The probe presents the token and then checks that an anonymous connection is
 refused; the run fails if NATS does not enforce authentication. With the key

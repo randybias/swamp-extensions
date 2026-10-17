@@ -157,11 +157,16 @@ install: `config.merge: {host: <mesh address>, http: "0.0.0.0:8222"}` with
   well, so a skipped wait cannot stand in for a failed join.
 - Optional NATS auth: `nats_auth_token_key` (a key in the `server-stack` vault)
   writes Secret `nats_auth_secret` (default `nats-auth`, key `token`) into the
-  chart namespace before the chart is installed, and `probe-nats-auth` presents
-  the token (env only, never argv) and then proves an anonymous connection is
-  refused; `check-nats` requires `auth_required`, a `+OK` and the refusal.
-  Unset, the three new steps are guarded off and the original `probe-nats` runs
-  unchanged.
+  chart namespace, through `k0s-cluster` `apply_manifests` on the host (the live
+  run found that the first version, `k8s-secret` from the control host, hangs:
+  the firewall opens no 6443 to it; the dormant `cluster_secrets` path has the
+  same flaw), before the chart is installed. `check-nats-token` first checks the
+  token shape in a shell (asserts cannot read the vault), because the token is
+  placed in a double-quoted YAML scalar and CEL has no escaping function, and
+  `probe-nats-auth` presents the token (env only, never argv) and then proves an
+  anonymous connection is refused; `check-nats` requires `auth_required`, a
+  `+OK` and the refusal. Unset, the four new auth steps are guarded off and the
+  original `probe-nats` runs unchanged.
 - Why the chart values are not generated: swamp CEL has no map merge and
   `string(map)` fails, so the workflow cannot add the token reference to the
   operator's `nats_chart.values`. The operator adds a reference (not the secret)
@@ -174,6 +179,10 @@ install: `config.merge: {host: <mesh address>, http: "0.0.0.0:8222"}` with
   secret needs a guarded step (as here), never `cond ? "" : vault.get(...)`.
 - The probe script's replies end in `\r`: assert on `"\n+OK"`, not `"\n+OK\n"`
   (found by running the script against a real NATS server in the test).
+- Live (throwaway host, auth on, README values): `check-mesh` passed on the
+  first run; the token never appeared in 700k local and 60k remote argv samples,
+  run logs or any file of the repo; adopt re-run was a no-op (manifests and Helm
+  `changed false`, firewall and lockdown already live).
 - Not done: TLS (server cert handling needs its own design), token rotation
   (re-running with a new vault value rewrites the Secret; the pods need a roll).
 

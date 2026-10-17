@@ -222,7 +222,9 @@ Deno.test("NATS auth is off by default: its steps are guarded and the plain prob
     "    nats_auth_token_key:\n      type: string",
   );
   assertStringIncludes(s, "      default: null\n      maxLength: 256");
-  for (const step of ["apply-nats-auth", "probe-nats-auth"]) {
+  for (
+    const step of ["check-nats-token", "apply-nats-auth", "probe-nats-auth"]
+  ) {
     assertStringIncludes(
       stepText(s, step),
       "guard: ${{ inputs.nats_auth_token_key == null }}",
@@ -245,9 +247,17 @@ Deno.test("the NATS token travels as a vault value in an environment variable or
   );
   const run = probe.slice(probe.indexOf("run: |"), probe.indexOf("env:"));
   assertEquals(run.includes("vault.get"), false);
+  const secret = stepText(s, "apply-nats-auth");
+  // Applied on the host: the API is not reachable from the control host.
+  assertStringIncludes(secret, "methodName: apply_manifests");
+  assertEquals(secret.includes("k8s-secret"), false);
   assertStringIncludes(
-    stepText(s, "apply-nats-auth"),
-    'token: ${{ vault.get("server-stack", inputs.nats_auth_token_key) }}',
+    secret,
+    'vault.get("server-stack", inputs.nats_auth_token_key)',
+  );
+  assertStringIncludes(
+    stepText(s, "check-nats-token"),
+    'NATS_TOKEN: ${{ vault.get("server-stack", inputs.nats_auth_token_key) }}',
   );
   for (const step of ["apply-nats", "apply-nats-after-secrets"]) {
     assertStringIncludes(

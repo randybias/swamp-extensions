@@ -82,8 +82,17 @@ creates and updates the declared rules and leaves undeclared rules alone. Pass
   written to state, logs or an argument.
 - `ensure_rule` and `apply_rule_set` compare the desired rule with the existing
   one (arrays order-insensitively) and only issue a PUT when something differs.
+- A single-element address or port list — and any `*` or service tag — is sent
+  in Azure's singular field; a multi-element list must be all CIDRs or ranges
+  and is sent in the plural field.
 - `apply_rule_set` is plan-first: it records create, update, unchanged and
-  undeclared rule names, and only applies when `apply` is explicitly true.
+  undeclared rule names, and only applies when `apply` is explicitly true. It
+  also records priority collisions (a duplicate rule name or priority inside the
+  declared set, or a declared priority already held by an undeclared or swapped
+  rule) and, with `apply` true, writes the record and refuses without issuing
+  any PUT, so the NSG is never half-converged.
+- Rule writes and deletes are polled until the rule reports `Succeeded` or is
+  gone, so state is only recorded once Azure has settled.
 - `delete`, `remove_rule` and `ensure_rule` are actions, so they do not
   tombstone the definition; state is keyed unambiguously by subscription,
   resource group, name and rule.

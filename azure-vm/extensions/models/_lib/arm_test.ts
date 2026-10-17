@@ -205,3 +205,36 @@ Deno.test("redact removes every secret occurrence", () => {
   assertEquals(redact(`a ${SECRET} b ${SECRET}`, [SECRET]), "a *** b ***");
   assertEquals(redact("nothing", ["x"]), "nothing");
 });
+
+Deno.test("nested ARM and AAD error bodies are parsed and redacted", async () => {
+  const nestedCalls: Call[] = [];
+  const nested = fakeFetch(
+    nestedCalls,
+    (call) =>
+      call.url.includes("/oauth2/v2.0/token")
+        ? json({ access_token: "token-value" })
+        : json({
+          error: { code: "ResourceNotFound", message: `gone ${SECRET}` },
+        }, 404),
+  );
+  const { client } = clientFor(nested);
+  const error = await assertRejects(() => client.get("/x"), ArmError);
+  assertEquals(error.code, "ResourceNotFound");
+  assertEquals(isNotFound(error), true);
+  assertEquals(error.message.includes(SECRET), false);
+  assert(error.message.includes("gone"), "message should survive");
+
+  const aad = fakeFetch(
+    [],
+    () =>
+      json(
+        { error: "invalid_client", error_description: `bad ${SECRET}` },
+        401,
+      ),
+  );
+  const { client: client2 } = clientFor(aad);
+  const error2 = await assertRejects(() => client2.get("/x"), ArmError);
+  assertEquals(error2.code, "invalid_client");
+  assert(error2.message.includes("bad"), "error_description should survive");
+  assertEquals(error2.message.includes(SECRET), false);
+});

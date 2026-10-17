@@ -161,7 +161,17 @@ Deno.test("model contract: empty globals, action delete, resources", () => {
   ) {
     assert(name in model.methods, `missing method ${name}`);
   }
-  assertEquals(model.methods.delete.kind, "action");
+  for (const method of ["create", "start", "deallocate", "stop", "delete"]) {
+    assertEquals(model.methods[method].kind, "action", method);
+  }
+  assert(
+    model.methods.deallocate.description.startsWith("DESTRUCTIVE."),
+    "deallocate must be labelled DESTRUCTIVE",
+  );
+  assert(
+    model.methods.stop.description.startsWith("DESTRUCTIVE."),
+    "stop must be labelled DESTRUCTIVE",
+  );
   assertEquals(Object.keys(model.resources).sort(), ["vm"]);
 });
 

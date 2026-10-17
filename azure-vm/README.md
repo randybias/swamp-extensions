@@ -12,15 +12,15 @@ One generic VM. The definition holds nothing instance-specific: every method
 takes its own tenant, subscription, resource group and name, and stored state is
 keyed by all three.
 
-| Method       | Description                                                               |
-| ------------ | ------------------------------------------------------------------------- |
-| `get`        | READ-ONLY. Fetch one VM and store its state                               |
-| `sync`       | READ-ONLY. Refresh state; records `not_found` when the VM is gone         |
-| `create`     | Create the VM or adopt the existing one; wait until provisioning succeeds |
-| `start`      | Start the VM and wait for the running power state                         |
-| `deallocate` | Deallocate the VM, releasing compute and stopping charges; or hibernate   |
-| `stop`       | Power off without deallocating; compute charges continue                  |
-| `delete`     | DESTRUCTIVE. Delete the VM; an already-absent VM is a clean no-op         |
+| Method       | Description                                                                          |
+| ------------ | ------------------------------------------------------------------------------------ |
+| `get`        | READ-ONLY. Fetch one VM and store its state                                          |
+| `sync`       | READ-ONLY. Refresh state; records `not_found` when the VM is gone                    |
+| `create`     | Create the VM or adopt the existing one; wait until provisioning succeeds            |
+| `start`      | Start the VM and wait for the running power state                                    |
+| `deallocate` | DESTRUCTIVE. Deallocate the VM, releasing compute and stopping charges; or hibernate |
+| `stop`       | DESTRUCTIVE. Power off without deallocating; compute charges continue                |
+| `delete`     | DESTRUCTIVE. Delete the VM; an already-absent VM is a clean no-op                    |
 
 ## Dependencies
 
@@ -86,8 +86,10 @@ sensitive arguments under `--json`.
   given SSH public key, then polled until its provisioning state is `Succeeded`.
 - `deallocate` calls the deallocate action (optionally hibernating) and waits
   for the deallocated power state; `stop` powers off without releasing compute.
-- `delete` is an action: it removes only this VM's record, waits until Azure no
-  longer returns it, and is a clean no-op when the VM is already gone.
+- Every mutating verb (`create`, `start`, `deallocate`, `stop`, `delete`) is a
+  `kind: "action"` method, so none of them tombstones the definition.
+- `delete` removes only this VM's record, waits until Azure no longer returns
+  it, and is a clean no-op when the VM is already gone.
 - Stored state is keyed unambiguously by subscription, resource group and name.
 
 ## License

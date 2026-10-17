@@ -102,10 +102,9 @@ const IPV4_CIDR_RE = /^\d{1,3}(?:\.\d{1,3}){3}\/\d{1,2}$/;
 const IPV6_CIDR_RE = /^[0-9a-fA-F:]+\/\d{1,3}$/;
 const TAG_RE = /^[A-Za-z][A-Za-z0-9]{0,63}$/;
 
-/** True when `value` is an Azure address prefix: `*`, a tag or a CIDR. */
-export function isAddressPrefix(value: string): boolean {
+/** True when `value` is an IPv4 or IPv6 CIDR, with no tag or `*`. */
+export function isCidr(value: string): boolean {
   if (typeof value !== "string" || value === "") return false;
-  if (value === "*") return true;
   if (value.includes(".") && IPV4_CIDR_RE.test(value)) {
     const [addr, prefix] = value.split("/");
     const octets = addr.split(".").map(Number);
@@ -116,6 +115,21 @@ export function isAddressPrefix(value: string): boolean {
   if (value.includes(":") && IPV6_CIDR_RE.test(value)) {
     return Number(value.split("/")[1]) <= 128;
   }
+  return false;
+}
+
+/** Throws unless `value` is a CIDR. */
+export function assertCidr(value: string, field: string): void {
+  if (!isCidr(value)) {
+    throw new GrammarError(`${field} may only use CIDRs, not tags or '*'`);
+  }
+}
+
+/** True when `value` is an Azure address prefix: `*`, a tag or a CIDR. */
+export function isAddressPrefix(value: string): boolean {
+  if (typeof value !== "string" || value === "") return false;
+  if (value === "*") return true;
+  if (isCidr(value)) return true;
   return TAG_RE.test(value);
 }
 

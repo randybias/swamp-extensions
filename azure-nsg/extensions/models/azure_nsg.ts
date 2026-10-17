@@ -24,6 +24,7 @@ import {
 } from "./_lib/arm.ts";
 import {
   assertAddressPrefix,
+  assertCidr,
   assertGuid,
   assertName,
   assertPortRange,
@@ -31,6 +32,7 @@ import {
   assertResourceGroup,
   canonicalList,
   childInstanceName,
+  GrammarError,
   GUID_RE,
   isAddressPrefix,
   isPortRange,
@@ -194,12 +196,14 @@ const RuleArgsSchema = z.strictObject({
   ...AuthFields,
   ...TargetFields,
   ...RuleFields,
+  ...PollFields,
 });
 
 const RemoveRuleArgsSchema = z.strictObject({
   ...AuthFields,
   ...TargetFields,
   ruleName: z.string().regex(NAME_RE).max(64).describe("Security rule name."),
+  ...PollFields,
 });
 
 const ApplyRuleSetArgsSchema = z.strictObject({
@@ -211,6 +215,7 @@ const ApplyRuleSetArgsSchema = z.strictObject({
   apply: z.boolean().default(false).describe(
     "Compute and record the plan only unless this is explicitly true.",
   ),
+  ...PollFields,
 });
 
 const DeleteArgsSchema = z.strictObject({
@@ -275,6 +280,7 @@ const RuleSetPlanSchema = z.strictObject({
   update: z.array(z.string()),
   unchanged: z.array(z.string()),
   undeclared: z.array(z.string()),
+  collisions: z.array(z.string()),
   applied: z.array(z.string()),
   observedAt: z.string(),
 });
@@ -308,15 +314,21 @@ interface RuleArgs extends TargetArgs {
   sourcePortRanges: string[];
   destinationPortRanges: string[];
   description?: string;
+  timeoutMs?: number;
+  pollIntervalMs?: number;
 }
 
 interface RemoveRuleArgs extends TargetArgs {
   ruleName: string;
+  timeoutMs?: number;
+  pollIntervalMs?: number;
 }
 
 interface ApplyRuleSetArgs extends TargetArgs {
   rules: RuleArgs[];
   apply: boolean;
+  timeoutMs?: number;
+  pollIntervalMs?: number;
 }
 
 interface DeleteArgs extends TargetArgs {
@@ -363,6 +375,43 @@ function properties(body: unknown): Record<string, unknown> {
   return {};
 }
 
+/**
+ * Renders one address field. Azure only accepts a tag or `*` in the singular
+ * field, so a single value always uses it and a plural list must be all CIDRs.
+ */
+function addressField(
+  values: string[],
+  plural: string,
+  singular: string,
+): Record<string, unknown> {
+  if (values.length === 1) return { [singular]: values[0] };
+  for (const value of values) assertCidr(value, plural);
+  return { [plural]: values };
+}
+
+/** Renders one port field as the singular or plural form, as Azure expects. */
+function portField(
+  values: string[],
+  plural: string,
+  singular: string,
+): Record<string, unknown> {
+  if (values.length === 1) return { [singular]: values[0] };
+  return { [plural]: values };
+}
+
+/** Normalizes a singular or plural rule list to a string array. */
+function fieldList(
+  props: Record<string, unknown>,
+  plural: string,
+  singular: string,
+): string[] | undefined {
+  const pluralValue = props[plural];
+  if (Array.isArray(pluralValue)) return pluralValue.map(String);
+  const singularValue = props[singular];
+  if (typeof singularValue === "string") return [singularValue];
+  return undefined;
+}
+
 /** Builds the ARM request body for one rule; pure and testable. */
 export function buildRuleBody(rule: RuleArgs): Record<string, unknown> {
   assertName(rule.ruleName, "ruleName");
@@ -384,10 +433,22 @@ export function buildRuleBody(rule: RuleArgs): Record<string, unknown> {
     direction: rule.direction,
     access: rule.access,
     protocol: rule.protocol,
-    sourceAddressPrefixes: rule.sourceAddressPrefixes,
-    destinationAddressPrefixes: rule.destinationAddressPrefixes,
-    sourcePortRanges: rule.sourcePortRanges,
-    destinationPortRanges: rule.destinationPortRanges,
+    ...addressField(
+      rule.sourceAddressPrefixes,
+      "sourceAddressPrefixes",
+      "sourceAddressPrefix",
+    ),
+    ...addressField(
+      rule.destinationAddressPrefixes,
+      "destinationAddressPrefixes",
+      "destinationAddressPrefix",
+    ),
+    ...portField(rule.sourcePortRanges, "sourcePortRanges", "sourcePortRange"),
+    ...portField(
+      rule.destinationPortRanges,
+      "destinationPortRanges",
+      "destinationPortRange",
+    ),
   };
   if (rule.description !== undefined) props.description = rule.description;
   return { name: rule.ruleName, properties: props };
@@ -396,27 +457,32 @@ export function buildRuleBody(rule: RuleArgs): Record<string, unknown> {
 /** True when an existing ARM rule already matches `desired`. */
 export function ruleMatches(existing: unknown, desired: RuleArgs): boolean {
   const props = properties(existing);
-  const want = buildRuleBody(desired).properties as Record<string, unknown>;
-  const fields: [string, unknown][] = [
-    ["priority", want.priority],
-    ["direction", want.direction],
-    ["access", want.access],
-    ["protocol", want.protocol],
-    ["sourceAddressPrefixes", want.sourceAddressPrefixes],
-    ["destinationAddressPrefixes", want.destinationAddressPrefixes],
-    ["sourcePortRanges", want.sourcePortRanges],
-    ["destinationPortRanges", want.destinationPortRanges],
+  if (props.priority !== desired.priority) return false;
+  if (props.direction !== desired.direction) return false;
+  if (props.access !== desired.access) return false;
+  if (props.protocol !== desired.protocol) return false;
+  const lists: [string, string, string[]][] = [
+    [
+      "sourceAddressPrefixes",
+      "sourceAddressPrefix",
+      desired.sourceAddressPrefixes,
+    ],
+    [
+      "destinationAddressPrefixes",
+      "destinationAddressPrefix",
+      desired.destinationAddressPrefixes,
+    ],
+    ["sourcePortRanges", "sourcePortRange", desired.sourcePortRanges],
+    [
+      "destinationPortRanges",
+      "destinationPortRange",
+      desired.destinationPortRanges,
+    ],
   ];
-  for (const [key, expected] of fields) {
-    const actual = props[key];
-    if (Array.isArray(expected)) {
-      if (
-        !Array.isArray(actual) || canonicalList(actual.map(String)) !==
-          canonicalList(expected.map(String))
-      ) return false;
-    } else if (actual !== expected) {
-      return false;
-    }
+  for (const [plural, singular, expected] of lists) {
+    const actual = fieldList(props, plural, singular);
+    if (actual === undefined) return false;
+    if (canonicalList(actual) !== canonicalList(expected)) return false;
   }
   const wantedDescription = desired.description ?? "";
   const actualDescription = typeof props.description === "string"
@@ -582,6 +648,83 @@ function nameOf(body: unknown): string {
   return "";
 }
 
+/** Waits until a rule write reaches Succeeded and returns the settled rule. */
+async function awaitRule(
+  deps: ArmDeps,
+  client: ArmClient,
+  args: TargetArgs & { timeoutMs?: number; pollIntervalMs?: number },
+  ruleName: string,
+  label: string,
+): Promise<ArmResult> {
+  return await pollUntil(deps, {
+    deadlineMs: args.timeoutMs ?? 900_000,
+    intervalMs: args.pollIntervalMs ?? 5000,
+    label,
+  }, async () => {
+    const current = await readRule(client, args, ruleName);
+    if (current === null) return null;
+    const state = properties(current.body).provisioningState;
+    return state === undefined || state === "Succeeded" ? current : null;
+  });
+}
+
+/** Waits until a rule is absent after a delete. */
+async function awaitRuleGone(
+  deps: ArmDeps,
+  client: ArmClient,
+  args: TargetArgs & { timeoutMs?: number; pollIntervalMs?: number },
+  ruleName: string,
+  label: string,
+): Promise<void> {
+  await pollUntil(deps, {
+    deadlineMs: args.timeoutMs ?? 900_000,
+    intervalMs: args.pollIntervalMs ?? 5000,
+    label,
+  }, async () => await readRule(client, args, ruleName) === null ? true : null);
+}
+
+/**
+ * The priority collisions that make a sequential apply unsafe: duplicate names
+ * or priorities inside the declared set, or a declared priority already held by
+ * a rule that is not being moved.
+ */
+function ruleSetCollisions(
+  rules: RuleArgs[],
+  existing: Record<string, unknown>[],
+): string[] {
+  const out: string[] = [];
+  const names = new Map<string, number>();
+  const priorities = new Map<string, string>();
+  for (const rule of rules) {
+    names.set(rule.ruleName, (names.get(rule.ruleName) ?? 0) + 1);
+    const key = `${rule.direction}|${rule.priority}`;
+    const holder = priorities.get(key);
+    if (holder !== undefined) {
+      out.push(
+        `duplicate priority ${rule.priority} for ${rule.direction}: ${holder} and ${rule.ruleName}`,
+      );
+    } else priorities.set(key, rule.ruleName);
+  }
+  for (const [name, count] of names) {
+    if (count > 1) out.push(`duplicate ruleName ${name} (${count} times)`);
+  }
+  for (const rule of rules) {
+    for (const entry of existing) {
+      const name = nameOf(entry);
+      if (name === rule.ruleName) continue;
+      const props = properties(entry);
+      if (
+        props.direction === rule.direction && props.priority === rule.priority
+      ) {
+        out.push(
+          `priority ${rule.priority} for ${rule.direction} is held by existing rule ${name} and declared by ${rule.ruleName}`,
+        );
+      }
+    }
+  }
+  return [...new Set(out)].sort();
+}
+
 /**
  * Builds the model with injectable dependencies. The production export is
  * `createModel()`; tests pass a fake fetch, clock and sleep.
@@ -591,7 +734,7 @@ export function createModel(deps: ArmDeps = denoArmDeps): NsgModel {
     type: "@randybias/azure-nsg",
     version: "2026.10.17.1",
     description:
-      "Create, inspect and delete an Azure network security group and converge its security rules through the Azure Resource Manager REST API with a service principal from a vault, keyed by subscription, resource group and name.",
+      "Inspect and delete an Azure network security group and converge its security rules through the Azure Resource Manager REST API with a service principal from a vault, keyed by subscription, resource group and name.",
     globalArguments: z.strictObject({}),
     resources: {
       nsg: {
@@ -708,12 +851,18 @@ export function createModel(deps: ArmDeps = denoArmDeps): NsgModel {
             };
           }
           await client.put(ruleUrl(args, args.ruleName), buildRuleBody(args));
-          const applied = await readRule(client, args, args.ruleName);
+          const applied = await awaitRule(
+            deps,
+            client,
+            args,
+            args.ruleName,
+            `Rule ${args.ruleName} update`,
+          );
           const handle = await writeRule(
             context,
             args,
             args.ruleName,
-            applied?.body ?? buildRuleBody(args),
+            applied.body,
             "present",
             true,
             new Date(deps.now()).toISOString(),
@@ -758,6 +907,13 @@ export function createModel(deps: ArmDeps = denoArmDeps): NsgModel {
             };
           }
           await client.del(ruleUrl(args, args.ruleName));
+          await awaitRuleGone(
+            deps,
+            client,
+            args,
+            args.ruleName,
+            `Rule ${args.ruleName} removal`,
+          );
           const handle = await writeRule(
             context,
             args,
@@ -797,6 +953,7 @@ export function createModel(deps: ArmDeps = denoArmDeps): NsgModel {
             undeclared: existing.map(nameOf).filter((name) =>
               name !== "" && !declared.has(name)
             ),
+            collisions: [] as string[],
             applied: [] as string[],
           };
           for (const rule of args.rules) {
@@ -806,12 +963,20 @@ export function createModel(deps: ArmDeps = denoArmDeps): NsgModel {
               plan.unchanged.push(rule.ruleName);
             } else plan.update.push(rule.ruleName);
           }
-          if (args.apply) {
+          plan.collisions = ruleSetCollisions(args.rules, existing);
+          if (args.apply && plan.collisions.length === 0) {
             for (const rule of args.rules) {
               if (plan.unchanged.includes(rule.ruleName)) continue;
               await client.put(
                 ruleUrl(args, rule.ruleName),
                 buildRuleBody(rule),
+              );
+              await awaitRule(
+                deps,
+                client,
+                args,
+                rule.ruleName,
+                `Rule ${rule.ruleName} update`,
               );
               plan.applied.push(rule.ruleName);
             }
@@ -833,10 +998,16 @@ export function createModel(deps: ArmDeps = denoArmDeps): NsgModel {
               update: plan.update,
               unchanged: plan.unchanged,
               undeclared: plan.undeclared,
+              collisions: plan.collisions,
               applied: plan.applied,
               observedAt,
             }),
           );
+          if (args.apply && plan.collisions.length > 0) {
+            throw new GrammarError(
+              `apply_rule_set refused ${plan.collisions.length} priority collision(s); no rule was changed`,
+            );
+          }
           context.logger.info(
             "Rule set plan for {nsg}: create {create}, update {update}, unchanged {unchanged}",
             {

@@ -275,11 +275,16 @@ Deno.test("remove_rule is a clean no-op when the rule is gone", async () => {
 });
 
 Deno.test("remove_rule deletes when the rule exists", async () => {
-  const { fetch, calls } = armFetch((method) =>
-    method === "DELETE"
-      ? { status: 202, body: null }
-      : { status: 200, body: buildRuleBody(RULE) }
-  );
+  let deleted = false;
+  const { fetch, calls } = armFetch((method) => {
+    if (method === "DELETE") {
+      deleted = true;
+      return { status: 202, body: null };
+    }
+    return deleted
+      ? { status: 404, body: { code: "NotFound" } }
+      : { status: 200, body: buildRuleBody(RULE) };
+  });
   const m = createModel(deps(fetch));
   const { context, written } = testContext();
   const result = await m.methods.remove_rule.execute(
@@ -301,6 +306,12 @@ Deno.test("apply_rule_set plans first and only writes when apply is true", async
   const { fetch, calls } = armFetch((method, url) => {
     if (method === "GET" && url.includes("/securityRules?")) {
       return { status: 200, body: { value: existing } };
+    }
+    if (method === "GET") {
+      return {
+        status: 200,
+        body: { name: "rule", properties: { provisioningState: "Succeeded" } },
+      };
     }
     if (method === "PUT") return { status: 200, body: {} };
     return { status: 404, body: {} };
@@ -324,11 +335,13 @@ Deno.test("apply_rule_set plans first and only writes when apply is true", async
     update: string[];
     unchanged: string[];
     undeclared: string[];
+    collisions: string[];
   };
   assertEquals(planned.create, []);
   assertEquals(planned.update, ["allow-http"]);
   assertEquals(planned.unchanged, ["allow-ssh"]);
   assertEquals(planned.undeclared, ["leftover"]);
+  assertEquals(planned.collisions, []);
 
   const appliedRun = testContext();
   await m.methods.apply_rule_set.execute(
@@ -415,4 +428,165 @@ Deno.test("instance keys include the NSG and the rule", () => {
     resourceInstanceName(SUB, RG, NSG),
     `s36-${SUB}-g10-${RG}-n5-${NSG}`,
   );
+});
+
+Deno.test("buildRuleBody maps tags and single values to singular fields", () => {
+  const single = buildRuleBody({
+    ...RULE,
+    destinationAddressPrefixes: ["*"],
+    destinationPortRanges: ["*"],
+  }) as { properties: Record<string, unknown> };
+  assertEquals(single.properties.destinationAddressPrefix, "*");
+  assertEquals("destinationAddressPrefixes" in single.properties, false);
+  assertEquals(single.properties.destinationPortRange, "*");
+  const multi = buildRuleBody({
+    ...RULE,
+    sourceAddressPrefixes: ["192.0.2.0/24", "198.51.100.0/24"],
+  }) as { properties: Record<string, unknown> };
+  assertEquals(multi.properties.sourceAddressPrefixes, [
+    "192.0.2.0/24",
+    "198.51.100.0/24",
+  ]);
+  assertThrows(
+    () =>
+      buildRuleBody({
+        ...RULE,
+        sourceAddressPrefixes: ["192.0.2.0/24", "Internet"],
+      }),
+    GrammarError,
+  );
+  assertThrows(
+    () =>
+      buildRuleBody({
+        ...RULE,
+        sourceAddressPrefixes: ["*", "192.0.2.0/24"],
+      }),
+    GrammarError,
+  );
+});
+
+Deno.test("ruleMatches compares singular and plural forms", () => {
+  const desired = { ...RULE, sourceAddressPrefixes: ["192.0.2.0/24"] };
+  const singular = {
+    name: "allow-ssh",
+    properties: {
+      priority: 100,
+      direction: "Inbound",
+      access: "Allow",
+      protocol: "Tcp",
+      sourceAddressPrefix: "192.0.2.0/24",
+      destinationAddressPrefix: "*",
+      sourcePortRange: "*",
+      destinationPortRange: "22",
+    },
+  };
+  assert(ruleMatches(singular, desired), "singular existing should match");
+  const plural = {
+    name: "allow-ssh",
+    properties: {
+      priority: 100,
+      direction: "Inbound",
+      access: "Allow",
+      protocol: "Tcp",
+      sourceAddressPrefixes: ["192.0.2.0/24"],
+      destinationAddressPrefixes: ["*"],
+      sourcePortRanges: ["*"],
+      destinationPortRanges: ["22"],
+    },
+  };
+  assert(ruleMatches(plural, desired), "plural existing should match");
+});
+
+Deno.test("apply_rule_set refuses duplicate names and priorities with no PUTs", async () => {
+  const existing: Record<string, unknown>[] = [];
+  const { fetch, calls } = armFetch((method, url) =>
+    method === "GET" && url.includes("/securityRules?")
+      ? { status: 200, body: { value: existing } }
+      : { status: 200, body: {} }
+  );
+  const m = createModel(deps(fetch));
+  const dupName = testContext();
+  await assertRejects(
+    () =>
+      m.methods.apply_rule_set.execute({
+        ...BASE,
+        rules: [RULE, { ...RULE, priority: 300 }],
+        apply: true,
+      }, dupName.context),
+    GrammarError,
+    "collision",
+  );
+  assertEquals(
+    calls.filter((c) => c.method === "PUT").length,
+    0,
+    "no PUT on a duplicate name",
+  );
+  const dupPriority = testContext();
+  await assertRejects(
+    () =>
+      m.methods.apply_rule_set.execute({
+        ...BASE,
+        rules: [RULE, { ...RULE, ruleName: "other" }],
+        apply: true,
+      }, dupPriority.context),
+    GrammarError,
+  );
+  assertEquals(
+    calls.filter((c) => c.method === "PUT").length,
+    0,
+    "no PUT on a duplicate priority",
+  );
+});
+
+Deno.test("apply_rule_set refuses a priority held by an undeclared or swapped rule", async () => {
+  const existing = [
+    buildRuleBody({ ...RULE, ruleName: "keep", priority: 200 }),
+  ];
+  const { fetch, calls } = armFetch((method, url) =>
+    method === "GET" && url.includes("/securityRules?")
+      ? { status: 200, body: { value: existing } }
+      : { status: 200, body: {} }
+  );
+  const m = createModel(deps(fetch));
+  const declared = testContext();
+  await assertRejects(
+    () =>
+      m.methods.apply_rule_set.execute({
+        ...BASE,
+        rules: [{ ...RULE, priority: 200 }],
+        apply: true,
+      }, declared.context),
+    GrammarError,
+  );
+  assertEquals(calls.filter((c) => c.method === "PUT").length, 0);
+  assert(
+    (declared.written[0].data as { collisions: string[] }).collisions.length >
+      0,
+    "the collision must be recorded",
+  );
+
+  const swapExisting = [
+    buildRuleBody({ ...RULE, ruleName: "a", priority: 100 }),
+    buildRuleBody({ ...RULE, ruleName: "b", priority: 200 }),
+  ];
+  const swap = armFetch((method, url) =>
+    method === "GET" && url.includes("/securityRules?")
+      ? { status: 200, body: { value: swapExisting } }
+      : { status: 200, body: {} }
+  );
+  const m2 = createModel(deps(swap.fetch));
+  const swapCtx = testContext();
+  await assertRejects(
+    () =>
+      m2.methods.apply_rule_set.execute({
+        ...BASE,
+        rules: [
+          { ...RULE, ruleName: "a", priority: 200 },
+          { ...RULE, ruleName: "b", priority: 100 },
+        ],
+        apply: true,
+      }, swapCtx.context),
+    GrammarError,
+  );
+  assertEquals(swap.calls.filter((c) => c.method === "PUT").length, 0);
 });

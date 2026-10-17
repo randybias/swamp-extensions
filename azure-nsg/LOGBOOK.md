@@ -21,3 +21,16 @@ Not packaged. Notes for whoever maintains this extension.
   service principal scoped to a throwaway resource group, and the account must
   be tagged for the run. Live cells are marked blocked in the run matrix, not
   skip. Everything here is unit/contract tested against a scripted fetch.
+- 2026-10-17 review round 1: `buildRuleBody` now uses Azure's singular
+  `sourceAddressPrefix`/`destinationAddressPrefix`/`sourcePortRange`/
+  `destinationPortRange` for a single value (and for `*` and service tags), and
+  the plural fields only for multi-element lists, which must be all CIDRs or
+  ranges; `ruleMatches` compares either form. `ensure_rule`, `remove_rule` and
+  `apply_rule_set` poll rule writes to `Succeeded` and deletes to gone before
+  recording state. `apply_rule_set` records priority collisions (duplicate rule
+  name or priority in the declared set, or a declared priority held by an
+  undeclared or swapped rule) and, with `apply` true, writes the plan and
+  refuses without issuing any PUT, so a partial converge cannot happen. The
+  model and manifest descriptions no longer claim a `create` method, which does
+  not exist. Shared `_lib/arm.ts` error parsing fixed as in
+  `@randybias/azure-vm`.

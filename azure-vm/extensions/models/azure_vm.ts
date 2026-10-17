@@ -547,6 +547,7 @@ export function createModel(deps: ArmDeps = denoArmDeps): VmModel {
       },
 
       create: {
+        kind: "action",
         description:
           "Create the VM, or adopt the existing one with the same name and never create a second. Idempotent; waits until provisioning succeeds and returns the stored state.",
         arguments: CreateArgsSchema,
@@ -617,6 +618,7 @@ export function createModel(deps: ArmDeps = denoArmDeps): VmModel {
       },
 
       start: {
+        kind: "action",
         description:
           "Start a stopped or deallocated VM and wait until its power state is running. Idempotent when the VM is already running.",
         arguments: ActionArgsSchema,
@@ -682,8 +684,9 @@ export function createModel(deps: ArmDeps = denoArmDeps): VmModel {
       },
 
       deallocate: {
+        kind: "action",
         description:
-          "Deallocate a VM, releasing compute and stopping charges, and wait until it is deallocated. Optionally hibernate instead.",
+          "DESTRUCTIVE. Deallocate a VM, releasing compute and stopping charges, and wait until it is deallocated. Optionally hibernate instead; the workload stops.",
         arguments: DeallocateArgsSchema,
         execute: async (
           rawArgs: unknown,
@@ -728,8 +731,9 @@ export function createModel(deps: ArmDeps = denoArmDeps): VmModel {
       },
 
       stop: {
+        kind: "action",
         description:
-          "Power off a VM without deallocating, so compute charges continue, and wait until its power state is stopped.",
+          "DESTRUCTIVE. Power off a VM without deallocating, so compute charges continue, and wait until its power state is stopped; the workload stops.",
         arguments: ActionArgsSchema,
         execute: async (
           rawArgs: unknown,

@@ -22,3 +22,10 @@ Not packaged. Notes for whoever maintains this extension.
   service principal scoped to a throwaway resource group, and the account must
   be tagged for the run. Live cells are marked blocked in the run matrix, not
   skip. Everything here is unit/contract tested against a scripted fetch.
+- 2026-10-17 review round 1: `create`, `start`, `deallocate` and `stop` are now
+  `kind: "action"` like `delete`, so no lifecycle verb tombstones the
+  definition; `deallocate` and `stop` are prefixed `DESTRUCTIVE.` because they
+  stop the workload. The shared `_lib/arm.ts` now unwraps Resource Manager's
+  nested `{error:{code,message}}` and AAD's `{error, error_description}`,
+  redacts the secret before truncating the message, and redacts the code; both
+  `_lib` copies stay byte-identical.

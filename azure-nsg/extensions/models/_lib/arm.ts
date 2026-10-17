@@ -117,26 +117,47 @@ function parseBody(text: string): unknown {
   }
 }
 
-/** Reads a short, secret-free error code from an Azure error body. */
+/** True when `value` is a non-null object. */
+function isObject(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+/**
+ * The Azure error envelope. Resource Manager nests it under `error`; AAD
+ * returns `error` as a string code with a top-level `error_description`.
+ */
+function errorEnvelope(body: unknown): Record<string, unknown> {
+  if (!isObject(body)) return {};
+  return isObject(body.error) ? body.error : body;
+}
+
+/** Reads a short error code from an Azure or AAD error body. */
 function errorCode(body: unknown): string | undefined {
-  if (body && typeof body === "object") {
-    const code = (body as Record<string, unknown>).code;
-    if (typeof code === "string" && /^[A-Za-z0-9_.-]{1,64}$/.test(code)) {
-      return code;
-    }
+  const envelope = errorEnvelope(body);
+  const raw = isObject(body) && typeof body.error === "string"
+    ? body.error
+    : envelope.code;
+  if (typeof raw === "string" && /^[A-Za-z0-9_.-]{1,64}$/.test(raw)) {
+    return raw;
   }
   return undefined;
 }
 
-/** Reads a short, secret-free error message from an Azure error body. */
-function errorMessage(body: unknown): string {
-  if (body && typeof body === "object") {
-    const message = (body as Record<string, unknown>).message;
-    if (typeof message === "string" && message.length > 0) {
-      return message.slice(0, 300);
-    }
-  }
-  return typeof body === "string" ? body.slice(0, 300) : "no response body";
+/**
+ * Reads a short, redacted error message. The secret is redacted before the
+ * message is truncated, so a secret cannot survive as a partial token at the
+ * 300-character boundary.
+ */
+function errorMessage(body: unknown, secrets: readonly string[]): string {
+  const envelope = errorEnvelope(body);
+  const raw = typeof envelope.message === "string"
+    ? envelope.message
+    : typeof envelope.error_description === "string"
+    ? envelope.error_description
+    : typeof body === "string"
+    ? body
+    : "no response body";
+  return redact(raw, secrets).slice(0, 300);
 }
 
 const DEFAULT_AUTHORITY = "https://login.microsoftonline.com";
@@ -186,12 +207,11 @@ export function createArmClient(
     if (res.status < 200 || res.status > 299) {
       const code = errorCode(parsed);
       throw new ArmError(
-        redact(
-          `${method} ${path} returned ${res.status}: ${errorMessage(parsed)}`,
-          secrets,
-        ),
+        `${method} ${path} returned ${res.status}: ${
+          errorMessage(parsed, secrets)
+        }`,
         res.status,
-        code,
+        code === undefined ? undefined : redact(code, secrets),
       );
     }
     return { status: res.status, body: parsed };
@@ -230,13 +250,11 @@ async function fetchToken(
   const text = await res.text();
   const parsed = parseBody(text);
   if (res.status < 200 || res.status > 299) {
+    const code = errorCode(parsed);
     throw new ArmError(
-      redact(
-        `token request returned ${res.status}: ${errorMessage(parsed)}`,
-        secrets,
-      ),
+      `token request returned ${res.status}: ${errorMessage(parsed, secrets)}`,
       res.status,
-      errorCode(parsed),
+      code === undefined ? undefined : redact(code, secrets),
     );
   }
   const accessToken = parsed && typeof parsed === "object"

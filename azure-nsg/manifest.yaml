@@ -1,7 +1,7 @@
 manifestVersion: 1
 name: "@randybias/azure-nsg"
 version: "2026.10.17.1"
-description: "Create, inspect and delete an Azure network security group and converge its security rules through the Azure Resource Manager REST API with a service principal from a vault. One generic model type, keyed by subscription, resource group and NSG name, with rule convergence that plans before it applies."
+description: "Inspect and delete an Azure network security group and converge its security rules through the Azure Resource Manager REST API with a service principal from a vault. One generic model type, keyed by subscription, resource group and NSG name, with rule convergence that plans before it applies."
 license: Apache-2.0
 repository: https://github.com/randybias/swamp-extensions
 platforms: [darwin-aarch64, darwin-x86_64, linux-x86_64, linux-aarch64]

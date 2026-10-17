@@ -82,3 +82,31 @@ for this round.
   `isSensitive` test throws if zod's wrapper shape changes.
 - Not fixed by design: the LOWs from the two OCR seats that timed out were not
   available at the time of this round; fold any that arrive into the next one.
+
+## Review ledger: round 3 (codex astra + terra on ab51a14)
+
+- MEDIUM-1 (ambiguous key): `host-port-user` concatenation could collide
+  (`a-22-x-3-y`). Instance names now use length-prefixed labeled components:
+  `h<len>-<host>-p<port>-u<len>-<user>`, so target identity is unambiguous.
+- MEDIUM-2 (non-transactional pin): a first-use `insecure_tofu` scan persisted
+  the pin before the operation ran. `resolveTarget` now learns the keys and pins
+  the operation only; `commitPin` writes the `connection` resource after the
+  transport returns without throwing, so a failed auth or key change leaves no
+  durable trust. Test added.
+- MEDIUM-3 (convergence skipped mode): `upload`'s probe now returns sha256 and
+  mode; identical bytes under a different mode get a chmod only, and identical
+  bytes and mode are the no-op case.
+- MEDIUM-4 (directory destination): the probe reports `DIRECTORY` and `upload`
+  throws; the write script also refuses a directory immediately before `mv`, so
+  a directory can never be treated as the file.
+- LOW-5: the mode is rendered with `posixQuote` in the chmod-only path and the
+  write script.
+- LOW-6: `exec` is prefixed `DESTRUCTIVE.` with a three-sentence description;
+  the README explains that reachability/rollback protection belongs in the
+  owning extension.
+- LOW-7 (dead code): `buildRemoteCommand` is now used by a public
+  `execPipeline(stages, operators)` entry, so the pipeline builder is live.
+- REFUTED, deliberately not done: terra's mandatory armed-revert on `exec` and
+  `upload`. This is a generic transport primitive; a forced rollback on every
+  exec breaks normal use. Reachability protection lives in the higher-level
+  extensions, and `DESTRUCTIVE.` plus the README note is the right treatment.

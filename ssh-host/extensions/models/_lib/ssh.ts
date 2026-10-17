@@ -718,13 +718,20 @@ export async function exec(
   return await runRemote(deps, target, quoteArgv(argv));
 }
 
+/** Normalizes an octal mode for comparison: `0600` and `600` are the same. */
+function normalizeMode(mode: string): string {
+  const trimmed = mode.replace(/^0+/, "");
+  return trimmed === "" ? "0" : trimmed;
+}
+
 /**
  * Pushes `content` to `path` on the target: a temporary file in the
  * destination directory is written from stdin, chmod'ed, and renamed over the
- * destination, so the destination is never partially written. Idempotent by
- * bytes: when the destination already holds the same SHA-256 the write is
- * skipped and `changed` is false. Returns the destination, byte count and
- * SHA-256.
+ * destination, so the destination is never partially written. Converges on
+ * bytes and mode: identical bytes and mode mean no write, no rename and no new
+ * resource version; identical bytes under a different mode get only a chmod. A
+ * destination that is a directory is refused. Returns the destination, byte
+ * count, SHA-256 and whether anything changed.
  */
 export async function upload(
   deps: SshDeps,
@@ -739,19 +746,30 @@ export async function upload(
     : options.content;
   const sha256 = await sha256Hex(bytes);
   const file = posixQuote(options.path);
-  // Idempotence: read the destination's SHA-256 first. Identical bytes mean no
-  // write, no rename and no new resource version. Portability: sha256sum on
-  // GNU, shasum -a 256 on macOS; if neither exists the check fails and the
-  // write proceeds.
+  // Convergence probe: read the destination's SHA-256 and mode first, and
+  // refuse a directory. Portability: sha256sum on GNU, shasum -a 256 on macOS;
+  // stat -c on GNU, stat -f on BSD. If none exists the probe yields `none` and
+  // the write proceeds.
   const check = await runRemote(
     deps,
     target,
     `f=${file}\n` +
-      `if [ -f "$f" ]; then { sha256sum "$f" 2>/dev/null || shasum -a 256 "$f" 2>/dev/null; }; else echo MISSING; fi`,
+      `if [ -d "$f" ]; then echo DIRECTORY; elif [ -f "$f" ]; then\n` +
+      `  h=$( { sha256sum "$f" 2>/dev/null || shasum -a 256 "$f" 2>/dev/null; } | awk '{print $1}' )\n` +
+      `  m=$( { stat -c %a "$f" 2>/dev/null || stat -f %Lp "$f" 2>/dev/null; } )\n` +
+      `  printf '%s %s\n' "\${h:-none}" "\${m:-none}"\n` +
+      `else echo MISSING; fi`,
   );
   if (check.exit_code === 0) {
-    const existing = check.stdout.trim().split(/\s+/)[0] ?? "";
-    if (existing === sha256) {
+    const tokens = check.stdout.trim().split(/\s+/);
+    if (tokens[0] === "DIRECTORY") {
+      throw new SshError(
+        `upload destination ${target.user}@${target.host}:${options.path} is a directory`,
+      );
+    }
+    const bytesMatch = tokens[0] === sha256;
+    const modeMatch = normalizeMode(tokens[1] ?? "") === normalizeMode(mode);
+    if (bytesMatch && modeMatch) {
       return {
         path: options.path,
         bytes: bytes.length,
@@ -759,15 +777,32 @@ export async function upload(
         changed: false,
       };
     }
+    if (bytesMatch) {
+      // Same content, different permissions: apply only the mode.
+      const chmod = await runRemote(
+        deps,
+        target,
+        `chmod ${posixQuote(mode)} ${file}`,
+      );
+      if (chmod.exit_code !== 0) {
+        throw new SshError(
+          `chmod on ${target.user}@${target.host}:${options.path} failed (exit ${chmod.exit_code})`,
+        );
+      }
+      return { path: options.path, bytes: bytes.length, sha256, changed: true };
+    }
   }
   const dir = options.path.slice(0, options.path.lastIndexOf("/")) || "/";
   const script = [
+    `f=${file}`,
+    `[ -d "$f" ] && exit 1`,
     `d=${posixQuote(dir)}`,
     `t=$(mktemp "$d/.ssh-host-upload.XXXXXX") || exit 1`,
     `trap 'rm -f "$t"' EXIT HUP INT TERM`,
     `cat > "$t" || exit 1`,
-    `chmod ${mode} "$t" || exit 1`,
-    `mv -f "$t" ${file} || exit 1`,
+    `chmod ${posixQuote(mode)} "$t" || exit 1`,
+    `[ ! -d "$f" ] || exit 1`,
+    `mv -f "$t" "$f" || exit 1`,
   ].join("\n");
   const res = await runRemote(deps, target, script, bytes);
   if (res.exit_code !== 0) {
@@ -776,6 +811,21 @@ export async function upload(
     );
   }
   return { path: options.path, bytes: bytes.length, sha256, changed: true };
+}
+
+/**
+ * Runs a pipeline of argv vectors joined by operators from the allowlist, for
+ * example `execPipeline(deps, target, [["wg", "show"], ["grep", "peer"]],
+ * ["|"])`. Every word of every stage is quoted, so no stage can inject a
+ * second command.
+ */
+export async function execPipeline(
+  deps: SshDeps,
+  target: SshTarget,
+  stages: string[][],
+  operators: RemoteOperator[] = [],
+): Promise<ExecResult> {
+  return await runRemote(deps, target, buildRemoteCommand(stages, operators));
 }
 
 /** Waits until the host answers SSH with acceptable host keys, or times out. */

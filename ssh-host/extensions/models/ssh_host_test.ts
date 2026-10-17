@@ -27,6 +27,8 @@ const HOST = "192.0.2.10";
 const KEY = "QUFBQUFB";
 const PRIVATE_KEY = "PLACEHOLDER-PRIVATE-KEY-MATERIAL";
 const KEY_LINE = `${HOST} ssh-ed25519 ${KEY}`;
+// Length-prefixed, labeled target key used for stored instance names.
+const SUFFIX = `h${HOST.length}-${HOST}-p22-u4-root`;
 
 const STRICT = {
   host: HOST,
@@ -166,6 +168,7 @@ Deno.test("model contract: type, empty globals, action methods, read-only label"
     "READ-ONLY.",
   );
   assertStringIncludes(model.methods.upload.description, "DESTRUCTIVE.");
+  assertStringIncludes(model.methods.exec.description, "DESTRUCTIVE.");
   assert(model.description.length > 20);
   assertEquals(Object.keys(model.resources).sort(), [
     "connection",
@@ -276,7 +279,7 @@ Deno.test("exec runs the argv, writes a host-keyed resource, returns data", asyn
   assertEquals(result.result, { stdout: "hi\n", stderr: "", exit_code: 0 });
   assertEquals(written.length, 1);
   assertEquals(written[0].specName, "execution");
-  assertEquals(written[0].name, `exec-${HOST}-22-root`);
+  assertEquals(written[0].name, `exec-${SUFFIX}`);
   assertEquals(written[0].data.exit_code, 0);
   assertEquals(written[0].data.stdout, "hi\n");
   assertEquals(
@@ -385,7 +388,7 @@ Deno.test("upload writes a host-keyed resource and is idempotent", async () => {
   assertEquals(first.result, second.result);
   assertEquals(new TextDecoder().decode(seen), "placeholder\n");
   assertEquals(written[0].specName, "upload");
-  assertEquals(written[0].name, `upload-${HOST}-22-root`);
+  assertEquals(written[0].name, `upload-${SUFFIX}`);
   assertEquals(written[0].data.bytes, 12);
   assertEquals(written[0].data.sha256, await sha256Hex("placeholder\n"));
   for (const call of calls) {
@@ -398,7 +401,7 @@ Deno.test("upload writes no resource when the remote bytes are unchanged", async
   const content = "already current\n";
   const sha = await sha256Hex(content);
   const deps = fakeDeps(fakeRun(calls, {
-    ssh: () => ({ code: 0, stdout: `${sha}  /etc/x\n`, stderr: "" }),
+    ssh: () => ({ code: 0, stdout: `${sha} 600\n`, stderr: "" }),
   }));
   const m = createModel(deps);
   const { context, written } = testContext();
@@ -487,7 +490,7 @@ Deno.test("wait_connection records reachability and accepted keys", async () => 
   assertEquals(value.reachable, true);
   assertEquals(value.host_keys[0].sha256.startsWith("SHA256:"), true);
   assertEquals(written[0].specName, "connection");
-  assertEquals(written[0].name, `connection-${HOST}-22-root`);
+  assertEquals(written[0].name, `connection-${SUFFIX}`);
   assertEquals(written[0].data.reachable, true);
 });
 
@@ -549,7 +552,7 @@ Deno.test("insecure_tofu records the first keys and pins them on later runs", as
   // First use scanned and recorded the keys, then pinned them for the run.
   assertEquals(calls.some((c) => c.cmd === "ssh-keyscan"), true);
   const connection = written.find((w) => w.specName === "connection");
-  assertEquals(connection?.name, `connection-${HOST}-22-root`);
+  assertEquals(connection?.name, `connection-${SUFFIX}`);
   const firstSsh = calls.filter((c) => c.cmd === "ssh").at(-1);
   assertEquals(firstSsh?.args.includes("StrictHostKeyChecking=yes"), true);
   assert(connection);
@@ -558,7 +561,7 @@ Deno.test("insecure_tofu records the first keys and pins them on later runs", as
   const calls2: Call[] = [];
   const deps2 = fakeDeps(fakeRun(calls2));
   const m2 = createModel(deps2);
-  const stored = { [`connection-${HOST}-22-root`]: connection.data };
+  const stored = { [`connection-${SUFFIX}`]: connection.data };
   const { context: context2, written: written2 } = testContext(stored);
   await m2.methods.exec.execute(args, context2);
   assertEquals(calls2.some((c) => c.cmd === "ssh-keyscan"), false);
@@ -569,6 +572,33 @@ Deno.test("insecure_tofu records the first keys and pins them on later runs", as
     true,
   );
   assertEquals(written2.some((w) => w.specName === "connection"), false);
+});
+
+Deno.test("a first-use TOFU scan does not persist a pin when auth fails", async () => {
+  const calls: Call[] = [];
+  const deps = fakeDeps(fakeRun(calls, {
+    ssh: () => ({
+      code: 255,
+      stdout: "",
+      stderr: "root@192.0.2.10: Permission denied (publickey).\n",
+    }),
+  }));
+  const m = createModel(deps);
+  const { context, written } = testContext();
+  await assertRejects(
+    () =>
+      m.methods.exec.execute({
+        ...STRICT,
+        host_key_policy: "insecure_tofu",
+        host_keys: undefined,
+        argv: ["true"],
+      }, context),
+    SshError,
+    "authentication failed",
+  );
+  // The scan ran, but a failed operation left no durable trust behind.
+  assertEquals(calls.some((c) => c.cmd === "ssh-keyscan"), true);
+  assertEquals(written.length, 0);
 });
 
 Deno.test("insecure_tofu refuses a changed key on a later run", async () => {
@@ -582,7 +612,7 @@ Deno.test("insecure_tofu refuses a changed key on a later run", async () => {
   }));
   const m = createModel(deps);
   const { context } = testContext({
-    [`connection-${HOST}-22-root`]: {
+    [`connection-${SUFFIX}`]: {
       host_keys: [{ type: "ssh-ed25519", key: "QkJCQkJC" }],
     },
   });

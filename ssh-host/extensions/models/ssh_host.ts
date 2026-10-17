@@ -286,11 +286,12 @@ function resolveContent(
 }
 
 /**
- * The per-target suffix for stored data: host, port and user together, so two
- * ports or two users on one host never overwrite each other's evidence.
+ * The per-target suffix for stored data. Length-prefixed, labeled components
+ * make it unambiguous: `h2-ab-p22-u3-x-y` and `h5-ab-22-p3-u2-y` differ, so two
+ * different targets can never share a stored record (and a TOFU pin).
  */
 function instanceSuffix(args: TargetArgs): string {
-  return `${args.host}-${args.port}-${args.user}`;
+  return `h${args.host.length}-${args.host}-p${args.port}-u${args.user.length}-${args.user}`;
 }
 
 /** The keys recorded by an earlier `insecure_tofu` connection, if any. */
@@ -322,28 +323,59 @@ async function pinnedTarget(
   };
 }
 
+/** A resolved target plus a first-use pin that must be committed on success. */
+interface ResolvedTarget {
+  /** The target to connect to, already pinned when a record or scan exists. */
+  target: SshTarget;
+  /** Keys learned on a first `insecure_tofu` use, to persist after success. */
+  pending?: { type: string; key: string; sha256: string }[];
+}
+
 /**
  * Resolves the target for a mutating transport call. On the first
- * `insecure_tofu` use it learns the host keys read-only, records them keyed by
- * host/port/user, and pins them for the call; later calls verify against the
- * record and refuse a changed key.
+ * `insecure_tofu` use it learns the host keys read-only and pins them for this
+ * call, but does not persist them yet: a failed authentication or a changed key
+ * must leave no durable trust behind. {@link commitPin} records them only after
+ * the operation succeeds. Later calls verify against the record.
  */
 async function resolveTarget(
   deps: SshDeps,
   context: MethodContext,
   args: TargetArgs,
-): Promise<SshTarget> {
+): Promise<ResolvedTarget> {
   const target = await pinnedTarget(context, args);
   if (
     args.host_key_policy !== "insecure_tofu" ||
     target.host_key_policy === "strict"
   ) {
-    return target;
+    return { target };
   }
   const learned = await waitConnection(deps, target, {
     timeout_s: args.connect_timeout_s,
     poll_interval_s: 1,
   });
+  return {
+    target: {
+      ...target,
+      host_key_policy: "strict",
+      host_keys: learned.host_keys.map((k) => `${k.type} ${k.key}`),
+    },
+    pending: learned.host_keys,
+  };
+}
+
+/**
+ * Persists a first-use pin after the operation that proved it succeeded. A
+ * non-zero remote exit still proves the host, so callers commit once the
+ * transport returns without throwing.
+ */
+async function commitPin(
+  deps: SshDeps,
+  context: MethodContext,
+  args: TargetArgs,
+  pending: { type: string; key: string; sha256: string }[] | undefined,
+): Promise<void> {
+  if (!pending || pending.length === 0) return;
   await context.writeResource(
     "connection",
     `connection-${instanceSuffix(args)}`,
@@ -351,16 +383,11 @@ async function resolveTarget(
       host: args.host,
       port: args.port,
       reachable: true,
-      host_keys: learned.host_keys,
+      host_keys: pending,
       checked_at: new Date(deps.now()).toISOString(),
       waited_seconds: 0,
     }),
   );
-  return {
-    ...target,
-    host_key_policy: "strict",
-    host_keys: learned.host_keys.map((k) => `${k.type} ${k.key}`),
-  };
 }
 
 /**
@@ -400,15 +427,18 @@ export function createModel(deps: SshDeps = denoDeps): SshHostModel {
       exec: {
         kind: "action",
         description:
-          "Run one argv vector on the host over SSH and return its stdout, stderr and exit code. Each element is passed as one literal argv word, never interpolated into a remote shell string, but argv can still run a destructive command on the host; a non-zero remote exit is data, while an unreachable host, rejected credential or host-key mismatch is an error. Never put a secret in argv. Stored stdout and stderr are sensitive.",
+          "DESTRUCTIVE. Run one argv vector on the host over SSH and return its stdout, stderr and exit code; each element is a literal argv word, never interpolated into a shell string, but argv can change or break the host and exec cannot roll that back. A non-zero remote exit is data while an unreachable host, rejected credential or host-key mismatch is an error. Never put a secret in argv; stored stdout and stderr are sensitive-marked.",
         arguments: ExecArgsSchema,
         execute: async (
           rawArgs: unknown,
           context: MethodContext,
         ): Promise<MethodResult> => {
           const args = rawArgs as ExecArgs;
-          const target = await resolveTarget(deps, context, args);
+          const { target, pending } = await resolveTarget(deps, context, args);
           const result = await sshExec(deps, target, args.argv);
+          // The host is proven only now; a failed auth or key change left no
+          // durable trust behind.
+          await commitPin(deps, context, args, pending);
           const handle = await context.writeResource(
             "execution",
             `exec-${instanceSuffix(args)}`,
@@ -445,12 +475,14 @@ export function createModel(deps: SshDeps = denoDeps): SshHostModel {
           context: MethodContext,
         ): Promise<MethodResult> => {
           const args = rawArgs as UploadArgs;
-          const target = await resolveTarget(deps, context, args);
+          const { target, pending } = await resolveTarget(deps, context, args);
           const result = await sshUpload(deps, target, {
             path: args.path,
             content: resolveContent(args),
             mode: args.mode,
           });
+          // Persist a first-use pin only after the transport succeeded.
+          await commitPin(deps, context, args, pending);
           if (!result.changed) {
             context.logger.info(
               "Upload to {host}:{path} already current; no write",

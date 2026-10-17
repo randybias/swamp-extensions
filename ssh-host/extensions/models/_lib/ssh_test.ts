@@ -18,6 +18,7 @@ import {
   type CommandRunner,
   denoDeps,
   exec,
+  execPipeline,
   fingerprint,
   type HostKey,
   keysForHost,
@@ -169,8 +170,22 @@ Deno.test("keysForHost accepts both host and [host]:22 pins on port 22", () => {
 Deno.test("the public surface exposes no raw command-string entry point", () => {
   assertEquals("runRemote" in sshModule, false);
   assertEquals(typeof sshModule.exec, "function");
+  assertEquals(typeof sshModule.execPipeline, "function");
   assertEquals(typeof sshModule.quoteArgv, "function");
   assertEquals(typeof sshModule.buildRemoteCommand, "function");
+});
+
+Deno.test("execPipeline runs quoted stages joined by an allowlisted operator", async () => {
+  const calls: Call[] = [];
+  const deps = fakeDeps(fakeRun(calls));
+  await execPipeline(deps, STRICT_TARGET, [
+    ["wg", "show"],
+    ["grep", "peer"],
+  ], ["|"] as RemoteOperator[]);
+  assertEquals(
+    calls.find((c) => c.cmd === "ssh")?.args.at(-1),
+    "'wg' 'show' | 'grep' 'peer'",
+  );
 });
 
 Deno.test("quoteArgv and buildRemoteCommand only emit quoted words", () => {
@@ -466,19 +481,20 @@ Deno.test("upload streams bytes over stdin and renames atomically", async () => 
   assertEquals(sshCalls[0].stdin, undefined);
   const remote = sshCalls[1].args.at(-1) ?? "";
   assertStringIncludes(remote, "mktemp");
-  assertStringIncludes(remote, "chmod 0640");
-  assertStringIncludes(remote, `mv -f \"$t\" '/etc/wireguard/wg0.conf'`);
+  assertStringIncludes(remote, "chmod '0640'");
+  assertStringIncludes(remote, `mv -f \"$t\" \"$f\"`);
+  assertStringIncludes(remote, `f='/etc/wireguard/wg0.conf'`);
   for (const call of calls) {
     assertEquals(call.args.join(" ").includes("placeholder config"), false);
   }
 });
 
-Deno.test("upload is idempotent: matching bytes mean no write", async () => {
+Deno.test("upload is idempotent: matching bytes and mode mean no write", async () => {
   const calls: Call[] = [];
   const content = "already there\n";
   const sha = await sha256Hex(content);
   const deps = fakeDeps(fakeRun(calls, {
-    ssh: () => ({ code: 0, stdout: `${sha}  /etc/x\n`, stderr: "" }),
+    ssh: () => ({ code: 0, stdout: `${sha} 600\n`, stderr: "" }),
   }));
   const result = await upload(deps, STRICT_TARGET, {
     path: "/etc/x",
@@ -488,6 +504,38 @@ Deno.test("upload is idempotent: matching bytes mean no write", async () => {
   const sshCalls = calls.filter((c) => c.cmd === "ssh");
   assertEquals(sshCalls.length, 1);
   assertEquals(sshCalls[0].stdin, undefined);
+});
+
+Deno.test("upload applies a mode change when only permissions differ", async () => {
+  const calls: Call[] = [];
+  const content = "same bytes\n";
+  const sha = await sha256Hex(content);
+  const deps = fakeDeps(fakeRun(calls, {
+    ssh: () => ({ code: 0, stdout: `${sha} 644\n`, stderr: "" }),
+  }));
+  const result = await upload(deps, STRICT_TARGET, {
+    path: "/etc/x",
+    content,
+    mode: "0600",
+  });
+  assertEquals(result.changed, true);
+  const sshCalls = calls.filter((c) => c.cmd === "ssh");
+  assertEquals(sshCalls.length, 2);
+  assertEquals(sshCalls[1].args.at(-1), "chmod '0600' '/etc/x'");
+  assertEquals(sshCalls[1].stdin, undefined);
+});
+
+Deno.test("upload refuses a destination that is a directory", async () => {
+  const calls: Call[] = [];
+  const deps = fakeDeps(fakeRun(calls, {
+    ssh: () => ({ code: 0, stdout: "DIRECTORY\n", stderr: "" }),
+  }));
+  await assertRejects(
+    () => upload(deps, STRICT_TARGET, { path: "/etc", content: "x" }),
+    SshError,
+    "is a directory",
+  );
+  assertEquals(calls.filter((c) => c.cmd === "ssh").length, 1);
 });
 
 Deno.test("upload to an unwritable path is a typed error", async () => {

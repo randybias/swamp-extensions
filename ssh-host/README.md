@@ -69,7 +69,7 @@ swamp model method run ssh-transport wait_connection \
 Read a result from stored data:
 
 ```bash
-swamp data query 'model("ssh-transport") && name == "exec-web-1.example.com-22-root"' \
+swamp data query 'model("ssh-transport") && name == "exec-h17-web-1.example.com-p22-u4-root"' \
   --select content
 ```
 
@@ -90,9 +90,11 @@ swamp CLI echoes method arguments, sensitive ones included, in `--json` output
 - `exec` takes a command and its arguments as an array. Each element is quoted
   as one literal word before it is sent, so `;`, `$()`, backticks and newlines
   inside an element can never become a second command. `argv` can still run a
-  destructive command on the host, so treat it as such. A non-zero remote exit
-  code is returned as data; an unreachable host, rejected credential or host-key
-  mismatch is an error that names the host. Persisted `stdout` and `stderr` are
+  destructive command on the host, and `exec` cannot roll back what it changed;
+  reachability protection (locking down a host, reverting a config) belongs in
+  the extension that owns that workflow. A non-zero remote exit code is returned
+  as data; an unreachable host, rejected credential or host-key mismatch is an
+  error that names the host. Persisted `stdout` and `stderr` are
   sensitive-marked.
 - `upload` writes a temporary file in the destination directory from stdin,
   applies `mode`, then renames it over the destination, so the destination is
@@ -103,9 +105,10 @@ swamp CLI echoes method arguments, sensitive ones included, in `--json` output
 - Credentials never touch the command line. A private key is loaded into a
   short-lived `ssh-agent` over stdin; a password goes through a temporary
   askpass helper and an environment variable. Neither appears in a spawned argv.
-- Stored data is keyed by host, port and user: `exec-<host>-<port>-<user>`,
-  `upload-<host>-<port>-<user>` and `connection-<host>-<port>-<user>`. The
-  definition name is never part of the key.
+- Stored data is keyed unambiguously by host, port and user with length-prefixed
+  components, so a target's identity can never be confused with another's:
+  `exec-h17-web-1.example.com-p22-u4-root`, and likewise `upload-…` and
+  `connection-…`. The definition name is never part of the key.
 - On Ubuntu 24.04, `sshd` is socket-activated: a cloud-init that changes the SSH
   port must restart `ssh.socket`, or the new port never accepts a connection.
 

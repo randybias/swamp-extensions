@@ -22,6 +22,7 @@ import {
   renderEntries,
   resolveContent,
   secretInstanceName,
+  stageWriteScript,
 } from "./secret_file.ts";
 
 const HOST = "192.0.2.10";
@@ -297,6 +298,52 @@ Deno.test("write uploads over stdin, never on argv, and stores no value", async 
   );
 });
 
+Deno.test("stageWriteScript writes, chmods, chowns and renames atomically", () => {
+  const script = stageWriteScript(PATH, "0600", "1000:svc");
+  assert(script.includes("set -euo pipefail"));
+  assert(script.includes("mktemp"));
+  assert(script.includes("trap 'rm -f"));
+  assert(script.includes('cat > "$t"'));
+  assert(script.includes(`chmod '0600' "$t"`));
+  assert(script.includes(`chown -h '1000:svc' "$t"`));
+  assert(script.includes('mv -T "$t"'));
+  assert(script.includes("trap - EXIT"));
+  assertEquals(stageWriteScript(PATH, "0640").includes("chown"), false);
+});
+
+Deno.test("write streams the secret into one sh -c script, not upload commands", async () => {
+  const sha = await sha256Hex(SECRET);
+  const { run, calls } = fakeRun(stagedRunner({
+    sha,
+    present: false,
+    statLine: "600 svc svc 1000 1000 18\n",
+  }));
+  const m = createModel(deps(run));
+  const { context } = testContext();
+  await m.methods.write.execute(
+    { ...WRITE, owner: "1000", group: "svc" },
+    context,
+  );
+  const write = calls.find((c) => c.command.includes("mktemp"));
+  assert(write, "the write stage ran");
+  assertEquals(write.command.includes("'sh' '-c'"), true, "one sh -c command");
+  assertEquals(write.command.includes("chown -h"), true);
+  assertEquals(write.command.includes("1000:svc"), true);
+  assertEquals(write.command.includes("trap"), true);
+  assertEquals(
+    new TextDecoder().decode(write.stdin as Uint8Array),
+    SECRET,
+    "the secret rides on stdin",
+  );
+  // No separate argv chown/mv commands remain.
+  assertEquals(
+    calls.filter((c) =>
+      c.command.includes("'chown'") || c.command.includes("'mv'")
+    ).length,
+    0,
+  );
+});
+
 Deno.test("write is idempotent when the remote bytes, mode and owner match", async () => {
   const sha = await sha256Hex(SECRET);
   const { run, calls } = fakeRun(stagedRunner({
@@ -331,13 +378,10 @@ Deno.test("write re-chowns only when the live owner differs", async () => {
       };
     }
     if (command.includes("mktemp")) {
+      // The write is now one sh -c script that chowns inside it.
+      chowned = command.includes("chown -h");
       return { code: 0, stdout: `${sha} 600\n`, stderr: "" };
     }
-    if (command.includes("'chown'")) {
-      chowned = true;
-      return { code: 0, stdout: "", stderr: "" };
-    }
-    if (command.includes("'mv'")) return { code: 0, stdout: "", stderr: "" };
     if (command.includes("'stat'")) {
       return {
         code: 0,
@@ -358,7 +402,7 @@ Deno.test("write re-chowns only when the live owner differs", async () => {
     { ...WRITE, owner: "1000", group: "svc" },
     context,
   );
-  const chown = calls.find((c) => c.command.includes("'chown'"));
+  const chown = calls.find((c) => c.command.includes("chown -h"));
   assert(chown, "chown must run");
   assert(chown.command.includes("-h"), "chown must not follow a symlink");
   assertEquals((result.result as { changed: boolean }).changed, true);

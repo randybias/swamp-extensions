@@ -1,6 +1,6 @@
 manifestVersion: 1
 name: "@randybias/secret-file"
-version: "2026.10.17.1"
+version: "2026.10.17.2"
 description: "Write a secret file onto one host over SSH from vault values delivered over stdin, atomically and idempotently by content hash, with settable owner and group and a remove action. One generic model type; state holds file metadata and at most a keyed HMAC of the content, never the value."
 license: Apache-2.0
 repository: https://github.com/randybias/swamp-extensions

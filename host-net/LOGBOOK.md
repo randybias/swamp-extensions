@@ -258,7 +258,91 @@ Every one of those tests fails on the previous round's code.
   in-session (an armed revert covers a dropped session).
 - Live fix 2: the post-restore checks raced the link re-settling after
   `netplan apply` (a cloud-init match+set-name NIC), so a correct restore could
-  record fail. The checks (restore and clear) are retried every 2 s for up to
-  30 s and fail only at the deadline. The `revert` resource schema now lists
+  record fail. The checks (restore and clear) are retried every 2 s for up to 30
+  s and fail only at the deadline. The `revert` resource schema now lists
   `staleDevices` and `staleFiles`, and a test validates every written record
   against its schema.
+
+## 2026-10-17 live e2e
+
+Folded from the run receipts (`sp-20261017`); real addresses, hostnames and ids
+are redacted: `<bm1>` is the target (bare metal, Ubuntu 24.04), its public
+management address is shown as 203.0.113.10/24 and the provider's own VLAN on
+the management NIC as `<provider-vlan>` (a private /24). Every head was
+installed from `git archive` into a separate repo. Target `<bm1>`: management
+NIC `enp7s0` (default route, carries `<provider-vlan>`, defined by a cloud-init
+netplan that matches by MAC and sets the name), `eno1`/`eno2` physical NICs with
+no carrier, no OVS. root over strict pins, key by vault reference;
+`revert_after_s` 120 for every apply; additive mode (no NIC declaration for the
+management NIC). No out-of-band console was confirmed, so every apply ran under
+the armed revert. Test VLANs 3011/3012/3013 carried 198.51.100.0/24 addresses.
+
+Earlier heads (superseded; each finding was fixed by the next head):
+
+- d371499, 8fd5da6, ffe0bd1: render, apply on the management NIC (armed), commit
+  after a fresh-connection verify, identical re-apply arms nothing, A+B then
+  B-only (A deleted, files updated), stacking refused while armed, commit after
+  expiry refused cleanly, revert fires when not committed and sync adopts it,
+  precheck failures (unknown NIC, a VLAN name colliding with an existing netdef)
+  leave no temp dirs, files or units: all PASS. Two bugs (the staged precheck
+  root and a VLAN link defined in another file) were fixed in 8fd5da6.
+- 263e7d5, 1d78e78: a correct restore on the match+set-name NIC recorded `fail`
+  (netplan apply exits 1); fixed by judging the post-restore path, not the
+  netplan exit. `clear_failed_revert` refusals (no marker, marker not failed,
+  checks still failing) and the clear itself: PASS. A restore run with a wrong
+  token leaves the armed revert untouched (rc 64): PASS.
+- 9699380: path recorded with `ip route get`; revert fires by expiry with marker
+  `pass`; clear refused while checks fail, then clears; MTU 9000 on `eno1`
+  apply/commit and remove restores 1500; remove again is a no-op; Linux bridge
+  on `eno1` (MTU 9000) apply/commit/remove; refusals (management bridge without
+  takeover, bridge type missing, VLAN on an undeclared NIC, VLAN id > 4094,
+  injected name, injected address) all refused with nothing armed: PASS.
+  FINDING: a VLAN MTU 9000 on a 1500 link was accepted (fixed in 1df0909:
+  refused before arming against the declared or live link MTU).
+- 33dfc0a: every arm refused (the recorded `route get ... from` form omits
+  prefsrc); fixed in 1df0909.
+- 51e4e88: VLAN MTU above the live link MTU refused before arming; apply+commit
+  leaves no revert units or timers; clear refused then clears; revert fires by
+  expiry with marker `pass`; next apply accepted: PASS. `revert_now` restored
+  the network but recorded `fail` (the restore ran inside the SSH session its
+  own netplan apply bounced): fixed in 5cbc9bc (detached `systemd-run`).
+- 5cbc9bc: `revert_now` passed once and recorded `fail` once on a restored host
+  (the post-restore checks raced the link re-settling), plus a schema warning
+  for `staleDevices`/`staleFiles`: fixed in c590bd8.
+
+### Final matrix on c590bd8
+
+| Cell                                           | Result  | Detail                                                                                       |
+| ---------------------------------------------- | ------- | -------------------------------------------------------------------------------------------- |
+| revert_now #1                                  | PASS    | uncommitted VLAN 3013 removed, committed VLAN back; marker `pass`; 0 units, 0 timers         |
+| next apply accepted after revert_now #1        | PASS    | identical config already live, so a no-op; nothing to commit                                 |
+| revert_now #2                                  | PASS    | as #1                                                                                        |
+| next apply accepted after revert_now #2        | PASS    | as above                                                                                     |
+| revert_now #3                                  | PASS    | as #1                                                                                        |
+| next apply accepted after revert_now #3        | PASS    | as above                                                                                     |
+| apply + commit (VLAN 3011 -> 3012)             | PASS    | armed 2 units; after commit 0 units, 0 timers                                                |
+| revert fired by expiry                         | PASS    | restored to the committed VLAN; marker `pass`; 0 units, 0 timers                             |
+| next apply accepted after the expiry revert    | PASS    | VLAN 3011 up                                                                                 |
+| schema warnings in every c590bd8 cell's output | PASS    | 0 (the `revert` record now lists `staleDevices` and `staleFiles`)                            |
+| IPv6 management path: arm + revert-fire        | BLOCKED | `<bm1>` has no global IPv6 address (link-local only) and the control host has no IPv6 egress |
+
+10 pass, 0 fail, 1 blocked.
+
+### Residuals (MEDIUM, accepted for beta)
+
+- `revert_now`: a failed SSH connect (bad credential, host-key mismatch,
+  unreachable host) is treated like the expected session drop, so it surfaces as
+  the 120 s poll timeout ("may have been superseded or still be running") rather
+  than the connection error. No restore runs; the armed timer still fires.
+- The restore removes the current marker before writing the result; a crash
+  between the two leaves neither, and the controller cannot tell a completed
+  restore from a superseded one.
+- The 120 s `revert_now` bound is checked between SSH calls, not during one in
+  flight, so a hung call can overrun it.
+- The arm refuses (fail-safe, exit 77) when the connection's source address is
+  on `lo` or on another NIC than the route's device, and for a link-local
+  management address with a `%scope`; such hosts cannot use host-net yet.
+- `apply` and `remove` run their forward `netplan apply` inside the SSH session;
+  a dropped session is covered by the armed revert.
+- LOW: the `revert_now` unit name interpolates the token unquoted; the token is
+  generated locally as 16 hex characters, so it cannot carry shell syntax.

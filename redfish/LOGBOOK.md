@@ -95,3 +95,61 @@ Not packaged. Notes for whoever maintains this extension.
 - MEDIUM: README documents the CA:FALSE leaf requirement.
 - LOW: power description shortened, a stale task doc comment removed, the
   restart test renamed and its warning asserted.
+
+## 2026-10-17 live e2e
+
+Run sp-20261017. Target: DMTF sushy-tools 2.2.0 `sushy-emulator` with the FAKE
+driver (one fake system `<system>`, no libvirt) on loopback, behind a throwaway
+test CA and a CA:FALSE leaf, with HTTP Basic from a bcrypt htpasswd. Credentials
+were random, stored in a local_encryption vault through stdin and wired as
+`vault.get` references; nothing went on argv and no method run was captured with
+`--json`. **No real BMC was tested: emulator only.** A first pass on d6374a4
+scored 18/23 (FAIL: T3 TLS refusal mistyped as unreachable, T5
+`insecure_skip_verify` could never work in Deno, A2 session mode against a BMC
+without a SessionService); round 5 (0e97c93) fixed all three. Final run on
+0e97c93, every cell on the default `auth_mode: auto` except A2 and A3:
+
+| Cell                                                           | Result  | Detail                                                                                                  |
+| -------------------------------------------------------------- | ------- | ------------------------------------------------------------------------------------------------------- |
+| T1 get, strict + ca_pem                                        | PASS    | anonymous `GET /redfish/v1`, then Systems and the system; data written                                  |
+| T2 sync, strict + ca_pem                                       | PASS    | same 3 requests, data written                                                                           |
+| T3 get/sync, strict, no ca_pem                                 | PASS    | typed TLS verification failure (untrusted CA); 0 requests reach the emulator                            |
+| T4 `insecure_skip_verify` (adapted)                            | PASS    | rejected by the schema (`tls_verify` is the literal `strict`); 0 requests                               |
+| T5 `allow_insecure_credentials` (adapted)                      | PASS    | rejected as an unknown input; 0 requests                                                                |
+| A1 wrong password                                              | PASS    | typed `BMC rejected the credentials (HTTP 401)`                                                         |
+| A2 auth_mode session (adapted: emulator has no SessionService) | PASS    | typed `no_session_service`; only the anonymous root GET, no POST, no credential sent                    |
+| A3 auth_mode basic                                             | PASS    | no root discovery; Systems and system 200                                                               |
+| P1 power On from Off                                           | PASS    | 1 Reset POST 204, On in 10.5 s                                                                          |
+| P2 power On when already On                                    | PASS    | `already On`, no Reset POST                                                                             |
+| P3 power ForceOff, then get                                    | PASS    | Off, read back Off                                                                                      |
+| P4 power On                                                    | PASS    | On in 15.6 s                                                                                            |
+| P5 power GracefulRestart                                       | PASS    | polled back to On, no warning                                                                           |
+| P6 power ForceRestart                                          | PASS    | On, no warning                                                                                          |
+| P7 power PushPowerButton (not allowed by the BMC)              | PASS    | typed refusal listing the allowed values; no Reset POST                                                 |
+| B1 set_boot Pxe Once, then get                                 | BLOCKED | emulator ignores `BootSourceOverrideEnabled` (stays Continuous); the model correctly refuses, no data   |
+| B2 set_boot Hdd Continuous, twice                              | PASS    | PATCH 204 and read-back; re-run `boot already Hdd`, no PATCH                                            |
+| B3 set_boot Disabled                                           | BLOCKED | same emulator limitation; the model refuses with `BMC did not apply the boot override`                  |
+| S1 get, no system_id                                           | PASS    | resolves the single system                                                                              |
+| S2 get, explicit system_id                                     | PASS    |                                                                                                         |
+| U1 get, unbound port                                           | PASS    | `BMC endpoint unreachable` in 1.9 s                                                                     |
+| U2 power ForceOff, unbound port, timeout_seconds 10            | PASS    | `BMC endpoint unreachable` in 1.8 s                                                                     |
+| X1 secret scan (343 files: logs, inputs, `.swamp`, vaults)     | PASS    | password, wrong password, Basic base64 and username: 0 hits; no session token was ever issued (vacuous) |
+| Extra S3/S4 unknown system_id (get / sync)                     | PASS    | typed 404 / records `not_found`                                                                         |
+| Extra X2/X3 header capture (session / auto)                    | PASS    | the discovery GET carries no Authorization; auto then sends Basic                                       |
+| Extra T6 self-signed CA:TRUE server cert pinned as ca_pem      | PASS    | typed TLS error explaining CaUsedAsEndEntity and the CA:FALSE leaf fix                                  |
+
+Result 21/23 PASS, 0 FAIL, 2 BLOCKED (B1, B3: emulator limitation). Session
+auth, task monitors, real vendor firmware and a real BMC certificate were not
+exercised, so the release stays on beta until a real BMC run.
+
+- 2026-10-17 (merge-prep, main): review CLEAN at 0e97c93 (delta from d6374a4;
+  earlier rounds 761b6df, e1ecad1, b3e629a, d6374a4). Residuals:
+  - MEDIUM (open): a 5xx during session discovery counts as "no SessionService",
+    so `auto` silently falls back to Basic over verified TLS. The credential
+    still goes only over strict TLS, but a BMC with a flaky SessionService gets
+    Basic instead of a session. Follow-up: treat a 5xx on discovery as an error.
+  - LOW (fixed at merge-prep, description only): the `power` description had
+    four sentences; now three.
+  - LOW (fixed at merge-prep, comment only): the `TlsPolicy` comment in
+    `_lib/http.ts` called `caPem` "pinned"; it is an additional trusted CA
+    alongside the system store, not an exclusive pin.

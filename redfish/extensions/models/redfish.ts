@@ -263,7 +263,7 @@ export const model = {
     power: {
       kind: "action" as const,
       description:
-        "DESTRUCTIVE. Power on, power off or restart the ComputerSystem, then wait for the resulting state; On and the off actions are a no-op when already there. A restart that shows no transition is accepted with a warning at the timeout. Returns the observed state.",
+        "DESTRUCTIVE. Power on, power off or restart the ComputerSystem, then wait for and return the resulting state; On and the off actions are a no-op when already there. A restart that shows no transition is accepted with a warning at the timeout.",
       arguments: PowerArgs,
       execute: async (args: z.input<typeof PowerArgs>, context: Ctx) => {
         const a = PowerArgs.parse(args);

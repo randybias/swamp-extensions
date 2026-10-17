@@ -26,8 +26,9 @@ export interface HttpClientHandle {
 
 /**
  * How the BMC's TLS certificate is validated: always against the system trust
- * store, or against a pinned `caPem` when one is given. There is no mode that
- * skips verification: Deno has no per-client switch for it (see the README).
+ * store, plus `caPem` as an additional trusted CA when one is given (not an
+ * exclusive pin). There is no mode that skips verification: Deno has no
+ * per-client switch for it (see the README).
  */
 export interface TlsPolicy {
   mode: "strict";

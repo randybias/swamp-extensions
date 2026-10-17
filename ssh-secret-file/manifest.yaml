@@ -1,0 +1,12 @@
+manifestVersion: 1
+name: "@randybias/ssh-secret-file"
+version: "2026.10.17.1"
+description: "Write a secret file onto one host over SSH from vault values delivered over stdin, atomically and idempotently by content hash, with settable owner and group and a remove action. One generic model type; state holds file metadata and at most a keyed HMAC of the content, never the value."
+license: Apache-2.0
+repository: https://github.com/randybias/swamp-extensions
+platforms: [darwin-aarch64, darwin-x86_64, linux-x86_64, linux-aarch64]
+labels: [secret, dotenv, environment-file, ssh, security, configuration]
+additionalFiles: [README.md, LICENSE.txt]
+models:
+  - ssh_secret_file.ts
+workflows: []

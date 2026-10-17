@@ -157,3 +157,46 @@ install: `config.merge: {host: <mesh address>, http: "0.0.0.0:8222"}` with
   read the last two fields, so `<type> <key>` pins every address and `strict`
   works for a host whose public address is unknown before it is ordered. Checked
   by evaluating the expression in a workflow assert for both shapes.
+
+## Live e2e 2026-10-17 (run sp-20261017)
+
+Folded from the maintainer's acceptance receipts. Real addresses, hostnames, DNS
+names and provider ids are redacted: `<stack1>` and `<stack2>` are throwaway
+Cherry VPS hosts (Ubuntu 24.04, hourly), `<mesh-hub>` the WireGuard hub,
+`<control>` the control host (joined through a temporary interface, removed
+afterwards), `<outside>` the outside probe source, `<zone>` the test DNS zone.
+Every model was installed from local sources, never the registry. Provider
+snapshots before and after each teardown were identical (Cherry project servers,
+`<zone>` records: ids, names, types, contents).
+
+| Part | Heads                                     | Cells               | Result                                                                                                                                                                                                                                                                                                                                                                                                                   |
+| ---- | ----------------------------------------- | ------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| 1    | server-stack 2b09a5b, server-host 0cfe601 | 13 pass, 2 fail, 15 | bad Cloudflare token stops in preflight; steps 1-16 pass; wait-k0s failed (server-host drop policies cut off the pods) and passed only with a manual firewall workaround; NATS over the mesh, not on the public address; refuse without adopt; adopt no-dup; wrong k0s sha256 refused with nothing changed; teardown twice. FAIL: apply-nats always skipped                                                              |
+| 3    | 8d77d02 then a988fa5, server-host cec6bfd | 14 pass, 3 fail, 17 | no manual rule: k0s Ready in 1m22s, kubeconfig on the mesh address, apply-nats runs, NATS INFO + PING over the mesh, public 22/4222/6443/8222/10250 closed from `<outside>`, DNS create/verify, teardown twice. FAIL: a stale record for a reused address (apply-base 0 steps); a too-strict harness assertion on the kubeconfig URL (the record masks the host; relaxed in a988fa5); adopt re-opened SSH for about 20 s |
+| 4    | e8aad54, server-host fd3716d              | 8 pass, 0 fail, 8   | below                                                                                                                                                                                                                                                                                                                                                                                                                    |
+
+Part 4 on `<stack2>` (fresh):
+
+| Cell                                                  | Result | Detail                                                                                                                                                                                                |
+| ----------------------------------------------------- | ------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| fresh provision, one uninterrupted run, no workaround | PASS   | 8m55s: order, wait-ready, apply-base, mesh handshake, firewall + lockdown committed, k0s Ready in 1m20s, kubeconfig on the mesh, apply-nats, NATS INFO + PING over the mesh, DNS created and verified |
+| adopt: no second server, no second record             | PASS   | `Ensuring server`, no order; `skipped create-record`; one record found                                                                                                                                |
+| adopt: firewall and lockdown are no-ops               | PASS   | `ruleset already live, no-op` for both; commit-firewall and commit-lockdown skipped                                                                                                                   |
+| adopt never reopens public SSH                        | PASS   | `<outside>` probed public :22 once a second for the whole run: 57 probes, 0 open                                                                                                                      |
+| adopt: NATS still answers, k0s still Ready            | PASS   | probe-nats, check-nats, wait-k0s                                                                                                                                                                      |
+| teardown forgets the server-host records              | PASS   | forget-public-record and forget-mesh-record run after check-cherry; both records hold only `host, forgotten_at, observed_at`                                                                          |
+| teardown proof against the providers                  | PASS   | DNS record deleted, k0s reset, server deleted; Cherry and `<zone>` counts equal the before snapshots                                                                                                  |
+| teardown again                                        | PASS   | delete-record, reset-k0s, delete-server skipped; verify steps pass                                                                                                                                    |
+
+bbfb279 (optional DNS inputs with `publish_dns: false`, host-agnostic
+known_hosts lines) was reviewed clean and checked by workflow asserts; it was
+not run live.
+
+Residuals on 2026.10.17.3 (beta):
+
+- MEDIUM: the mesh steps accept a bare `<type> <key>` known_hosts line with no
+  host field, which pins that key for every address.
+- The known_hosts input description still describes the host-field form.
+- DNS checks read only `records[0]`; with two A records for the name the second
+  is not checked.
+- A wedged NATS Helm release needs the manual recovery above.

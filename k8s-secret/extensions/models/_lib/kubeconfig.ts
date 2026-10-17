@@ -47,6 +47,45 @@ const EXEC_REASON =
   "kubeconfig uses exec credentials, which run a local command; not allowed";
 const AUTH_PROVIDER_REASON =
   "kubeconfig uses an auth-provider credential plugin, which can run a local command; not allowed";
+const UNSUPPORTED_USER_REASON =
+  "kubeconfig uses a user field that names a local file or is not a supported static credential; not allowed";
+const UNSUPPORTED_CLUSTER_REASON =
+  "kubeconfig uses a cluster field that names a local file or is not supported; not allowed";
+
+/** User fields with a named reason, checked before the allowlist. */
+const USER_PATH_REASONS: Record<string, string> = {
+  tokenFile:
+    "kubeconfig uses a tokenFile credential, which reads a local file; not allowed",
+  "client-certificate":
+    "kubeconfig uses a client-certificate file, which reads a local file; not allowed",
+  "client-key":
+    "kubeconfig uses a client-key file, which reads a local file; not allowed",
+};
+
+/** Cluster fields with a named reason, checked before the allowlist. */
+const CLUSTER_PATH_REASONS: Record<string, string> = {
+  "certificate-authority":
+    "kubeconfig uses a certificate-authority file, which reads a local file; not allowed",
+};
+
+/** The only user fields accepted: embedded credentials, never a file path. */
+const USER_KEYS = new Set([
+  "client-certificate-data",
+  "client-key-data",
+  "token",
+  "username",
+  "password",
+]);
+
+/** The only cluster fields accepted; a CA file path is not one of them. */
+const CLUSTER_KEYS = new Set([
+  "server",
+  "certificate-authority-data",
+  "insecure-skip-tls-verify",
+  "tls-server-name",
+  "proxy-url",
+  "disable-compression",
+]);
 
 /**
  * Parses and inspects a kubeconfig. Returns its context/cluster facts when it
@@ -69,6 +108,25 @@ export function checkKubeconfig(content: string): KubeconfigCheck {
     if (user.exec !== undefined) return { ok: false, reason: EXEC_REASON };
     if (user["auth-provider"] !== undefined) {
       return { ok: false, reason: AUTH_PROVIDER_REASON };
+    }
+    for (const key of Object.keys(user)) {
+      const named = USER_PATH_REASONS[key];
+      if (named) return { ok: false, reason: named };
+      if (!USER_KEYS.has(key)) {
+        return { ok: false, reason: UNSUPPORTED_USER_REASON };
+      }
+    }
+  }
+
+  for (const entry of Array.isArray(root.clusters) ? root.clusters : []) {
+    const cluster = asRecord(asRecord(entry)?.cluster);
+    if (!cluster) continue;
+    for (const key of Object.keys(cluster)) {
+      const named = CLUSTER_PATH_REASONS[key];
+      if (named) return { ok: false, reason: named };
+      if (!CLUSTER_KEYS.has(key)) {
+        return { ok: false, reason: UNSUPPORTED_CLUSTER_REASON };
+      }
     }
   }
 

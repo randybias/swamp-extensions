@@ -76,9 +76,13 @@ comparison hashes exist only inside an `apply` call. Failures are typed
 fixed message: remote kubectl text is never returned, because it can echo the
 manifest. Namespace, name, context, type and keys are validated against
 Kubernetes grammars before any process starts, and data is bounded by key count
-and total UTF-8 size. A kubeconfig that uses `exec` or `auth-provider`
-credentials is rejected before kubectl runs, because those plugins execute a
-local command.
+and total UTF-8 size. A kubeconfig is inspected before kubectl runs and rejected
+if it uses `exec` or `auth-provider` credentials (which execute a local command)
+or any credential that names a local file (`tokenFile`, `client-certificate`,
+`client-key`, `certificate-authority`); only embedded `*-data` credentials and
+`token`/`username`/`password` are accepted. The server-side apply field manager
+is derived from the definition name, so two definitions that target the same
+Secret do not prune each other's keys.
 
 ## License
 

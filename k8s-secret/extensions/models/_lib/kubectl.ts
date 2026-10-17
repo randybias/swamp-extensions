@@ -149,8 +149,19 @@ export function defaultDeps(): Deps {
   return { run: denoRun, files: denoFiles, now: () => new Date() };
 }
 
-/** Field manager this extension uses for server-side apply. */
-export const FIELD_MANAGER = "swamp-k8s-secret";
+/** Prefix of the server-side apply field manager. */
+export const FIELD_MANAGER_PREFIX = "swamp-k8s-secret";
+
+/**
+ * Stable server-side apply field manager for one model definition. Deriving it
+ * from the definition name keeps two definitions that target the same Secret
+ * from sharing ownership, so neither prunes the other's keys.
+ */
+export async function fieldManager(definitionName: string): Promise<string> {
+  return `${FIELD_MANAGER_PREFIX}-${
+    (await sha256Hex(definitionName)).slice(0, 12)
+  }`;
+}
 
 const DNS_LABEL = /^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?$/;
 const DNS_SUBDOMAIN =

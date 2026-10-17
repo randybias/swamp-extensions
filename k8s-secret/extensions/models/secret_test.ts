@@ -1,9 +1,30 @@
 import { assert, assertEquals, assertRejects } from "jsr:@std/assert@1.0.19";
 import { createModelTestContext } from "jsr:@swamp-club/swamp-testing@0.20261014.55";
 import { MAX_KEYS, model, setDeps, stateName } from "./secret.ts";
-import { b64, K8sSecretError, type KubectlResult } from "./_lib/kubectl.ts";
+import {
+  b64,
+  fieldManager,
+  K8sSecretError,
+  type KubectlResult,
+} from "./_lib/kubectl.ts";
 
 const KC = "apiVersion: v1\nkind: Config\nclusters: []\n";
+const DEF = "test-secret";
+const MANAGER = await fieldManager(DEF);
+
+type TestCtxOptions = Omit<
+  NonNullable<Parameters<typeof createModelTestContext>[0]>,
+  "definition"
+>;
+
+/** A test context with a stable definition name, so its field manager is `MANAGER`. */
+function testCtx(options: TestCtxOptions = {}) {
+  return createModelTestContext({
+    globalArgs: {},
+    definition: { name: DEF },
+    ...options,
+  });
+}
 const VAL = "placeholder-value-one";
 const BASE = { kubeconfig: KC, namespace: "app", name: "db-creds" };
 const APPLY = { ...BASE, data: { password: VAL, user: "svc" } };
@@ -57,7 +78,7 @@ const secretJson = (
       resourceVersion: opts.rv ?? "7",
       managedFields: [
         {
-          manager: "swamp-k8s-secret",
+          manager: MANAGER,
           operation: "Apply",
           fieldsV1: {
             "f:data": Object.fromEntries(
@@ -104,7 +125,7 @@ Deno.test("apply creates: values on stdin only, output and state carry no value"
     return { stdout: "secret/db-creds\n" };
   });
   try {
-    const { context, getWrittenResources } = createModelTestContext({
+    const { context, getWrittenResources } = testCtx({
       globalArgs: {},
     });
     const out = await model.methods.apply.execute(APPLY, context) as {
@@ -134,7 +155,7 @@ Deno.test("apply is a no-op when desired keys, values and type are unchanged", a
     verb(c) === "get" ? { stdout: secretJson(APPLY.data) } : {}
   );
   try {
-    const { context } = createModelTestContext({ globalArgs: {} });
+    const { context } = testCtx({ globalArgs: {} });
     const out = await model.methods.apply.execute(APPLY, context) as {
       result: { resource_version: string };
     };
@@ -153,7 +174,7 @@ Deno.test("apply preserves a key owned by another manager (no-op)", async () => 
       : {}
   );
   try {
-    const { context } = createModelTestContext({ globalArgs: {} });
+    const { context } = testCtx({ globalArgs: {} });
     await model.methods.apply.execute(APPLY, context);
     // The external key is reported but never makes the apply mutate.
     assertEquals(h.calls.some((c) => verb(c) === "apply"), false);
@@ -177,7 +198,7 @@ Deno.test("apply re-applies when this manager owns a key no longer given", async
     return { stdout: "secret/db-creds\n" };
   });
   try {
-    const { context } = createModelTestContext({ globalArgs: {} });
+    const { context } = testCtx({ globalArgs: {} });
     const out = await model.methods.apply.execute(APPLY, context) as {
       result: { resource_version: string };
     };
@@ -200,7 +221,7 @@ Deno.test("apply updates when one value changes", async () => {
     return { stdout: "secret/db-creds" };
   });
   try {
-    const { context } = createModelTestContext({ globalArgs: {} });
+    const { context } = testCtx({ globalArgs: {} });
     const out = await model.methods.apply.execute(APPLY, context) as {
       result: { resource_version: string };
     };
@@ -214,7 +235,7 @@ Deno.test("apply updates when one value changes", async () => {
 Deno.test("get returns key names and metadata, never values or hashes", async () => {
   const h = harness(() => ({ stdout: secretJson(APPLY.data) }));
   try {
-    const { context, getWrittenResources } = createModelTestContext({
+    const { context, getWrittenResources } = testCtx({
       globalArgs: {},
     });
     const out = await model.methods.get.execute(BASE, context);
@@ -232,7 +253,7 @@ Deno.test("get returns key names and metadata, never values or hashes", async ()
 Deno.test("get of a missing Secret is a typed not_found", async () => {
   const h = harness(() => ({ stdout: "" }));
   try {
-    const { context } = createModelTestContext({ globalArgs: {} });
+    const { context } = testCtx({ globalArgs: {} });
     const e = await assertRejects(() =>
       model.methods.get.execute(BASE, context)
     );
@@ -245,7 +266,7 @@ Deno.test("get of a missing Secret is a typed not_found", async () => {
 Deno.test("sync records not_found instead of failing", async () => {
   const h = harness(() => ({ stdout: "" }));
   try {
-    const { context, getWrittenResources } = createModelTestContext({
+    const { context, getWrittenResources } = testCtx({
       globalArgs: {},
     });
     await model.methods.sync.execute(BASE, context);
@@ -262,7 +283,7 @@ Deno.test("delete: deleted, then clean no-op when absent", async () => {
   let n = 0;
   const h = harness(() => ({ stdout: n++ === 0 ? "secret/db-creds\n" : "" }));
   try {
-    const { context, getWrittenResources } = createModelTestContext({
+    const { context, getWrittenResources } = testCtx({
       globalArgs: {},
     });
     await model.methods.delete.execute(BASE, context);
@@ -300,7 +321,7 @@ Deno.test("failure modes are typed and leak nothing; kubeconfig removed", async 
       verb(c) === "get" ? { stdout: "" } : { code: 1, stderr }
     );
     try {
-      const { context } = createModelTestContext({ globalArgs: {} });
+      const { context } = testCtx({ globalArgs: {} });
       const e = await assertRejects(() =>
         model.methods.apply.execute(APPLY, context)
       ) as K8sSecretError;
@@ -320,7 +341,7 @@ Deno.test("malformed kubectl JSON is typed and leaks no value", async () => {
     verb(c) === "get" ? { stdout: `{"data":{"password":"${b64(VAL)}"` } : {}
   );
   try {
-    const { context } = createModelTestContext({ globalArgs: {} });
+    const { context } = testCtx({ globalArgs: {} });
     const e = await assertRejects(() =>
       model.methods.get.execute(BASE, context)
     ) as K8sSecretError;
@@ -335,7 +356,7 @@ Deno.test("malformed kubectl JSON is typed and leaks no value", async () => {
 Deno.test("get failure also removes the kubeconfig", async () => {
   const h = harness(() => ({ code: 1, stderr: "Unauthorized" }));
   try {
-    const { context } = createModelTestContext({ globalArgs: {} });
+    const { context } = testCtx({ globalArgs: {} });
     await assertRejects(() => model.methods.get.execute(BASE, context));
     assertEquals(h.removed, h.written);
   } finally {
@@ -346,7 +367,7 @@ Deno.test("get failure also removes the kubeconfig", async () => {
 Deno.test("adversarial input is rejected before any kubectl call", async () => {
   const h = harness(() => ({}));
   try {
-    const { context } = createModelTestContext({ globalArgs: {} });
+    const { context } = testCtx({ globalArgs: {} });
     const bad: Record<string, unknown>[] = [
       { ...APPLY, name: "a; rm -rf /" },
       { ...APPLY, name: "$(id)" },
@@ -388,7 +409,7 @@ Deno.test("adversarial input is rejected before any kubectl call", async () => {
 Deno.test("data is bounded by key count and total bytes before kubectl", async () => {
   const h = harness(() => ({}));
   try {
-    const { context } = createModelTestContext({ globalArgs: {} });
+    const { context } = testCtx({ globalArgs: {} });
     const tooMany: Record<string, string> = {};
     for (let i = 0; i < MAX_KEYS + 1; i++) tooMany[`k${i}`] = "v";
     await assertRejects(() =>
@@ -409,7 +430,7 @@ Deno.test("data is bounded by key count and total bytes before kubectl", async (
 Deno.test("a kubeconfig with exec credentials is rejected before kubectl", async () => {
   const h = harness(() => ({}));
   try {
-    const { context } = createModelTestContext({ globalArgs: {} });
+    const { context } = testCtx({ globalArgs: {} });
     const execKc = [
       "apiVersion: v1",
       "kind: Config",

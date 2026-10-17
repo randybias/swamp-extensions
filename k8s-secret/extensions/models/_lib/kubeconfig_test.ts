@@ -74,6 +74,55 @@ users:
   assert(!p.ok && p.reason.includes("auth-provider"));
 });
 
+Deno.test("checkKubeconfig rejects local-file credential paths", () => {
+  const userFields: [string, string][] = [
+    ["tokenFile", "/var/run/secrets/token"],
+    ["client-certificate", "/etc/kubernetes/pki/cert"],
+    ["client-key", "/etc/kubernetes/pki/key"],
+  ];
+  for (const [field, path] of userFields) {
+    const kc =
+      `apiVersion: v1\nkind: Config\nusers:\n- name: u\n  user:\n    ${field}: ${path}\n`;
+    const check = checkKubeconfig(kc);
+    assertEquals(check.ok, false, field);
+    assert(!check.ok && check.reason.includes(field), field);
+  }
+  const clusterKc =
+    "apiVersion: v1\nkind: Config\nclusters:\n- name: c\n  cluster:\n    server: https://a.test\n    certificate-authority: /etc/kubernetes/pki/ca\n";
+  const ca = checkKubeconfig(clusterKc);
+  assertEquals(ca.ok, false);
+  assert(!ca.ok && ca.reason.includes("certificate-authority"));
+});
+
+Deno.test("checkKubeconfig rejects unknown user and cluster fields", () => {
+  const extraUser =
+    "apiVersion: v1\nkind: Config\nusers:\n- name: u\n  user:\n    impersonate: admin\n";
+  assertEquals(checkKubeconfig(extraUser).ok, false);
+  const extraCluster =
+    "apiVersion: v1\nkind: Config\nclusters:\n- name: c\n  cluster:\n    server: https://a.test\n    extensions: []\n";
+  assertEquals(checkKubeconfig(extraCluster).ok, false);
+});
+
+Deno.test("checkKubeconfig accepts embedded data credentials", () => {
+  const kc = [
+    "apiVersion: v1",
+    "kind: Config",
+    "clusters:",
+    "- name: c",
+    "  cluster:",
+    "    server: https://a.test:6443",
+    "    certificate-authority-data: placeholder-ca",
+    "users:",
+    "- name: u",
+    "  user:",
+    "    client-certificate-data: placeholder-cert",
+    "    client-key-data: placeholder-key",
+    "    token: placeholder",
+    "",
+  ].join("\n");
+  assert(checkKubeconfig(kc).ok);
+});
+
 Deno.test("checkKubeconfig refuses YAML alias expansion", () => {
   let bomb = "a: &a [x,x,x,x,x,x,x,x,x]\n";
   for (let i = 0; i < 9; i++) {

@@ -67,6 +67,22 @@ Not packaged. Notes for whoever maintains this extension.
   - LOW: removed `totalDigest`/`total`; hashes are plain per-key maps. Extracted
     `persistState` for the shared state write. Dependency added:
     `npm:yaml@2.9.1` (alias-safe parse).
+- 2026-10-17 (lane/d2): review round 4 (codex astra + terra on 264c595).
+  Dispositions:
+  - HIGH file-path credential exfiltration: `checkKubeconfig` now default-denies
+    every user field except `client-certificate-data`, `client-key-data`,
+    `token`, `username` and `password`, and every cluster field except `server`,
+    `certificate-authority-data`, `insecure-skip-tls-verify`, `tls-server-name`,
+    `proxy-url` and `disable-compression`. `tokenFile`, `client-certificate`,
+    `client-key` and `certificate-authority` are rejected by name (one test per
+    key); unknown fields are rejected too. A caller kubeconfig can no longer
+    make kubectl read a local host file and send it as a credential.
+  - MEDIUM shared field manager: the server-side apply field manager is now
+    derived per definition (`swamp-k8s-secret-<sha256(name)[0:12]>`), so two
+    definitions that target the same Secret do not prune each other's keys.
+  - LOW: the manifest description now says state carries metadata and key names,
+    not hashes.
+  - REFUTED (held): rename `delete` to `remove`.
 - Real-swamp check with a stub `kubectl` on PATH (not a live cell): vault
   expressions in `--input` (including inside `data:json=`) resolve; kubectl argv
   carries no value, stdin carries the base64 manifest, output and state hold key

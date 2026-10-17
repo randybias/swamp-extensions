@@ -4,7 +4,7 @@ import {
   b64ToBytes,
   buildManifest,
   classify,
-  FIELD_MANAGER,
+  fieldManager,
   hashData,
   hashObserved,
   isContext,
@@ -73,10 +73,18 @@ Deno.test("grammars", () => {
   assertEquals(isContext("-x"), false);
 });
 
+Deno.test("fieldManager is stable per definition and distinct across them", async () => {
+  const a = await fieldManager("db-secret");
+  assertEquals(a, await fieldManager("db-secret"));
+  assert(a.startsWith("swamp-k8s-secret-"));
+  assert(a !== await fieldManager("other-secret"));
+});
+
 Deno.test("ownedDataKeys reads only this manager's applied data keys", () => {
+  const manager = "swamp-k8s-secret-abc123def456";
   const entries = [
     {
-      manager: FIELD_MANAGER,
+      manager,
       operation: "Apply",
       fieldsV1: { "f:data": { "f:password": {}, "f:user": {} } },
     },
@@ -86,13 +94,13 @@ Deno.test("ownedDataKeys reads only this manager's applied data keys", () => {
       fieldsV1: { "f:data": { "f:extra": {} } },
     },
     {
-      manager: FIELD_MANAGER,
+      manager,
       operation: "Update",
       fieldsV1: { "f:data": { "f:ignored": {} } },
     },
   ];
-  assertEquals(ownedDataKeys(entries, FIELD_MANAGER), ["password", "user"]);
-  assertEquals(ownedDataKeys(undefined, FIELD_MANAGER), []);
+  assertEquals(ownedDataKeys(entries, manager), ["password", "user"]);
+  assertEquals(ownedDataKeys(undefined, manager), []);
 });
 
 Deno.test("classify returns fixed messages that never echo stderr", () => {

@@ -19,7 +19,7 @@ import {
   classify,
   defaultDeps,
   type Deps,
-  FIELD_MANAGER,
+  fieldManager,
   hashData,
   hashObserved,
   isContext,
@@ -166,6 +166,7 @@ async function observe(
     { code: number; stdout: string; stderr: string }
   >,
   t: Target,
+  fm: string,
 ): Promise<Observed | null> {
   const r = await kubectl([
     "get",
@@ -189,7 +190,7 @@ async function observe(
     type: raw.type ?? "Opaque",
     resource_version: raw.metadata?.resourceVersion ?? "",
     dataB64: raw.data ?? {},
-    ownedKeys: ownedDataKeys(raw.metadata?.managedFields, FIELD_MANAGER),
+    ownedKeys: ownedDataKeys(raw.metadata?.managedFields, fm),
   };
 }
 
@@ -273,8 +274,9 @@ export const model = {
         const t = target(a);
         const want = await hashData(a.data);
         const desiredKeys = Object.keys(want);
+        const fm = await fieldManager(context.definition.name);
         const state = await withKubectl(deps, t, async (kubectl) => {
-          const before = await observe(kubectl, t);
+          const before = await observe(kubectl, t, fm);
           if (before && await unchanged(before, a.type, want, desiredKeys)) {
             context.logger.info("Secret {name} unchanged", { name: t.name });
             return toState(t, before, "present", deps.now());
@@ -284,7 +286,7 @@ export const model = {
               "apply",
               "--server-side",
               "--force-conflicts",
-              `--field-manager=${FIELD_MANAGER}`,
+              `--field-manager=${fm}`,
               "-f",
               "-",
               "-o",
@@ -293,7 +295,7 @@ export const model = {
             buildManifest(t, a.type, a.data),
           );
           if (r.code !== 0) throw classify(r.stderr, t);
-          const after = await observe(kubectl, t);
+          const after = await observe(kubectl, t, fm);
           context.logger.info("Secret {name} applied", { name: t.name });
           return toState(t, after, "present", deps.now());
         });
@@ -309,8 +311,9 @@ export const model = {
       execute: async (args: z.infer<typeof TargetArgs>, context: Ctx) => {
         const a = TargetArgs.parse(args);
         const t = target(a);
+        const fm = await fieldManager(context.definition.name);
         const state = await withKubectl(deps, t, async (k) => {
-          const o = await observe(k, t);
+          const o = await observe(k, t, fm);
           if (!o) {
             throw new K8sSecretError(
               "not_found",
@@ -331,8 +334,9 @@ export const model = {
       execute: async (args: z.infer<typeof TargetArgs>, context: Ctx) => {
         const a = TargetArgs.parse(args);
         const t = target(a);
+        const fm = await fieldManager(context.definition.name);
         const state = await withKubectl(deps, t, async (k) => {
-          const o = await observe(k, t);
+          const o = await observe(k, t, fm);
           return toState(t, o, o ? "present" : "not_found", deps.now());
         });
         context.logger.info("Secret {name} status {status}", {

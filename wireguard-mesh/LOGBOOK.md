@@ -7,6 +7,26 @@ Not packaged. Notes for whoever maintains this extension.
   reviewed, corrected and finished. It shipped 33 tests; there are 54 now plus
   an env-gated netns behavioural test.
 
+## Naming and visibility
+
+Answers to the five naming questions (naming and visibility convention, §3):
+
+visibility: public
+
+audience: general
+
+1. Private or public? Public: published to swamp-club with public visibility,
+   source in this repo.
+2. Individual or general? General: any operator running a WireGuard mesh; the
+   mesh data, nodes and hosts are inputs, nothing is baked in.
+3. Does the name clearly describe and disambiguate while staying short? Yes: it
+   names the system (WireGuard) and what it builds (a mesh). The run sp-20261017
+   naming audit judged "keep".
+4. Private purpose check: not applicable (public).
+5. Would a stranger guess roughly right and wrong about nothing? Yes: it renders
+   and applies one WireGuard node's config for a mesh over SSH, which is what
+   the name suggests.
+
 ## Design
 
 - One generic type, empty `globalArguments`; the mesh data and target node
@@ -470,3 +490,40 @@ Residuals (follow-ups, not failures):
   `trap 'exit 129' HUP`, 130 INT, 143 TERM and 141 PIPE after the `EXIT` trap,
   so a signalled run still removes the staging directory and its 0600 key copy.
   The signal test is restored (`signalTrapLines`, run under `sh`).
+
+## 2026-10-17 live e2e (2026.10.17.6): 8 pass, 0 fail, 0 blocked
+
+Run sp-20261017 on lane/d4-wireguard-mesh-stdin 7023c53 (copied into a scratch
+repo, model typeVersion 2026.10.17.6). Two throwaway Ubuntu 24.04 VPS `<vps5>`
+and `<vps6>`, wireguard-tools 1.0.20210914, strict host-key pins only, every
+secret a vault reference, no run with `--json`. Each cell ran an argv sampler on
+both nodes and locally (positive control caught a 50 ms canary) and counted
+remote temp files.
+
+| Cell                           | Result | Detail                                                                                                                                                                                                                                                   |
+| ------------------------------ | ------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 1 strict pins, apply both      | PASS   | "Applied" on both (about 6 s); ping both ways, recent handshake; `wg0.conf` and `wg0.key` 0600                                                                                                                                                           |
+| 2 re-apply                     | PASS   | "No change" on both (about 3 s); epoch, ifindex and config sha256 unchanged                                                                                                                                                                              |
+| 3 armed revert (manual)        | PASS   | `applyScript` without the confirmation step, Address changed: rollback armed, ping lost; baseline restored after about 128 s, rollback dirs 0, a swamp apply right after: "No change"                                                                    |
+| 4 hung apply (remote deadline) | PASS   | a shadow `wg-quick` hangs on `up`, `ssh.command_timeout_s: 20`: the apply returned after 24 s with `apply failed on the node (exit 124)`; no hung process, stage dirs 0, lock free; the armed rollback restored the baseline at about t+126 s. Run twice |
+| 5 wrong pin                    | PASS   | another host's pin lines refused, and the right host with the wrong key blobs refused; node state and lock mtime unchanged, nothing ran remotely                                                                                                         |
+| 6 no remote secret temp files  | PASS   | `.ssh-host-upload*`, `wgmesh.*` and `.wg0.stage.*` count 0 on both nodes after every cell, including the hung and refused ones; no key content outside `/etc/wireguard/wg0.key`                                                                          |
+| 7 argv scan                    | PASS   | 0 hits for the WireGuard keys, the SSH key or their sha256 on either node or locally, about 6,250 unique argv lines                                                                                                                                      |
+| 8 delete, then again           | PASS   | "Deleted" on both, then "No change"; wg0 gone, UDP port closed, config and key gone; rollback dirs gone after the window                                                                                                                                 |
+
+Residuals (not failures, do not block beta):
+
+- While a rollback is armed (120 s after each apply or delete), its backup holds
+  a 0600 copy of the key under `/etc/wireguard/.wg0.rollback.*/` (dir 0700); it
+  is removed when the window ends, so after a delete the key stays on disk for
+  up to 120 s.
+- The hung-apply error is the remote exit code
+  (`apply failed on the node (exit 124)`); it does not name the deadline.
+- Delete still leaves `.wg0.epoch` and `.wg0.lock` in `/etc/wireguard` (as in
+  2026.10.17.5).
+
+- 2026-10-17 (merge-prep, main): review at dec6338 routed one High (a hung apply
+  held the node lock past the rollback's `flock -w 60`, so the revert was lost);
+  7023c53 fixed it with a remote `timeout -k 5` around every script and a
+  retrying rollback lock, netns-tested. Live above is on 7023c53, and the
+  published bytes are that code. `_lib/ssh.ts` is blob `8f132c43`.

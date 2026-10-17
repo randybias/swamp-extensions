@@ -82,6 +82,18 @@ copies stay byte-identical; `bogworks-harness-version` records the blobs.
   output, validated by the real-tool gate); `nft-real-listings.json` keeps a
   `.source` sidecar.
 
+- 2026-10-17 tightness pass: COULD-BE-TIGHTER. The new code is small
+  (`remote.ts` about 110 lines, one `RemoteCall` shape replacing the
+  argv/stdin/timeout triple) and nothing exported is unused, but
+  `server_host.ts` (about 1270 lines) and its test file (about 2400) are past
+  the size guideline from earlier versions; splitting the method bodies out is a
+  separate change.
+- 2026-10-17 blocked: swamp gates 2 (swamp fmt), 3 (quality) and 7 (registry dry
+  run) need a swamp account and the lane environment has no credential; the seed
+  forbids `swamp auth login`. Everything else in the self-check is green. The
+  gate-7 rules are met by construction (literal `type`, `version` and
+  `upgrades[]` with a 17.4 entry, a sibling test, no new secret-like names).
+
 ## Residuals
 
 | Sev    | What                                                                                              | Why accepted                                                                                 |

@@ -52,11 +52,11 @@ function assertToken(token: string): void {
 }
 
 /** Seconds a script waits for the host lock before it reports the host busy. */
-export const LOCK_WAIT_S = 20;
+const LOCK_WAIT_S = 20;
 /** Seconds an arm or cancel may run on the host. */
 const CHANGE_DEADLINE_S = 60;
 /** Seconds the guarded apply may run, kept under the shortest revert (60 s). */
-export const APPLY_DEADLINE_S = 30;
+const APPLY_DEADLINE_S = 30;
 /** Seconds a read-only probe may run on the host. */
 export const PROBE_DEADLINE_S = 30;
 /** Seconds the revert script waits for the lock before it restores anyway. */
@@ -216,9 +216,13 @@ bw_data | nft -f -
   };
 }
 
-function cancelCall(token: string, sudo: boolean, requireActive: boolean) {
+function cancelCall(
+  token: string,
+  sudo: boolean,
+  requireActive: boolean,
+): RemoteCall {
   const unit = unitName(token);
-  const call: RemoteCall = {
+  return {
     sudo,
     deadlineS: CHANGE_DEADLINE_S,
     lock: LOCK,
@@ -241,7 +245,6 @@ if [ "$ctok" = '${token}' ]; then rm -f "${CURRENT_PATH}"; fi
 rm -f '${snapshotPath(token)}' '${scriptPath(token)}'
 `,
   };
-  return call;
 }
 
 /**

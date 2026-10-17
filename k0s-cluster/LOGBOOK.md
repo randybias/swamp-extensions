@@ -168,3 +168,13 @@ Low findings fixed as noted.
   the server URL of the returned and vaulted kubeconfig from them. Whether k0s
   itself writes the mesh address into its kubeconfig is unverified until a live
   run, which is why the method sets it explicitly.
+- 2026-10-17: live bug: role `single` installed `--enable-worker` without
+  `--no-taints`, so the node kept the control-plane NoSchedule taint and no
+  workload (the Helm controller included) ever scheduled. `single` now installs
+  with `--enable-worker --no-taints` rather than `--single`, which also switches
+  the datastore to kine and would override `storage_type`. The installed mode is
+  read from the `argv[]=` field of the real `systemctl show -p ExecStart` struct
+  and classified as single, controller+worker (the old tainted mode) or
+  controller; any mismatch with the requested role needs `confirm_role_change`.
+  The pinned-version behaviour of `--no-taints` is from the k0s docs, not tried
+  here: swamp-live's re-run is the check.

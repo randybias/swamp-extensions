@@ -221,14 +221,47 @@ export async function verifyBinary(
   return actual;
 }
 
-/** `k0s install` arguments for a role. */
+/**
+ * `k0s install` arguments for a role. `single` is a controller that also runs
+ * workloads, so it carries both `--enable-worker` and `--no-taints`: with only
+ * the first the node keeps the control-plane `NoSchedule` taint and nothing is
+ * ever scheduled. (`--single` would also do it but switches the datastore to
+ * kine, overriding the `storage_type` input, so the two explicit flags are used.)
+ */
 export function installArgs(role: K0sRole, force = false): string[] {
   const base = role === "single"
-    ? ["install", "controller", "--enable-worker"]
+    ? ["install", "controller", "--enable-worker", "--no-taints"]
     : role === "controller"
     ? ["install", "controller"]
     : ["install", "worker", "--token-file", K0S_WORKER_TOKEN_PATH];
   return force ? [...base, "--force"] : base;
+}
+
+/** How an installed k0scontroller unit was set up. */
+export type ControllerMode = "single" | "controller+worker" | "controller";
+
+/**
+ * Classifies the output of `systemctl show -p ExecStart --value k0scontroller`.
+ * systemd prints a struct, `{ path=... ; argv[]=<command line> ; ignore_errors=...
+ * ; ... }`, so the command line is taken from its `argv[]=` field, never from
+ * the start of the text. `single` is `--single`, or a worker with no taints;
+ * `controller+worker` is a worker that kept the control-plane taint (what an
+ * install without `--no-taints` produces); `controller` has neither.
+ */
+export function classifyControllerExecStart(text: string): ControllerMode {
+  const field = /argv\[\]=(.*?)\s;\s/s.exec(text);
+  if (!field) throw new Error("ExecStart has no argv field");
+  const words = field[1].trim().split(/\s+/);
+  if (!words.includes("controller")) {
+    throw new Error("ExecStart is not a k0s controller command line");
+  }
+  const on = (flag: string): boolean =>
+    words.some((w) => w === flag || w === `${flag}=true`);
+  if (on("--single")) return "single";
+  if (on("--enable-worker")) {
+    return on("--no-taints") ? "single" : "controller+worker";
+  }
+  return "controller";
 }
 
 /** systemd unit name for a role. */

@@ -136,12 +136,27 @@ function primary<T extends { specName: string }>(rows: T[], all?: true) {
   return all ? kept : kept[0];
 }
 
-/** What `systemctl show -p ExecStart --value k0scontroller` prints. */
-const showController = (withWorker: boolean) => ({
+/**
+ * The real `systemctl show -p ExecStart --value k0scontroller` output of an
+ * install made with `k0s install controller --enable-worker` and no
+ * `--no-taints` (the old, tainted "single" mode). It is a struct, and the
+ * command line is its `argv[]=` field.
+ */
+const REAL_TAINTED_EXECSTART =
+  "{ path=/usr/local/bin/k0s ; argv[]=/usr/local/bin/k0s controller --enable-worker=true ; ignore_errors=no ; start_time=[...] ; stop_time=[n/a] ; pid=12838 ; code=(null) ; status=0/0 }";
+
+/** The same struct for each way the unit can have been installed. */
+const execStart = (cmd: string) =>
+  `{ path=/usr/local/bin/k0s ; argv[]=/usr/local/bin/k0s ${cmd} ; ignore_errors=no ; start_time=[...] ; stop_time=[n/a] ; pid=12838 ; code=(null) ; status=0/0 }\n`;
+
+/** true = a real single node, false = controller only, "tainted" = the old mode. */
+const showController = (mode: boolean | "tainted") => ({
   code: 0,
-  stdout: `{ path=/usr/local/bin/k0s ; argv[]=/usr/local/bin/k0s controller${
-    withWorker ? " --enable-worker" : ""
-  } --config=/etc/k0s/k0s.yaml ; }\n`,
+  stdout: mode === "tainted"
+    ? REAL_TAINTED_EXECSTART + "\n"
+    : mode
+    ? execStart("controller --enable-worker=true --no-taints")
+    : execStart("controller"),
 });
 const isShow = (argv: string[]) =>
   argv[0] === "systemctl" && argv[1] === "show";
@@ -295,7 +310,13 @@ Deno.test("install verifies, uploads and starts a single-node cluster", async ()
   assertEquals(fake.uploads.some((u) => u.path === K0S_CONFIG_PATH), true);
   assertEquals(
     fake.execs.find((argv) => argv[1] === "install"),
-    [K0S_BINARY_PATH, "install", "controller", "--enable-worker"],
+    [
+      K0S_BINARY_PATH,
+      "install",
+      "controller",
+      "--enable-worker",
+      "--no-taints",
+    ],
   );
   assertEquals(
     fake.execs.some((argv) => argv[0] === "systemctl" && argv[1] === "enable"),
@@ -1722,7 +1743,11 @@ Deno.test("single and controller are different roles on the shared unit", async 
 Deno.test("a confirmed single/controller change resets and reinstalls in the new mode", async () => {
   for (
     const [role, installedWithWorker, expected] of [
-      ["single", false, ["install", "controller", "--enable-worker"]],
+      [
+        "single",
+        false,
+        ["install", "controller", "--enable-worker", "--no-taints"],
+      ],
       ["controller", true, ["install", "controller"]],
     ] as const
   ) {
@@ -2018,4 +2043,119 @@ Deno.test("kubeconfig builds the server URL from api_address and stores that kub
     createModelTestContext().context,
   );
   assertEquals(v6.result.server, "https://[2001:db8::7]:6444");
+});
+
+Deno.test("the exact install argv for single, controller and worker", async () => {
+  const cases: [string, string[]][] = [
+    ["single", ["install", "controller", "--enable-worker", "--no-taints"]],
+    ["controller", ["install", "controller"]],
+    [
+      "worker",
+      ["install", "worker", "--token-file", "/etc/k0s/worker-token"],
+    ],
+  ];
+  for (const [role, expected] of cases) {
+    const fake = makeDeps({
+      exec: installRouter,
+      fetch: () => Promise.resolve(PAYLOAD),
+    });
+    const model = createModel(fake.deps);
+    const { context } = createModelTestContext();
+    await model.methods.install.execute(
+      installArgs({ role, join_token: "PLACEHOLDER-JOIN-TOKEN" }),
+      context,
+    );
+    assertEquals(
+      fake.execs.find((argv) => argv[1] === "install"),
+      [K0S_BINARY_PATH, ...expected],
+      role,
+    );
+  }
+});
+
+Deno.test("an install in the old tainted single mode is detected, never silently adopted", async () => {
+  for (const role of ["single", "controller"] as const) {
+    const fake = makeDeps({
+      exec: (argv) =>
+        isShow(argv) ? showController("tainted") : controllerHost(true)(argv),
+      fetch: () => Promise.resolve(PAYLOAD),
+    });
+    const model = createModel(fake.deps);
+    const { context, getWrittenResources } = createModelTestContext();
+    const e = await assertRejects(
+      () => model.methods.install.execute(installArgs({ role }), context),
+      Error,
+      "confirm_role_change",
+    );
+    assertEquals(e.message.includes("controller+worker"), true);
+    assertEquals(e.message.includes("taint"), true);
+    assertEquals(fake.fetches.length, 0);
+    assertEquals(fake.uploads.length, 0);
+    assertEquals(
+      fake.execs.some((argv) => argv[1] === "stop" || argv[1] === "reset"),
+      false,
+    );
+    assertEquals(primary(getWrittenResources(), true).length, 0);
+  }
+});
+
+Deno.test("confirming reconciles the tainted mode into a real single node", async () => {
+  let reinstalled = false;
+  const fake = makeDeps({
+    exec: (argv) => {
+      if (argv[1] === "install") reinstalled = true;
+      if (argv[0] === "systemctl" && argv[1] === "enable") reinstalled = true;
+      if (isShow(argv)) {
+        return showController(reinstalled ? true : "tainted");
+      }
+      if (reinstalled && argv[0] === "systemctl" && argv[1] === "is-active") {
+        return { code: 0 };
+      }
+      return controllerHost(true)(argv);
+    },
+    fetch: () => Promise.resolve(PAYLOAD),
+  });
+  const model = createModel(fake.deps);
+  const { context, getWrittenResources } = createModelTestContext();
+  await model.methods.install.execute(
+    installArgs({ confirm_role_change: HOST }),
+    context,
+  );
+  const verbs = fake.execs.map((argv) => argv.slice(0, 2).join(" "));
+  const at = (v: string) => verbs.indexOf(`${K0S_BINARY_PATH} ${v}`);
+  assertEquals(at("stop") >= 0 && at("stop") < at("reset"), true);
+  assertEquals(at("reset") < at("install"), true);
+  assertEquals(fake.execs.find((argv) => argv[1] === "install"), [
+    K0S_BINARY_PATH,
+    "install",
+    "controller",
+    "--enable-worker",
+    "--no-taints",
+  ]);
+  assertEquals(
+    (primary(getWrittenResources()).data as { role: string }).role,
+    "single",
+  );
+});
+
+Deno.test("a host whose unit cannot be read as a k0s controller fails closed", async () => {
+  for (
+    const stdout of [
+      "",
+      "{ path=/usr/bin/true ; argv[]=/usr/bin/true ; ignore_errors=no }",
+      "{ path=/usr/local/bin/k0s ; ignore_errors=no }",
+    ]
+  ) {
+    const fake = makeDeps({
+      exec: (argv) =>
+        isShow(argv) ? { code: 0, stdout } : controllerHost(true)(argv),
+    });
+    const model = createModel(fake.deps);
+    const { context } = createModelTestContext();
+    await assertRejects(
+      () => model.methods.install.execute(installArgs(), context),
+      Error,
+      "could not read how k0scontroller is installed",
+    );
+  }
 });

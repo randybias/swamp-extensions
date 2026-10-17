@@ -151,12 +151,15 @@ manifest where possible.
   reference) or `K0S_DOWNLOAD_TOKEN` and is sent as an `Authorization` header. A
   re-run re-verifies the installed binary digest and version, then adopts the
   active service and never installs a second node. Role `worker` requires a
-  `join_token`, written to a root-only token file. An installed role is never
-  replaced by another (`single` and `controller` count as different roles even
-  though they share one unit): set `confirm_role_change` to the host name to
-  stop and reset the old role, which is irreversible and happens only after the
-  replacement binary has been downloaded and verified. Config, token and
-  manifest uploads are mode 0600.
+  `join_token`, written to a root-only token file. Role `single` installs
+  `k0s install controller --enable-worker --no-taints`, a real single node that
+  schedules workloads; an older install without `--no-taints` is detected from
+  the unit's own command line and needs `confirm_role_change` to be reinstalled.
+  An installed role is never replaced by another (`single` and `controller`
+  count as different roles even though they share one unit): set
+  `confirm_role_change` to the host name to stop and reset the old role, which
+  is irreversible and happens only after the replacement binary has been
+  downloaded and verified. Config, token and manifest uploads are mode 0600.
 - `wait_ready` returns `ready: false` after `ready_timeout_s`; a connection,
   authentication or host-key failure is raised instead, because it is not the
   same as a cluster that has not finished starting. `get` and `sync` reflect

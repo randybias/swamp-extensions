@@ -31,6 +31,8 @@ import {
   type BinaryFetcher,
   chartBaseName,
   type ChartStatus,
+  classifyControllerExecStart,
+  type ControllerMode,
   defaultFetcher,
   downloadUrl,
   type HelmRelease,
@@ -710,14 +712,11 @@ async function unitExists(
   );
 }
 
-/**
- * Whether the installed k0scontroller unit runs a worker too (`k0s install
- * controller --enable-worker`), read from the unit's own command line.
- */
-async function controllerRunsWorker(
+/** How the installed k0scontroller unit was set up, read from its command line. */
+async function controllerMode(
   deps: K0sDeps,
   target: SshTarget,
-): Promise<boolean> {
+): Promise<ControllerMode> {
   const shown = await deps.ssh.exec(target, [
     "systemctl",
     "show",
@@ -726,12 +725,18 @@ async function controllerRunsWorker(
     "--value",
     "k0scontroller",
   ]);
-  if (!ok(shown) || !/\bcontroller\b/.test(shown.stdout)) {
+  if (!ok(shown)) {
     throw new Error(
       `could not read how k0scontroller is installed on ${target.host}`,
     );
   }
-  return /--enable-worker\b/.test(shown.stdout);
+  try {
+    return classifyControllerExecStart(shown.stdout);
+  } catch {
+    throw new Error(
+      `could not read how k0scontroller is installed on ${target.host}`,
+    );
+  }
 }
 
 /**
@@ -1009,13 +1014,18 @@ function buildK0sModel(deps: K0sDeps) {
           // may still have been installed in the other mode. That is a role
           // change like any other.
           if (unitPresent && service === "k0scontroller") {
-            const hasWorker = await controllerRunsWorker(deps, target);
-            if (hasWorker !== (args.role === "single")) {
+            const mode = await controllerMode(deps, target);
+            const wanted: ControllerMode = args.role === "single"
+              ? "single"
+              : "controller";
+            if (mode !== wanted) {
               if (args.confirm_role_change?.toLowerCase() !== target.host) {
                 throw new Error(
-                  `${target.host} has k0scontroller installed ${
-                    hasWorker ? "with" : "without"
-                  } a worker; refusing to install it as ${args.role}. Set confirm_role_change to ${target.host} to replace it (IRREVERSIBLE: this resets the existing role).`,
+                  `${target.host} has k0scontroller installed as ${mode}${
+                    mode === "controller+worker"
+                      ? " (a worker that kept the control-plane taint, so no workload schedules)"
+                      : ""
+                  }; refusing to install it as ${args.role}. Set confirm_role_change to ${target.host} to replace it (IRREVERSIBLE: this resets the existing role).`,
                 );
               }
               migrating = true;

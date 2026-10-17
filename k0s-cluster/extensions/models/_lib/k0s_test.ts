@@ -8,6 +8,7 @@ import {
   archFromUname,
   chartBaseName,
   ChecksumMismatchError,
+  classifyControllerExecStart,
   DownloadError,
   downloadUrl,
   installArgs,
@@ -139,6 +140,7 @@ Deno.test("installArgs and serviceName cover every role", () => {
     "install",
     "controller",
     "--enable-worker",
+    "--no-taints",
   ]);
   assertEquals(installArgs("controller"), ["install", "controller"]);
   assertEquals(installArgs("worker"), [
@@ -436,4 +438,53 @@ Deno.test("apiServerUrl brackets IPv6 and withServer rewrites every server line"
     withServer(text, "https://198.51.100.7:6443"),
     "clusters:\n- cluster:\n    server: https://198.51.100.7:6443\n  name: k\n",
   );
+});
+
+Deno.test("classifyControllerExecStart reads the argv[] field of the real systemd struct", () => {
+  // Verbatim from a live host: the node kept the control-plane taint.
+  const real =
+    "{ path=/usr/local/bin/k0s ; argv[]=/usr/local/bin/k0s controller --enable-worker=true ; ignore_errors=no ; start_time=[...] ; stop_time=[n/a] ; pid=12838 ; code=(null) ; status=0/0 }";
+  assertEquals(classifyControllerExecStart(real), "controller+worker");
+  const wrap = (cmd: string) =>
+    `{ path=/usr/local/bin/k0s ; argv[]=/usr/local/bin/k0s ${cmd} ; ignore_errors=no ; status=0/0 }`;
+  assertEquals(
+    classifyControllerExecStart(wrap("controller --enable-worker --no-taints")),
+    "single",
+  );
+  assertEquals(
+    classifyControllerExecStart(
+      wrap("controller --enable-worker=true --no-taints=true"),
+    ),
+    "single",
+  );
+  assertEquals(
+    classifyControllerExecStart(wrap("controller --single")),
+    "single",
+  );
+  assertEquals(
+    classifyControllerExecStart(wrap("controller --config=/etc/k0s/k0s.yaml")),
+    "controller",
+  );
+  // A flag-looking word outside argv[] (here in another field) is not read.
+  assertEquals(
+    classifyControllerExecStart(
+      "{ path=/usr/local/bin/k0s ; argv[]=/usr/local/bin/k0s controller ; ignore_errors=no ; note=--enable-worker }",
+    ),
+    "controller",
+  );
+  for (
+    const bad of [
+      "",
+      "controller --enable-worker",
+      "{ path=/usr/bin/true ; argv[]=/usr/bin/true ; ignore_errors=no }",
+    ]
+  ) {
+    let threw = false;
+    try {
+      classifyControllerExecStart(bad);
+    } catch {
+      threw = true;
+    }
+    assertEquals(threw, true, bad);
+  }
 });

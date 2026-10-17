@@ -18,23 +18,22 @@ Deno.test("virshArgv: the URI is always selected with -c", () => {
   ]);
 });
 
-Deno.test("consoleArgv: pty wrapper with a real kill bound, no --timeout", () => {
+Deno.test("consoleArgv: a shell wrapper turns a timeout into exit 0", () => {
   const argv = consoleArgv("qemu:///system", "node-a", 15);
-  assertEquals(argv.slice(0, 6), [
-    "timeout",
-    "-s",
-    "KILL",
-    "15",
-    "script",
-    "-qec",
-  ]);
-  assertEquals(argv.at(-1), "/dev/null");
-  const joined = argv.join(" ");
-  assertEquals(joined.includes("--timeout"), false);
-  assertEquals(joined.includes("'console' 'node-a' '--force'"), true);
-  assertEquals(joined.includes("'virsh' '-c' 'qemu:///system'"), true);
+  assertEquals(argv[0], "sh");
+  assertEquals(argv[1], "-c");
+  const script = argv[2];
+  assertEquals(script.startsWith("timeout -s KILL 15 script -qec "), true);
+  assertEquals(script.includes("/dev/null; rc=$?"), true);
   assertEquals(
-    consoleArgv("qemu:///system", "node-a", 5, "serial0").join(" ")
+    script.includes("[ $rc -eq 137 ] || [ $rc -eq 124 ]; exit $?"),
+    true,
+  );
+  assertEquals(script.includes("--timeout"), false);
+  assertEquals(script.includes("'console' 'node-a' '--force'"), true);
+  assertEquals(script.includes("'virsh' '-c' 'qemu:///system'"), true);
+  assertEquals(
+    consoleArgv("qemu:///system", "node-a", 5, "serial0")[2]
       .includes("'--devname' 'serial0'"),
     true,
   );

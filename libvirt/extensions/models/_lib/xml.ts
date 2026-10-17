@@ -9,11 +9,13 @@
 
 import {
   assertArch,
+  assertDiskBus,
+  assertDiskPath,
   assertDnsName,
+  assertIfname,
   assertIpv4,
   assertMac,
   assertName,
-  DISK_FORMATS,
   NETWORK_MODES,
 } from "./validate.ts";
 
@@ -37,22 +39,34 @@ export interface NetworkSpec {
   domain?: string;
 }
 
+/** One disk attached to a rendered domain. */
+export interface DomainDiskSpec {
+  /** Absolute path of the backing file or ISO. */
+  path: string;
+  /** qemu driver format, e.g. `qcow2` or `raw`. */
+  format: string;
+  /** Target device name, e.g. `vda` or `sda`. */
+  target: string;
+  /** Bus, e.g. `virtio` or `sata`. */
+  bus: string;
+  /** `disk` or `cdrom`. */
+  device: "disk" | "cdrom";
+  /** Attach read-only media. */
+  readonly: boolean;
+}
+
 /** Structured inputs for a rendered domain. */
 export interface DomainSpec {
   /** Domain name. */
   name: string;
-  /** Pool holding the backing volume. */
-  pool: string;
-  /** Volume the domain boots from. */
-  volume: string;
   /** Virtual CPU count. */
   vcpus: number;
   /** Memory in MiB. */
   memoryMib: number;
-  /** Disk driver format. */
-  format: (typeof DISK_FORMATS)[number];
   /** Guest architecture. */
   arch: string;
+  /** Disks to attach, the first being the boot disk. */
+  disks: DomainDiskSpec[];
   /** libvirt network to attach, or `bridge` for a host bridge. */
   network?: string;
   /** Host bridge to attach, or `network` for a libvirt network. */
@@ -74,10 +88,20 @@ function indent(depth: number): string {
   return "  ".repeat(depth);
 }
 
+/** A deterministic bridge name that fits IFNAMSIZ for any network name. */
+export function defaultBridgeName(name: string): string {
+  let hash = 0x811c9dc5;
+  for (let i = 0; i < name.length; i++) {
+    hash ^= name.charCodeAt(i);
+    hash = Math.imul(hash, 0x01000193) >>> 0;
+  }
+  return `vb-${hash.toString(16).padStart(8, "0")}`;
+}
+
 /** Renders a deterministic `<network>` definition from structured inputs. */
 export function renderNetworkXml(spec: NetworkSpec): string {
   assertName(spec.name, "network name");
-  if (spec.bridge !== undefined) assertName(spec.bridge, "bridge name");
+  if (spec.bridge !== undefined) assertIfname(spec.bridge);
   if (spec.domain !== undefined) assertDnsName(spec.domain);
   const lines: string[] = ["<network>"];
   lines.push(`${indent(1)}<name>${escapeXmlAttribute(spec.name)}</name>`);
@@ -86,9 +110,10 @@ export function renderNetworkXml(spec: NetworkSpec): string {
   }
   const bridge = spec.bridge ??
     (spec.mode === "nat" || spec.mode === "route"
-      ? `virbr-${spec.name}`
+      ? defaultBridgeName(spec.name)
       : undefined);
   if (bridge !== undefined) {
+    assertIfname(bridge);
     lines.push(`${indent(1)}<bridge name='${bridge}'/>`);
   }
   // `<domain>` is a direct child of `<network>`, not a child of `<dhcp>`.
@@ -121,13 +146,14 @@ export function renderNetworkXml(spec: NetworkSpec): string {
   return lines.join("\n") + "\n";
 }
 
-/** Renders a deterministic KVM `<domain>` that boots from a pool volume. */
+/** Renders a deterministic KVM `<domain>` that boots from a resolved path. */
 export function renderDomainXml(spec: DomainSpec): string {
   assertName(spec.name, "domain name");
-  assertName(spec.pool, "pool name");
-  assertName(spec.volume, "volume name");
   assertArch(spec.arch);
   if (spec.mac !== undefined) assertMac(spec.mac);
+  if (spec.disks.length === 0) {
+    throw new Error("a rendered domain needs at least one disk");
+  }
   const lines: string[] = [
     "<domain type='kvm'>",
     `${indent(1)}<name>${escapeXmlAttribute(spec.name)}</name>`,
@@ -137,13 +163,30 @@ export function renderDomainXml(spec: DomainSpec): string {
     `${indent(2)}<type arch='${spec.arch}'>hvm</type>`,
     `${indent(2)}<boot dev='hd'/>`,
     `${indent(1)}</os>`,
+    // Without ACPI the guest starts with acpi=off and ignores the ACPI power
+    // button, so `virsh shutdown` never powers it off.
+    `${indent(1)}<features>`,
+    `${indent(2)}<acpi/>`,
+    `${indent(2)}<apic/>`,
+    `${indent(1)}</features>`,
     `${indent(1)}<devices>`,
-    `${indent(2)}<disk type='volume' device='disk'>`,
-    `${indent(3)}<driver name='qemu' type='${spec.format}'/>`,
-    `${indent(3)}<source pool='${spec.pool}' volume='${spec.volume}'/>`,
-    `${indent(3)}<target dev='vda' bus='virtio'/>`,
-    `${indent(2)}</disk>`,
   ];
+  for (const disk of spec.disks) {
+    assertDiskPath(disk.path);
+    assertName(disk.target, "disk target");
+    assertDiskBus(disk.bus);
+    // `type='file'` with the resolved path, never `type='volume'`: on a stock
+    // Ubuntu host virt-aa-helper grants AppArmor access to an explicit file but
+    // not to a volume reference, so qemu gets Permission denied.
+    lines.push(`${indent(2)}<disk type='file' device='${disk.device}'>`);
+    lines.push(`${indent(3)}<driver name='qemu' type='${disk.format}'/>`);
+    lines.push(
+      `${indent(3)}<source file='${escapeXmlAttribute(disk.path)}'/>`,
+    );
+    lines.push(`${indent(3)}<target dev='${disk.target}' bus='${disk.bus}'/>`);
+    if (disk.readonly) lines.push(`${indent(3)}<readonly/>`);
+    lines.push(`${indent(2)}</disk>`);
+  }
   if (spec.network !== undefined && spec.bridge !== undefined) {
     throw new Error("give network or bridge, not both");
   }
@@ -247,6 +290,74 @@ export function parseVolList(text: string): { name: string; path: string }[] {
     if (parts.length >= 2) out.push({ name: parts[0], path: parts[1] });
   }
   return out;
+}
+
+/** One disk reference parsed from domain XML or `domblklist`. */
+export interface DomainDiskRef {
+  /** `disk` or `cdrom`. */
+  device: string;
+  /** Backing file path. */
+  path: string;
+  /** Whether the media is read-only. */
+  readonly: boolean;
+}
+
+function tagAttribute(openTag: string, name: string): string {
+  const m = new RegExp(`\\b${name}=(['\"])(.*?)\\1`).exec(openTag);
+  return m ? m[2] : "";
+}
+
+/** Parses the disks out of a domain XML, ignoring comments. */
+export function parseDomainDisks(xml: string): DomainDiskRef[] {
+  const clean = stripXmlComments(xml);
+  const out: DomainDiskRef[] = [];
+  for (const match of clean.matchAll(/<disk\b([^>]*)>([\s\S]*?)<\/disk>/g)) {
+    const device = tagAttribute(match[1], "device");
+    const sourceTag = /<source\b[^>]*>/.exec(match[2])?.[0] ?? "";
+    const path = tagAttribute(sourceTag, "file");
+    if (path !== "") {
+      out.push({ device, path, readonly: /<readonly\b/.test(match[2]) });
+    }
+  }
+  return out;
+}
+
+/** One `virsh domblklist --details` row. */
+export interface BlkListEntry {
+  /** Block type, e.g. `file`. */
+  type: string;
+  /** Device type, e.g. `disk` or `cdrom`. */
+  device: string;
+  /** Target device name, e.g. `vda`. */
+  target: string;
+  /** Backing source path. */
+  source: string;
+}
+
+/** Parses `virsh domblklist --details` rows, skipping header and separator. */
+export function parseBlkListDetails(text: string): BlkListEntry[] {
+  const out: BlkListEntry[] = [];
+  for (const raw of text.split("\n")) {
+    const line = raw.trim();
+    if (line === "" || line.startsWith("-") || /^type\b/i.test(line)) continue;
+    const parts = line.split(/\s+/);
+    if (parts.length >= 4) {
+      out.push({
+        type: parts[0],
+        device: parts[1],
+        target: parts[2],
+        source: parts[3],
+      });
+    }
+  }
+  return out;
+}
+
+/** The `type` attribute of the first `<format>` in a volume XML, or "". */
+export function parseVolumeFormat(xml: string): string {
+  const clean = stripXmlComments(xml);
+  const match = /<format\b[^>]*\btype=(["'])(.*?)\1/.exec(clean);
+  return match ? match[2] : "";
 }
 
 /** Reads the domain state out of `virsh dominfo` key-values, lower-cased. */

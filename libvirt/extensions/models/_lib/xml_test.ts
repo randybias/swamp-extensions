@@ -1,15 +1,19 @@
 import { assertEquals, assertThrows } from "jsr:@std/assert@1.0.19";
 import { LibvirtConfigError } from "./validate.ts";
 import {
+  defaultBridgeName,
   domainState,
   isOffState,
   isPausedState,
   isRunningState,
   memoryMib,
   networkProjection,
+  parseBlkListDetails,
+  parseDomainDisks,
   parseKeyValues,
   parseNameList,
   parseVolList,
+  parseVolumeFormat,
   renderDomainXml,
   renderNetworkXml,
 } from "./xml.ts";
@@ -28,7 +32,7 @@ Deno.test("network xml: deterministic nat with a dhcp range", () => {
     `<network>
   <name>net-a</name>
   <forward mode='nat'/>
-  <bridge name='virbr-net-a'/>
+  <bridge name='${defaultBridgeName("net-a")}'/>
   <ip address='192.0.2.1' prefix='24'>
     <dhcp>
       <range start='192.0.2.10' end='192.0.2.99'/>
@@ -37,6 +41,16 @@ Deno.test("network xml: deterministic nat with a dhcp range", () => {
 </network>
 `,
   );
+});
+
+Deno.test("network xml: the default bridge is short and deterministic", () => {
+  const name = "e2e-longnet-x";
+  const bridge = defaultBridgeName(name);
+  assertEquals(bridge.length <= 15, true);
+  assertEquals(/^vb-[0-9a-f]{8}$/.test(bridge), true);
+  assertEquals(defaultBridgeName(name), bridge);
+  const xml = renderNetworkXml({ name, mode: "nat", gateway: "192.0.2.1" });
+  assertEquals(xml.includes(`<bridge name='${bridge}'/>`), true);
 });
 
 Deno.test("network xml: bridge mode carries the requested bridge", () => {
@@ -50,29 +64,72 @@ Deno.test("network xml: bridge mode carries the requested bridge", () => {
   assertEquals(xml.includes("<ip "), false);
 });
 
-Deno.test("domain xml: boots from a pool volume, carries a pty console", () => {
+Deno.test("domain xml: boots from a resolved file, carries ACPI and a pty console", () => {
   const xml = renderDomainXml({
     name: "node-a",
-    pool: "pool-a",
-    volume: "node-a-root",
     vcpus: 2,
     memoryMib: 2048,
-    format: "qcow2",
     arch: "x86_64",
+    disks: [{
+      path: "/var/lib/libvirt/e2e-pool/node-a-root.qcow2",
+      format: "qcow2",
+      target: "vda",
+      bus: "virtio",
+      device: "disk",
+      readonly: false,
+    }],
     network: "net-a",
     mac: "02:00:00:00:00:01",
   });
   assertEquals(xml.startsWith("<domain type='kvm'>"), true);
+  assertEquals(xml.includes("<disk type='file' device='disk'>"), true);
   assertEquals(
-    xml.includes("<source pool='pool-a' volume='node-a-root'/>"),
+    xml.includes(
+      "<source file='/var/lib/libvirt/e2e-pool/node-a-root.qcow2'/>",
+    ),
     true,
   );
+  assertEquals(xml.includes("<source pool="), false);
+  assertEquals(xml.includes("<features>"), true);
+  assertEquals(xml.includes("<acpi/>"), true);
+  assertEquals(xml.includes("<apic/>"), true);
   assertEquals(xml.includes("<interface type='network'>"), true);
   assertEquals(xml.includes("<source network='net-a'/>"), true);
   assertEquals(xml.includes("<mac address='02:00:00:00:00:01'/>"), true);
   assertEquals(xml.includes("<serial type='pty'>"), true);
   assertEquals(xml.includes("<console type='pty'>"), true);
   assertEquals(xml.includes(`<memory unit='MiB'>2048</memory>`), true);
+});
+
+Deno.test("domain xml: a read-only cdrom seed is attached", () => {
+  const xml = renderDomainXml({
+    name: "node-a",
+    vcpus: 1,
+    memoryMib: 1024,
+    arch: "x86_64",
+    disks: [
+      {
+        path: "/pool/root.qcow2",
+        format: "qcow2",
+        target: "vda",
+        bus: "virtio",
+        device: "disk",
+        readonly: false,
+      },
+      {
+        path: "/pool/seed.iso",
+        format: "raw",
+        target: "sda",
+        bus: "sata",
+        device: "cdrom",
+        readonly: true,
+      },
+    ],
+  });
+  assertEquals(xml.includes("<disk type='file' device='cdrom'>"), true);
+  assertEquals(xml.includes("<source file='/pool/seed.iso'/>"), true);
+  assertEquals(xml.includes("<target dev='sda' bus='sata'/>"), true);
+  assertEquals(xml.includes("<readonly/>"), true);
 });
 
 Deno.test("projection: re-render and reformatted dumpxml compare equal", () => {
@@ -87,7 +144,7 @@ Deno.test("projection: re-render and reformatted dumpxml compare equal", () => {
   const dumpxml = `<network>
     <name>net-a</name>
     <forward mode="nat"/>
-    <bridge name="virbr-net-a"/>
+    <bridge name="${defaultBridgeName("net-a")}"/>
     <ip prefix="24" address="192.0.2.1">
       <dhcp>
         <range end="192.0.2.99" start="192.0.2.10"/>
@@ -144,15 +201,94 @@ Deno.test("domain xml: an unaccepted arch is refused", () => {
     () =>
       renderDomainXml({
         name: "node-a",
-        pool: "pool-a",
-        volume: "node-a-root",
         vcpus: 2,
         memoryMib: 2048,
-        format: "qcow2",
         arch: "x86_64'> <script/>",
+        disks: [{
+          path: "/pool/root.qcow2",
+          format: "qcow2",
+          target: "vda",
+          bus: "virtio",
+          device: "disk",
+          readonly: false,
+        }],
       }),
     LibvirtConfigError,
   );
+});
+
+Deno.test("parseDomainDisks: single- and double-quoted disk XML", () => {
+  const rendered = renderDomainXml({
+    name: "node-a",
+    vcpus: 1,
+    memoryMib: 1024,
+    arch: "x86_64",
+    disks: [
+      {
+        path: "/pool/root.qcow2",
+        format: "qcow2",
+        target: "vda",
+        bus: "virtio",
+        device: "disk",
+        readonly: false,
+      },
+      {
+        path: "/pool/seed.iso",
+        format: "raw",
+        target: "sda",
+        bus: "sata",
+        device: "cdrom",
+        readonly: true,
+      },
+    ],
+  });
+  assertEquals(parseDomainDisks(rendered), [
+    { device: "disk", path: "/pool/root.qcow2", readonly: false },
+    { device: "cdrom", path: "/pool/seed.iso", readonly: true },
+  ]);
+  const dumpxml = `<domain><devices>
+    <disk type="file" device="disk"><source file="/p/root.qcow2"/></disk>
+    <disk type="file" device="cdrom"><source file="/p/seed.iso"/><readonly/></disk>
+  </devices></domain>`;
+  assertEquals(parseDomainDisks(dumpxml).length, 2);
+  assertEquals(parseDomainDisks(dumpxml)[1].readonly, true);
+});
+
+Deno.test("parseBlkListDetails and parseVolumeFormat read virsh output", () => {
+  assertEquals(
+    parseBlkListDetails(
+      ` Type   Device   Target   Source
+-----------------------------------------------
+ file   disk     vda      /pool/root.qcow2
+ file   cdrom    sda      /pool/seed.iso
+`,
+    ),
+    [
+      {
+        type: "file",
+        device: "disk",
+        target: "vda",
+        source: "/pool/root.qcow2",
+      },
+      {
+        type: "file",
+        device: "cdrom",
+        target: "sda",
+        source: "/pool/seed.iso",
+      },
+    ],
+  );
+  assertEquals(
+    parseVolumeFormat(
+      `<volume type='file'><target><format type='qcow2'/></target></volume>`,
+    ),
+    "qcow2",
+  );
+  assertEquals(
+    parseVolumeFormat(`<volume><format type="raw"/></volume>`),
+    "raw",
+  );
+  assertEquals(parseVolumeFormat("<volume/>"), "");
 });
 
 Deno.test("network xml: a dns domain with a quote is refused", () => {

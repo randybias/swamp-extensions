@@ -16,17 +16,17 @@ One definition manages any hypervisor: the SSH target, the libvirt URI and every
 operand are method arguments. State is keyed by the canonical
 `{host, port, user}` plus the resource name.
 
-| Method             | Kind   | Description                                                                                        |
-| ------------------ | ------ | -------------------------------------------------------------------------------------------------- |
-| `define_network`   | action | Define a network (raw XML or structured), start and autostart it; `replace=true` to redefine       |
-| `undefine_network` | action | Stop a network if active and undefine it; use this to remove the `default` network                 |
-| `clone_volume`     | action | Clone a golden volume or zvol in a pool to a new volume, via the pool driver (`vol-clone`)         |
-| `define_domain`    | action | Define a KVM domain that boots from a pool volume, with a pty serial console; optionally start it  |
-| `power`            | action | `start`, `shutdown`, `destroy`, `reboot`, `suspend`, `resume`; idempotent toward the desired state |
-| `console`          | query  | Attach to the serial console under a hard timeout; returns `bytes` and `sha256`, not the text      |
-| `undefine_domain`  | action | Destroy the domain if running, then undefine it; `remove_volumes` deletes its managed volumes      |
-| `get`              | query  | Report networks, domains and pool volumes from `net-list`, `list` and `vol-list`                   |
-| `sync`             | query  | Probe the host and report drift between the last recorded inventory and the live state             |
+| Method             | Kind   | Description                                                                                                                                         |
+| ------------------ | ------ | --------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `define_network`   | action | Define a network (raw XML or structured), start and autostart it; `replace=true` to redefine                                                        |
+| `undefine_network` | action | Stop a network if active and undefine it; use this to remove the `default` network                                                                  |
+| `clone_volume`     | action | Clone a golden volume or zvol in a pool to a new volume, via the pool driver (`vol-clone`)                                                          |
+| `define_domain`    | action | Define a KVM domain from a pool volume with ACPI and a pty console, plus optional extra/CD-ROM disks; optionally start it                           |
+| `power`            | action | `start`, `shutdown`, `destroy`, `reboot`, `suspend`, `resume`; idempotent toward the desired state, `shutdown` waits for power-off                  |
+| `console`          | query  | Attach to the serial console under a hard timeout; returns `bytes` and `sha256`, not the text                                                       |
+| `undefine_domain`  | action | Destroy the domain if running, then undefine it; `remove_volumes` removes its volumes but keeps an attached seed ISO unless `remove_attached_media` |
+| `get`              | query  | Report networks, domains and pool volumes from `net-list`, `list` and `vol-list`                                                                    |
+| `sync`             | query  | Probe the host and report drift between the last recorded inventory and the live state                                                              |
 
 `define_network`, `undefine_network`, `clone_volume`, `define_domain`, `power`
 and `undefine_domain` are `kind: action`, so a single method call cannot mark
@@ -43,10 +43,15 @@ undefine_domain name=node-a remove_volumes=true
 ```
 
 `clone_volume` is idempotent: an existing target is a no-op, never a second
-clone. `define_domain` renders the domain XML, including a `<serial type='pty'>`
-and a matching `<console type='pty'>`, so `console` and `virsh console node-a`
-both attach. `define_domain` refuses to define from a volume that does not
-exist, so it always follows a successful clone.
+clone. `define_domain` renders the domain XML, including a pty `<serial>` and
+`<console>`, so `console` and `virsh console node-a` both attach. The boot disk
+is `<disk type='file'>` with the path resolved by `virsh vol-path`: a
+`type='volume'` disk is denied by AppArmor on a stock Ubuntu host, so qemu could
+not open the clone. `<features><acpi/><apic/></features>` is always rendered so
+the ACPI power button works and `power shutdown` can power the guest off.
+`extra_disks` attaches more disks — a `cdrom` defaults to read-only, so a
+cloud-init NoCloud seed ISO can be attached. `define_domain` refuses to define
+from a volume that does not exist, so it always follows a successful clone.
 
 ## Idempotency and safety
 
@@ -85,9 +90,12 @@ exist, so it always follows a successful clone.
   `bytes` and `sha256`, never the text, because swamp has no sensitive result
   channel; read the text from the sensitive resource. Capture is bounded by a
   remote `timeout -s KILL` around `script -qec` (a pty, since `virsh console`
-  needs one and has no `--timeout`), with a local deadline as a backstop, and
-  `max_output_bytes` caps the bytes the transport returns. It passes `--force`,
-  so a capture takes over the console from any operator already attached to it.
+  needs one and has no `--timeout`), run inside an outer `sh -c` that survives
+  the killed child and exits 0 on a timeout, so a timed-out capture returns the
+  bytes read so far instead of an ssh transport error. A local deadline is a
+  backstop, and `max_output_bytes` caps the bytes the transport returns. It
+  passes `--force`, so a capture takes over the console from any operator
+  already attached to it.
 
 ## Install
 

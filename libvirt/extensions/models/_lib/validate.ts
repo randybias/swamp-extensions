@@ -66,6 +66,15 @@ export const NETWORK_MODES = ["nat", "route", "bridge", "none"] as const;
 /** Disk formats accepted for a rendered domain. */
 export const DISK_FORMATS = ["qcow2", "raw"] as const;
 
+/** Bus types accepted for a rendered domain disk. */
+export const DISK_BUSES = ["virtio", "sata", "scsi", "ide"] as const;
+
+/** Linux interface-name limit (IFNAMSIZ): a bridge name must fit in 15 chars. */
+export const IFNAME_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,14}$/;
+
+/** Grammar for an absolute backing-file path. */
+const DISK_PATH_RE = /^\/[A-Za-z0-9._/-]{1,255}$/;
+
 /** Throws unless `s` is a valid libvirt object name. */
 export function assertName(s: string, what = "name"): void {
   if (!NAME_RE.test(s)) {
@@ -115,4 +124,34 @@ export function assertDnsName(s: string): void {
 /** True when `s` is a dotted-quad IPv4 address. */
 export function isIpv4(s: string): boolean {
   return IPV4_RE.test(s);
+}
+
+/** Throws unless `s` is a bridge interface name within the IFNAMSIZ limit. */
+export function assertIfname(s: string, what = "bridge name"): void {
+  if (!IFNAME_RE.test(s)) {
+    throw new LibvirtConfigError(
+      `Not a valid ${what} (max 15 chars): ${JSON.stringify(s)}`,
+    );
+  }
+}
+
+/** Throws unless `s` is an absolute backing-file path with no `..` component. */
+export function assertDiskPath(s: string, what = "disk path"): void {
+  if (
+    !DISK_PATH_RE.test(s) || s.endsWith("/") ||
+    s.split("/").includes("..")
+  ) {
+    throw new LibvirtConfigError(`Not a valid ${what}: ${JSON.stringify(s)}`);
+  }
+}
+
+/** Throws unless `bus` is an accepted disk bus. */
+export function assertDiskBus(bus: string): void {
+  if (!(DISK_BUSES as readonly string[]).includes(bus)) {
+    throw new LibvirtConfigError(
+      `Not an accepted disk bus: ${bus} (expected one of ${
+        DISK_BUSES.join(", ")
+      })`,
+    );
+  }
 }

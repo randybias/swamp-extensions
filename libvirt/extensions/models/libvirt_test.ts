@@ -39,12 +39,16 @@ type Respond = (command: string) => Resp;
 interface Fake {
   deps: Partial<LibvirtDeps>;
   commands: string[];
+  uploads: string[];
+  clock: { value: number };
 }
 
 /** A transport fake: records ssh command strings and dispatches responses. */
 function fakeLibvirt(respond: Respond): Fake {
   const commands: string[] = [];
-  const run: CommandRunner = async (cmd, args, _options = {}) => {
+  const uploads: string[] = [];
+  const clock = { value: NOW };
+  const run: CommandRunner = async (cmd, args, options = {}) => {
     await Promise.resolve();
     if (cmd === "ssh-agent") {
       return args[0] === "-s"
@@ -63,6 +67,13 @@ function fakeLibvirt(respond: Respond): Fake {
       return { code: 0, stdout: "MISSING\n", stderr: "" };
     }
     if (command.includes(".ssh-host-upload")) {
+      if (options.stdin !== undefined) {
+        uploads.push(
+          typeof options.stdin === "string"
+            ? options.stdin
+            : new TextDecoder().decode(options.stdin),
+        );
+      }
       return { code: 0, stdout: "", stderr: "" };
     }
     const r = respond(command);
@@ -70,11 +81,14 @@ function fakeLibvirt(respond: Respond): Fake {
   };
   const deps: Partial<LibvirtDeps> = {
     run,
-    now: () => NOW,
-    sleep: () => Promise.resolve(),
+    now: () => clock.value,
+    sleep: (ms) => {
+      clock.value += ms;
+      return Promise.resolve();
+    },
     token: () => TOKEN,
   };
-  return { deps, commands };
+  return { deps, commands, uploads, clock };
 }
 
 /** A responder that consumes a per-matcher sequence of replies. */
@@ -550,6 +564,7 @@ Deno.test("define_domain: defines from the clone and starts when asked", async (
       "'vol-info'",
       () => ({ code: 0, stdout: "Name: node-a-root\nPath: /p/x\n" }),
     ],
+    ["'vol-path'", () => ({ code: 0, stdout: "/p/node-a-root.qcow2\n" })],
     [
       "'dominfo'",
       (n) =>
@@ -577,8 +592,49 @@ Deno.test("define_domain: defines from the clone and starts when asked", async (
     ctx.context,
   );
   assertEquals(out.result.changed, true);
+  assertEquals(has(f, "'vol-path'"), true);
   assertEquals(has(f, "'define'"), true);
   assertEquals(has(f, "'start'"), true);
+  // The uploaded XML must use type='file' with the resolved path, and ACPI.
+  const xml = f.uploads[0];
+  assertEquals(xml.includes("<disk type='file' device='disk'>"), true);
+  assertEquals(xml.includes("<source file='/p/node-a-root.qcow2'/>"), true);
+  assertEquals(xml.includes("<source pool="), false);
+  assertEquals(xml.includes("<acpi/>"), true);
+});
+
+Deno.test("define_domain: extra_disks attach a read-only seed", async () => {
+  const f = fakeLibvirt(seq([
+    ["'vol-info'", () => ({ code: 0, stdout: "Name: node-a-root\n" })],
+    ["'vol-path'", () => ({ code: 0, stdout: "/p/node-a-root.qcow2\n" })],
+    [
+      "'dominfo'",
+      (n) =>
+        n === 0
+          ? { code: 1, stderr: "error: failed to get domain" }
+          : { code: 0, stdout: SHUT_OFF },
+    ],
+    ["'define'", () => ({ code: 0 })],
+  ]));
+  const m = modelWith(f);
+  const ctx = createModelTestContext({ globalArgs: {} });
+  await m.methods.define_domain.execute(
+    m.methods.define_domain.arguments.parse({
+      ...SSH,
+      uri: URI,
+      name: "node-a",
+      pool: "pool-a",
+      volume: "node-a-root",
+      vcpus: 1,
+      memory_mib: 1024,
+      extra_disks: [{ path: "/p/seed.iso", device: "cdrom" }],
+    }),
+    ctx.context,
+  );
+  const xml = f.uploads[0];
+  assertEquals(xml.includes("<disk type='file' device='cdrom'>"), true);
+  assertEquals(xml.includes("<source file='/p/seed.iso'/>"), true);
+  assertEquals(xml.includes("<readonly/>"), true);
 });
 
 Deno.test("power: idempotent toward the state; destroy runs; reboot off refuses", async () => {
@@ -659,8 +715,8 @@ Deno.test("console: bounded capture stores the text and returns only its digest"
   assertEquals(typeof out.result.sha256, "string");
   assertEquals((out.result as Record<string, unknown>).text, undefined);
   assertEquals(has(f, "'console'"), true);
-  assertEquals(has(f, "'timeout'"), true);
-  assertEquals(has(f, "'script'"), true);
+  assertEquals(f.commands.some((c) => c.includes("timeout -s KILL")), true);
+  assertEquals(f.commands.some((c) => c.includes("script -qec")), true);
   assertEquals(has(f, "--force"), true);
   const written = ctx.getWrittenResources()[0];
   assertEquals(written.data.text, "boot log line\nlogin: ");
@@ -785,12 +841,11 @@ Deno.test("virsh non-zero exit: typed error, no success state written", async ()
 });
 
 Deno.test("console: a timed-out capture returns the text so far, never hangs", async () => {
+  // The console wrapper turns the timeout (SIGKILL 137 / timeout 124) into
+  // exit 0, so the bytes read before the bound are a normal capture.
   const f = fakeLibvirt(seq([
     ["'dominfo'", () => ({ code: 0, stdout: RUNNING })],
-    [
-      "'console'",
-      () => ({ code: 1, stdout: "partial boot log\n", stderr: "timeout" }),
-    ],
+    ["'console'", () => ({ code: 0, stdout: "partial boot log\n" })],
   ]));
   const m = modelWith(f);
   const ctx = createModelTestContext({ globalArgs: {} });
@@ -807,6 +862,241 @@ Deno.test("console: a timed-out capture returns the text so far, never hangs", a
   assertEquals((out.result as Record<string, unknown>).text, undefined);
   assertEquals(ctx.getWrittenResources()[0].data.text, "partial boot log\n");
   assertEquals(ctx.getWrittenResources().length, 1);
+});
+
+Deno.test("console refuses a domain that is not running", async () => {
+  const f = fakeLibvirt(seq([
+    ["'dominfo'", () => ({ code: 0, stdout: SHUT_OFF })],
+  ]));
+  const m = modelWith(f);
+  await assertRejects(
+    () =>
+      m.methods.console.execute(
+        m.methods.console.arguments.parse({
+          ...SSH,
+          uri: URI,
+          name: "node-a",
+        }),
+        createModelTestContext({ globalArgs: {} }).context,
+      ),
+    Error,
+    "not running",
+  );
+  assertEquals(has(f, "'console'"), false);
+});
+
+Deno.test("console: a virsh error is a typed error, not a capture", async () => {
+  const f = fakeLibvirt(seq([
+    ["'dominfo'", () => ({ code: 0, stdout: RUNNING })],
+    [
+      "'console'",
+      () => ({ code: 1, stdout: "error: The domain is not running\n" }),
+    ],
+  ]));
+  const m = modelWith(f);
+  const ctx = createModelTestContext({ globalArgs: {} });
+  await assertRejects(
+    () =>
+      m.methods.console.execute(
+        m.methods.console.arguments.parse({
+          ...SSH,
+          uri: URI,
+          name: "node-a",
+        }),
+        ctx.context,
+      ),
+    Error,
+    "could not attach to the console",
+  );
+  assertEquals(ctx.getWrittenResources().length, 0);
+});
+
+Deno.test("power shutdown waits for the guest to power off", async () => {
+  const f = fakeLibvirt(seq([
+    [
+      "'dominfo'",
+      (n) =>
+        n < 2 ? { code: 0, stdout: RUNNING } : { code: 0, stdout: SHUT_OFF },
+    ],
+    ["'shutdown'", () => ({ code: 0 })],
+  ]));
+  const m = modelWith(f);
+  const ctx = createModelTestContext({ globalArgs: {} });
+  const out = await m.methods.power.execute(
+    m.methods.power.arguments.parse({
+      ...SSH,
+      uri: URI,
+      name: "node-a",
+      action: "shutdown",
+      shutdown_timeout_s: 60,
+      poll_interval_s: 5,
+    }),
+    ctx.context,
+  );
+  assertEquals(out.result.changed, true);
+  assertEquals(out.result.state, "shut off");
+});
+
+Deno.test("power shutdown times out rather than reporting success", async () => {
+  const f = fakeLibvirt(seq([
+    ["'dominfo'", () => ({ code: 0, stdout: RUNNING })],
+    ["'shutdown'", () => ({ code: 0 })],
+  ]));
+  const m = modelWith(f);
+  const ctx = createModelTestContext({ globalArgs: {} });
+  await assertRejects(
+    () =>
+      m.methods.power.execute(
+        m.methods.power.arguments.parse({
+          ...SSH,
+          uri: URI,
+          name: "node-a",
+          action: "shutdown",
+          shutdown_timeout_s: 10,
+          poll_interval_s: 5,
+        }),
+        ctx.context,
+      ),
+    Error,
+    "did not shut down within 10s",
+  );
+  assertEquals(ctx.getWrittenResources().length, 0);
+});
+
+Deno.test("define_network: a start failure is typed and rolls back", async () => {
+  const f = fakeLibvirt(seq([
+    [
+      "'net-info'",
+      (n) =>
+        n === 0 ? { code: 1, stderr: "error: failed to get network" } : {
+          code: 0,
+          stdout: "Name: net-a\nActive: no\nAutostart: no\nUUID: u1\n",
+        },
+    ],
+    ["'net-define'", () => ({ code: 0 })],
+    [
+      "'net-start'",
+      () => ({
+        code: 1,
+        stderr:
+          "error: error creating bridge interface virbr-x: Numerical result out of range",
+      }),
+    ],
+    ["'net-undefine'", () => ({ code: 0 })],
+  ]));
+  const m = modelWith(f);
+  const ctx = createModelTestContext({ globalArgs: {} });
+  await assertRejects(
+    () =>
+      m.methods.define_network.execute(
+        m.methods.define_network.arguments.parse({
+          ...NET,
+          mode: "nat",
+          gateway: "192.0.2.1",
+          start: true,
+        }),
+        ctx.context,
+      ),
+    Error,
+    "Numerical result out of range",
+  );
+  assertEquals(has(f, "'net-define'"), true);
+  assertEquals(has(f, "'net-undefine'"), true);
+  assertEquals(ctx.getWrittenResources().length, 0);
+});
+
+Deno.test("undefine_domain keeps a seed ISO unless asked to remove it", async () => {
+  const mk = () =>
+    fakeLibvirt(seq([
+      ["'dominfo'", () => ({ code: 0, stdout: SHUT_OFF })],
+      [
+        "'domblklist'",
+        () => ({
+          code: 0,
+          stdout:
+            " Type   Device   Target   Source\n-----------------------------------------------\n file   disk     vda      /p/root.qcow2\n file   cdrom    sda      /p/seed.iso\n",
+        }),
+      ],
+      ["'detach-disk'", () => ({ code: 0 })],
+      ["'undefine'", () => ({ code: 0 })],
+    ]));
+  const kept = mk();
+  await modelWith(kept).methods.undefine_domain.execute(
+    modelWith(kept).methods.undefine_domain.arguments.parse({
+      ...SSH,
+      uri: URI,
+      name: "node-a",
+      remove_volumes: true,
+    }),
+    createModelTestContext({ globalArgs: {} }).context,
+  );
+  assertEquals(has(kept, "'detach-disk'"), true);
+  assertEquals(
+    kept.commands.some((c) =>
+      c.includes("'undefine'") && c.includes("--remove-all-storage")
+    ),
+    true,
+  );
+
+  const removed = mk();
+  await modelWith(removed).methods.undefine_domain.execute(
+    modelWith(removed).methods.undefine_domain.arguments.parse({
+      ...SSH,
+      uri: URI,
+      name: "node-a",
+      remove_volumes: true,
+      remove_attached_media: true,
+    }),
+    createModelTestContext({ globalArgs: {} }).context,
+  );
+  assertEquals(has(removed, "'detach-disk'"), false);
+});
+
+Deno.test("clone_volume records the qemu format from the volume XML", async () => {
+  const f = fakeLibvirt(seq([
+    [
+      "'vol-dumpxml'",
+      () => ({
+        code: 0,
+        stdout:
+          "<volume type='file'><target><format type='raw'/></target></volume>",
+      }),
+    ],
+    ["'golden'", () => ({ code: 0, stdout: "Name: golden\n" })],
+    [
+      "'node-a-root'",
+      (n) =>
+        n === 0
+          ? { code: 1, stderr: "error: Storage volume not found" }
+          : { code: 0, stdout: "Name: node-a-root\nPath: /p/node-a-root\n" },
+    ],
+    ["'vol-clone'", () => ({ code: 0 })],
+    [
+      "'vol-info'",
+      () => ({ code: 0, stdout: "Name: node-a-root\nPath: /p/x\n" }),
+    ],
+    [
+      "'vol-dumpxml'",
+      () => ({
+        code: 0,
+        stdout:
+          "<volume type='file'><target><format type='raw'/></target></volume>",
+      }),
+    ],
+  ]));
+  const m = modelWith(f);
+  const ctx = createModelTestContext({ globalArgs: {} });
+  await m.methods.clone_volume.execute(
+    m.methods.clone_volume.arguments.parse({
+      ...SSH,
+      uri: URI,
+      pool: "pool-a",
+      source_volume: "golden",
+      target_volume: "node-a-root",
+    }),
+    ctx.context,
+  );
+  assertEquals(ctx.getWrittenResources()[0].data.format, "raw");
 });
 
 Deno.test("schema: max_output_bytes is bounded and defaults to the transport cap", () => {

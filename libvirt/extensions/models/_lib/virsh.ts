@@ -110,19 +110,16 @@ export function consoleArgv(
   const args = ["console", name, "--force"];
   if (devname !== undefined) args.push("--devname", devname);
   // `virsh console` has no --timeout option and needs a controlling TTY, so
-  // wrap it: `script` allocates a pty and `timeout -s KILL` is the real bound
-  // (its stdin is the ssh channel, which the transport closes).
+  // wrap it: `script` allocates a pty and `timeout -s KILL` is the real bound.
+  // The wrapper runs in an outer shell that survives the killed child: without
+  // it, GNU timeout kills the session process, ssh exits 255, and the canonical
+  // transport (correctly) reports a transport failure, discarding the bytes
+  // captured so far. Here 137 (SIGKILL) and 124 (timeout) become exit 0.
   const inner = quoteArgv(virshArgv(uri, args));
-  return [
-    "timeout",
-    "-s",
-    "KILL",
-    String(timeoutS),
-    "script",
-    "-qec",
-    inner,
-    "/dev/null",
-  ];
+  const script =
+    `timeout -s KILL ${timeoutS} script -qec ${inner} /dev/null; rc=$?; ` +
+    `[ $rc -eq 137 ] || [ $rc -eq 124 ]; exit $?`;
+  return ["sh", "-c", script];
 }
 
 const NOT_FOUND: Record<string, RegExp> = {

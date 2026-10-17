@@ -27,6 +27,7 @@ import {
   ARCHES,
   assertName,
   assertUri,
+  DISK_BUSES,
   DISK_FORMATS,
   DNS_NAME_RE,
   IPV4_ADDRESS_RE,
@@ -37,6 +38,7 @@ import {
   URI_RE,
 } from "./_lib/validate.ts";
 import {
+  type DomainDiskSpec,
   domainState,
   firstTagText,
   isOffState,
@@ -44,9 +46,11 @@ import {
   isRunningState,
   memoryMib,
   networkProjection,
+  parseBlkListDetails,
   parseKeyValues,
   parseNameList,
   parseVolList,
+  parseVolumeFormat,
   renderDomainXml,
   renderNetworkXml,
 } from "./_lib/xml.ts";
@@ -165,6 +169,29 @@ const CloneVolumeArgs = z.strictObject({
   ),
 });
 
+const ExtraDiskArgs = z.strictObject({
+  path: z.string().min(2).max(255).regex(/^\/[A-Za-z0-9._/-]{1,254}$/)
+    .refine(
+      (p) => !p.endsWith("/") && !p.split("/").includes(".."),
+      "path must not end with / or contain ..",
+    ).describe("Absolute path of a backing file or ISO on the host"),
+  device: z.enum(["disk", "cdrom"]).default("disk").describe(
+    "Attach as a disk or a CD-ROM",
+  ),
+  readonly: z.boolean().optional().describe(
+    "Attach read-only; defaults to true for a CD-ROM",
+  ),
+  target: NameField.optional().describe(
+    "Target device name, e.g. sda; derived when omitted",
+  ),
+  bus: z.enum(DISK_BUSES).optional().describe(
+    "Bus; defaults to sata for a CD-ROM and virtio for a disk",
+  ),
+  format: z.enum(DISK_FORMATS).optional().describe(
+    "Driver format; defaults to raw for a CD-ROM and qcow2 for a disk",
+  ),
+});
+
 const DefineDomainArgs = z.strictObject({
   ...SshFields,
   uri: UriField,
@@ -177,6 +204,9 @@ const DefineDomainArgs = z.strictObject({
   ),
   format: z.enum(DISK_FORMATS).default("qcow2").describe("Disk driver format"),
   arch: z.enum(ARCHES).default("x86_64").describe("Guest architecture"),
+  extra_disks: z.array(ExtraDiskArgs).max(8).default([]).describe(
+    "Extra disks to attach, e.g. a read-only CD-ROM seed ISO",
+  ),
   network: z.string().min(1).max(63).regex(NAME_RE).optional().describe(
     "libvirt network to attach",
   ),
@@ -206,6 +236,12 @@ const PowerArgs = z.strictObject({
   uri: UriField,
   name: NameField.describe("Domain name"),
   action: PowerAction,
+  shutdown_timeout_s: z.number().int().min(1).max(3600).default(120).describe(
+    "Seconds to wait for a shutdown to complete",
+  ),
+  poll_interval_s: z.number().int().min(1).max(60).default(5).describe(
+    "Seconds between shutdown polls",
+  ),
 });
 
 const ConsoleArgs = z.strictObject({
@@ -226,6 +262,9 @@ const UndefineDomainArgs = z.strictObject({
   name: NameField.describe("Domain to destroy and undefine"),
   remove_volumes: z.boolean().default(false).describe(
     "Also remove the domain's managed volumes (virsh undefine --remove-all-storage)",
+  ),
+  remove_attached_media: z.boolean().default(false).describe(
+    "Also remove attached read-only media the domain did not create, e.g. a seed ISO; without this a CD-ROM seed is detached first and kept",
   ),
 });
 
@@ -387,6 +426,11 @@ function yesNo(value: string | undefined): boolean {
   return value !== undefined && /^yes$/i.test(value);
 }
 
+/** The letter for a disk target index: 0 -> a, 1 -> b, ... */
+function diskLetter(index: number): string {
+  return String.fromCharCode(97 + index);
+}
+
 const BENIGN = {
   start: [/already (active|running)/i, /domain is already running/i],
   shutdown: [/already shut ?off/i, /domain is not running/i, /not running/i],
@@ -397,6 +441,7 @@ const BENIGN = {
   netDestroy: [/network is not active/i, /not active/i],
   define: [/already exists/i],
   clone: [/already exists/i],
+  detach: [/no such device|could not find|not found/i],
 };
 
 /** Defines an object from XML uploaded to a temporary remote file. */
@@ -595,6 +640,7 @@ export function createModel(overrides: Partial<LibvirtDeps> = {}) {
           const before = await networkInfo(deps, t, args.uri, args.name);
           let changed = false;
           let drift = false;
+          let createdHere = false;
           if (before.present) {
             if (args.replace) {
               if (before.active) {
@@ -630,6 +676,7 @@ export function createModel(overrides: Partial<LibvirtDeps> = {}) {
           } else {
             await defineFromXml(deps, t, args.uri, "net-define", xml);
             changed = true;
+            createdHere = true;
           }
           let after = await networkInfo(deps, t, args.uri, args.name);
           if (args.start && !after.active) {
@@ -638,7 +685,19 @@ export function createModel(overrides: Partial<LibvirtDeps> = {}) {
               args.name,
             ]);
             if (start.exit_code !== 0 && !isBenign(start, BENIGN.netStart)) {
-              throw new LibvirtError(`could not start network ${args.name}`);
+              // Surface the virsh cause, and roll back a network this call
+              // created so it does not linger defined-but-inactive.
+              const detail = `${start.stderr || start.stdout}`.trim().split(
+                "\n",
+              ).slice(-3).join(" ").slice(0, 400);
+              if (createdHere) {
+                await virshTry(deps, t, args.uri, ["net-undefine", args.name]);
+              }
+              throw new LibvirtError(
+                `could not start network ${args.name} (exit ${start.exit_code})${
+                  detail ? `: ${detail}` : ""
+                }`,
+              );
             }
             changed = true;
             after = await networkInfo(deps, t, args.uri, args.name);
@@ -800,6 +859,19 @@ export function createModel(overrides: Partial<LibvirtDeps> = {}) {
             args.target_volume,
           ]);
           const kv = parseKeyValues(info.stdout);
+          let format: string | undefined = args.format;
+          if (format === undefined) {
+            // `vol-info` reports `Type: file`, not the qemu driver format, so
+            // read the format from the volume XML instead.
+            const dump = await virsh(deps, t, args.uri, [
+              "vol-dumpxml",
+              "--pool",
+              args.pool,
+              "--",
+              args.target_volume,
+            ]);
+            format = parseVolumeFormat(dump.stdout) || "qcow2";
+          }
           const handle = await context.writeResource(
             "volume_state",
             instanceName("vol", args, args.pool, args.target_volume),
@@ -811,7 +883,7 @@ export function createModel(overrides: Partial<LibvirtDeps> = {}) {
               path: kv["path"],
               capacity: kv["capacity"],
               allocation: kv["allocation"],
-              format: args.format ?? kv["type"],
+              format,
               observed_at: new Date(deps.now()).toISOString(),
             },
           );
@@ -850,14 +922,52 @@ export function createModel(overrides: Partial<LibvirtDeps> = {}) {
               `volume ${args.volume} not found in pool ${args.pool}; clone it first`,
             );
           }
+          const volPath = (
+            await virsh(deps, t, args.uri, [
+              "vol-path",
+              "--pool",
+              args.pool,
+              "--",
+              args.volume,
+            ])
+          ).stdout.trim();
+          if (volPath === "") {
+            throw new LibvirtError(
+              `could not resolve the path of volume ${args.volume} in pool ${args.pool}`,
+            );
+          }
+          const disks: DomainDiskSpec[] = [{
+            path: volPath,
+            format: args.format,
+            target: "vda",
+            bus: "virtio",
+            device: "disk",
+            readonly: false,
+          }];
+          let virtioIndex = 1;
+          let sdIndex = 0;
+          for (const extra of args.extra_disks) {
+            const device = extra.device;
+            const bus = extra.bus ?? (device === "cdrom" ? "sata" : "virtio");
+            const target = extra.target ??
+              (bus === "virtio"
+                ? `vd${diskLetter(virtioIndex++)}`
+                : `sd${diskLetter(sdIndex++)}`);
+            disks.push({
+              path: extra.path,
+              format: extra.format ?? (device === "cdrom" ? "raw" : "qcow2"),
+              target,
+              bus,
+              device,
+              readonly: extra.readonly ?? (device === "cdrom"),
+            });
+          }
           const xml = renderDomainXml({
             name: args.name,
-            pool: args.pool,
-            volume: args.volume,
             vcpus: args.vcpus,
             memoryMib: args.memory_mib,
-            format: args.format,
             arch: args.arch,
+            disks,
             network: args.network,
             bridge: args.bridge,
             mac: args.mac,
@@ -989,6 +1099,26 @@ export function createModel(overrides: Partial<LibvirtDeps> = {}) {
             }
             changed = true;
           }
+          // A successful `virsh shutdown` only sends the ACPI request. Wait for
+          // the guest to actually power off; a guest without ACPI (or one that
+          // ignores the request) must not be reported as shut down.
+          if (args.action === "shutdown" && !noop) {
+            const deadline = deps.now() + args.shutdown_timeout_s * 1000;
+            let state = domainState(
+              await domainInfo(deps, t, args.uri, args.name),
+            );
+            while (!isOffState(state) && deps.now() < deadline) {
+              await deps.sleep(args.poll_interval_s * 1000);
+              state = domainState(
+                await domainInfo(deps, t, args.uri, args.name),
+              );
+            }
+            if (!isOffState(state)) {
+              throw new LibvirtError(
+                `domain ${args.name} did not shut down within ${args.shutdown_timeout_s}s (state: ${state}); a guest that ignores the ACPI request needs a forced destroy`,
+              );
+            }
+          }
           const after = await domainInfo(deps, t, args.uri, args.name);
           const handle = await context.writeResource(
             "domain_state",
@@ -1031,6 +1161,11 @@ export function createModel(overrides: Partial<LibvirtDeps> = {}) {
           if (Object.keys(info).length === 0) {
             throw new LibvirtError(`domain ${args.name} not found`);
           }
+          if (isOffState(domainState(info))) {
+            throw new LibvirtError(
+              `cannot attach to the console of ${args.name}: it is not running`,
+            );
+          }
           const guardMs = (args.timeout_s + args.connect_timeout_s + 30) * 1000;
           const res: ExecResult = await withDeadline(
             exec(
@@ -1044,11 +1179,12 @@ export function createModel(overrides: Partial<LibvirtDeps> = {}) {
             }s local deadline`,
           );
           const text = res.stdout;
-          if (res.exit_code !== 0 && text.trim() === "") {
+          if (res.exit_code !== 0) {
             throw new LibvirtError(
               `could not attach to the console of ${args.name} (exit ${res.exit_code})`,
             );
           }
+          const bytes = new TextEncoder().encode(text).length;
           const sha256 = await sha256Hex(text);
           const handle = await context.writeResource(
             "console_capture",
@@ -1058,7 +1194,7 @@ export function createModel(overrides: Partial<LibvirtDeps> = {}) {
               domain: args.name,
               text,
               sha256,
-              bytes: text.length,
+              bytes,
               observed_at: new Date(deps.now()).toISOString(),
             },
           );
@@ -1067,7 +1203,7 @@ export function createModel(overrides: Partial<LibvirtDeps> = {}) {
             result: {
               target: targetKey(args),
               domain: args.name,
-              bytes: text.length,
+              bytes,
               sha256,
             },
           };
@@ -1116,6 +1252,29 @@ export function createModel(overrides: Partial<LibvirtDeps> = {}) {
               throw new LibvirtError(
                 `could not destroy domain ${args.name} before undefining it`,
               );
+            }
+          }
+          if (args.remove_volumes && !args.remove_attached_media) {
+            // Detach read-only media (e.g. a seed ISO this extension did not
+            // create) so `--remove-all-storage` cannot delete it.
+            const blk = await virsh(deps, t, args.uri, [
+              "domblklist",
+              args.name,
+              "--details",
+            ]);
+            for (const entry of parseBlkListDetails(blk.stdout)) {
+              if (entry.device !== "cdrom") continue;
+              const detach = await virshTry(deps, t, args.uri, [
+                "detach-disk",
+                args.name,
+                entry.target,
+                "--config",
+              ]);
+              if (detach.exit_code !== 0 && !isBenign(detach, BENIGN.detach)) {
+                throw new LibvirtError(
+                  `could not detach ${entry.target} from ${args.name} before undefining it; refusing to remove volumes`,
+                );
+              }
             }
           }
           const undefine = ["undefine", args.name];

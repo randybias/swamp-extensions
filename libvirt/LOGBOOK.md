@@ -147,3 +147,41 @@ release.yaml).
   read.
 - The README documents that `console` passes `--force`, taking the console over
   from any operator already attached.
+
+## Live-run fixes (Ubuntu 24.04, 37/41 cells)
+
+Applied to lane/d5-libvirt on top of 0733670. Drafted directly, not via
+`codex exec`: codex was blocked by a missing `codex-code-mode-host` binary in
+this environment.
+
+- **A. Domains could not start on stock Ubuntu.** `renderDomainXml` now emits
+  `<disk type='file'>` with the path resolved by `virsh vol-path`, instead of
+  `<disk type='volume'>`; virt-aa-helper grants a file AppArmor access but not a
+  volume reference, so qemu got Permission denied.
+- **B. `shutdown` never powered the guest off.** The XML now carries
+  `<features><acpi/><apic/></features>` (qemu previously ran with acpi=off), and
+  `power shutdown` polls until the domain is off, up to `shutdown_timeout_s`,
+  and raises a typed error instead of returning success if it never stops.
+- **C. Console capture was discarded on the hard timeout.** `consoleArgv` now
+  runs `timeout -s KILL … script -qec '<virsh console>'` inside an outer `sh -c`
+  that survives the killed child and exits 0 on 137/124, so a timed-out capture
+  returns the bytes read so far instead of an ssh exit 255. Tests prove a
+  running-domain capture stores text in the sensitive resource and returns only
+  bytes+sha256.
+- **D. Console on a shut-off domain stored virsh's error as the capture.**
+  `console` refuses a non-running domain with a typed error and refuses any
+  non-zero console exit; `bytes` is now the real UTF-8 byte count.
+- **E. Network start failure dropped the cause and left a half-defined
+  network.** The typed error now includes the sanitized virsh text, and a
+  network this call created is `net-undefine`d. The default bridge is now
+  `vb-<8 hex>` (`defaultBridgeName`), inside the 15-char IFNAMSIZ limit, for any
+  network name.
+- **Seed/extra disks.** `define_domain` takes `extra_disks` (path, device, bus,
+  format, target, readonly); a CD-ROM defaults to read-only, so a cloud-init
+  NoCloud seed ISO can be attached. `undefine_domain remove_volumes` detaches
+  read-only media before `--remove-all-storage` unless `remove_attached_media`
+  is set, so a seed the extension did not create is kept.
+- Minor: `clone_volume` records the qemu format parsed from `vol-dumpxml`, not
+  `vol-info`'s `Type: file`.
+- `ssh.ts` is unchanged (blob cb61c4ad). `release.yaml` gains the required
+  `libvirt` beta stanza so the offline gates can run.

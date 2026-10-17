@@ -171,10 +171,21 @@ swamp behavior run cephadm cephHostPrep --input host=node1.example.com \
   of or is an ancestor of whatever backs the root or boot filesystems, an
   `/etc/fstab` entry, swap, an md array, an LVM volume group or a ZFS pool, and
   it refuses everything when a read of the host fails or is empty. Its reads run
-  as root, so a host without udev still reports types and UUIDs. Limits: an
-  external filesystem journal or log device, and a `resume=` partition named
-  only on the kernel command line, are not modelled; the kernel refuses a write
-  to a device that is mounted, swapped on or claimed by an assembled array.
+  as root, so a host without udev still reports types and UUIDs. A boot-type
+  partition (BIOS boot, EFI System, and similar) on any disk is refused too,
+  because the firmware's boot device cannot be found from the root topology;
+  `acknowledgeBootPartitions` on a data device's serial lifts that one refusal
+  for that disk and nothing else. Boot code in sector 0 of a candidate disk (a
+  non-zero code area with the 55 AA signature, as GRUB leaves in an msdos MBR
+  gap) is treated the same way, and an unreadable sector 0 or partition type
+  refuses. On an EFI host the entries named by BootCurrent, BootNext and
+  BootOrder, in GPT or MBR form, are protected even when acknowledged. The
+  acknowledgement cannot lift a multipath data disk (its partitions sit on the
+  path devices); that is fail-closed. A serial may be listed once in
+  `dataDevices`. Limits: an external filesystem journal or log device, and a
+  `resume=` partition named only on the kernel command line, are not modelled;
+  the kernel refuses a write to a device that is mounted, swapped on or claimed
+  by an assembled array.
 - Records are strict and declare every field written. No secret reaches a
   record, a log line or an error message.
 

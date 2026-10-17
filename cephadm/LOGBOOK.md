@@ -370,3 +370,40 @@ a secret. Fixtures are synthetic only (RFC 5737 addresses, `.test` names).
   protected volume group needs a pvs row. Accepted limits: external fs
   journal/log devices and `resume=` (the kernel's exclusive open refuses a write
   to a mounted, swapped or claimed device).
+- 2026-10-17 live fix of the wipe guard, from a run on a real two-disk host
+  (mdadm 4.3, util-linux 2.39): (A) mdadm 4.3 reads `--` as "no devices given",
+  so `--examine --`, `--stop --` and `--zero-superblock --` all did nothing and
+  the guard refused every candidate; mdadm is now given bare, grammar-checked
+  `/dev` paths (`--examine --scan --` happened to work and was changed too for
+  uniformity; LVM tools and wipefs accept `--` and were left alone). The wipe's
+  own array stop and superblock zero were affected the same way. (B) a BIOS-boot
+  (EF02) or EFI System partition has no filesystem or mount, so nothing
+  protected it; the lsblk probe now reads PARTTYPE/PARTTYPENAME and every
+  boot-type partition of a disk that holds a protected device is protected, and
+  an unreadable partition type on such a disk refuses. Tests use the real
+  captured shapes (`protected_devices_real_test.ts`).
+- 2026-10-17 guard r7: boot-type partitions (BIOS boot, EFI System, extended
+  boot, PReP, MBR 0xef/0x41) are now refused on ANY disk, not only disks that
+  hold a protected device: legacy-BIOS GRUB can live on a SATA disk with / on
+  NVMe, and a fallback ESP is never in fstab. A new `boot-partition` refusal
+  (`wipe.boot-partition`) is lifted only by `acknowledgeBootPartitions` on that
+  data device's serial, and never lifts a protection. On an EFI host
+  `efibootmgr -v` adds hard evidence (partitions named by BootCurrent/BootOrder
+  are protected even when acknowledged) but a missing efibootmgr does not block
+  the host. Rule 3a now covers the partitions of any protected node (a multipath
+  device), `PARTTYPENAME` is dropped (util-linux 2.34 lacks it), and the GUID
+  lowercasing is pinned by a test. Left as is: a foreign array named
+  `/dev/md/<host>:0` fails the array-path grammar in `validate.ts` and aborts
+  the wipe (fail-closed).
+- 2026-10-17 guard r8: EFI entries in `HD(n,MBR,0x<sig>,...)` form map to the
+  dos PARTUUID (`<sig padded to 8>-<n as 2 hex>`) and BootNext counts, so an
+  acknowledged msdos ESP, or a booted 0x0c partition, is protected. Sector 0 of
+  every candidate disk is read (`dd bs=512 count=1 | od`, exactly 512 bytes or
+  unverifiable); a non-zero code area with 55 AA refuses as `boot-partition`
+  (`mbr-boot-code`), lifted only by that disk's acknowledgement. A partition
+  with no readable type is a `boot-partition` refusal too. A serial listed twice
+  in `dataDevices` is refused. New tests pin the `some` and `continue` mutants.
+- 2026-10-17 guard r9: the sector-0 rule also covers every disk behind a
+  non-partition candidate (a multipath device is wiped through its paths); a
+  missing or short read of any of them is unverifiable. The boundary is pinned
+  (bytes 0-439 are boot code, 440-445 are not).

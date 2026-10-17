@@ -1,9 +1,12 @@
 import { assertEquals, assertRejects } from "jsr:@std/assert@1.0.19";
+import { sector0 } from "./boot_fixtures.ts";
 import { PhaseError } from "./errors.ts";
 import { listByIdCommand } from "./resolve.ts";
 import type { CommandResult, RunOptions, SshSession } from "./ssh.ts";
 import {
   BLKID_COMMAND,
+  EFI_COMMAND,
+  EFIBOOTMGR_COMMAND,
   FINDMNT_COMMAND,
   LINKS_COMMAND,
   LSBLK_COMMAND,
@@ -65,6 +68,8 @@ function guardRow(
     uuid: null,
     partuuid: null,
     label: null,
+    parttype: type === "part" ? "0fc63daf-8483-4772-8e79-3d69d8477de4" : null,
+    parttypename: null,
     mountpoints: [null],
     ...extra,
     ...(children ? { children } : {}),
@@ -96,6 +101,9 @@ const HEALTHY: Probes = {
   blkid: done('/dev/sdz9: UUID="1111" TYPE="ext4"\n'),
   zpool: done("", 127),
   pvs: done("", 127),
+  // A BIOS host without efibootmgr.
+  efi: done("", 1),
+  efibootmgr: done("", 127),
 };
 
 const NO_SUPERBLOCK = done("", 1, "mdadm: No md superblock detected\n");
@@ -115,13 +123,21 @@ function probeAnswer(
     [BLKID_COMMAND, "blkid"],
     [ZPOOL_COMMAND, "zpool"],
     [PVS_COMMAND, "pvs"],
+    [EFI_COMMAND, "efi"],
+    [EFIBOOTMGR_COMMAND, "efibootmgr"],
   ];
   const hit = names.find(([c]) => c === command);
   if (hit) {
     const answer = over[hit[1]] ?? HEALTHY[hit[1]];
     return typeof answer === "function" ? answer(command) : answer;
   }
-  const examine = /^mdadm --examine -- '(.+)'$/.exec(command);
+  const mbr = /^dd if='(.+)' bs=512 count=1 status=none \| od -An -v -tx1$/
+    .exec(command);
+  if (mbr) {
+    const answer = over[`mbr:${mbr[1]}`] ?? done(sector0());
+    return typeof answer === "function" ? answer(command) : answer;
+  }
+  const examine = /^mdadm --examine '(.+)'$/.exec(command);
   if (examine) {
     const answer = over[`examine:${examine[1]}`] ?? NO_SUPERBLOCK;
     return typeof answer === "function" ? answer(command) : answer;
@@ -774,4 +790,212 @@ Deno.test("a failed mdadm --examine before --stop refuses and nothing is stopped
   );
   assertEquals(examines, 3);
   assertEquals(calls.some((c) => c.command.startsWith("mdadm --stop")), false);
+});
+
+Deno.test("no mdadm command is ever given `--` (mdadm 4.3 reads it as 'no devices')", async () => {
+  const { session, calls } = routedSession((opts) => {
+    const base = discover(opts, DIRTY_TREE);
+    if (base) return base;
+    if (opts.command === "test -e /etc/mdadm/mdadm.conf") return done("", 1);
+    if (opts.command.startsWith("mdadm --detail --scan")) return done("");
+    if (opts.command === "cat /etc/fstab") return done("");
+    if (
+      /^(mdadm --zero-superblock|wipefs -a|sgdisk|partprobe)/.test(
+        opts.command,
+      )
+    ) {
+      return done("");
+    }
+    return undefined;
+  });
+  await wipeDiskToRaw({ ...deps, session }, {
+    dataDevices: [{ serial: "SN0001" }],
+    excludeDevices: [],
+  });
+  const mdadm = calls.map((c) => c.command).filter((c) =>
+    c.startsWith("mdadm ")
+  );
+  assertEquals(mdadm.length > 0, true);
+  for (const c of mdadm) assertEquals(/ -- /.test(c), false, c);
+  assertEquals(
+    mdadm.includes("mdadm --zero-superblock '/dev/nvme0n1'"),
+    true,
+  );
+  assertEquals(
+    mdadm.some((c) => c === "mdadm --examine --scan '/dev/nvme0n1'"),
+    true,
+  );
+});
+
+Deno.test("an array stopped by the wipe is named bare, after the grammar check", async () => {
+  let stopped = false;
+  let examines = 0;
+  const probes: Probes = {
+    // The two guard reads see no superblock; the belt check before --stop
+    // then sees the array's own (unprotected) UUID.
+    "examine:/dev/nvme0n1": () =>
+      ++examines <= 2 ? NO_SUPERBLOCK : examineOut(),
+  };
+  const { session, calls } = routedSession(
+    (opts) => {
+      if (opts.command.startsWith("mdadm --examine --scan")) {
+        return done("ARRAY /dev/md9 metadata=1.2 name=host:9 UUID=abc\n");
+      }
+      if (opts.command.startsWith("mdadm --stop")) {
+        stopped = true;
+        return done("");
+      }
+      if (opts.command === "cat /proc/mdstat") {
+        return done(stopped ? "" : "md9 : active raid1 nvme0n1[0]\n");
+      }
+      if (opts.command === "test -e /etc/mdadm/mdadm.conf") return done("", 1);
+      if (opts.command.startsWith("mdadm --detail --scan")) return done("");
+      if (opts.command === "cat /etc/fstab") return done("");
+      if (
+        /^(mdadm --zero-superblock|wipefs -a|sgdisk|partprobe)/.test(
+          opts.command,
+        )
+      ) {
+        return done("");
+      }
+      return discover(opts, DIRTY_TREE);
+    },
+    "192.0.2.10",
+    probes,
+  );
+  await wipeDiskToRaw({ ...deps, session }, {
+    dataDevices: [{ serial: "SN0001" }],
+    excludeDevices: [],
+  });
+  const stops = calls.map((c) => c.command).filter((c) =>
+    c.startsWith("mdadm --stop")
+  );
+  assertEquals(stops.length > 0, true);
+  for (const c of stops) assertEquals(c, "mdadm --stop '/dev/md9'");
+});
+
+const BIOS_BOOT_GUID = "21686148-6449-6e6f-744e-656564454649";
+
+/** Root on sda; the candidate nvme0n1 carries a BIOS-boot partition and nothing else. */
+function bootDiskProbes(): Probes {
+  return {
+    lsblk: guardLsblk(
+      guardRow("sda", "disk", {}, [
+        guardRow("sda1", "part", { fstype: "ext4", mountpoints: ["/"] }),
+      ]),
+      guardRow("nvme0n1", "disk", {}, [
+        guardRow("nvme0n1p1", "part", { parttype: BIOS_BOOT_GUID }),
+      ]),
+    ),
+  };
+}
+
+Deno.test("a disk holding a boot partition is refused unless its serial is acknowledged", async () => {
+  await refusedWith(bootDiskProbes(), "wipe.boot-partition");
+  // The acknowledgement is per serial and lifts only that refusal.
+  const { session, calls } = routedSession(
+    discover,
+    "192.0.2.10",
+    bootDiskProbes(),
+  );
+  const record = await wipeDiskToRaw({ ...deps, session }, {
+    dataDevices: [{ serial: "SN0001", acknowledgeBootPartitions: true }],
+    excludeDevices: [],
+    dryRun: true,
+  });
+  assertEquals(record.dryRun, true);
+  assertEquals(calls.some((c) => NO_DESTRUCTIVE.test(c.command)), false);
+  // A false flag is no acknowledgement.
+  const { session: s2 } = routedSession(
+    discover,
+    "192.0.2.10",
+    bootDiskProbes(),
+  );
+  await assertRejects(
+    () =>
+      wipeDiskToRaw({ ...deps, session: s2 }, {
+        dataDevices: [{ serial: "SN0001", acknowledgeBootPartitions: false }],
+        excludeDevices: [],
+        dryRun: true,
+      }),
+    PhaseError,
+    "wipe.boot-partition",
+  );
+});
+
+Deno.test("the acknowledgement never lifts a protection from the root topology", async () => {
+  const probes: Probes = {
+    lsblk: guardLsblk(
+      guardRow("nvme0n1", "disk", {}, [
+        guardRow("nvme0n1p1", "part", { parttype: BIOS_BOOT_GUID }),
+        guardRow("nvme0n1p2", "part", { fstype: "ext4", mountpoints: ["/"] }),
+      ]),
+    ),
+    findmnt: done(
+      JSON.stringify({
+        filesystems: [{
+          target: "/",
+          source: "/dev/nvme0n1p2",
+          fstype: "ext4",
+        }],
+      }),
+    ),
+    fstab: done(""),
+  };
+  const { session } = routedSession(discover, "192.0.2.10", probes);
+  await assertRejects(
+    () =>
+      wipeDiskToRaw({ ...deps, session }, {
+        dataDevices: [{ serial: "SN0001", acknowledgeBootPartitions: true }],
+        excludeDevices: [],
+        dryRun: true,
+      }),
+    PhaseError,
+    "wipe.boot-protected",
+  );
+});
+
+Deno.test("a serial listed twice in dataDevices is refused before any probe", async () => {
+  const { session, calls } = routedSession(discover, "192.0.2.10", {});
+  await assertRejects(
+    () =>
+      wipeDiskToRaw({ ...deps, session }, {
+        dataDevices: [
+          { serial: "SN0001", acknowledgeBootPartitions: true },
+          { serial: "SN0001", acknowledgeBootPartitions: false },
+        ],
+        excludeDevices: [],
+        dryRun: true,
+      }),
+    PhaseError,
+    "wipe.conflict",
+  );
+  assertEquals(calls.some((c) => NO_DESTRUCTIVE.test(c.command)), false);
+});
+
+Deno.test("MBR boot code on a candidate disk is refused unless its serial is acknowledged", async () => {
+  const probes: Probes = {
+    ...bootDiskProbes(),
+    "mbr:/dev/nvme0n1": done(sector0({ code: true })),
+    lsblk: guardLsblk(
+      guardRow("sda", "disk", {}, [
+        guardRow("sda1", "part", { fstype: "ext4", mountpoints: ["/"] }),
+      ]),
+      guardRow("nvme0n1", "disk", {}, [
+        guardRow("nvme0n1p1", "part", {
+          parttype: "0fc63daf-8483-4772-8e79-3d69d8477de4",
+        }),
+      ]),
+    ),
+  };
+  await refusedWith(probes, "wipe.boot-partition");
+  // The same disk with an empty sector 0 is not refused for boot code.
+  const quiet: Probes = { ...probes, "mbr:/dev/nvme0n1": done(sector0()) };
+  const { session } = routedSession(discover, "192.0.2.10", quiet);
+  const record = await wipeDiskToRaw({ ...deps, session }, {
+    dataDevices: [{ serial: "SN0001" }],
+    excludeDevices: [],
+    dryRun: true,
+  });
+  assertEquals(record.dryRun, true);
 });

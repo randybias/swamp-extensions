@@ -176,6 +176,8 @@ const RemoveArgs = RenderArgs;
 const ClearFailedArgs = z.strictObject({ ...TargetFields });
 const RevertNowArgs = z.strictObject({
   ...TargetFields,
+  // The revert token is a random correlation id, not a credential.
+  // swamp-quality-ignore credentials-sensitive-field
   token: z.string().regex(TOKEN_RE),
 });
 
@@ -202,6 +204,7 @@ const ConfigSchema = z.strictObject({
 
 const RevertSchema = z.strictObject({
   target: z.string(),
+  // swamp-quality-ignore credentials-sensitive-field
   token: z.string(),
   armedAt: z.string(),
   expiresAt: z.string(),
@@ -1637,5 +1640,9 @@ export interface VerifyResult {
 
 /** Runs the verify checks and returns the typed verdict. */
 
-/** Production model export. */
-export const model = createModel();
+/** Production model export: plain literals so the registry catalogs the type. */
+export const model = {
+  ...createModel(),
+  type: "@randybias/host-net",
+  version: "2026.10.17.1",
+};

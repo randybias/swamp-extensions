@@ -1,0 +1,88 @@
+{
+  "extension": "@randybias/server-stack",
+  "version": "2026.10.17.3",
+  "reviewedAt": "2026-10-17T16:03:25Z",
+  "dimensions": [
+    {
+      "id": "credentials-secrets",
+      "verdict": "pass",
+      "note": "Workflows only. Every secret (Cherry and Cloudflare tokens, the SSH private key, the WireGuard private key, host user data, the kubeconfig) is read from the fixed vault server-stack by key name with vault.get and handed to the composed models' sensitive-marked arguments; no literal secret is a workflow input, and README examples pass vault key names only and never --json. Terra filed Critical (vault values become ordinary model arguments that the CLI can print): refuted under ruling 3 as the platform limitation swamp-club lab 3555, mitigated by sensitive-marked fields and vault-reference-only examples."
+    },
+    {
+      "id": "logging-quality",
+      "verdict": "pass",
+      "note": "No logging of its own; each step logs through the composed model. Step descriptions name the safety each gate provides. The stored kubeconfig record and NATS banner mask the host, so the log line is the evidence of the mesh address (documented)."
+    },
+    {
+      "id": "error-handling",
+      "verdict": "pass",
+      "note": "Every safety gate is a succeeded-only dependency, and every destructive step (delete-record, reset-k0s, delete-server) depends directly on every gate that protects it (2b09a5b, proven with mock APIs: a failing gate leaves everything downstream skipped). Bad Cloudflare token stops in preflight; a wrong k0s sha256 is refused with nothing changed (both live)."
+    },
+    {
+      "id": "testing-completeness",
+      "verdict": "pass",
+      "note": "11 workflow tests (dependency edges, guard polarity, gate coverage), workflow asserts evaluated for both known_hosts shapes, and scratch runs with real models and fake inputs up to the safety gates. Live end to end on throwaway Cherry VPS hosts with Cloudflare DNS: Part 1 13/15 (with a manual firewall workaround), Part 3 14/17, Part 4 8/8 on e8aad54 (fresh uninterrupted run, adopt re-run with 0 of 57 public :22 probes open, teardown with provider snapshots equal, teardown again). bbfb279 (optional DNS inputs, host-agnostic known_hosts) not run live. Astra MEDIUM: tests read textual order rather than parsing dependency paths."
+    },
+    {
+      "id": "idempotency-resilience",
+      "verdict": "pass",
+      "note": "Provision with adopt re-uses the tagged server and owned record (no second order or record, live), and firewall/lockdown are no-ops on a locked-down host (live). Teardown is re-runnable: a second run skips every delete and passes the verify steps (live, three times). A rebuilt host given a deleted host's address no longer inherits records: steps pass the Cherry server id as identity and teardown forgets both records."
+    },
+    {
+      "id": "api-contracts",
+      "verdict": "pass",
+      "note": "Composes @randybias/cherry-servers, ssh-host, wireguard-mesh, server-host 2026.10.17.3, k0s-cluster, k8s-secret, @swamp/cloudflare/dns and @webframp/cloudflare at their current output contracts; DNS absence uses list (empty records), never an error. Residual MEDIUM: DNS checks read only records[0], so a second A record for the name is not checked."
+    },
+    {
+      "id": "resource-management",
+      "verdict": "pass",
+      "note": "Teardown deletes the DNS record, resets k0s and deletes the server, then proves absence against both providers; forget empties the server-host records. A wedged NATS Helm release needs the documented manual recovery."
+    },
+    {
+      "id": "published-surface-hygiene",
+      "verdict": "pass",
+      "note": "Manifest: @randybias/server-stack 2026.10.17.3, workflows only (models: []), Apache-2.0, additionalFiles README.md and LICENSE.txt. Examples use example values and vault key names; the LOGBOOK redacts every real address, hostname, DNS name and provider id. Leak scan, gitleaks and fixture guard pass. Astra LOW: deno.json check targets model directories this package does not have."
+    },
+    {
+      "id": "schema-strictness",
+      "verdict": "pass",
+      "note": "Workflow inputs are typed with length bounds; confirm_hostname must equal hostname; publish_dns true requires the three Cloudflare inputs. Residual MEDIUMs: remote-bound usernames and addresses have length limits but no grammar at the workflow layer (the composed models validate them); nats_chart.values is unconstrained; the mesh steps accept a bare <type> <key> known_hosts line that pins the key for every address, and the input description still describes the host-field form."
+    },
+    {
+      "id": "lifetime-gc",
+      "verdict": "pass",
+      "note": "No resources of its own; lifetimes are those of the composed models."
+    },
+    {
+      "id": "crud-completeness",
+      "verdict": "pass",
+      "note": "server-stack-provision-host (preflight, order or adopt, wait-ready, base, mesh, firewall, lockdown, k0s, kubeconfig, NATS, DNS) and server-stack-teardown-host (record, k0s, server, forget, provider verification)."
+    },
+    {
+      "id": "preflight-checks",
+      "verdict": "pass",
+      "note": "check-inputs, the Cloudflare token check and the ownership/adopt checks run before any order; provision refuses an existing server or record without adopt (live). Teardown refuses a server without the ownership tag and a record without this host's marker before any delete. Residuals (filed High on e8aad54, downgraded at triage to MEDIUM): teardown's project_id is declared but unused (the server definition carries its own project and the ownership tag gates delete); mesh_address for the k0s reset is operator input not bound to the owned server (strict pins and confirm_host still apply)."
+    },
+    {
+      "id": "instance-names",
+      "verdict": "pass",
+      "note": "Uses the operator's definition names (server_model) and the composed models' per-host instance names; one pair of workflows serves any host."
+    },
+    {
+      "id": "data-access",
+      "verdict": "pass",
+      "note": "Reads only the composed models' latest data for the given hostname and record name, and the fixed server-stack vault by key name."
+    },
+    {
+      "id": "version-upgrades",
+      "verdict": "pass",
+      "note": "First release; no earlier data. 2026.10.17.1 and .2 were never published."
+    }
+  ],
+  "panel": {
+    "codex-astra": "codex gpt-6-astra conformance seat over e8aad54 (base 63987af): 2 High (teardown mesh_address not bound to the owned server; project_id unused) downgraded to MEDIUM at triage; Mediums (input grammars, host_key_policy ignored by reset, dormant cluster_secrets branch, textual-order tests) and 1 Low, all LOGBOOK residuals. Earlier rounds (r1-r4, 2b09a5b) routed and fixed; 2b09a5b effectively clean with mock-API proofs.",
+    "codex-terra": "codex gpt-5.6-terra adversarial seat over e8aad54: 1 Critical (vault values as ordinary model arguments) refuted under ruling 3 (lab 3555); 2 High (two A records, only records[0] checked; project_id unused) downgraded to MEDIUM residuals; Mediums on cluster_secrets and nats_chart.values. bbfb279 delta reviewed CLEAN.",
+    "merge-prep": "Merged on main as a4d7356 from lane/b3-stack bbfb279 (server-stack/ plus its release.yaml stanza; release.yaml conflict resolved by keeping main and appending the stanza) after server-host 2026.10.17.3. No code change at merge prep; gates 0-7 passed without changes. Live: receipts Parts 1, 3 and 4 folded into the LOGBOOK with addresses redacted.",
+    "ocr-llm": "OCR sonnet5 and glm seats were not run"
+  }
+}

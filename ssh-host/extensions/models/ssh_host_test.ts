@@ -205,7 +205,10 @@ Deno.test("argument schemas are strict and mark every secret sensitive", () => {
   ) {
     assertEquals(isSensitive(uploadShape[field]), true);
   }
-  assertEquals(isSensitive(waitShape.private_key), true);
+  // wait_connection only scans public keys, so it carries no credential fields.
+  assertEquals("private_key" in waitShape, false);
+  assertEquals("password" in waitShape, false);
+  assertEquals("host_keys" in waitShape, true);
   // host_key_policy has no default and is required.
   assertEquals(
     execArgsSchema.safeParse({
@@ -287,7 +290,8 @@ Deno.test("exec runs the argv, writes a host-keyed resource, returns data", asyn
   assertEquals(written[0].specName, "execution");
   assertEquals(written[0].name, `exec-${SUFFIX}`);
   assertEquals(written[0].data.exit_code, 0);
-  assertEquals(written[0].data.stdout, "hi\n");
+  // Raw output is not returned and not stored unless return_output is set.
+  assertEquals("stdout" in written[0].data, false);
   assertEquals(written[0].data.stdout_sha256, await sha256Hex("hi\n"));
   assertEquals(
     written[0].data.argv_sha256,
@@ -300,21 +304,27 @@ Deno.test("exec runs the argv, writes a host-keyed resource, returns data", asyn
   }
 });
 
-Deno.test("exec returns captured output only when return_output is set", async () => {
+Deno.test("exec never returns raw output; return_output stores it sensitively", async () => {
   const calls: Call[] = [];
   const deps = fakeDeps(fakeRun(calls));
   const m = createModel(deps);
-  const { context } = testContext();
+  const withContext = testContext();
   const withOutput = await m.methods.exec.execute(
     { ...STRICT, argv: ["printenv"], return_output: true },
-    context,
+    withContext.context,
   );
-  assertEquals((withOutput.result as { stdout: string }).stdout, "hi\n");
+  const withResult = withOutput.result as Record<string, unknown>;
+  assertEquals("stdout" in withResult, false);
+  assertEquals(withResult.output_resource, `exec-${SUFFIX}`);
+  assertEquals(withContext.written[0].data.stdout, "hi\n");
+
+  const withoutContext = testContext();
   const withoutOutput = await m.methods.exec.execute(
     { ...STRICT, argv: ["printenv"] },
-    context,
+    withoutContext.context,
   );
   assertEquals("stdout" in (withoutOutput.result as object), false);
+  assertEquals("stdout" in withoutContext.written[0].data, false);
 });
 
 Deno.test("schemas reject a NUL byte in argv", () => {

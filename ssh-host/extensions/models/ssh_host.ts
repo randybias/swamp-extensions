@@ -151,7 +151,7 @@ const ExecArgsSchema = z.strictObject({
     "Command and arguments. Each element is passed as one literal argv word over SSH; none may contain a NUL byte.",
   ),
   return_output: z.boolean().default(false).describe(
-    "When true, include stdout and stderr in the method result. Off by default because the swamp CLI prints method results in --json; captured output is always persisted in the sensitive-marked execution resource.",
+    "When true, store captured stdout and stderr in the sensitive-marked execution resource and reference it from the result. Raw output is never returned in the method result.",
   ),
 });
 
@@ -173,8 +173,18 @@ const UploadArgsSchema = z.strictObject({
   ),
 });
 
+// wait_connection only scans public keys, so it takes no credential fields.
+const ScanTargetShape = {
+  host: TargetShape.host,
+  port: TargetShape.port,
+  user: TargetShape.user,
+  host_key_policy: TargetShape.host_key_policy,
+  host_keys: TargetShape.host_keys,
+  connect_timeout_s: TargetShape.connect_timeout_s,
+};
+
 const WaitArgsSchema = z.strictObject({
-  ...TargetShape,
+  ...ScanTargetShape,
   timeout_s: z.number().int().min(1).max(3600).default(60).describe(
     "Give up after this many seconds.",
   ),
@@ -197,8 +207,8 @@ const ExecutionSchema = z.strictObject({
   port: z.number().int(),
   user: z.string(),
   argv_sha256: z.string(),
-  stdout: z.string().meta({ sensitive: true }),
-  stderr: z.string().meta({ sensitive: true }),
+  stdout: z.string().meta({ sensitive: true }).optional(),
+  stderr: z.string().meta({ sensitive: true }).optional(),
   stdout_sha256: z.string(),
   stderr_sha256: z.string(),
   exit_code: z.number().int(),
@@ -257,6 +267,9 @@ interface UploadArgs extends TargetArgs {
 interface WaitArgs extends TargetArgs {
   timeout_s: number;
   poll_interval_s: number;
+  // wait_connection never authenticates, so it takes no credential fields.
+  private_key?: undefined;
+  password?: undefined;
 }
 
 /** Maps the shared arguments onto the transport target, refusing bad combinations. */
@@ -452,21 +465,29 @@ export function createModel(deps: SshDeps = denoDeps): SshHostModel {
           await commitPin(deps, context, args, pending);
           const stdoutSha = await sha256Hex(result.stdout);
           const stderrSha = await sha256Hex(result.stderr);
+          // Raw output is never returned in the result. When requested it is
+          // written to the sensitive-marked resource, and the result carries
+          // only that resource's name plus the hashes; the vault holds the
+          // value and a model read resolves it.
+          const includeOutput = args.return_output === true;
+          const data: Record<string, unknown> = {
+            host: args.host,
+            port: args.port,
+            user: args.user,
+            argv_sha256: await sha256Hex(args.argv.join("\u0000")),
+            stdout_sha256: stdoutSha,
+            stderr_sha256: stderrSha,
+            exit_code: result.exit_code,
+            ran_at: new Date(deps.now()).toISOString(),
+          };
+          if (includeOutput) {
+            data.stdout = result.stdout;
+            data.stderr = result.stderr;
+          }
           const handle = await context.writeResource(
             "execution",
             `exec-${instanceSuffix(args)}`,
-            ExecutionSchema.parse({
-              host: args.host,
-              port: args.port,
-              user: args.user,
-              argv_sha256: await sha256Hex(args.argv.join("\u0000")),
-              stdout: result.stdout,
-              stderr: result.stderr,
-              stdout_sha256: stdoutSha,
-              stderr_sha256: stderrSha,
-              exit_code: result.exit_code,
-              ran_at: new Date(deps.now()).toISOString(),
-            }),
+            ExecutionSchema.parse(data),
           );
           context.logger.info(
             "Ran {argv0} on {host}: exit {exit_code}",
@@ -481,10 +502,7 @@ export function createModel(deps: SshDeps = denoDeps): SshHostModel {
             stdout_sha256: stdoutSha,
             stderr_sha256: stderrSha,
           };
-          if (args.return_output === true) {
-            methodResult.stdout = result.stdout;
-            methodResult.stderr = result.stderr;
-          }
+          if (includeOutput) methodResult.output_resource = handle.name;
           return { dataHandles: [handle], result: methodResult };
         },
       },

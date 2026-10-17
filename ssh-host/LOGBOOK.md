@@ -129,3 +129,23 @@ for this round.
 - LOW-5: the upload idempotence test keeps remote state (sha + mode) and asserts
   the second run writes nothing and returns `changed: false`.
 - REFUTED, kept: terra's armed-revert-on-exec; see the round-3 disposition.
+
+## Review ledger: round 5 (codex astra + terra on af55e6f)
+
+- HIGH-1 (exec result output not sensitive): fix (a) is unavailable — swamp has
+  no method-result schema to mark sensitive; only resource/data output schemas
+  support `.meta({ sensitive: true })`, and `result` is not even part of the
+  documented `UserMethodResult`. Fix (b) applied: raw stdout/stderr are never
+  returned in the result. The result is
+  `{ exit_code, stdout_sha256,
+  stderr_sha256 }`; `return_output: true`
+  additionally stores the raw output in the sensitive-marked `execution`
+  resource and adds `output_resource` to the result. Default runs store only
+  hashes, so no secret is persisted either.
+- HIGH-2 (macOS mv fallback raced the dir check): the non-Linux fallback is
+  gone. `upload` fails closed on a non-Linux target with a typed
+  `SshConfigError` (`mv -T` is the only no-target-directory rename); the write
+  also verifies the destination's SHA-256 after the rename.
+- LOW (wait schema carried credentials): `wait_connection` now takes a scan-only
+  target shape with no `private_key` or `password`; a test asserts they are
+  absent.

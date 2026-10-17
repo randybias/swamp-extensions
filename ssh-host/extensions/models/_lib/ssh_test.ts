@@ -487,11 +487,11 @@ Deno.test("upload streams bytes over stdin and renames atomically", async () => 
   const remote = sshCalls[1].args.at(-1) ?? "";
   assertStringIncludes(remote, "mktemp");
   assertStringIncludes(remote, "chmod '0640'");
-  assertStringIncludes(remote, `mv -f \"$t\" \"$f\"`);
   assertStringIncludes(remote, `f='/etc/wireguard/wg0.conf'`);
-  // No-target-directory rename on Linux and a post-move verification.
+  // No-target-directory rename on Linux only, then a post-move verification.
   assertStringIncludes(remote, "mv -T");
   assertStringIncludes(remote, `[ "$h" = '${result.sha256}' ]`);
+  assertEquals(remote.includes("mv -f "), false);
   for (const call of calls) {
     assertEquals(call.args.join(" ").includes("placeholder config"), false);
   }
@@ -531,6 +531,24 @@ Deno.test("upload applies a mode change when only permissions differ", async () 
   assertEquals(sshCalls.length, 2);
   assertEquals(sshCalls[1].args.at(-1), "chmod '0600' '/etc/x'");
   assertEquals(sshCalls[1].stdin, undefined);
+});
+
+Deno.test("upload fails closed on a target without a no-target-directory rename", async () => {
+  const calls: Call[] = [];
+  const marker = "ssh-host: upload requires a Linux target with mv -T";
+  const deps = fakeDeps(fakeRun(calls, {
+    ssh: (args) => {
+      const remote = args.at(-1) ?? "";
+      return remote.includes("mktemp")
+        ? { code: 1, stdout: `${marker}\n`, stderr: "" }
+        : { code: 0, stdout: "MISSING\n", stderr: "" };
+    },
+  }));
+  await assertRejects(
+    () => upload(deps, STRICT_TARGET, { path: "/etc/x", content: "x" }),
+    SshConfigError,
+    "Linux target",
+  );
 });
 
 Deno.test("upload refuses a destination that is a directory", async () => {

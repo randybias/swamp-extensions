@@ -751,6 +751,8 @@ export async function upload(
     : options.content;
   const sha256 = await sha256Hex(bytes);
   const file = posixQuote(options.path);
+  const UNSUPPORTED_PLATFORM =
+    "ssh-host: upload requires a Linux target with mv -T";
   // Convergence probe: read the destination's SHA-256 and mode first, and
   // refuse a directory. Portability: sha256sum on GNU, shasum -a 256 on macOS;
   // stat -c on GNU, stat -f on BSD. If none exists the probe yields `none` and
@@ -807,9 +809,11 @@ export async function upload(
     `chmod ${posixQuote(mode)} "$t" || exit 1`,
     `[ -d "$f" ] && exit 1`,
     // GNU mv -T has rename(2) no-target-directory semantics: it replaces a
-    // symlink or file but never descends into a directory. BSD/macOS mv lacks
-    // -T, so guard with the directory test and verify the result below.
-    `case "$(uname -s)" in Linux) mv -T "$t" "$f" || exit 1;; *) mv -f "$t" "$f" || exit 1;; esac`,
+    // symlink or file but never descends into a directory. No other platform
+    // gives that guarantee, so fail closed rather than race a dir check.
+    `case "$(uname -s)" in Linux) mv -T "$t" "$f" || exit 1;; *) echo ${
+      posixQuote(UNSUPPORTED_PLATFORM)
+    }; exit 1;; esac`,
     `[ -f "$f" ] && [ ! -d "$f" ] || exit 1`,
     // Verify the destination really holds these bytes before reporting success.
     `h=$( { sha256sum "$f" 2>/dev/null || shasum -a 256 "$f" 2>/dev/null; } | awk '{print $1}' )`,
@@ -817,6 +821,11 @@ export async function upload(
   ].join("\n");
   const res = await runRemote(deps, target, script, bytes);
   if (res.exit_code !== 0) {
+    if (res.stdout.includes(UNSUPPORTED_PLATFORM)) {
+      throw new SshConfigError(
+        "upload requires a Linux target with mv -T (a no-target-directory rename)",
+      );
+    }
     throw new SshError(
       `upload to ${target.user}@${target.host}:${options.path} failed (exit ${res.exit_code})`,
     );

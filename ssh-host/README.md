@@ -13,7 +13,7 @@ method takes its target as arguments.
 
 | Method            | Description                                                                                     |
 | ----------------- | ----------------------------------------------------------------------------------------------- |
-| `exec`            | Run one argv vector over SSH; return the exit code and output hashes, not the raw output        |
+| `exec`            | Run one argv vector over SSH; return the exit code and output hashes, never raw output          |
 | `upload`          | DESTRUCTIVE. Write bytes to a file over stdin, atomically; unchanged bytes and mode are a no-op |
 | `wait_connection` | READ-ONLY. Poll until the host answers SSH with acceptable host keys, read-only                 |
 
@@ -26,8 +26,9 @@ swamp extension pull @randybias/ssh-host
 ## Dependencies
 
 - OpenSSH client tools on the runner: `ssh`, `ssh-agent`, `ssh-add` and
-  `ssh-keyscan`. `upload` uses `sha256sum` or `shasum -a 256` on the remote for
-  its idempotence check.
+  `ssh-keyscan`. `upload` needs a Linux target with `mv -T` (a
+  no-target-directory rename) and uses `sha256sum` or `shasum -a 256` for its
+  convergence check; a non-Linux target is refused.
 - A POSIX runner host (macOS or Linux); `ssh-agent -s` output is parsed.
 
 ## Example
@@ -95,10 +96,10 @@ swamp CLI echoes method arguments, sensitive ones included, in `--json` output
   the extension that owns that workflow. A non-zero remote exit code is returned
   as data; an unreachable host, rejected credential or host-key mismatch is an
   error that names the host. The result carries only `exit_code` and the
-  `stdout_sha256`/`stderr_sha256` hashes: captured output is persisted in the
-  sensitive-marked `execution` resource and returned in the result only when
-  `return_output` is set. Because the swamp CLI prints method results in
-  `--json`, do not set `return_output` and capture `--json` together.
+  `stdout_sha256`/`stderr_sha256` hashes, never the raw bytes. Set
+  `return_output` to store the captured output in the sensitive-marked
+  `execution` resource; the result then also names that resource, and a model
+  read resolves its vault reference.
 - `upload` writes a temporary file in the destination directory from stdin,
   applies `mode`, then renames it over the destination, so the destination is
   never half-written and an unwritable path or a destination that is a directory

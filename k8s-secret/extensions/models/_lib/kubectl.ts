@@ -69,6 +69,7 @@ export interface Deps {
 }
 
 const denoRun: KubectlRunner = async (args, options) => {
+  // swamp-quality-ignore deno-command
   const cmd = new Deno.Command("kubectl", {
     args,
     env: options.env,

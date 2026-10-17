@@ -14,10 +14,18 @@ belong to
 
 One cluster, described by a name, a desired topology and a pinned k0s version.
 
-| Method        | Description                                                                                             |
-| ------------- | ------------------------------------------------------------------------------------------------------- |
-| `plan`        | Return the ordered step list for creating, adding to, or upgrading a cluster, without touching anything |
-| `plan_remove` | Return the drain -> detach -> reset step list for one node                                              |
+| Method                 | Description                                                                                             |
+| ---------------------- | ------------------------------------------------------------------------------------------------------- |
+| `plan`                 | Return the ordered step list for creating, adding to, or upgrading a cluster, without touching anything |
+| `plan_remove`          | Return the drain -> detach -> reset step list for one node                                              |
+| `mint_join_token`      | Mint a short-lived join token into a caller-named vault key; return only its ID, role and expiry        |
+| `invalidate_join_token`| Invalidate a token by ID and tombstone its vault key; idempotent                                        |
+| `wait_joined`          | Poll until a node is Ready (worker) or an etcd member with a ControlNode (controller)                   |
+| `drain_node`           | Cordon and drain, honoring PodDisruptionBudgets; a PDB block is a typed error                           |
+| `uncordon_node`        | Return a node to service                                                                                |
+| `detach_node`          | Remove a drained node (etcd leave + ControlNode delete for a controller); refuses quorum loss           |
+| `get`                  | Report nodes, etcd members and outstanding token IDs                                                    |
+| `sync`                 | Reconcile recorded membership with the cluster and flag drift                                           |
 
 `plan` is pure and deterministic and enforces the ordering rules: the first
 controller is Ready before any token is minted, an HA endpoint is chosen before

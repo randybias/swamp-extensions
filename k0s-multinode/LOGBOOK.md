@@ -41,3 +41,31 @@ explicit input.
   rejection, duplicate names/addresses, upgrade ordering and the downgrade/skip
   refusals, the quorum refusal on a controller detach, and the last-controller
   refusal.
+
+## Cluster-scope methods (17.3 dependency landed)
+
+`@randybias/k0s-cluster` 2026.10.17.3 (head a101b99) supplies every per-node
+feature §2 required, so the action and read methods are now wired. The shared
+`_lib` (`grammar.ts`, `k0s.ts`, `transport.ts`, `ssh.ts`) is vendored from that
+head byte-identically; `_lib/cluster.ts` adds only cluster-scope argv builders
+and output parsers.
+
+- `mint_join_token` refuses before any remote call when no vault service is
+  exposed, writes the token to the caller-named key and stores only the ID, role
+  and expiry. The ID is the diff of `k0s token list`, falling back to the token's
+  own `<id>.<secret>` prefix.
+- `invalidate_join_token` overwrites the key with a fixed tombstone and is a
+  no-op for an unknown or expired ID.
+- `detach_node` runs `k0s etcd leave --peer-address` (derived from
+  `etcd member-list` when not passed) plus a ControlNode delete for a controller,
+  a Node delete for a worker, and refuses an undrained node or a 3->2 / 2->1
+  controller removal without `confirm`.
+- `get`/`sync` write `status`, keyed `<cluster>-status`; `sync` compares the
+  `plan` record against the live nodes and etcd members. Resource instances are
+  named `<cluster>` (plan), `<cluster>-status`, `<cluster>-tokens` because
+  `readResource` keys on the instance name, not the spec name.
+
+Tests (`cluster_test.ts`, `k0s_multinode_test.ts`) cover the parsers, the argv
+builders, the vault refusals, the drain PDB block, the detach refusals and the
+`sync` drift. 26 pass offline. Workflows and their `swamp workflow validate`
+runs are the next slice.

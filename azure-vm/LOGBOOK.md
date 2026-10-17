@@ -29,3 +29,39 @@ Not packaged. Notes for whoever maintains this extension.
   nested `{error:{code,message}}` and AAD's `{error, error_description}`,
   redacts the secret before truncating the message, and redacts the code; both
   `_lib` copies stay byte-identical.
+
+## 2026-10-17 live e2e: blocked
+
+Reason: Azure subscription + service principal scoped to a throwaway resource
+group not yet provided (Randy). Every cell below is `blocked`, not skipped; run
+them through `swamp model method run` against a throwaway resource group before
+promoting to stable. Unit/contract tests (scripted fetch) cover every path.
+
+| Cell                                            | Result  |
+| ----------------------------------------------- | ------- |
+| 1 get, VM absent                                | blocked |
+| 2 create new VM (SSH key only, polls Succeeded) | blocked |
+| 3 create again adopts, no second PUT            | blocked |
+| 4 get / sync present                            | blocked |
+| 5 stop                                          | blocked |
+| 6 start                                         | blocked |
+| 7 deallocate                                    | blocked |
+| 8 deallocate with hibernation                   | blocked |
+| 9 delete                                        | blocked |
+| 10 delete again, clean no-op                    | blocked |
+| 11 bad client secret, typed AAD error redacted  | blocked |
+| 12 invalid name/grammar refused before any call | blocked |
+
+## Review ledger: final verify and merge prep
+
+- No Critical/High open; azure-vm code is unchanged since round 1 (85a59da) and
+  the round-3 delta touched only azure-nsg. `_lib/arm.ts` and `_lib/validate.ts`
+  remain byte-identical with `@randybias/azure-nsg`.
+- Known residuals for the next version: MEDIUM `tags` is not bounded to Azure's
+  tag-count limit; MEDIUM `deallocate`/`stop` always POST even when the VM is
+  already in the target state (Azure accepts the repeat; not verified live);
+  MEDIUM README documents the state key as
+  `<subscription>-<resource-group>-<name>` but the instance name is
+  length-prefixed (`resourceInstanceName`); MEDIUM IPv6 prefix validation
+  accepts some malformed forms (shared `_lib`); LOW duplicated power-state
+  polling and state writing in start/deallocate/stop.

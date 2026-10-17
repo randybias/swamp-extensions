@@ -90,5 +90,8 @@ server-host:
 
 redfish:
   channel: beta
-  ci: false
-  published: {}
+  ci: true
+  published:
+    2026.10.17.1: 72438164e802ae182df22a25d5739d8468101dfc593c5890161cb19eaa4a4043
+  notes:
+    2026.10.17.1: 'First release, beta. Read and control one ComputerSystem over DMTF Redfish: get/sync (read-only), power (On, the off actions and restarts, validated against the BMC''s allowed reset types, a no-op when already there, polled to a bounded deadline) and set_boot (If-Match, read back). Vault-wired credentials travel only in a header; TLS is strict only, with ca_pem as an additional trusted CA; auth auto discovers a SessionService anonymously and falls back to Basic. Live end to end against the sushy-tools emulator only, no real BMC: 21 of 23 cells pass, 0 fail; two set_boot cells are blocked by an emulator limitation that the model correctly refuses. Residual: a 5xx during session discovery is treated as no SessionService.'

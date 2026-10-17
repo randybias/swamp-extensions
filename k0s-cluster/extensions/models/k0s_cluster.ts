@@ -1889,4 +1889,8 @@ export function createModel(deps: K0sDeps): K0sClusterModel {
 }
 
 /** Production model definition. */
-export const model: K0sClusterModel = buildK0sModel(defaultK0sDeps);
+export const model = {
+  ...buildK0sModel(defaultK0sDeps),
+  type: "@randybias/k0s-cluster",
+  version: "2026.10.17.1",
+} satisfies K0sClusterModel;

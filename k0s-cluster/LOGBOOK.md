@@ -315,3 +315,14 @@ the triage checks, no Critical/High. `_lib/ssh.ts` is the canonical blob
 - LOW: hash-then-`rm` race on the binary; a replacement written between the
   `sha256sum` and the `rm` is removed (terra HIGH, downgraded: needs a
   concurrent root writer on the target).
+
+## Backlog (after the upgrade action)
+
+- Optional `binary_source: "control-host" | "host-download"` (default
+  `control-host`, byte-identical to today). With `host-download` the HOST
+  fetches the pinned k0s release URL itself over https with a bounded timeout,
+  computes its own sha256, and returns the hash; the model compares it and
+  installs only on a match, otherwise deletes the file and fails. The expected
+  hash never reaches the host argv. Live finding: pushing the ~261 MB binary
+  from the control host over SSH stdin through a lossy mesh took over an hour.
+  The upgrade action must use the same path.

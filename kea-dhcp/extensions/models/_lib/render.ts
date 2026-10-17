@@ -163,9 +163,8 @@ function optionData(
   return rendered;
 }
 
-/** Renders one subnet object. */
-function subnetBody(subnet: SubnetInput): Record<string, unknown> {
-  const cidr = assertCidr(subnet.subnet, "subnet");
+/** Parses, sorts and overlap-checks a subnet's pools. */
+function subnetPools(subnet: SubnetInput, cidr: Cidr): Pool[] {
   const pools: Pool[] = subnet.pools.map((pool) => {
     const parsed = parsePool(pool, cidr);
     if (parsed === null) {
@@ -194,6 +193,14 @@ function subnetBody(subnet: SubnetInput): Record<string, unknown> {
       }
     }
   }
+  return pools;
+}
+
+/** Sorts, validates and de-duplicates a subnet's reservations. */
+function subnetReservations(
+  subnet: SubnetInput,
+  cidr: Cidr,
+): ReservationInput[] {
   const reservations = [...subnet.reservations].sort((a, b) => {
     const ai = parseIpv4(a.ip_address) ?? 0;
     const bi = parseIpv4(b.ip_address) ?? 0;
@@ -225,6 +232,14 @@ function subnetBody(subnet: SubnetInput): Record<string, unknown> {
     macs.add(reservation.hw_address);
     ips.add(reservation.ip_address);
   }
+  return reservations;
+}
+
+/** Renders one subnet object. */
+function subnetBody(subnet: SubnetInput): Record<string, unknown> {
+  const cidr = assertCidr(subnet.subnet, "subnet");
+  const pools = subnetPools(subnet, cidr);
+  const reservations = subnetReservations(subnet, cidr);
   const body: Record<string, unknown> = {
     id: subnet.id,
     subnet: cidr.text,
@@ -245,9 +260,8 @@ function subnetBody(subnet: SubnetInput): Record<string, unknown> {
   return body;
 }
 
-/** Renders the Kea configuration; throws on any invalid combination. */
-export function renderConfig(input: RenderInput): RenderResult {
-  const interfaces = [...interfaceList(input.interfaces)].sort();
+/** Sorts subnets and refuses duplicate ids and overlapping ranges. */
+function orderedSubnets(input: RenderInput): SubnetInput[] {
   if (input.subnets.length < 1 || input.subnets.length > 64) {
     throw new KeaInputError("subnets must have 1-64 entries");
   }
@@ -270,21 +284,15 @@ export function renderConfig(input: RenderInput): RenderResult {
       }
     }
   }
-  if (input.renew_timer_s !== undefined && input.rebind_timer_s !== undefined) {
-    if (
-      !(input.renew_timer_s < input.rebind_timer_s &&
-        input.rebind_timer_s < input.valid_lifetime_s)
-    ) {
-      throw new KeaInputError(
-        "renew_timer_s < rebind_timer_s < valid_lifetime_s is required",
-      );
-    }
-  }
-  if (input.lease_api === true && !input.lease_cmds_path) {
-    throw new KeaInputError(
-      "lease_api requires lease_cmds_path; discover it with install",
-    );
-  }
+  return subnets;
+}
+
+/** Assembles the Dhcp4 object from validated input. */
+function dhcp4Body(
+  input: RenderInput,
+  interfaces: string[],
+  subnets: SubnetInput[],
+): Record<string, unknown> {
   const dhcp4: Record<string, unknown> = {
     "interfaces-config": {
       interfaces,
@@ -314,10 +322,11 @@ export function renderConfig(input: RenderInput): RenderResult {
   if (input.lease_api === true) {
     dhcp4["hooks-libraries"] = [{ library: input.lease_cmds_path }];
   }
-  const config = { Dhcp4: dhcp4 };
-  const json = `${JSON.stringify(config, null, 2)}\n`;
+  return dhcp4;
+}
 
-  // A reservation inside a pool is allowed but warned about.
+/** Reservations that fall inside a pool (a warning, not an error). */
+function poolWarnings(subnets: SubnetInput[]): string[] {
   const warnings: string[] = [];
   for (const subnet of subnets) {
     const cidr = assertCidr(subnet.subnet, "subnet");
@@ -336,5 +345,28 @@ export function renderConfig(input: RenderInput): RenderResult {
       }
     }
   }
-  return { config, json, warnings };
+  return warnings;
+}
+
+/** Renders the Kea configuration; throws on any invalid combination. */
+export function renderConfig(input: RenderInput): RenderResult {
+  const interfaces = [...interfaceList(input.interfaces)].sort();
+  const subnets = orderedSubnets(input);
+  if (
+    input.renew_timer_s !== undefined && input.rebind_timer_s !== undefined &&
+    !(input.renew_timer_s < input.rebind_timer_s &&
+      input.rebind_timer_s < input.valid_lifetime_s)
+  ) {
+    throw new KeaInputError(
+      "renew_timer_s < rebind_timer_s < valid_lifetime_s is required",
+    );
+  }
+  if (input.lease_api === true && !input.lease_cmds_path) {
+    throw new KeaInputError(
+      "lease_api requires lease_cmds_path; discover it with install",
+    );
+  }
+  const config = { Dhcp4: dhcp4Body(input, interfaces, subnets) };
+  const json = `${JSON.stringify(config, null, 2)}\n`;
+  return { config, json, warnings: poolWarnings(subnets) };
 }

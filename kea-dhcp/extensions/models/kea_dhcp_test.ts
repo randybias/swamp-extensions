@@ -58,10 +58,21 @@ interface Call {
   stdin?: Uint8Array | string;
 }
 
-interface Event {
-  kind: string;
-  detail: string;
+interface Written {
+  specName: string;
+  name: string;
+  data: Record<string, unknown>;
 }
+
+type Exec = { code: number; stdout: string; stderr: string };
+type Handler = (
+  stdin: Uint8Array | string | undefined,
+  command: string,
+) => Exec | Promise<Exec>;
+type Match = string | ((command: string) => boolean);
+
+const OK: Exec = { code: 0, stdout: "", stderr: "" };
+const out = (stdout: string, code = 0): Exec => ({ code, stdout, stderr: "" });
 
 function text(value?: Uint8Array | string): string {
   return typeof value === "string"
@@ -71,10 +82,76 @@ function text(value?: Uint8Array | string): string {
     : "";
 }
 
-interface Written {
-  specName: string;
-  name: string;
-  data: Record<string, unknown>;
+function matches(match: Match, command: string): boolean {
+  return typeof match === "string" ? command.includes(match) : match(command);
+}
+
+/**
+ * A fake SSH host driven by ordered matchers. It answers the common verbs
+ * (validate, arm, upload, config-set, probe) and tracks the calls and the last
+ * uploaded payload; tests override specific verbs with `when`.
+ */
+function fakeHost(): {
+  runner: CommandRunner;
+  calls: Call[];
+  when: (match: Match, handler: Handler) => void;
+  armed: () => boolean;
+} {
+  const calls: Call[] = [];
+  const overrides: [Match, Handler][] = [];
+  let armed = false;
+  let uploaded = "";
+  const base: [Match, Handler][] = [
+    ["kea-dhcp4 -t", () => OK],
+    ["systemd-run", () => {
+      armed = true;
+      return OK;
+    }],
+    ["ip -o route get", () => out("eth9\n")],
+    ["systemctl show", () => out("_kea\n")],
+    ["is-enabled", () => out("enabled\n")],
+    ["is-active", () => out("active\n")],
+    ["MISSING", () => out("MISSING\n")],
+    ["DIRECTORY", () => out("MISSING\n")],
+    ["mktemp", async (stdin, command) => {
+      uploaded = text(stdin);
+      const mode = /chmod '(\d+)'/.exec(command)?.[1] ?? "600";
+      return out(`${await sha256Hex(uploaded)} ${mode}\n`);
+    }],
+    ["UNIX-CONNECT", () => {
+      const request = JSON.parse(uploaded || "{}") as { command?: string };
+      return out(JSON.stringify(
+        request.command === "config-hash-get"
+          ? { result: 0, arguments: { hash: "kea-hash" } }
+          : { result: 0 },
+      ));
+    }],
+    ["sha256sum", () => out(`${"0".repeat(64)}\n`)],
+  ];
+  const runner: CommandRunner = async (cmd, args, options = {}) => {
+    const command = args.at(-1) ?? "";
+    calls.push({ cmd, command, stdin: options.stdin });
+    if (cmd === "ssh-agent") {
+      return out(
+        "SSH_AUTH_SOCK=/tmp/agent.test; export SSH_AUTH_SOCK;\nSSH_AGENT_PID=42; export SSH_AGENT_PID;\n",
+      );
+    }
+    if (cmd === "ssh-add") return OK;
+    if (cmd !== "ssh") return OK;
+    for (const [match, handler] of overrides) {
+      if (matches(match, command)) return await handler(options.stdin, command);
+    }
+    for (const [match, handler] of base) {
+      if (matches(match, command)) return await handler(options.stdin, command);
+    }
+    return OK;
+  };
+  return {
+    runner,
+    calls,
+    when: (match, handler) => overrides.push([match, handler]),
+    armed: () => armed,
+  };
 }
 
 /** A plain-object method context, as swamp actually passes one. */
@@ -106,59 +183,6 @@ function makeContext(vaultValue = "PLACEHOLDER-KEY"): {
     },
   };
   return { context, written };
-}
-
-/** The full apply runner: kea test, arm, uploads, config-set, probes. */
-function applyHandler() {
-  let uploaded = "";
-  return async (command: string, stdin?: Uint8Array | string) => {
-    if (command.includes("kea-dhcp4 -t")) {
-      return { code: 0, stdout: "", stderr: "" };
-    }
-    if (command.includes("systemd-run")) {
-      return { code: 0, stdout: "", stderr: "" };
-    }
-    if (command.includes("ip -o route get")) {
-      return { code: 0, stdout: "eth9\n", stderr: "" };
-    }
-    if (command.includes("systemctl show")) {
-      return { code: 0, stdout: "_kea\n", stderr: "" };
-    }
-    if (command.includes("MISSING") || command.includes("DIRECTORY")) {
-      return { code: 0, stdout: "MISSING\n", stderr: "" };
-    }
-    if (command.includes("mktemp")) {
-      uploaded = text(stdin);
-      const mode = /chmod '(\d+)'/.exec(command)?.[1] ?? "600";
-      return {
-        code: 0,
-        stdout: `${await sha256Hex(uploaded)} ${mode}\n`,
-        stderr: "",
-      };
-    }
-    if (command.includes("UNIX-CONNECT")) {
-      const request = JSON.parse(uploaded) as { command?: string };
-      return {
-        code: 0,
-        stdout: JSON.stringify(
-          request.command === "config-hash-get"
-            ? { result: 0, arguments: { hash: "kea-hash" } }
-            : { result: 0 },
-        ),
-        stderr: "",
-      };
-    }
-    if (command.includes("is-active")) {
-      return { code: 0, stdout: "active\n", stderr: "" };
-    }
-    if (command.includes("sha256sum")) {
-      return { code: 0, stdout: `${"0".repeat(64)}\n`, stderr: "" };
-    }
-    if (command.includes("ip -o -4 addr")) {
-      return { code: 0, stdout: "", stderr: "" };
-    }
-    return { code: 0, stdout: "", stderr: "" };
-  };
 }
 
 const depsFor = (
@@ -203,25 +227,14 @@ Deno.test("schemas refuse invalid interfaces, options and combinations", () => {
   }
   assertEquals(applyArgsSchema.safeParse({ ...SSH, ...DHCP }).success, true);
   assertEquals(configArgsSchema.safeParse(DHCP).success, true);
-  assert(
-    (configArgsSchema as unknown as { _def: unknown })._def !== undefined,
-  );
 });
 
 Deno.test("host scripts encode the revert and hook semantics", () => {
-  const claim = claimScript(
-    "/var/lib/kea-dhcp-revert/tok",
-    '{"token":"tok"}',
-  );
+  const claim = claimScript("/var/lib/kea-dhcp-revert/tok", '{"token":"tok"}');
   assert(claim.includes("flock -w 30"), "the claim is serialized");
   assert(claim.includes("exit 9"), "an armed revert refuses a second claim");
 
-  const active = restoreScript(
-    "tok",
-    "/run/kea/kea4-ctrl-socket",
-    true,
-    true,
-  );
+  const active = restoreScript("tok", "/run/kea/kea4-ctrl-socket", true, true);
   assert(active.includes("result=pass"));
   assert(active.includes("previous.conf"));
   assert(active.includes('rm -f "$a"'), "the restore always clears active");
@@ -238,6 +251,7 @@ Deno.test("host scripts encode the revert and hook semantics", () => {
   );
   assert(active.includes('systemctl enable "$svc"'));
   assert(active.includes('systemctl is-enabled "$svc"'));
+
   const inactive = restoreScript(
     "tok",
     "/run/kea/kea4-ctrl-socket",
@@ -261,10 +275,7 @@ Deno.test("host scripts encode the revert and hook semantics", () => {
   assert(hook.includes("no-hooks-dir"));
   assert(hook.includes("readlink -f"));
 
-  const install = installFileScript(
-    "/etc/kea/kea-dhcp4.conf.staged-t",
-    "_kea",
-  );
+  const install = installFileScript("/etc/kea/kea-dhcp4.conf.staged-t", "_kea");
   assert(install.includes("chgrp '_kea'"));
   assert(install.includes("chmod 0640"));
   assert(install.includes("mv -T"));
@@ -280,39 +291,22 @@ Deno.test("configSetRequest sends the whole Dhcp4 object", async () => {
   assertEquals(request.service, ["dhcp4"]);
   const args = request.arguments as { Dhcp4?: unknown };
   assertEquals(typeof args.Dhcp4, "object");
-  assertEquals(
-    args.Dhcp4,
-    (rendered.config as { Dhcp4: unknown }).Dhcp4,
-  );
+  assertEquals(args.Dhcp4, (rendered.config as { Dhcp4: unknown }).Dhcp4);
 });
 
 Deno.test("render is host-free, deterministic and exposes the plan", async () => {
   const result = await model.methods.render.execute(DHCP);
   const expected = await renderAndHash(configArgsSchema.parse(DHCP));
-  assertEquals(
-    (result as { result: { sha256: string } }).result.sha256,
-    expected.sha256,
-  );
-  assertEquals(
-    (result as { result: { plan: string[] } }).result.plan[0],
-    "validate",
-  );
-  assertEquals(
-    (result as { result: { plan: string[] } }).result.plan.includes("arm"),
-    true,
-  );
+  const body =
+    (result as { result: { sha256: string; plan: string[] } }).result;
+  assertEquals(body.sha256, expected.sha256);
+  assertEquals(body.plan[0], "validate");
+  assertEquals(body.plan.includes("arm"), true);
 });
 
 Deno.test("apply arms the revert before writing and setting the config", async () => {
-  const calls: Call[] = [];
-  const handle = applyHandler();
-  const runner: CommandRunner = async (cmd, args, options = {}) => {
-    const command = args.at(-1) ?? "";
-    calls.push({ cmd, command, stdin: options.stdin });
-    if (cmd !== "ssh") return { code: 0, stdout: "", stderr: "" };
-    return await handle(command, options.stdin);
-  };
-  const prior = setDeps(depsFor(runner));
+  const host = fakeHost();
+  const prior = setDeps(depsFor(host.runner));
   try {
     const { context, written } = makeContext();
     const result = await model.methods.apply.execute(
@@ -322,13 +316,11 @@ Deno.test("apply arms the revert before writing and setting the config", async (
     assert(
       (result as { result: { revert_token: string } }).result.revert_token,
     );
-    const order = calls.map((c) => c.command);
+    const order = host.calls.map((call) => call.command);
     const armAt = order.findIndex((c) => c.includes("systemd-run"));
     const writeAt = order.findIndex((c) =>
       c.includes("mv -T") && c.includes("'/etc/kea/kea-dhcp4.conf'")
     );
-    // The first socket call is the pre-check hash; the config-set follows the
-    // config write.
     const setAt = order.findIndex((c, i) =>
       i > writeAt && c.includes("UNIX-CONNECT")
     );
@@ -345,75 +337,32 @@ Deno.test("apply arms the revert before writing and setting the config", async (
 
 Deno.test("apply is a no-op when the live config already matches", async () => {
   const rendered = await renderAndHash(configArgsSchema.parse(DHCP));
-  let armed = false;
-  const runner: CommandRunner = async (cmd, args, options = {}) => {
-    const command = args.at(-1) ?? "";
-    const stdin = options.stdin;
-    if (cmd !== "ssh") return { code: 0, stdout: "", stderr: "" };
-    if (command.includes("systemd-run")) {
-      armed = true;
-      return { code: 0, stdout: "", stderr: "" };
-    }
-    if (command.includes("kea-dhcp4 -t")) {
-      return { code: 0, stdout: "", stderr: "" };
-    }
-    if (command.includes("ip -o route get")) {
-      return { code: 0, stdout: "eth9\n", stderr: "" };
-    }
-    if (command.includes("is-active")) {
-      return { code: 0, stdout: "active\n", stderr: "" };
-    }
-    if (command.includes("mktemp")) {
-      const mode = /chmod '(\d+)'/.exec(command)?.[1] ?? "600";
-      return {
-        code: 0,
-        stdout: `${await sha256Hex(text(stdin))} ${mode}\n`,
-        stderr: "",
-      };
-    }
-    if (command.includes("MISSING") || command.includes("DIRECTORY")) {
-      return { code: 0, stdout: "MISSING\n", stderr: "" };
-    }
-    if (command.includes("UNIX-CONNECT")) {
-      return {
-        code: 0,
-        stdout: JSON.stringify({ result: 0, arguments: { hash: "kea-hash" } }),
-        stderr: "",
-      };
-    }
-    if (command.includes("sha256sum")) {
-      return { code: 0, stdout: `${rendered.sha256}\n`, stderr: "" };
-    }
-    return { code: 0, stdout: "", stderr: "" };
-  };
-  setDeps(depsFor(runner));
+  const host = fakeHost();
+  host.when(
+    (c) => c.includes("sha256sum") && c.includes("'/etc/kea/kea-dhcp4.conf'"),
+    () => out(`${rendered.sha256}\n`),
+  );
+  const prior = setDeps(depsFor(host.runner));
   try {
     const { context } = makeContext();
     const result = await model.methods.apply.execute(
       { ...SSH, ...DHCP },
       context,
     );
-    assertEquals(armed, false, "no timer is armed on a no-op");
+    assertEquals(host.armed(), false, "no timer is armed on a no-op");
     assertEquals(
       (result as { result: { revert_token: string } }).result.revert_token,
       "",
     );
   } finally {
-    setDeps({ resolveSecret: undefined });
+    setDeps(prior);
   }
 });
 
 Deno.test("apply refuses the management interface without an ack", async () => {
-  const runner: CommandRunner = async (cmd, args) => {
-    await Promise.resolve();
-    const command = args.at(-1) ?? "";
-    if (cmd !== "ssh") return { code: 0, stdout: "", stderr: "" };
-    if (command.includes("ip -o route get")) {
-      return { code: 0, stdout: "eth1\n", stderr: "" };
-    }
-    return { code: 0, stdout: "", stderr: "" };
-  };
-  setDeps(depsFor(runner));
+  const host = fakeHost();
+  host.when("ip -o route get", () => out("eth1\n"));
+  const prior = setDeps(depsFor(host.runner));
   try {
     const { context } = makeContext();
     await assertRejects(
@@ -422,47 +371,15 @@ Deno.test("apply refuses the management interface without an ack", async () => {
       "management",
     );
   } finally {
-    setDeps({ resolveSecret: undefined });
+    setDeps(prior);
   }
 });
 
-Deno.test("get persists its observation through vaultService", async () => {
-  let sawKeyOnArgv = false;
-  const runner: CommandRunner = async (cmd, args, options = {}) => {
-    await Promise.resolve();
-    const command = args.at(-1) ?? "";
-    if (cmd === "ssh-add") {
-      assertEquals(text(options.stdin).includes("PLACEHOLDER-KEY"), true);
-      return { code: 0, stdout: "", stderr: "" };
-    }
-    if (cmd === "ssh-agent" && args[0] === "-s") {
-      return {
-        code: 0,
-        stdout:
-          "SSH_AUTH_SOCK=/tmp/agent.test; export SSH_AUTH_SOCK;\nSSH_AGENT_PID=42; export SSH_AGENT_PID;\n",
-        stderr: "",
-      };
-    }
-    if (cmd !== "ssh") return { code: 0, stdout: "", stderr: "" };
-    if (command.includes("PLACEHOLDER-KEY")) sawKeyOnArgv = true;
-    if (command.includes("is-active")) {
-      return { code: 0, stdout: "active\n", stderr: "" };
-    }
-    if (command.includes("kea-dhcp4 -V")) {
-      return { code: 0, stdout: "Kea 2.4.1\n", stderr: "" };
-    }
-    if (command.includes("UNIX-CONNECT")) {
-      return {
-        code: 0,
-        stdout: JSON.stringify({ result: 0, arguments: { hash: "kea-hash" } }),
-        stderr: "",
-      };
-    }
-    return { code: 0, stdout: "", stderr: "" };
-  };
-  // Deliberately no resolveSecret: this drives context.vaultService.get and
-  // the ssh-agent path with a plain-object context, as swamp passes one.
-  setDeps(depsFor(runner, { resolveSecret: undefined }));
+Deno.test("get resolves the key through vaultService, never on argv", async () => {
+  const host = fakeHost();
+  // Deliberately no resolveSecret: this drives context.vaultService.get and the
+  // ssh-agent path with a plain-object context, as swamp passes one.
+  const prior = setDeps(depsFor(host.runner, { resolveSecret: undefined }));
   try {
     const { context, written } = makeContext();
     const result = await model.methods.get.execute(SSH, context);
@@ -471,9 +388,14 @@ Deno.test("get persists its observation through vaultService", async () => {
       true,
     );
     assertEquals(written[0].specName, "observation");
-    assertEquals(sawKeyOnArgv, false, "the key is never on argv");
+    const add = host.calls.find((call) => call.cmd === "ssh-add");
+    assert(add && text(add.stdin).includes("PLACEHOLDER-KEY"));
+    assert(
+      !host.calls.some((call) => call.command.includes("PLACEHOLDER-KEY")),
+      "the key is never on argv",
+    );
   } finally {
-    setDeps({ resolveSecret: undefined });
+    setDeps(prior);
   }
 });
 
@@ -481,19 +403,10 @@ Deno.test("leases parses the memfile without writing", async () => {
   const csv =
     "address,hwaddr,client_id,valid_lifetime,expire,subnet_id,fqdn_fwd,fqdn_rev,hostname,state\n" +
     "192.0.2.10,02:00:00:00:00:01,,3600,4000000000,10,0,0,web-1,0\n";
-  const runner: CommandRunner = async (cmd, args) => {
-    await Promise.resolve();
-    const command = args.at(-1) ?? "";
-    if (cmd !== "ssh") return { code: 0, stdout: "", stderr: "" };
-    if (command.includes("'.2'")) {
-      return { code: 1, stdout: "", stderr: "" };
-    }
-    if (command.includes("'cat'")) {
-      return { code: 0, stdout: csv, stderr: "" };
-    }
-    return { code: 0, stdout: "", stderr: "" };
-  };
-  setDeps(depsFor(runner));
+  const host = fakeHost();
+  host.when("'.2'", () => out("", 1));
+  host.when("'cat'", () => out(csv));
+  const prior = setDeps(depsFor(host.runner));
   try {
     const { context, written } = makeContext();
     const result = await model.methods.leases.execute(
@@ -503,39 +416,14 @@ Deno.test("leases parses the memfile without writing", async () => {
     assertEquals((result as { result: { count: number } }).result.count, 1);
     assertEquals(written[0].specName, "leases");
   } finally {
-    setDeps({ resolveSecret: undefined });
+    setDeps(prior);
   }
 });
 
 Deno.test("a rejected kea-dhcp4 -t stops before arming anything", async () => {
-  let armed = false;
-  const runner: CommandRunner = async (cmd, args, options = {}) => {
-    const command = args.at(-1) ?? "";
-    if (cmd === "ssh-add") return { code: 0, stdout: "", stderr: "" };
-    if (cmd === "ssh-agent" && args[0] === "-s") {
-      return {
-        code: 0,
-        stdout:
-          "SSH_AUTH_SOCK=/tmp/a; export SSH_AUTH_SOCK;\nSSH_AGENT_PID=1; export SSH_AGENT_PID;\n",
-        stderr: "",
-      };
-    }
-    if (cmd !== "ssh") return { code: 0, stdout: "", stderr: "" };
-    if (command.includes("systemd-run")) armed = true;
-    if (command.includes("kea-dhcp4 -t")) {
-      return { code: 1, stdout: "", stderr: "config error\n" };
-    }
-    if (command.includes("mktemp")) {
-      const mode = /chmod '(\d+)'/.exec(command)?.[1] ?? "600";
-      return {
-        code: 0,
-        stdout: `${await sha256Hex(text(options.stdin))} ${mode}\n`,
-        stderr: "",
-      };
-    }
-    return { code: 0, stdout: "MISSING\n", stderr: "" };
-  };
-  setDeps(depsFor(runner));
+  const host = fakeHost();
+  host.when("kea-dhcp4 -t", () => ({ code: 1, stdout: "", stderr: "bad\n" }));
+  const prior = setDeps(depsFor(host.runner));
   try {
     const { context, written } = makeContext();
     await assertRejects(
@@ -543,10 +431,10 @@ Deno.test("a rejected kea-dhcp4 -t stops before arming anything", async () => {
       KeaInputError,
       "rejected",
     );
-    assertEquals(armed, false);
+    assertEquals(host.armed(), false);
     assertEquals(written.length, 0);
   } finally {
-    setDeps({ resolveSecret: undefined });
+    setDeps(prior);
   }
 });
 
@@ -561,64 +449,29 @@ Deno.test("remove arms the revert before disabling and restoring", async () => {
     "",
   ].join("\n");
   const originalSha = await sha256Hex(original);
-  const calls: Call[] = [];
-  let armed = false;
-  const runner: CommandRunner = async (cmd, args, options = {}) => {
-    const command = args.at(-1) ?? "";
-    calls.push({ cmd, command, stdin: options.stdin });
-    if (cmd !== "ssh") return { code: 0, stdout: "", stderr: "" };
-    if (command.includes("kea-dhcp4 -t")) {
-      return { code: 0, stdout: "", stderr: "" };
-    }
-    if (command.includes("systemd-run")) {
-      armed = true;
-      return { code: 0, stdout: "", stderr: "" };
-    }
-    if (command.includes("systemctl show")) {
-      return { code: 0, stdout: "_kea\n", stderr: "" };
-    }
-    if (command.includes("is-active")) {
-      return { code: 0, stdout: "active\n", stderr: "" };
-    }
-    if (command.includes("mktemp")) {
-      const mode = /chmod '(\d+)'/.exec(command)?.[1] ?? "600";
-      return {
-        code: 0,
-        stdout: `${await sha256Hex(text(options.stdin))} ${mode}\n`,
-        stderr: "",
-      };
-    }
-    if (command.includes("MISSING") || command.includes("DIRECTORY")) {
-      return { code: 0, stdout: "MISSING\n", stderr: "" };
-    }
-    if (command.includes("sha256sum") && command.includes("original.conf")) {
-      return { code: 0, stdout: `${originalSha}\n`, stderr: "" };
-    }
-    if (command.includes("sha256sum")) {
-      return { code: 0, stdout: `${"1".repeat(64)}\n`, stderr: "" };
-    }
-    if (command.includes("cat") && command.includes("original.conf")) {
-      return { code: 0, stdout: original, stderr: "" };
-    }
-    if (command.includes("UNIX-CONNECT")) {
-      return {
-        code: 0,
-        stdout: JSON.stringify({ result: 0, arguments: { hash: "kea-hash" } }),
-        stderr: "",
-      };
-    }
-    return { code: 0, stdout: "", stderr: "" };
-  };
-  setDeps(depsFor(runner));
+  const host = fakeHost();
+  host.when(
+    (c) => c.includes("sha256sum") && c.includes("original.conf"),
+    () => out(`${originalSha}\n`),
+  );
+  host.when(
+    (c) => c.includes("sha256sum") && c.includes("'/etc/kea/kea-dhcp4.conf'"),
+    () => out(`${"1".repeat(64)}\n`),
+  );
+  host.when(
+    (c) => c.includes("cat") && c.includes("original.conf"),
+    () => out(original),
+  );
+  const prior = setDeps(depsFor(host.runner));
   try {
     const { context, written } = makeContext();
     const result = await model.methods.remove.execute(SSH, context);
-    assert(armed, "the revert timer is armed before converging");
+    assert(host.armed(), "the revert timer is armed before converging");
     assertEquals(
       (result as { result: { removed: boolean } }).result.removed,
       true,
     );
-    const order = calls.map((c) => c.command);
+    const order = host.calls.map((call) => call.command);
     const armAt = order.findIndex((c) => c.includes("systemd-run"));
     const disableAt = order.findIndex((c) => c.includes("systemctl disable"));
     assert(armAt >= 0, "the arm step ran");
@@ -626,7 +479,7 @@ Deno.test("remove arms the revert before disabling and restoring", async () => {
     assert(written.some((w) => w.specName === "revert"), "revert persisted");
     assert(written.some((w) => w.specName === "config"), "config persisted");
   } finally {
-    setDeps({ resolveSecret: undefined });
+    setDeps(prior);
   }
 });
 
@@ -634,8 +487,7 @@ Deno.test("rendered goldens pass kea-dhcp4 -t when the tool is present", async (
   const probe = new Deno.Command("bash", {
     args: ["-c", "command -v kea-dhcp4 || true"],
   }).outputSync();
-  const found = new TextDecoder().decode(probe.stdout).trim() !== "";
-  if (!found) {
+  if (new TextDecoder().decode(probe.stdout).trim() === "") {
     assert(true, "kea-dhcp4 is not installed; the live cell covers this");
     return;
   }
@@ -672,11 +524,7 @@ Deno.test("rendered goldens pass kea-dhcp4 -t when the tool is present", async (
     const result = new Deno.Command("bash", {
       args: ["-c", `kea-dhcp4 -t ${path}`],
     }).outputSync();
-    assertEquals(
-      result.code,
-      0,
-      new TextDecoder().decode(result.stderr),
-    );
+    assertEquals(result.code, 0, new TextDecoder().decode(result.stderr));
   } finally {
     await Deno.remove(path);
   }

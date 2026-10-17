@@ -179,3 +179,31 @@ validated with the real tools, not just goldens:
   socket answer triggers the restart fallback and a failed restore writes the
   recovery note, commit returns `committed`/`drifted`/`fired` correctly, and a
   restore after a commit does not revert.
+
+## Quality pass (standing order, 2026-10-17)
+
+One deliberate simplify/split pass after the patch rounds:
+
+- **Split by concern.** `kea_dhcp.ts` is now only the model definition, the
+  read-only methods and the public re-exports (313 lines). The rest moved to
+  `_lib/`: `deps.ts` (injectable deps, `MethodContext`), `schemas.ts` (zod plus
+  inferred state types and `toRenderInput`), `host_scripts.ts` (every remote
+  shell body and the paths it acts on), `transport.ts` (SSH and control-socket
+  I/O, typed markers, `configSetRequest`), `probe.ts` (live probe and verify),
+  `apply.ts` (install/apply/commit/remove orchestration), `install.ts`. Every
+  file is under 800 lines and every function under ~75.
+- **Consolidated duplication.** One `refineConfig` shared by the render and
+  apply schemas; one `claimAndArm` shared by apply and remove; one
+  `parseFiredMarker` replacing the two fired.json readers; one `lastLine`; one
+  `posixQuote` for every remote string.
+- **Typed state.** `ActiveMarker`, `FiredMarker`, `VerifyResult`/`VerifyField`
+  and `MethodOutcome` replace `Record<string, unknown>` and stringly results.
+- **No dead code.** The unused `disarmScript` and `productionDeps` export are
+  gone; the test suite now drives the model through one shared `fakeHost` runner
+  instead of copy-pasted per-test matchers.
+
+Re-validated in the real container after the split: all host scripts under
+`sh -eu` pass the harness, `restore.sh` against a running Kea restores the
+previous pool and records `result: pass`, `config-set` with `{"Dhcp4": ...}` is
+accepted while the inner body is refused, and the stock `//`-commented config
+passes `kea-dhcp4 -t`.

@@ -1,0 +1,88 @@
+{
+  "extension": "@randybias/host-net",
+  "version": "2026.10.17.1",
+  "reviewedAt": "2026-10-17T15:29:11Z",
+  "dimensions": [
+    {
+      "id": "credentials-secrets",
+      "verdict": "pass",
+      "note": "The SSH private key is read only through ssh_key_ref (vault and key names, sensitive-marked) via context.vaultService.get in the real runtime shape, and reaches the vendored canonical transport (_lib/ssh.ts blob fe0139f08c42e3fdae0061b9688fb5c534174957) which loads it into a short-lived ssh-agent over stdin, never argv. No content-derived hash appears on any argv or remote script text; sha256 comparisons run locally. The revert token is a random 16-hex correlation id (crypto.getRandomValues), not a credential; its two schema fields carry a swamp-quality-ignore for credentials-sensitive-field. Known external issue swamp-club lab 3555: the CLI prints literal sensitive arguments, so examples use vault references only."
+    },
+    {
+      "id": "logging-quality",
+      "verdict": "pass",
+      "note": "Methods log once with structured placeholders (target, operation, token, verdict); no key material, rendered secret or raw remote output in log fields."
+    },
+    {
+      "id": "error-handling",
+      "verdict": "pass",
+      "note": "Every OpenSSH exit 255 is a typed SshError from the canonical transport. Precheck, arm (exit 77 when the management path cannot be recorded or fails its own checks), stacking, expiry, wrong-token (rc 64) and clear refusals are typed, clean errors, all live-verified. The restore's netplan apply exit is advisory; pass or fail rests on the post-restore path checks, retried every 2 s for up to 30 s while the link re-settles (live-verified 3/3 revert_now and expiry). Residual MEDIUM (terra): in revert_now a failed SSH connect is treated like the expected session drop and surfaces as the 120 s poll timeout instead of the connection error; no restore runs and the armed timer still fires. Residual MEDIUM (terra): a crash between the restore removing the current marker and writing its result leaves neither."
+    },
+    {
+      "id": "testing-completeness",
+      "verdict": "pass",
+      "note": "124 tests: unit tests with injected deps, a host simulator (fake ip/netplan/systemctl/systemd-run/networkctl, including a session hang-up on netplan apply and a link that re-settles) and real-parser tests that run every render through netplan generate --root-dir (reported ignored without netplan). A test validates every written resource against its schema and drives the vault path through a plain-object context. Live end-to-end on bare metal: final matrix 10/10 on c590bd8 (revert_now x3 plus the following apply, apply+commit, revert fired by expiry plus the following apply, no schema warning), plus the earlier per-head matrices in the LOGBOOK. IPv6 management path BLOCKED (target has no global IPv6)."
+    },
+    {
+      "id": "idempotency-resilience",
+      "verdict": "pass",
+      "note": "An identical apply arms nothing and writes no new version (live). remove with nothing managed is a no-op (live). Every change runs under a revert armed host-side before anything changes; stacking is refused while armed; a failed restore fail-closes later applies until clear_failed_revert, which refuses unless the checks pass now. Residual MEDIUM (astra): the 120 s revert_now bound is checked between SSH calls, not during one in flight. Residual MEDIUM: apply and remove run their forward netplan apply in-session; a dropped session is covered by the armed revert."
+    },
+    {
+      "id": "api-contracts",
+      "verdict": "pass",
+      "note": "Targets netplan with the networkd renderer and systemd (systemd-run transient units and timers); OVS bridges need openvswitch-switch. The arm records the path actually in use (peer, device, gateway, source, prefix; both families) via ip route get. Residual MEDIUM: the arm refuses fail-safe when the connection source is on lo or another NIC than the route's device, or a link-local management address with a %scope."
+    },
+    {
+      "id": "resource-management",
+      "verdict": "pass",
+      "note": "Precheck uses a private mktemp -d root removed on every path (live: 0 leftover dirs). Commit stops and removes the revert timer and units (live: 0 units, 0 timers after commit, revert_now and expiry). Snapshots live under one per-token state dir."
+    },
+    {
+      "id": "published-surface-hygiene",
+      "verdict": "pass",
+      "note": "Manifest: @randybias/host-net 2026.10.17.1 (model version literal matches), two-sentence description, Apache-2.0, additionalFiles README.md and LICENSE.txt. Every mutating method is kind action and its description starts DESTRUCTIVE; render and get start READ-ONLY. Fixtures use RFC 5737 addresses and synthetic keys; the LOGBOOK redacts the live target. Leak scan, gitleaks and fixture guard pass. Merge prep changed the model export to plain literals so the registry catalogs the type (no behaviour change). LOW (astra): the revert_now unit name interpolates the token unquoted; the token matches a 16-hex grammar, so it cannot carry shell syntax."
+    },
+    {
+      "id": "schema-strictness",
+      "verdict": "pass",
+      "note": "All arguments and resources are strictObject. Interface, VLAN, bridge and address fields carry grammars (injected name and address refused live); VLAN id 1-4094 and MTU bounds; a VLAN MTU above the declared or live link MTU is refused before arming (live). host_key_policy is the literal strict with at least one pinned key required (insecure_tofu dropped because no pin is persisted)."
+    },
+    {
+      "id": "lifetime-gc",
+      "verdict": "pass",
+      "note": "config and revert: lifetime infinite, garbageCollection 10. probe: lifetime 1d, garbageCollection 5."
+    },
+    {
+      "id": "crud-completeness",
+      "verdict": "pass",
+      "note": "render (read-only plan), apply, commit, get, sync, remove, plus revert_now and clear_failed_revert for recovery. remove deletes the managed devices and files and restores MTUs under the same armed revert (live)."
+    },
+    {
+      "id": "preflight-checks",
+      "verdict": "pass",
+      "note": "Validation, management-interface protection (takeover requires management_change_ack), and a netplan generate precheck over a copy of the whole live /etc/netplan with the render on top run before anything is armed or written; precheck failures leave no files, dirs or units (live)."
+    },
+    {
+      "id": "instance-names",
+      "verdict": "pass",
+      "note": "config-, revert- and probe-<user>@<host lowercased>:<port>; one record set per target."
+    },
+    {
+      "id": "data-access",
+      "verdict": "pass",
+      "note": "Methods read only this model's own config and revert records for the target; every interface, VLAN, MTU and address arrives as method arguments, so one definition serves any host."
+    },
+    {
+      "id": "version-upgrades",
+      "verdict": "pass",
+      "note": "First release; no earlier data to upgrade (upgrades: [])."
+    }
+  ],
+  "panel": {
+    "codex-astra": "codex gpt-6-astra conformance seat over the 5cbc9bc delta (base 51e4e88): 0 Critical/High; 2 Medium (revert_now token interpolated unquoted, downgraded to LOW because the token is 16-hex by grammar; the 120 s bound not enforced during an in-flight SSH call, carried as a MEDIUM residual). Earlier rounds over the full extension (9699380, 1df0909, 51e4e88) are dispositioned in the LOGBOOK; triage verdict CLEAN.",
+    "codex-terra": "codex gpt-5.6-terra adversarial seat over the 5cbc9bc delta: 0 Critical/High; 2 Medium (a failed connect in revert_now looks like a 120 s timeout; a crash between marker removal and the result write), both carried as residuals in the LOGBOOK.",
+    "merge-prep": "Merged as 74f60ba from lane/b2-hostnet c590bd8; release.yaml conflict resolved by keeping main and adding the host-net beta stanza. The c590bd8 delta over 5cbc9bc (post-restore checks retried for up to 30 s; staleDevices/staleFiles added to the revert schema) was self-reviewed against triage 4b-4h: no new remote-bound input (the settle overrides are read from the host environment and grammar-checked as digits), no hash on argv, sim tests cover the re-settling link and schema validation of every written record; no Critical/High. Code change at merge prep for gate 7 only: plain model export and quality-ignore comments on the two token fields (7693400), no behaviour change.",
+    "ocr-llm": "OCR sonnet5 and glm seats were not run"
+  }
+}

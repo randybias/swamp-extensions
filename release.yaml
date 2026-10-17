@@ -176,3 +176,8 @@ ubuntu-autoinstall:
     2026.10.17.1: de4aedc1a536a6ccabfa377a29a54b2f400e0f951671b5ff6bfbe082a07c1d4d
   notes:
     2026.10.17.1: 'First release, beta. Render and validate an Ubuntu Server autoinstall NoCloud seed from typed inputs (identity, guided or explicit curtin storage including a RAID1+LVM preset, netplan network, packages and argv late-commands), then publish it over SSH into an artifact-server bundle and set a ref, or hand the files to the CIDATA builder (@evrardjp/cloud-init-nocloud). The password is a vault crypt(3) hash, never a plaintext; a LUKS passphrase is refused because autoinstall serves it in plaintext. Host keys are strict only. The rendered user-data is re-parsed with a YAML 1.1 loader and deep-compared, validated against cloud-init''s vendored 26.1 cloud-config schema and our own structural checks (subiquity''s AGPL-3.0 schema is not shipped; an optional dev test fetches it and cross-checks). Live end to end: 11 of 11 cells on the final head, a real unattended install of the official 24.04.5 live-server ISO (sha-verified) in a KVM guest with the lvm profile, seeded through publish_http, rebooted and SSH-verified, plus validate, get, sync, unpublish and plaintext-password refusals; the extension bundles in a fresh repo without its lock. Residual: the CIDATA path was not live-tested; the guest was created with virt-install (the libvirt extension has no direct-kernel boot); an unpublish without a ref treats a bundle with no meta-data as absent.'
+
+knot-dns:
+  channel: beta
+  ci: false
+  published: {}

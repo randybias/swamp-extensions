@@ -1,6 +1,6 @@
 import { assertEquals, assertRejects } from "jsr:@std/assert@1.0.19";
 import { PhaseError } from "./errors.ts";
-import type { CommandResult, SshSession } from "./ssh.ts";
+import type { CommandResult, SshSession } from "./ssh_session.ts";
 import {
   capPairs,
   createCsiUser,
@@ -28,8 +28,7 @@ function dpSession(
   let dir = 0;
   let scriptBody = "";
   const session: SshSession = {
-    target: { host: "192.0.2.10", user: "admin", strictHostKeyChecking: "yes" },
-    controlPath: null,
+    target: { host: "192.0.2.10", port: 22 },
     run: (opts) => {
       if (opts.command.startsWith("mktemp -d")) {
         dir++;

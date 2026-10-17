@@ -2,7 +2,7 @@ import { assertEquals, assertRejects } from "jsr:@std/assert@1.0.19";
 import { sector0 } from "./boot_fixtures.ts";
 import { PhaseError } from "./errors.ts";
 import { listByIdCommand } from "./resolve.ts";
-import type { CommandResult, RunOptions, SshSession } from "./ssh.ts";
+import type { CommandResult, RunOptions, SshSession } from "./ssh_session.ts";
 import {
   BLKID_COMMAND,
   EFI_COMMAND,
@@ -157,8 +157,7 @@ function fakeSession(
 ): { session: SshSession; calls: RunOptions[] } {
   const calls: RunOptions[] = [];
   const session: SshSession = {
-    target: { host, user: "admin", strictHostKeyChecking: "yes" },
-    controlPath: null,
+    target: { host, port: 22 },
     run: (opts) => {
       calls.push(opts);
       const probe = probeAnswer(opts.command, probes);
@@ -281,8 +280,7 @@ function routedSession(
 ): { session: SshSession; calls: RunOptions[] } {
   const calls: RunOptions[] = [];
   const session: SshSession = {
-    target: { host, user: "admin", strictHostKeyChecking: "yes" },
-    controlPath: null,
+    target: { host, port: 22 },
     run: (opts) => {
       calls.push(opts);
       const probe = probeAnswer(opts.command, probes);

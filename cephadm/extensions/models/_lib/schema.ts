@@ -113,9 +113,6 @@ export const SSH_FIELDS = {
   ).max(64).nullish().describe(
     "ssh-keyscan host keys, each naming its host (host type blob or [host]:port type blob); a bare key line is refused. Required for strict, learned for insecure_tofu.",
   ),
-  multiplex: z.boolean().nullish().describe(
-    "Reuse one authenticated SSH master per host; absent means false.",
-  ),
 };
 
 /** Field names every SSH-using method must declare. */
@@ -135,8 +132,6 @@ export interface SshFieldValues {
   host_key_policy?: "strict" | "insecure_tofu" | null;
   /** Pinned ssh-keyscan lines or null. */
   host_keys?: string[] | null;
-  /** Multiplex switch or null. */
-  multiplex?: boolean | null;
 }
 
 /** Hostname used when a method needs a target-shaped host. */

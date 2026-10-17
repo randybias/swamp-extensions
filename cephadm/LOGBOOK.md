@@ -758,3 +758,23 @@ Sites with `stdin` keep streaming on stdin.
 | wipe.ts:1158        | ``lsblk -nro NAME`                                     | allowNonZero                         |
 | cephadm.ts:3688     | `"bash -s --"`                                         | stdin,allowNonZero                   |
 | cephadm.ts:3716     | `"bash -s --"`                                         | stdin,allowNonZero                   |
+
+## Transport swap to the canonical ssh.ts (2026.10.17.3, blob 89e679e1)
+
+The bespoke `_lib/ssh.ts` (3ed79a2) was replaced by the canonical vendored
+`_lib/ssh.ts` (89e679e1) and `_lib/ssh_test.ts` (eaff7e8c), byte-identical. A
+new `_lib/ssh_session.ts` keeps the module-facing shape
+(`session.run({command, stdin, sudo, allowNonZero, budgetMs})`, `runStep`,
+`isSudoRefusal`) over the canonical
+`exec(argv, {stdin, timeoutMs,
+maxOutputBytes})`: the command is run through
+`sh -c`, stdin streams to the child, and ssh 255 / config / timeout map onto the
+existing `TransportError` / `LocalRefusalError` vocabulary. Multiplex,
+ControlPath and the in-memory inline-key nonce map are gone; the key goes into a
+short-lived ssh-agent over stdin. `openSession` resolves pins from the request
+or the `hostkeys` record, and on a first `insecure_tofu` contact learns with
+`waitConnection` and persists them per host:port. Every pinned line must name
+its host; a bare `type blob` line is refused. The call-site changes were
+import-only plus the session construction (the earlier 46-site map); the command
+strings are unchanged, so the rendered scripts and remote command text are
+byte-identical and only the transport args differ (the `sh -c` wrapper).

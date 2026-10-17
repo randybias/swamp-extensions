@@ -13,7 +13,7 @@
  */
 
 import { fail } from "./errors.ts";
-import type { SshSession } from "./ssh.ts";
+import type { SshSession } from "./ssh_session.ts";
 import { CEPH_ID_CREATE_RE, quote } from "./validate.ts";
 import {
   matchesSerial,

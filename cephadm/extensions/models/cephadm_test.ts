@@ -2,10 +2,26 @@ import { assertEquals, assertRejects } from "jsr:@std/assert@1.0.19";
 import { createModelTestContext } from "jsr:@swamp-club/swamp-testing@0.20261014.55";
 import { createCephadmModel, model, S3_METHODS, VERSION } from "./cephadm.ts";
 import { busyProbeScript } from "./_lib/hostprep.ts";
-import type { Spawner } from "./_lib/ssh.ts";
+import type { Spawner } from "./_lib/ssh_session.ts";
 
 const decoder = new TextDecoder();
 const encoder = new TextEncoder();
+/** A valid ssh-keyscan pin naming the host the tests dial. */
+const KEY_LINE = "192.0.2.10 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFakeKey";
+
+/**
+ * Unwraps the canonical `'sh' '-c' '<remote>'` argv tail back to the remote
+ * command the tests route on.
+ */
+function unquoteSh(remote: string): string {
+  const match = /^'sh' '-c' (.*)$/.exec(remote);
+  if (match === null) return remote;
+  let inner = match[1];
+  if (inner.startsWith("'") && inner.endsWith("'")) {
+    inner = inner.slice(1, -1);
+  }
+  return inner.replace(/'\\''/g, "'");
+}
 
 /** A fake ssh spawner routed by the remote command (the last argv element). */
 function routeSpawner(
@@ -15,7 +31,7 @@ function routeSpawner(
   ) => { code: number; stdout: string; stderr: string },
 ): Spawner {
   return (_cmd, args) => {
-    const command = args.at(-1) ?? "";
+    const command = unquoteSh(args.at(-1) ?? "");
     let stdin = "";
     return {
       stdin: new WritableStream<Uint8Array>({
@@ -89,7 +105,6 @@ Deno.test(
           "privateKey",
           "host_key_policy",
           "host_keys",
-          "multiplex",
         ]
       ) {
         assertEquals(fields.includes(field), true, `${name} lacks ${field}`);
@@ -104,16 +119,22 @@ Deno.test("the 2026.10.17.3 upgrade maps the legacy host-key fields", () => {
   const upgrade = up!.upgradeAttributes as (
     old: Record<string, unknown>,
   ) => Record<string, unknown>;
-  assertEquals(upgrade({ strictHostKeyChecking: "yes", sshUser: "admin" }), {
-    sshUser: "admin",
-    host_key_policy: "strict",
-    host_keys: [],
-  });
+  assertEquals(
+    upgrade({
+      strictHostKeyChecking: "yes",
+      sshUser: "admin",
+      multiplex: true,
+    }),
+    { sshUser: "admin", host_key_policy: "strict", host_keys: [] },
+  );
   assertEquals(upgrade({ strictHostKeyChecking: "no" }), {
     host_key_policy: "insecure_tofu",
     host_keys: [],
   });
-  // A record without the legacy field is returned untouched.
+  // The dropped multiplex field is removed; a bare record is unchanged.
+  assertEquals(upgrade({ sshUser: "admin", multiplex: true }), {
+    sshUser: "admin",
+  });
   assertEquals(upgrade({ sshUser: "admin" }), { sshUser: "admin" });
 });
 
@@ -155,7 +176,7 @@ Deno.test("host preparation rejects hostile hosts, packages, URLs and budgets", 
     keyPath: null,
     privateKey: null,
     host_key_policy: "strict",
-    multiplex: null,
+    host_keys: [KEY_LINE] as string[],
     packages: ["chrony"],
     cephadmUrl: "https://download.example.com/cephadm",
     cephadmVersion: "19.2.1",
@@ -203,7 +224,7 @@ Deno.test("wipe requires both device lists and rejects injection serials", () =>
     keyPath: null,
     privateKey: null,
     host_key_policy: "strict",
-    multiplex: null,
+    host_keys: [KEY_LINE] as string[],
     dataDevices: [{ serial: "SN0001" }],
     excludeDevices: [],
     dryRun: null,
@@ -268,7 +289,7 @@ Deno.test("a ready host preparing end to end writes a complete record", async ()
     keyPath: null,
     privateKey: null,
     host_key_policy: "strict",
-    multiplex: null,
+    host_keys: [KEY_LINE] as string[],
     packages: ["chrony"],
     cephadmUrl: "https://download.example.com/cephadm",
     cephadmVersion: "19.2.1",
@@ -336,7 +357,7 @@ const SSH_NULLS = {
   keyPath: null,
   privateKey: null,
   host_key_policy: "strict",
-  multiplex: null,
+  host_keys: [KEY_LINE] as string[],
   sshUser: "admin",
 } as const;
 
@@ -642,6 +663,11 @@ Deno.test("distribute-key reports all hosts and fails at the end naming failures
   });
   await m.methods.cephDistributeKey.execute({
     ...SSH_NULLS,
+    // A multi-host set: one line per host, selected per host by the transport.
+    host_keys: [
+      KEY_LINE,
+      "[198.51.100.9]:2202 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFakeKey",
+    ],
     cephPubKey: key,
     hosts: [{ host: "192.0.2.10", port: 22 }, {
       host: "198.51.100.9",
@@ -689,7 +715,7 @@ Deno.test("verifyPackageSource records first, then throws, when throwOnFail is u
         keyPath: null,
         privateKey: null,
         host_key_policy: "strict",
-        multiplex: null,
+        host_keys: [KEY_LINE] as string[],
         cephadmUrl: "https://download.example.com/cephadm",
         throwOnFail: null,
       }, context),
@@ -829,6 +855,7 @@ Deno.test("the raw-disk gate accepts the wipe's boot-partition acknowledgement a
     host: "192.0.2.10",
     sshUser: "admin",
     host_key_policy: "strict",
+    host_keys: [KEY_LINE] as string[],
     port: 22,
   };
   const withAck = gate.safeParse({

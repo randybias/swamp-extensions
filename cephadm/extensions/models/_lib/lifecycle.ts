@@ -12,8 +12,8 @@
  */
 
 import { fail, TransportError } from "./errors.ts";
-import type { CommandResult, SshSession } from "./ssh.ts";
-import { runStep } from "./ssh.ts";
+import type { CommandResult, SshSession } from "./ssh_session.ts";
+import { runStep } from "./ssh_session.ts";
 import {
   assertSshPublicKey,
   CEPH_ID_CREATE_RE,

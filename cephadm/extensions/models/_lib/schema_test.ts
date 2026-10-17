@@ -27,7 +27,6 @@ Deno.test(
       "privateKey",
       "host_key_policy",
       "host_keys",
-      "multiplex",
     ]);
     const allNull = {
       sshUser: "admin",
@@ -36,7 +35,6 @@ Deno.test(
       privateKey: null,
       host_key_policy: "strict",
       host_keys: null,
-      multiplex: null,
     };
     assertEquals(SshObject.safeParse(allNull).success, true);
     // Each optional field is null on its own while the others are real.
@@ -47,7 +45,7 @@ Deno.test(
         keyPath: "/k",
         privateKey: null,
         host_key_policy: "strict",
-        multiplex: true,
+        host_keys: null,
       }).success,
       true,
     );
@@ -77,7 +75,6 @@ Deno.test("the shared SSH family rejects widened and off-menu values", () => {
       { sshUser: "admin", host_key_policy: "" },
       { sshUser: "admin", host_key_policy: "maybe" },
       { sshUser: "admin", host_key_policy: "accept-new" },
-      { sshUser: "admin", multiplex: "yes" },
       { sshUser: "" },
       { sshUser: "1admin" },
       { sshUser: "admin" },

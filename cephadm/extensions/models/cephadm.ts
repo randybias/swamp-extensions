@@ -38,7 +38,7 @@ import {
   type Spawner,
   type SshSession,
   toTarget,
-} from "./_lib/ssh.ts";
+} from "./_lib/ssh_session.ts";
 import {
   CAPS_SCHEMA,
   CEPH_ID_REF_SCHEMA,
@@ -1278,24 +1278,20 @@ const MODEL_UPGRADES = [
   {
     toVersion: VERSION,
     description:
-      "SSH host-key policy is now host_key_policy strict|insecure_tofu with ssh-keyscan host_keys; strict requires pins, insecure_tofu learns and pins the first key per host:port. Legacy strictHostKeyChecking yes maps to strict, no to insecure_tofu.",
+      "Adopted the canonical ssh transport (typed exit-255 error, authoritative pins, no key on disk, no multiplex/ControlMaster): host_key_policy is strict|insecure_tofu with ssh-keyscan host_keys, strict requires pins, insecure_tofu learns and pins the first key per host:port in the hostkeys resource. Legacy strictHostKeyChecking yes maps to strict, no to insecure_tofu; multiplex is dropped. Every pinned line must name its host.",
     upgradeAttributes: (old: Record<string, unknown>) => {
-      const { strictHostKeyChecking, ...rest } = old;
-      if (strictHostKeyChecking === "yes") {
-        return {
-          ...rest,
-          host_key_policy: "strict",
-          host_keys: rest.host_keys ?? [],
-        };
+      const next = { ...old };
+      const legacy = next.strictHostKeyChecking;
+      delete next.strictHostKeyChecking;
+      delete next.multiplex;
+      if (legacy === "yes") {
+        next.host_key_policy = "strict";
+        next.host_keys = next.host_keys ?? [];
+      } else if (legacy === "no") {
+        next.host_key_policy = "insecure_tofu";
+        next.host_keys = next.host_keys ?? [];
       }
-      if (strictHostKeyChecking === "no") {
-        return {
-          ...rest,
-          host_key_policy: "insecure_tofu",
-          host_keys: rest.host_keys ?? [],
-        };
-      }
-      return old;
+      return next;
     },
   },
 ];
@@ -1308,6 +1304,7 @@ export function createCephadmModel(overrides: Partial<CephadmDeps> = {}) {
   const deps: CephadmDeps = { ...productionDeps, ...overrides };
 
   const sessionFor = (
+    context: MethodContext,
     a: {
       host: string;
       sshUser: string;
@@ -1316,7 +1313,6 @@ export function createCephadmModel(overrides: Partial<CephadmDeps> = {}) {
       privateKey?: string | null;
       host_key_policy: "strict" | "insecure_tofu";
       host_keys?: string[] | null;
-      multiplex?: boolean | null;
     },
   ) =>
     openSession(
@@ -1330,7 +1326,7 @@ export function createCephadmModel(overrides: Partial<CephadmDeps> = {}) {
         host_key_policy: a.host_key_policy,
         host_keys: a.host_keys,
       }),
-      { multiplex: a.multiplex ?? false },
+      context,
     );
 
   const methods = {
@@ -1352,7 +1348,7 @@ export function createCephadmModel(overrides: Partial<CephadmDeps> = {}) {
           host_key_policy: args.host_key_policy,
           host_keys: args.host_keys,
         });
-        const session = await openSession(deps, target, { multiplex: true });
+        const session = await openSession(deps, target, context);
         context.logger.info("Preparing host {host}", { host: args.host });
         try {
           const phase = await runPackagePhase(
@@ -1419,9 +1415,7 @@ export function createCephadmModel(overrides: Partial<CephadmDeps> = {}) {
           host_key_policy: args.host_key_policy,
           host_keys: args.host_keys,
         });
-        const session = await openSession(deps, target, {
-          multiplex: args.multiplex ?? false,
-        });
+        const session = await openSession(deps, target, context);
         try {
           const result = await checkPackageSources(
             session,
@@ -1474,9 +1468,7 @@ export function createCephadmModel(overrides: Partial<CephadmDeps> = {}) {
           host_key_policy: args.host_key_policy,
           host_keys: args.host_keys,
         });
-        const session = await openSession(deps, target, {
-          multiplex: args.multiplex ?? false,
-        });
+        const session = await openSession(deps, target, context);
         context.logger.info(
           "Wiping {count} device(s) on {host} (dryRun {dryRun})",
           {
@@ -1502,12 +1494,7 @@ export function createCephadmModel(overrides: Partial<CephadmDeps> = {}) {
           );
           return { dataHandles: [handle] };
         } finally {
-          const closed = await session.close();
-          if (!closed.closed && session.controlPath !== null) {
-            context.logger.warn("SSH control master not closed: {detail}", {
-              detail: closed.detail,
-            });
-          }
+          await session.close();
         }
       },
     },
@@ -1530,7 +1517,7 @@ export function createCephadmModel(overrides: Partial<CephadmDeps> = {}) {
           host_key_policy: args.host_key_policy,
           host_keys: args.host_keys,
         });
-        const session = await openSession(deps, target, { multiplex: true });
+        const session = await openSession(deps, target, context);
         context.logger.info("Bootstrapping {host}", { host: args.host });
         try {
           const result = await bootstrapCluster(
@@ -1591,9 +1578,7 @@ export function createCephadmModel(overrides: Partial<CephadmDeps> = {}) {
             host_key_policy: args.host_key_policy,
             host_keys: args.host_keys,
           });
-          const session = await openSession(deps, target, {
-            multiplex: args.multiplex ?? false,
-          });
+          const session = await openSession(deps, target, context);
           try {
             outcomes.push(
               await distributeKeyToHost(
@@ -1671,7 +1656,7 @@ export function createCephadmModel(overrides: Partial<CephadmDeps> = {}) {
             host_key_policy: args.host_key_policy,
             host_keys: args.host_keys,
           }),
-          { multiplex: args.multiplex ?? false },
+          context,
         );
         try {
           const result = await hostAdd(
@@ -1717,7 +1702,7 @@ export function createCephadmModel(overrides: Partial<CephadmDeps> = {}) {
             host_key_policy: args.host_key_policy,
             host_keys: args.host_keys,
           }),
-          { multiplex: args.multiplex ?? false },
+          context,
         );
         try {
           const result = await applyMon(
@@ -1768,7 +1753,7 @@ export function createCephadmModel(overrides: Partial<CephadmDeps> = {}) {
             host_key_policy: args.host_key_policy,
             host_keys: args.host_keys,
           }),
-          { multiplex: args.multiplex ?? false },
+          context,
         );
         try {
           const result = await applyPlacement(
@@ -1820,7 +1805,7 @@ export function createCephadmModel(overrides: Partial<CephadmDeps> = {}) {
             host_key_policy: args.host_key_policy,
             host_keys: args.host_keys,
           }),
-          { multiplex: args.multiplex ?? false },
+          context,
         );
         try {
           const result = await applyPlacement(
@@ -1875,7 +1860,7 @@ export function createCephadmModel(overrides: Partial<CephadmDeps> = {}) {
             host_key_policy: args.host_key_policy,
             host_keys: args.host_keys,
           }),
-          { multiplex: args.multiplex ?? false },
+          context,
         );
         let targetSession: SshSession | null = null;
         try {
@@ -1891,7 +1876,7 @@ export function createCephadmModel(overrides: Partial<CephadmDeps> = {}) {
                 host_key_policy: args.host_key_policy,
                 host_keys: args.host_keys,
               }),
-              { multiplex: args.multiplex ?? false },
+              context,
             );
           }
           const result = await applyOsd(
@@ -1944,7 +1929,7 @@ export function createCephadmModel(overrides: Partial<CephadmDeps> = {}) {
             host_key_policy: args.host_key_policy,
             host_keys: args.host_keys,
           }),
-          { multiplex: args.multiplex ?? false },
+          context,
         );
         try {
           const result = await createPool(deps, session, {
@@ -1987,7 +1972,7 @@ export function createCephadmModel(overrides: Partial<CephadmDeps> = {}) {
             host_key_policy: args.host_key_policy,
             host_keys: args.host_keys,
           }),
-          { multiplex: args.multiplex ?? false },
+          context,
         );
         try {
           const result = await createFs(deps, session, {
@@ -2027,7 +2012,7 @@ export function createCephadmModel(overrides: Partial<CephadmDeps> = {}) {
             host_key_policy: args.host_key_policy,
             host_keys: args.host_keys,
           }),
-          { multiplex: args.multiplex ?? false },
+          context,
         );
         try {
           const result = await createCsiUser(deps, session, {
@@ -2065,7 +2050,7 @@ export function createCephadmModel(overrides: Partial<CephadmDeps> = {}) {
             host_key_policy: args.host_key_policy,
             host_keys: args.host_keys,
           }),
-          { multiplex: args.multiplex ?? false },
+          context,
         );
         try {
           const result = await getConnBundle(deps, session, context.logger);
@@ -2100,7 +2085,7 @@ export function createCephadmModel(overrides: Partial<CephadmDeps> = {}) {
             host_key_policy: args.host_key_policy,
             host_keys: args.host_keys,
           }),
-          { multiplex: args.multiplex ?? false },
+          context,
         );
         try {
           const result = await fetchCsiKey(
@@ -2141,7 +2126,7 @@ export function createCephadmModel(overrides: Partial<CephadmDeps> = {}) {
             host_key_policy: args.host_key_policy,
             host_keys: args.host_keys,
           }),
-          { multiplex: args.multiplex ?? false },
+          context,
         );
         try {
           const result = await deleteFs(deps, session, {
@@ -2182,7 +2167,7 @@ export function createCephadmModel(overrides: Partial<CephadmDeps> = {}) {
             host_key_policy: args.host_key_policy,
             host_keys: args.host_keys,
           }),
-          { multiplex: args.multiplex ?? false },
+          context,
         );
         try {
           const result = await removeOsds(deps, session, {
@@ -2222,7 +2207,7 @@ export function createCephadmModel(overrides: Partial<CephadmDeps> = {}) {
             host_key_policy: args.host_key_policy,
             host_keys: args.host_keys,
           }),
-          { multiplex: args.multiplex ?? false },
+          context,
         );
         try {
           const outcome = await verifyMonQuorum(deps, session, {
@@ -2264,7 +2249,7 @@ export function createCephadmModel(overrides: Partial<CephadmDeps> = {}) {
             host_key_policy: args.host_key_policy,
             host_keys: args.host_keys,
           }),
-          { multiplex: args.multiplex ?? false },
+          context,
         );
         try {
           const outcome = await verifyMgr(deps, session, {
@@ -2304,7 +2289,7 @@ export function createCephadmModel(overrides: Partial<CephadmDeps> = {}) {
             host_key_policy: args.host_key_policy,
             host_keys: args.host_keys,
           }),
-          { multiplex: args.multiplex ?? false },
+          context,
         );
         try {
           const outcome = await verifyOsd(deps, session, {
@@ -2349,7 +2334,7 @@ export function createCephadmModel(overrides: Partial<CephadmDeps> = {}) {
             host_key_policy: args.host_key_policy,
             host_keys: args.host_keys,
           }),
-          { multiplex: args.multiplex ?? false },
+          context,
         );
         try {
           const outcome = await verifyCsiUsers(
@@ -2392,7 +2377,7 @@ export function createCephadmModel(overrides: Partial<CephadmDeps> = {}) {
             host_key_policy: args.host_key_policy,
             host_keys: args.host_keys,
           }),
-          { multiplex: args.multiplex ?? false },
+          context,
         );
         try {
           const outcome = await verifyHealth(deps, session, {
@@ -2433,7 +2418,7 @@ export function createCephadmModel(overrides: Partial<CephadmDeps> = {}) {
             host_key_policy: args.host_key_policy,
             host_keys: args.host_keys,
           }),
-          { multiplex: args.multiplex ?? false },
+          context,
         );
         try {
           const outcome = await verifyHostNoout(deps, session, {
@@ -2474,7 +2459,7 @@ export function createCephadmModel(overrides: Partial<CephadmDeps> = {}) {
             host_key_policy: args.host_key_policy,
             host_keys: args.host_keys,
           }),
-          { multiplex: args.multiplex ?? false },
+          context,
         );
         try {
           const outcome = await verifyHostPrep(deps, session, {
@@ -2516,7 +2501,7 @@ export function createCephadmModel(overrides: Partial<CephadmDeps> = {}) {
             host_key_policy: args.host_key_policy,
             host_keys: args.host_keys,
           }),
-          { multiplex: args.multiplex ?? false },
+          context,
         );
         try {
           const outcome = await verifyDisksRaw(
@@ -2565,7 +2550,7 @@ export function createCephadmModel(overrides: Partial<CephadmDeps> = {}) {
                 host_key_policy: args.host_key_policy,
                 host_keys: args.host_keys,
               }),
-              { multiplex: false },
+              context,
             ),
         }, context.logger);
         const key = `cephVerifyKeyDistributed-${
@@ -2621,7 +2606,7 @@ export function createCephadmModel(overrides: Partial<CephadmDeps> = {}) {
             host_key_policy: args.host_key_policy,
             host_keys: args.host_keys,
           }),
-          { multiplex: args.multiplex ?? false },
+          context,
         );
         try {
           const report = await capacityReport(deps, session, context.logger);
@@ -2660,7 +2645,7 @@ export function createCephadmModel(overrides: Partial<CephadmDeps> = {}) {
             host_key_policy: args.host_key_policy,
             host_keys: args.host_keys,
           }),
-          { multiplex: args.multiplex ?? false },
+          context,
         );
         try {
           const outcome = await verifyMonPlacement(
@@ -2703,7 +2688,7 @@ export function createCephadmModel(overrides: Partial<CephadmDeps> = {}) {
             host_key_policy: args.host_key_policy,
             host_keys: args.host_keys,
           }),
-          { multiplex: args.multiplex ?? false },
+          context,
         );
         try {
           const outcome = await verifyMgrPlacement(
@@ -2746,7 +2731,7 @@ export function createCephadmModel(overrides: Partial<CephadmDeps> = {}) {
             host_key_policy: args.host_key_policy,
             host_keys: args.host_keys,
           }),
-          { multiplex: args.multiplex ?? false },
+          context,
         );
         try {
           const outcome = await verifyPool(deps, session, {
@@ -2793,7 +2778,7 @@ export function createCephadmModel(overrides: Partial<CephadmDeps> = {}) {
             host_key_policy: args.host_key_policy,
             host_keys: args.host_keys,
           }),
-          { multiplex: args.multiplex ?? false },
+          context,
         );
         try {
           const outcome = await verifyRbdSmoke(
@@ -2836,7 +2821,7 @@ export function createCephadmModel(overrides: Partial<CephadmDeps> = {}) {
             host_key_policy: args.host_key_policy,
             host_keys: args.host_keys,
           }),
-          { multiplex: args.multiplex ?? false },
+          context,
         );
         try {
           const outcome = await verifyOsdClaimable(deps, session, {
@@ -2868,7 +2853,7 @@ export function createCephadmModel(overrides: Partial<CephadmDeps> = {}) {
         args: z.infer<typeof MaintenanceEnterArgs>,
         context: MethodContext,
       ) => {
-        const session = await sessionFor(args);
+        const session = await sessionFor(context, args);
         try {
           const result = await enterMaintenance(deps, session, {
             host: args.host,
@@ -2898,7 +2883,7 @@ export function createCephadmModel(overrides: Partial<CephadmDeps> = {}) {
         args: z.infer<typeof MaintenanceExitArgs>,
         context: MethodContext,
       ) => {
-        const session = await sessionFor(args);
+        const session = await sessionFor(context, args);
         try {
           const result = await exitMaintenance(deps, session, {
             host: args.host,
@@ -2926,7 +2911,7 @@ export function createCephadmModel(overrides: Partial<CephadmDeps> = {}) {
         args: z.infer<typeof MaintenanceStateArgs>,
         context: MethodContext,
       ) => {
-        const session = await sessionFor(args);
+        const session = await sessionFor(context, args);
         try {
           const result = await maintenanceState(
             deps,
@@ -2954,7 +2939,7 @@ export function createCephadmModel(overrides: Partial<CephadmDeps> = {}) {
         args: z.infer<typeof HostNameArgs>,
         context: MethodContext,
       ) => {
-        const session = await sessionFor(args);
+        const session = await sessionFor(context, args);
         try {
           const result = await okToStop(
             deps,
@@ -2983,7 +2968,7 @@ export function createCephadmModel(overrides: Partial<CephadmDeps> = {}) {
         args: z.infer<typeof HostNameArgs>,
         context: MethodContext,
       ) => {
-        const session = await sessionFor(args);
+        const session = await sessionFor(context, args);
         try {
           const result = await checkHost(
             deps,
@@ -3018,7 +3003,7 @@ export function createCephadmModel(overrides: Partial<CephadmDeps> = {}) {
         args: z.infer<typeof MaintenanceExitArgs>,
         context: MethodContext,
       ) => {
-        const session = await sessionFor(args);
+        const session = await sessionFor(context, args);
         try {
           const result = await nooutClear(deps, session, {
             host: args.host,
@@ -3047,7 +3032,7 @@ export function createCephadmModel(overrides: Partial<CephadmDeps> = {}) {
         args: z.infer<typeof HostNameArgs>,
         context: MethodContext,
       ) => {
-        const session = await sessionFor(args);
+        const session = await sessionFor(context, args);
         try {
           const result = await osdActivate(
             deps,
@@ -3076,7 +3061,7 @@ export function createCephadmModel(overrides: Partial<CephadmDeps> = {}) {
         args: z.infer<typeof MaintenanceStateArgs>,
         context: MethodContext,
       ) => {
-        const session = await sessionFor(args);
+        const session = await sessionFor(context, args);
         try {
           const state = await observeHost(deps, session, args.host);
           context.logger.info(
@@ -3107,7 +3092,7 @@ export function createCephadmModel(overrides: Partial<CephadmDeps> = {}) {
         args: z.infer<typeof VerifyClusterFsidArgs>,
         context: MethodContext,
       ) => {
-        const session = await sessionFor(args);
+        const session = await sessionFor(context, args);
         try {
           const result = await verifyClusterFsid(
             deps,
@@ -3137,7 +3122,10 @@ export function createCephadmModel(overrides: Partial<CephadmDeps> = {}) {
         args: z.infer<typeof DisableOrchArgs>,
         context: MethodContext,
       ) => {
-        const session = await sessionFor({ ...args, host: args.adminHost });
+        const session = await sessionFor(context, {
+          ...args,
+          host: args.adminHost,
+        });
         try {
           const result = await disableOrchestration(
             deps,
@@ -3166,7 +3154,7 @@ export function createCephadmModel(overrides: Partial<CephadmDeps> = {}) {
         args: z.infer<typeof RmClusterArgs>,
         context: MethodContext,
       ) => {
-        const session = await sessionFor(args);
+        const session = await sessionFor(context, args);
         try {
           const result = await rmCluster(deps, session, {
             host: args.host,
@@ -3195,7 +3183,7 @@ export function createCephadmModel(overrides: Partial<CephadmDeps> = {}) {
         args: z.infer<typeof VerifyHostTornDownArgs>,
         context: MethodContext,
       ) => {
-        const session = await sessionFor(args);
+        const session = await sessionFor(context, args);
         try {
           const result = await hostTornDown(
             deps,
@@ -3222,7 +3210,7 @@ export function createCephadmModel(overrides: Partial<CephadmDeps> = {}) {
         args: z.infer<typeof BucketInventoryArgs>,
         context: MethodContext,
       ) => {
-        const session = await sessionFor(args);
+        const session = await sessionFor(context, args);
         const realm = args.rgwRealm ?? "";
         try {
           const record = await bucketInventory(
@@ -3254,7 +3242,7 @@ export function createCephadmModel(overrides: Partial<CephadmDeps> = {}) {
         args: z.infer<typeof RgwUserArgs>,
         context: MethodContext,
       ) => {
-        const session = await sessionFor(args);
+        const session = await sessionFor(context, args);
         try {
           const result = await ensureRgwUser(deps, session, {
             host: args.host,
@@ -3637,24 +3625,20 @@ export const model = {
     {
       toVersion: "2026.10.17.3",
       description:
-        "SSH host-key policy is now host_key_policy strict|insecure_tofu with ssh-keyscan host_keys; strict requires pins, insecure_tofu learns and pins the first key per host:port. Legacy strictHostKeyChecking yes maps to strict, no to insecure_tofu.",
+        "Adopted the canonical ssh transport (typed exit-255 error, authoritative pins, no key on disk, no multiplex/ControlMaster): host_key_policy is strict|insecure_tofu with ssh-keyscan host_keys, strict requires pins, insecure_tofu learns and pins the first key per host:port in the hostkeys resource. Legacy strictHostKeyChecking yes maps to strict, no to insecure_tofu; multiplex is dropped. Every pinned line must name its host.",
       upgradeAttributes: (old: Record<string, unknown>) => {
-        const { strictHostKeyChecking, ...rest } = old;
-        if (strictHostKeyChecking === "yes") {
-          return {
-            ...rest,
-            host_key_policy: "strict",
-            host_keys: rest.host_keys ?? [],
-          };
+        const next = { ...old };
+        const legacy = next.strictHostKeyChecking;
+        delete next.strictHostKeyChecking;
+        delete next.multiplex;
+        if (legacy === "yes") {
+          next.host_key_policy = "strict";
+          next.host_keys = next.host_keys ?? [];
+        } else if (legacy === "no") {
+          next.host_key_policy = "insecure_tofu";
+          next.host_keys = next.host_keys ?? [];
         }
-        if (strictHostKeyChecking === "no") {
-          return {
-            ...rest,
-            host_key_policy: "insecure_tofu",
-            host_keys: rest.host_keys ?? [],
-          };
-        }
-        return old;
+        return next;
       },
     },
   ],

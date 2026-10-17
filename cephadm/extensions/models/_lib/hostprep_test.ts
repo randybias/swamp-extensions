@@ -23,7 +23,7 @@ import {
   sanitizeProxyLine,
   splitSections,
 } from "./hostprep.ts";
-import type { CommandResult, RunOptions, SshSession } from "./ssh.ts";
+import type { CommandResult, RunOptions, SshSession } from "./ssh_session.ts";
 
 /** A scripted session: route sees the exact command string and throws when unrouted. */
 function fakeSession(
@@ -32,8 +32,7 @@ function fakeSession(
 ): { session: SshSession; calls: RunOptions[] } {
   const calls: RunOptions[] = [];
   const session: SshSession = {
-    target: { host, user: "admin", strictHostKeyChecking: "yes" },
-    controlPath: null,
+    target: { host, port: 22 },
     run: async (opts) => {
       calls.push(opts);
       return await route(opts);

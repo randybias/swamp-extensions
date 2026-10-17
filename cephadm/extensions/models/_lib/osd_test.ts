@@ -1,7 +1,7 @@
 import { assertEquals, assertRejects } from "jsr:@std/assert@1.0.19";
 import { PhaseError, RemoteExitError } from "./errors.ts";
 import { listByIdCommand } from "./resolve.ts";
-import type { CommandResult, RunOptions, SshSession } from "./ssh.ts";
+import type { CommandResult, RunOptions, SshSession } from "./ssh_session.ts";
 import {
   applyOsd,
   checkExclusions,
@@ -30,8 +30,7 @@ function adminSession(
   let dir = 0;
   let scriptBody = "";
   const session: SshSession = {
-    target: { host: "192.0.2.10", user: "admin", strictHostKeyChecking: "yes" },
-    controlPath: null,
+    target: { host: "192.0.2.10", port: 22 },
     run: (opts) => {
       if (opts.command.startsWith("mktemp -d")) {
         dir++;
@@ -70,8 +69,7 @@ function adminSession(
 /** A fake target session for the serial resolver. */
 function targetSession(device = "/dev/nvme0n1"): SshSession {
   return {
-    target: { host: "192.0.2.50", user: "admin", strictHostKeyChecking: "yes" },
-    controlPath: null,
+    target: { host: "192.0.2.50", port: 22 },
     run: (opts: RunOptions) => {
       if (opts.command === listByIdCommand()) {
         return Promise.resolve({
@@ -342,8 +340,7 @@ Deno.test("a resolution failure leaves the cluster untouched", async () => {
     return { code: 0, stdout: "[]", stderr: "" };
   });
   const badTarget: SshSession = {
-    target: { host: "192.0.2.50", user: "admin", strictHostKeyChecking: "yes" },
-    controlPath: null,
+    target: { host: "192.0.2.50", port: 22 },
     run: (opts: RunOptions) =>
       Promise.resolve(
         opts.command === listByIdCommand()

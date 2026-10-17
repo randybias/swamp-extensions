@@ -11,7 +11,7 @@
  */
 
 import { fail, TransportError } from "./errors.ts";
-import type { SshSession } from "./ssh.ts";
+import type { SshSession } from "./ssh_session.ts";
 import type { PrepDeps } from "./hostprep.ts";
 import { runCeph } from "./shell.ts";
 import { quote } from "./validate.ts";

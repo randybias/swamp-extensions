@@ -13,8 +13,8 @@
  */
 
 import { fail } from "./errors.ts";
-import type { CommandResult, ResendPolicy, SshSession } from "./ssh.ts";
-import { runStep } from "./ssh.ts";
+import type { CommandResult, ResendPolicy, SshSession } from "./ssh_session.ts";
+import { runStep } from "./ssh_session.ts";
 import { quote, truncate } from "./validate.ts";
 import { CEPHADM_SHELL_FLOOR_MS, type PrepDeps } from "./hostprep.ts";
 

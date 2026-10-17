@@ -7,7 +7,7 @@
 import { assertEquals, assertThrows } from "jsr:@std/assert@1.0.19";
 import { LocalRefusalError } from "./errors.ts";
 import {
-  assertPinsApply,
+  assertPinsNamed,
   hostKeysName,
   HostKeysSchema,
   resolvePins,
@@ -27,35 +27,25 @@ Deno.test("hostKeysName keys a pin by host and port", () => {
   );
 });
 
-Deno.test("assertPinsApply accepts an applicable pin", () => {
-  assertPinsApply([HOST_PORT], "192.0.2.10", 2222);
-  assertPinsApply([HOST_22], "192.0.2.10", 22);
+Deno.test("assertPinsNamed accepts any pin that names a host", () => {
+  assertPinsNamed([HOST_PORT]);
+  assertPinsNamed([HOST_22, OTHER_HOST]);
 });
 
 Deno.test(
-  "assertPinsApply refuses a bare key line: it would apply to every host",
+  "assertPinsNamed refuses a bare key line: it would apply to every host",
   () => {
     assertThrows(
-      () => assertPinsApply([BARE], "192.0.2.10", 22),
+      () => assertPinsNamed([BARE]),
       LocalRefusalError,
       "must name its host",
     );
   },
 );
 
-Deno.test("assertPinsApply refuses a non-applicable pin and a malformed line", () => {
+Deno.test("assertPinsNamed refuses a malformed line", () => {
   assertThrows(
-    () => assertPinsApply([OTHER_HOST], "192.0.2.10", 2222),
-    LocalRefusalError,
-    "does not apply",
-  );
-  assertThrows(
-    () => assertPinsApply([HOST_22], "192.0.2.10", 2222),
-    LocalRefusalError,
-    "does not apply",
-  );
-  assertThrows(
-    () => assertPinsApply(["not a key"], "192.0.2.10", 22),
+    () => assertPinsNamed(["not a key"]),
     LocalRefusalError,
     "not an ssh-keyscan line",
   );
@@ -130,10 +120,10 @@ Deno.test("resolvePins: an explicit pin wins over a stored one", () => {
       host: "192.0.2.10",
       port: 22,
       host_key_policy: "strict",
-      supplied: [HOST_22],
+      supplied: [HOST_22, OTHER_HOST],
       stored,
     }),
-    { hostKeys: [HOST_22], learn: false },
+    { hostKeys: [HOST_22, OTHER_HOST], learn: false },
   );
 });
 

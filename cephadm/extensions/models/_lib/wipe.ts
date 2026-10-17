@@ -15,8 +15,8 @@
  */
 
 import { fail, TransportError } from "./errors.ts";
-import type { CommandResult, SshSession } from "./ssh.ts";
-import { isSudoRefusal } from "./ssh.ts";
+import type { CommandResult, SshSession } from "./ssh_session.ts";
+import { isSudoRefusal } from "./ssh_session.ts";
 import { assertMdArrayPath, assertVgName, quote } from "./validate.ts";
 import { type ResolvedDevice, resolveSerial } from "./resolve.ts";
 import type { PrepDeps } from "./hostprep.ts";

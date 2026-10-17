@@ -159,7 +159,7 @@ Deno.test("the local client sends the key only as a header and refuses redirects
         Promise.resolve(
           new Response("", {
             status: 302,
-            headers: { location: "https://evil" },
+            headers: { location: "https://evil.test" },
           }),
         ),
     },
@@ -244,6 +244,35 @@ Deno.test("the ssh client keeps the key off argv and runs curl with its cleanup"
     (curl.args.at(-1) ?? "").includes("trap 'rm -f"),
     "the cleanup must run in the same shell",
   );
+});
+
+Deno.test("a failed remote prepare aborts before any upload", async () => {
+  const calls: string[] = [];
+  const run: CommandRunner = (cmd, args): Promise<CommandResult> => {
+    const remote = args.at(-1) ?? "";
+    calls.push([cmd, ...args].join(" "));
+    if (remote.includes("mmin +5")) {
+      return Promise.resolve({ code: 1, stdout: "", stderr: "not owner" });
+    }
+    return Promise.resolve({ code: 0, stdout: "", stderr: "" });
+  };
+  const client = createClient({ ...DEPS, run }, "ssh", {
+    apiUrl: "http://127.0.0.1:8384",
+    apiKey: HEADER_VALUE,
+  }, {
+    host: "192.0.2.10",
+    port: 22,
+    user: "root",
+    host_key_policy: "strict",
+    host_keys: ["192.0.2.10 ssh-ed25519 AAAA"],
+    connect_timeout_s: 15,
+  });
+  await assertRejects(
+    () => client.request("GET", "/rest/system/status"),
+    Error,
+    "prepare",
+  );
+  assertEquals(calls.some((c) => c.includes("mktemp")), false, "no upload");
 });
 
 Deno.test("device and folder specs validate and match", () => {

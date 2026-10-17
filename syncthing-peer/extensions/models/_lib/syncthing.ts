@@ -124,10 +124,20 @@ export function assertApiKey(value: string): void {
   }
 }
 
-/** A device address: exactly `dynamic`, or a tcp/quic/relay host:port URL. */
+/**
+ * A device address: exactly `dynamic`, or a tcp/quic/relay URL with a plain
+ * hostname, IPv4 or bracketed IPv6 host and a port 1-65535, with no userinfo or
+ * query.
+ */
 export function isDeviceAddress(value: string): boolean {
   if (value === "dynamic") return true;
-  return /^(?:tcp|quic|relay):\/\/[^\s/]+:\d{1,5}$/.test(value);
+  const match = /^(?:tcp|quic|relay):\/\/([^/?#@]+):(\d{1,5})$/.exec(value);
+  if (match === null) return false;
+  const host = match[1];
+  const port = Number(match[2]);
+  if (!Number.isInteger(port) || port < 1 || port > 65535) return false;
+  if (/^\[[0-9a-fA-F:.]+\]$/.test(host)) return true;
+  return /^[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?$/.test(host);
 }
 
 /** True when `value` has no control characters and is not blank. */
@@ -202,6 +212,7 @@ export function curlRequestConfig(
     `url = ${curlConfigValue(url)}`,
     `header = ${curlConfigValue(`X-API-Key: ${apiKey}`)}`,
     `header = ${curlConfigValue("Accept: application/json")}`,
+    `proto = ${curlConfigValue("=http,https")}`,
     `write-out = ${curlConfigValue("__SYNCTHING_STATUS__%{http_code}")}`,
   ];
   if (body !== undefined) {
@@ -279,9 +290,14 @@ export function createClient(
     const prepared = await sshExec(deps, sshTarget, [
       "sh",
       "-c",
-      'd="$HOME/.cache/syncthing-peer"; mkdir -p -m 700 "$d" && ' +
+      "umask 077\n" +
+      'd="$HOME/.cache/syncthing-peer"\n' +
+      'mkdir -p "$d" && [ -d "$d" ] && [ ! -L "$d" ] && [ -O "$d" ] && ' +
+      'chmod 700 "$d" || exit 1\n' +
+      'm=$(stat -c %a "$d" 2>/dev/null || stat -f %Lp "$d" 2>/dev/null)\n' +
+      '[ "$m" = "700" ] || exit 1\n' +
       'find "$d" -maxdepth 1 -name "*.curlrc" -type f -mmin +5 -delete ' +
-      '2>/dev/null; printf %s "$d"',
+      '2>/dev/null && printf %s "$d"',
     ]);
     if (prepared.exit_code !== 0) {
       throw new SshError(
@@ -302,7 +318,7 @@ export function createClient(
       const result = await sshExec(deps, sshTarget, [
         "sh",
         "-c",
-        'trap \'rm -f "$1"\' EXIT HUP INT TERM; curl --config "$1"',
+        'trap \'rm -f "$1"\' EXIT HUP INT TERM; curl -q --config "$1"',
         "sh",
         tempPath,
       ]);
@@ -313,7 +329,14 @@ export function createClient(
           }`,
         );
       }
-      return parseCurlOutput(result.stdout);
+      const parsed = parseCurlOutput(result.stdout);
+      if (parsed.status >= 300 && parsed.status <= 399) {
+        throw new SyncthingError(
+          `refusing a redirect (${parsed.status}); the API key would be re-sent`,
+          parsed.status,
+        );
+      }
+      return parsed;
     } catch (error) {
       await sshExec(deps, sshTarget, ["rm", "-f", tempPath]).catch(
         () => undefined,

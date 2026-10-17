@@ -5,6 +5,7 @@ import {
   type CommandRunner,
   sha256Hex,
   SshConfigError,
+  SshError,
 } from "./_lib/ssh.ts";
 import {
   type FetchFn,
@@ -295,7 +296,8 @@ Deno.test("get stores node status and counts", async () => {
 });
 
 Deno.test("sync records unreachable on a connect failure", async () => {
-  const fetch: FetchFn = () => Promise.reject(new Error("connection refused"));
+  const fetch: FetchFn = () =>
+    Promise.reject(new TypeError("connection refused"));
   const m = createModel(deps(fetch));
   const { context, written } = testContext();
   const result = await m.methods.sync.execute(BASE, context);
@@ -312,6 +314,60 @@ Deno.test("sync rethrows an auth failure instead of recording unreachable", asyn
     SyncthingError,
   );
   assertEquals(error.status, 401);
+  assertEquals(written.length, 0);
+});
+
+Deno.test("sync rethrows an HTTP 500 instead of recording unreachable", async () => {
+  const s = server({ status: 500 });
+  const m = createModel(deps(s.fetch));
+  const { context, written } = testContext();
+  const error = await assertRejects(
+    () => m.methods.sync.execute(BASE, context),
+    SyncthingError,
+  );
+  assertEquals(error.status, 500);
+  assertEquals(written.length, 0);
+});
+
+Deno.test("sync rethrows a TLS/curl failure instead of recording unreachable", async () => {
+  const run: CommandRunner = async (_cmd, args, options = {}) => {
+    const remote = args.at(-1) ?? "";
+    if (remote.includes("mmin +5")) {
+      return { code: 0, stdout: "/root/.cache/syncthing-peer", stderr: "" };
+    }
+    if (remote.includes("mktemp")) {
+      const config = typeof options.stdin === "string"
+        ? options.stdin
+        : new TextDecoder().decode(options.stdin ?? new Uint8Array());
+      return {
+        code: 0,
+        stdout: `${await sha256Hex(config)} 600\n`,
+        stderr: "",
+      };
+    }
+    if (remote.includes("trap") && remote.includes("curl")) {
+      return { code: 60, stdout: "", stderr: "SSL certificate problem" };
+    }
+    return { code: 0, stdout: "", stderr: "" };
+  };
+  const m = createModel(deps(() => Promise.resolve(json({})), run));
+  const { context, written } = testContext();
+  await assertRejects(
+    () =>
+      m.methods.sync.execute(
+        {
+          ...BASE,
+          access: "ssh",
+          host: "192.0.2.10",
+          user: "root",
+          host_key_policy: "strict",
+          host_keys: [KEY_LINE],
+        },
+        context,
+      ),
+    SshError,
+    "exit 60",
+  );
   assertEquals(written.length, 0);
 });
 

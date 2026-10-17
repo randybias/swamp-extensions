@@ -326,17 +326,23 @@ function sshTargetOf(args: AccessArgs): SshTarget | undefined {
   };
 }
 
-/** A configuration, host-key or auth failure that must never be "unreachable". */
-function isFatalObservationError(error: unknown): boolean {
-  if (error instanceof SshConfigError) return true;
-  if (error instanceof SyncthingError) {
-    return error.status === 401 || error.status === 403;
-  }
+/**
+ * True only for a connect or timeout failure. Everything else — a 4xx/5xx
+ * response, a refused redirect, a TLS failure, a bad key or a malformed body —
+ * is rethrown so `sync` never hides a real problem as "unreachable".
+ */
+function isUnreachable(error: unknown): boolean {
+  if (error instanceof SshConfigError) return false;
+  if (error instanceof SyncthingError) return false;
   if (error instanceof SshError) {
-    return /host key verification failed|authentication failed/i.test(
-      error.message,
-    );
+    if (/could not connect|ssh transport failed/i.test(error.message)) {
+      return true;
+    }
+    // curl 6 (DNS), 7 (connect) and 28 (timeout).
+    const curl = /remote curl failed \(exit (\d+)\)/.exec(error.message);
+    return curl !== null && ["6", "7", "28"].includes(curl[1]);
   }
+  if (error instanceof TypeError) return true;
   return false;
 }
 
@@ -672,9 +678,9 @@ export function createModel(
               },
             };
           } catch (error) {
-            // A configuration, host-key or auth failure is not "unreachable";
-            // only a connect or timeout failure is recorded as down.
-            if (isFatalObservationError(error)) throw error;
+            // Only a connect or timeout failure means the node is down; an HTTP
+            // error, a TLS failure or a configuration error is rethrown.
+            if (!isUnreachable(error)) throw error;
             const message = error instanceof Error
               ? error.message
               : String(error);
@@ -928,6 +934,11 @@ export function createModel(
           const nodeHash = await nodeInstance(args.node, args.api_url);
           const instance = childInstance(nodeHash, "f", args.folder_id);
           const observedAt = new Date(deps.now()).toISOString();
+          const status = await readStatus(client);
+          const myIdRaw = status && typeof status === "object"
+            ? (status as Record<string, unknown>).myID
+            : undefined;
+          const ownId = typeof myIdRaw === "string" ? myIdRaw : undefined;
           const existing = await readFolder(client, args.folder_id);
           if (existing === null) {
             const handle = await writeFolder(context, args, instance, spec, {
@@ -958,7 +969,7 @@ export function createModel(
             context,
             args,
             instance,
-            folderSpecOf(existing, spec),
+            folderSpecOf(existing, spec, ownId),
             { changed: true, status: "removed" },
             observedAt,
           );

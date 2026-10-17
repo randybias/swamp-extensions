@@ -57,3 +57,22 @@ transport.
   host:port URL; names and labels reject control characters.
 - LOW: removed the dead `errorText`/`checkResult`/`isNotFound` helpers and the
   unused `Reply`; `get` and `sync` share one `observe` path.
+
+## Review round 2
+
+- HIGH: the remote key-file directory is now verified, not assumed. The prepare
+  shell runs under `umask 077`, refuses a symlinked or foreign-owned directory,
+  forces mode 700 and checks it with `stat`, chains the stale sweep, and prints
+  the directory only on success; a non-zero prepare exit aborts before any
+  upload (tested).
+- MEDIUM: remote `curl` runs with `-q` first, so `~/.curlrc` cannot make it
+  follow redirects or skip TLS checks; the config pins `proto = "=http,https"`,
+  and a 3xx response is refused on the remote path too.
+- MEDIUM: `sync` now treats only a connect or timeout failure (SshError "could
+  not connect"/"ssh transport failed", curl exit 6/7/28, or a fetch `TypeError`)
+  as `unreachable`; an HTTP 500, a refused redirect, a TLS failure and
+  everything else are rethrown (500 and curl-exit-60 tested).
+- MEDIUM: `isDeviceAddress` parses the host and port structurally, rejecting
+  userinfo, query, an extra colon and a port outside 1-65535.
+- LOW: test fixture uses `https://evil.test`; `remove_folder` records the
+  observed device list without the node's own `myID`, matching `ensure_folder`.

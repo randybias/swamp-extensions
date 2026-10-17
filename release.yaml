@@ -98,5 +98,8 @@ redfish:
 
 syncthing-peer:
   channel: beta
-  ci: false
-  published: {}
+  ci: true
+  published:
+    2026.10.17.1: abb4df5af6f0919cd9866a4d9f444a5038ad2cf02bf780c6825c4510d64f621a
+  notes:
+    2026.10.17.1: 'First release, beta. Ensure a peer device and a shared folder on one Syncthing node through its REST API, reached locally or over SSH, and inspect or remove them; existing entries are updated with PATCH so fields the model does not manage survive, and repeats are no-ops. The API key is a vault reference that travels only in the X-API-Key header (over SSH, inside a curl config uploaded over stdin into a 0700 directory and removed in the same shell); plain HTTP is loopback-only and requests are bounded by timeout_s. sync records a node unreachable only for a connect, DNS or timeout failure. Live end to end on two VPS nodes with Syncthing 1.27.2: 10/10 cells, including a real file sync, a stalled API, a wrong key and an argv scan with 0 secret hits. Residual: curl''s stderr is cut to its last line in errors; no spec yet.'

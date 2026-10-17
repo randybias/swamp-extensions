@@ -110,7 +110,13 @@ function plainRoute(overrides: Route = () => undefined): Route {
   return (remote) => {
     if (has(remote, "lsblk -J -b -o")) return { code: 0, stdout: LSBLK };
     if (has(remote, "find /dev")) return { code: 0, stdout: "" };
-    if (has(remote, "blkid")) return { code: 127, stdout: "" };
+    if (has(remote, "blkid")) {
+      return {
+        code: 0,
+        stdout:
+          '/dev/sdz9: UUID="99999999-0000-0000-0000-000000000000" TYPE="ext4"\n',
+      };
+    }
     if (has(remote, "findmnt -J")) return { code: 0, stdout: FINDMNT };
     if (has(remote, "/etc/fstab")) {
       return { code: 0, stdout: "UUID=ROOT-UUID / ext4 defaults 0 1\n" };

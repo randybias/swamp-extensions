@@ -194,7 +194,13 @@ function guardProbeRoute(fixture: GuardFixture = {}): Route {
     if (has(remote, "find /dev")) {
       return { code: 0, stdout: fixture.links ?? "" };
     }
-    if (has(remote, "blkid")) return { code: 0, stdout: fixture.blkid ?? "" };
+    if (has(remote, "blkid")) {
+      return {
+        code: 0,
+        stdout: fixture.blkid ??
+          '/dev/sdz9: UUID="99999999-0000-0000-0000-000000000000" TYPE="ext4"\n',
+      };
+    }
     if (has(remote, "findmnt -J")) {
       return { code: 0, stdout: fixture.findmnt ?? FINDMNT };
     }
@@ -566,6 +572,71 @@ Deno.test("create_pool refuses a faulty md member with combined flags", async ()
     args,
     createModelTestContext().context,
   );
+});
+
+Deno.test("create_pool allows a free sibling of a root md member", async () => {
+  const arrayUuid = MD_ARRAY_UUID.replaceAll(":", "-");
+  const member = (n: string): DevSpec => ({
+    name: `${n}1`,
+    type: "part",
+    fstype: "linux_raid_member",
+    uuid: arrayUuid,
+    children: [{ name: "md0", type: "raid1", fstype: "ext4", mounts: ["/"] }],
+  });
+  const free = (n: string): DevSpec => ({ name: `${n}2`, type: "part" });
+  const route = fullCreateRoute({
+    lsblk: lsblkJson(
+      { name: "sda", type: "disk", children: [member("sda"), free("sda")] },
+      { name: "sdb", type: "disk", children: [member("sdb"), free("sdb")] },
+    ),
+    findmnt: findmntJson({ target: "/", source: "/dev/md0", fstype: "ext4" }),
+    fstab: "/dev/md0 / ext4 defaults 0 1\n",
+    mdstat: "md0 : active raid1 sdb1[1] sda1[0]\n",
+    links: "/dev/disk/by-id/ata-EXAMPLE_A-part2 /dev/sda2\n" +
+      "/dev/disk/by-id/ata-EXAMPLE_B-part2 /dev/sdb2\n",
+    blkid: `/dev/sda1: UUID="${arrayUuid}" TYPE="linux_raid_member"\n` +
+      `/dev/sdb1: UUID="${arrayUuid}" TYPE="linux_raid_member"\n` +
+      `/dev/md0: UUID="11111111-2222-3333-4444-555555555555" TYPE="ext4"\n`,
+    mdExamine: {
+      "/dev/sda1": { code: 0, stdout: MD_EXAMINE },
+      "/dev/sdb1": { code: 0, stdout: MD_EXAMINE },
+    },
+  });
+  // A whole disk carries a root md member partition, so it is refused.
+  for (const vdev of ["/dev/sda", "/dev/sdb"]) {
+    const error = await assertRejects(
+      () =>
+        model(route).methods.create_pool.execute(
+          model(route).methods.create_pool.arguments.parse({
+            ssh: SSH,
+            pool: "tank",
+            vdevs: [vdev],
+          }),
+          createModelTestContext().context,
+        ),
+      DeviceGuardError,
+      vdev,
+    );
+    assertEquals(error.code, "boot-protected", vdev);
+  }
+  // A new free sibling partition is allowed, plain and by-id.
+  for (
+    const vdev of [
+      "/dev/sda2",
+      "/dev/sdb2",
+      "/dev/disk/by-id/ata-EXAMPLE_A-part2",
+    ]
+  ) {
+    const args = model(route).methods.create_pool.arguments.parse({
+      ssh: SSH,
+      pool: "tank",
+      vdevs: [vdev],
+    });
+    await model(route).methods.create_pool.execute(
+      args,
+      createModelTestContext().context,
+    );
+  }
 });
 
 Deno.test("create_pool is a no-op when the pool has the same vdevs", async () => {

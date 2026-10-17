@@ -111,7 +111,11 @@ function plain(overrides: Partial<ProbeInputs> = {}): ProbeInputs {
     swaps: file(SWAP_HEADER),
     mdstat: { state: "absent" },
     links: ok(""),
-    blkid: missing,
+    // A working blkid that knows one unrelated device and nothing else, so a raw
+    // disk is "empty, unrelated". Tests that need it to fail say so.
+    blkid: ok(
+      '/dev/sdz9: UUID="99999999-0000-0000-0000-000000000000" TYPE="ext4"\n',
+    ),
     zpool: missing,
     pvs: missing,
     mdExamine: {},
@@ -1515,4 +1519,402 @@ Deno.test("22 a mounted non-root filesystem outside fstab also needs a known typ
   );
   refused(plain({ ...mounted, lsblk: rows("xfs") }), ["/dev/sdb"], "protected");
   safe(plain({ ...mounted, lsblk: rows("xfs") }), ["/dev/sdc"]);
+});
+
+// --- round 3: siblings of a protected partition are not protected ----------------
+
+/** A two-disk layout: root RAID1 on sdX1, free space in sdX2. */
+function twinHost(opts: {
+  sibling?: Partial<Dev>;
+  extra?: Partial<ProbeInputs>;
+} = {}): ProbeInputs {
+  const u = ARRAY_UUID.replaceAll(":", "-");
+  const member = (n: string): Dev => ({
+    name: `${n}1`,
+    type: "part",
+    fstype: "linux_raid_member",
+    uuid: u,
+    children: [{ name: "md0", type: "raid1", fstype: "ext4", mounts: ["/"] }],
+  });
+  const free = (n: string): Dev => ({
+    name: `${n}2`,
+    type: "part",
+    ...(opts.sibling ?? {}),
+  });
+  return plain({
+    lsblk: lsblk(
+      { name: "sda", type: "disk", children: [member("sda"), free("sda")] },
+      { name: "sdb", type: "disk", children: [member("sdb"), free("sdb")] },
+    ),
+    findmnt: findmnt({ target: "/", source: "/dev/md0", fstype: "ext4" }),
+    fstab: file("/dev/md0 / ext4 defaults 0 1\n"),
+    mdstat: file("md0 : active raid1 sdb1[1] sda1[0]\n"),
+    links: ok(
+      "/dev/disk/by-id/ata-EXAMPLE_A-part2 /dev/sda2\n" +
+        "/dev/disk/by-id/ata-EXAMPLE_B-part2 /dev/sdb2\n",
+    ),
+    // A working blkid: it knows the members and md0 and nothing at all about
+    // the free partitions.
+    blkid: ok(
+      `/dev/sda1: UUID="${u}" TYPE="linux_raid_member"\n` +
+        `/dev/sdb1: UUID="${u}" TYPE="linux_raid_member"\n` +
+        `/dev/md0: UUID="11111111-2222-3333-4444-555555555555" TYPE="ext4"\n`,
+    ),
+    mdExamine: {
+      "/dev/sda1": ok(examineOut(ARRAY_UUID)),
+      "/dev/sdb1": ok(examineOut(ARRAY_UUID)),
+    },
+    ...opts.extra,
+  });
+}
+
+Deno.test("23a whole disks of the twin layout are refused", () => {
+  const input = twinHost();
+  refused(input, ["/dev/sda"], "protected");
+  refused(input, ["/dev/sdb"], "protected");
+});
+
+Deno.test("23b a free sibling partition is allowed, plain and by-id", () => {
+  const input = twinHost();
+  safe(input, ["/dev/sda2"]);
+  safe(input, ["/dev/sdb2"]);
+  safe(input, ["/dev/disk/by-id/ata-EXAMPLE_A-part2"]);
+  safe(input, ["/dev/sda2", "/dev/sdb2"]);
+  // The protected partitions themselves stay refused, however they are named.
+  refused(input, ["/dev/sda1"], "protected");
+  refused(input, ["/dev/sda2", "/dev/sdb1"], "protected");
+});
+
+Deno.test("23c a sibling that is swap, in fstab, a PV of root's VG or an array member is refused", () => {
+  // active swap
+  refused(
+    twinHost({
+      sibling: { fstype: "swap" },
+      extra: {
+        swaps: file(SWAP_HEADER + "/dev/sda2 partition 100 0 -2\n"),
+      },
+    }),
+    ["/dev/sda2"],
+    "protected",
+  );
+  // listed in fstab
+  refused(
+    twinHost({
+      sibling: { fstype: "ext4", uuid: "44444444-5555-6666-7777-888888888888" },
+      extra: {
+        fstab: file(
+          "/dev/md0 / ext4 defaults 0 1\nUUID=44444444-5555-6666-7777-888888888888 /srv ext4 nofail 0 2\n",
+        ),
+      },
+    }),
+    ["/dev/sda2"],
+    "protected",
+  );
+  // member of the root array that dropped out
+  refused(
+    twinHost({
+      sibling: {
+        fstype: "linux_raid_member",
+        uuid: ARRAY_UUID.replaceAll(":", "-"),
+      },
+      extra: {
+        mdExamine: {
+          "/dev/sda1": ok(examineOut(ARRAY_UUID)),
+          "/dev/sdb1": ok(examineOut(ARRAY_UUID)),
+          "/dev/sda2": ok(examineOut(ARRAY_UUID)),
+          "/dev/sdb2": ok(examineOut(ARRAY_UUID)),
+        },
+      },
+    }),
+    ["/dev/sda2"],
+    "protected",
+  );
+});
+
+Deno.test("23d a sibling that is a PV of the root volume group is refused", () => {
+  const input = plain({
+    lsblk: lsblk(
+      {
+        name: "sda",
+        type: "disk",
+        children: [
+          {
+            name: "sda1",
+            type: "part",
+            fstype: "LVM2_member",
+            children: [
+              { name: "vg0-root", type: "lvm", fstype: "ext4", mounts: ["/"] },
+            ],
+          },
+          { name: "sda2", type: "part", fstype: "LVM2_member" },
+          { name: "sda3", type: "part" },
+        ],
+      },
+    ),
+    findmnt: findmnt({
+      target: "/",
+      source: "/dev/mapper/vg0-root",
+      fstype: "ext4",
+    }),
+    fstab: file(""),
+    links: ok("/dev/mapper/vg0-root /dev/dm-0\n"),
+    pvs: ok("  /dev/sda1  vg0\n  /dev/sda2  vg0\n"),
+    blkid: ok(
+      `/dev/sda1: UUID="aaaa" TYPE="LVM2_member"\n/dev/sda2: UUID="bbbb" TYPE="LVM2_member"\n`,
+    ),
+  });
+  refused(input, ["/dev/sda2"], "protected");
+  safe(input, ["/dev/sda3"]);
+  // Without a working blkid the free third partition cannot be vouched for.
+  refused({ ...input, blkid: missing }, ["/dev/sda3"], "unverifiable");
+});
+
+Deno.test("23e udev-less host with working blkid: an empty sibling is allowed", () => {
+  const input = plain({
+    lsblk: bare(
+      {
+        name: "sda",
+        type: "disk",
+        children: [
+          {
+            name: "sda1",
+            type: "part",
+            children: [{ name: "md0", type: "raid1", mounts: ["/"] }],
+          },
+          { name: "sda2", type: "part" },
+        ],
+      },
+      {
+        name: "sdb",
+        type: "disk",
+        children: [
+          {
+            name: "sdb1",
+            type: "part",
+            children: [{ name: "md0", type: "raid1", mounts: ["/"] }],
+          },
+          { name: "sdb2", type: "part" },
+        ],
+      },
+    ),
+    findmnt: findmnt({ target: "/", source: "/dev/md0", fstype: "ext4" }),
+    fstab: file("/dev/md0 / ext4 defaults 0 1\n"),
+    mdstat: file("md0 : active raid1 sdb1[1] sda1[0]\n"),
+    // blkid reports the raid members and md0, and nothing at all for sda2/sdb2.
+    blkid: ok(
+      `/dev/sda1: UUID="${
+        ARRAY_UUID.replaceAll(":", "-")
+      }" TYPE="linux_raid_member"\n` +
+        `/dev/sdb1: UUID="${
+          ARRAY_UUID.replaceAll(":", "-")
+        }" TYPE="linux_raid_member"\n` +
+        `/dev/md0: UUID="11111111-2222-3333-4444-555555555555" TYPE="ext4"\n`,
+    ),
+    mdExamine: {
+      "/dev/sda1": ok(examineOut(ARRAY_UUID)),
+      "/dev/sdb1": ok(examineOut(ARRAY_UUID)),
+    },
+  });
+  safe(input, ["/dev/sda2"]);
+  refused(input, ["/dev/sda"], "protected");
+  // blkid failing: nothing can be told apart, so the same host refuses.
+  for (const failing of [missing, NO_SB, { code: 2, stdout: "" }]) {
+    refused({ ...input, blkid: failing }, ["/dev/sda2"], "unverifiable");
+  }
+});
+
+// Unlike 23e, root's type is VISIBLE here (udev-ful lsblk), so only the free
+// sibling's empty type can be what refuses it.
+Deno.test("24a a free sibling is refused when blkid failed, however it failed", () => {
+  const input = twinHost();
+  safe(input, ["/dev/sda2"]);
+  for (const failing of [missing, NO_SB, { code: 2, stdout: "" }]) {
+    refused({ ...input, blkid: failing }, ["/dev/sda2"], "unverifiable");
+    refused({ ...input, blkid: failing }, ["/dev/sdb2"], "unverifiable");
+  }
+  // Even a raw disk with no protected neighbour is refused when blkid failed:
+  // an untyped disk cannot be told from the second device of a root.
+  const alone = twinHost();
+  alone.lsblk = lsblk(
+    {
+      name: "sda",
+      type: "disk",
+      children: [{
+        name: "sda1",
+        type: "part",
+        fstype: "ext4",
+        mounts: ["/"],
+      }],
+    },
+    { name: "sdc", type: "disk" },
+  );
+  alone.findmnt = findmnt({ target: "/", source: "/dev/sda1", fstype: "ext4" });
+  alone.fstab = file("");
+  alone.mdstat = { state: "absent" };
+  alone.links = ok("");
+  alone.mdExamine = {};
+  alone.blkid = ok('/dev/sda1: UUID="1111" TYPE="ext4"\n');
+  safe(alone, ["/dev/sdc"]);
+  for (const failing of [missing, NO_SB, { code: 2, stdout: "" }]) {
+    refused({ ...alone, blkid: failing }, ["/dev/sdc"], "unverifiable");
+  }
+});
+
+Deno.test("24b btrfs root on sda1 with an untyped sda2: refused without blkid, allowed with it", () => {
+  const rows = lsblk(
+    {
+      name: "sda",
+      type: "disk",
+      children: [
+        {
+          name: "sda1",
+          type: "part",
+          fstype: "btrfs",
+          uuid: BTRFS_UUID,
+          mounts: ["/"],
+        },
+        // A stale row: the type column is empty although the partition holds
+        // the second device of the root filesystem.
+        { name: "sda2", type: "part" },
+      ],
+    },
+    { name: "sdc", type: "disk" },
+  );
+  const base = plain({
+    lsblk: rows,
+    findmnt: findmnt({ target: "/", source: "/dev/sda1", fstype: "btrfs" }),
+    fstab: file(""),
+  });
+  for (const failing of [missing, NO_SB, { code: 2, stdout: "" }]) {
+    refused({ ...base, blkid: failing }, ["/dev/sda2"], "unverifiable");
+  }
+  // blkid works and says sda2 is the other btrfs device: protected.
+  refused(
+    {
+      ...base,
+      blkid: ok(
+        `/dev/sda1: UUID="${BTRFS_UUID}" TYPE="btrfs"\n/dev/sda2: UUID="${BTRFS_UUID}" TYPE="btrfs"\n`,
+      ),
+    },
+    ["/dev/sda2"],
+    "protected",
+  );
+  // blkid works and knows nothing about sda2: empty, unrelated.
+  safe(
+    { ...base, blkid: ok(`/dev/sda1: UUID="${BTRFS_UUID}" TYPE="btrfs"\n`) },
+    ["/dev/sda2"],
+  );
+});
+
+Deno.test("24c btrfs root spanning sda1 and the whole disk sdc: sdc is judged by blkid, never by its empty type", () => {
+  const rows = lsblk(
+    {
+      name: "sda",
+      type: "disk",
+      children: [{
+        name: "sda1",
+        type: "part",
+        fstype: "btrfs",
+        uuid: BTRFS_UUID,
+        mounts: ["/"],
+      }],
+    },
+    // The second device of the root filesystem is a whole disk with no partition
+    // table, and this host shows no type for it.
+    { name: "sdc", type: "disk" },
+    { name: "sdd", type: "disk" },
+  );
+  const base = plain({
+    lsblk: rows,
+    findmnt: findmnt({ target: "/", source: "/dev/sda1", fstype: "btrfs" }),
+    fstab: file(""),
+  });
+  // blkid failing, however it failed: both whole disks are unverifiable.
+  for (const failing of [missing, NO_SB, { code: 2, stdout: "" }]) {
+    refused({ ...base, blkid: failing }, ["/dev/sdc"], "unverifiable");
+    refused({ ...base, blkid: failing }, ["/dev/sdd"], "unverifiable");
+  }
+  // blkid working and naming sdc as the other btrfs device: protected.
+  const names = ok(
+    `/dev/sda1: UUID="${BTRFS_UUID}" TYPE="btrfs"\n/dev/sdc: UUID="${BTRFS_UUID}" TYPE="btrfs"\n`,
+  );
+  refused({ ...base, blkid: names }, ["/dev/sdc"], "protected");
+  safe({ ...base, blkid: names }, ["/dev/sdd"]);
+  // blkid working and knowing nothing about sdc: empty, unrelated, allowed.
+  safe(
+    { ...base, blkid: ok(`/dev/sda1: UUID="${BTRFS_UUID}" TYPE="btrfs"\n`) },
+    ["/dev/sdc"],
+  );
+});
+
+Deno.test("25a lsblk and blkid disagreeing about a type or UUID refuses everything", () => {
+  const rows = lsblk(
+    {
+      name: "sda",
+      type: "disk",
+      children: [{
+        name: "sda1",
+        type: "part",
+        fstype: "ext4",
+        uuid: BTRFS_UUID,
+        mounts: ["/"],
+      }],
+    },
+    { name: "sdc", type: "disk" },
+  );
+  const base = plain({
+    lsblk: rows,
+    findmnt: findmnt({ target: "/", source: "/dev/sda1", fstype: "ext4" }),
+    fstab: file(""),
+  });
+  // Agreement: fine.
+  safe(
+    { ...base, blkid: ok(`/dev/sda1: UUID="${BTRFS_UUID}" TYPE="ext4"\\n`) },
+    ["/dev/sdc"],
+  );
+  // lsblk says ext4, blkid says btrfs: the stale lsblk type must not win, and
+  // an unrelated candidate is refused as well.
+  refused(
+    { ...base, blkid: ok(`/dev/sda1: UUID="${BTRFS_UUID}" TYPE="btrfs"\\n`) },
+    ["/dev/sdc"],
+    "unverifiable",
+  );
+  // Same type, different UUID.
+  refused(
+    {
+      ...base,
+      blkid: ok(
+        `/dev/sda1: UUID="deadbeef-0000-0000-0000-000000000000" TYPE="ext4"\\n`,
+      ),
+    },
+    ["/dev/sdc"],
+    "unverifiable",
+  );
+});
+
+Deno.test("25b a multipath candidate cannot escape the empty-type check", () => {
+  const rows = lsblk(
+    {
+      name: "sda",
+      type: "disk",
+      children: [{ name: "sda1", type: "part", fstype: "ext4", mounts: ["/"] }],
+    },
+    {
+      name: "sdc",
+      type: "disk",
+      children: [{ name: "mpatha", type: "mpath", path: "/dev/mapper/mpatha" }],
+    },
+    { name: "sdd", type: "disk" },
+  );
+  const base = plain({
+    lsblk: rows,
+    findmnt: findmnt({ target: "/", source: "/dev/sda1", fstype: "ext4" }),
+    fstab: file(""),
+    links: ok("/dev/mapper/mpatha /dev/dm-5\\n"),
+  });
+  for (const failing of [missing, NO_SB, { code: 2, stdout: "" }]) {
+    refused({ ...base, blkid: failing }, ["/dev/sdc"], "unverifiable");
+  }
+  // With a working blkid that knows nothing of it, it is empty and unrelated.
+  safe(base, ["/dev/sdc"]);
 });

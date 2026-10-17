@@ -17,6 +17,14 @@
  * ZFS pool that backs one. Device-mapper and md devices that sit on several
  * disks protect all of them.
  *
+ * Protection follows the stack, never the neighbourhood: a protected device,
+ * everything stacked on it and everything those sit on are protected, but a
+ * free partition that merely shares a disk with a protected one is not. The
+ * whole disk is still refused (it contains a protected partition), and a
+ * sibling is refused as soon as a normal rule claims it (fstab, swap, an LVM
+ * physical volume of a protected group, a member of a protected array or
+ * pool).
+ *
  * Accepted limits, because the kernel refuses the destructive write anyway
  * when it opens a device that is mounted, in use as swap or claimed by an
  * assembled md array or device-mapper target (it opens block devices
@@ -210,6 +218,8 @@ interface Node {
 interface Graph {
   nodes: Map<string, Node>;
   byName: Map<string, Node>;
+  /** Devices whose lsblk and blkid answers disagree about type or UUID. */
+  disagreements: string[];
 }
 
 function str(value: unknown): string {
@@ -298,18 +308,28 @@ function parseLsblkGraph(
   }
   // A host without udev gives lsblk empty identifier columns; blkid, read as
   // root, still knows them. Fill what is empty, never overwrite.
+  const disagreements: string[] = [];
   if (blkid) {
     const ids = parseBlkid(blkid);
     for (const node of nodes.values()) {
       const have = ids.get(node.path);
       if (!have) continue;
+      // Two readers of the same superblock must agree; a stale row in one of
+      // them is exactly how a live device looks like something else.
+      if (
+        (node.fstype && have.TYPE && node.fstype !== have.TYPE) ||
+        (node.uuid && have.UUID &&
+          normalizeUuid(node.uuid) !== normalizeUuid(have.UUID))
+      ) {
+        disagreements.push(node.path);
+      }
       if (!node.fstype && have.TYPE) node.fstype = have.TYPE;
       if (!node.uuid && have.UUID) node.uuid = have.UUID;
       if (!node.partuuid && have.PARTUUID) node.partuuid = have.PARTUUID;
       if (!node.label && have.LABEL) node.label = have.LABEL;
     }
   }
-  return { nodes, byName };
+  return { nodes, byName, disagreements };
 }
 
 /** Lowercase hex with separators removed, so mdadm and blkid UUIDs compare. */
@@ -384,22 +404,43 @@ function subtree(graph: Graph, path: string): string[] {
   return out;
 }
 
-/** The connected component of a path in the undirected device graph. */
-function component(graph: Graph, path: string): string[] {
-  const out: string[] = [];
+/** Every device `path` sits on or is held by, transitively, and itself. */
+function closure(
+  graph: Graph,
+  path: string,
+  next: (n: Node) => Iterable<string>,
+): Set<string> {
   const seen = new Set<string>();
   const stack = [path];
   while (stack.length > 0) {
     const current = stack.pop()!;
     if (seen.has(current)) continue;
     seen.add(current);
-    out.push(current);
     const node = graph.nodes.get(current);
-    for (const next of [...(node?.parents ?? []), ...(node?.children ?? [])]) {
-      stack.push(next);
-    }
+    if (node) { for (const p of next(node)) stack.push(p); }
   }
-  return out;
+  return seen;
+}
+
+/**
+ * The stack a protected device belongs to: itself, everything stacked on it
+ * (descendants), and everything any of those sit on (ancestors), so the other
+ * members of an array or the other disks of a volume that spans several are
+ * included. It does not spread sideways: a free partition next to a protected
+ * one shares only their disk, and that is not a reason to protect it.
+ */
+function stackOf(graph: Graph, path: string): string[] {
+  const held = closure(graph, path, (n) => n.children);
+  // One walk up from every descendant at once.
+  const out = new Set<string>();
+  const stack = [...held];
+  while (stack.length > 0) {
+    const current = stack.pop()!;
+    if (out.has(current)) continue;
+    out.add(current);
+    for (const p of graph.nodes.get(current)?.parents ?? []) stack.push(p);
+  }
+  return [...out];
 }
 
 /** The md and swap and zfs lines of the probes, parsed. */
@@ -546,9 +587,9 @@ class Collector {
 
   constructor(private readonly graph: Graph) {}
 
-  /** Protects the whole connected stack around `path`. */
+  /** Protects `path` and the stack it belongs to, but not its siblings. */
   protect(path: string, reason: string): void {
-    for (const p of component(this.graph, path)) {
+    for (const p of stackOf(this.graph, path)) {
       const list = (this.devices[p] ??= []);
       const why = p === path
         ? reason
@@ -621,6 +662,11 @@ function resolveSpec(
 /** Computes the protected set from the probes, or throws {@link Unverifiable}. */
 function compute(input: ProbeInputs): ProtectedSet {
   const graph = parseLsblkGraph(input.lsblk, input.blkid);
+  if (graph.disagreements.length > 0) {
+    unverifiable("lsblk and blkid disagree about a device", {
+      device: graph.disagreements[0],
+    });
+  }
   const resolver = new Resolver(graph, input.links);
   const mounts = parseFindmnt(input.findmnt);
   const collector = new Collector(graph);
@@ -1137,6 +1183,8 @@ function conflict(
       }
     }
   }
+  const blkidUsable = input.blkid.code === 0 &&
+    parseBlkid(input.blkid).size > 0;
   const uuids = new Set(set.arrayUuids);
   const vgs = new Set(set.volumeGroups);
   const pools = new Set(set.pools);
@@ -1162,6 +1210,22 @@ function conflict(
       }
       const node = graph.nodes.get(p)!;
       const probe = input.mdExamine[p];
+      // Without a working blkid an empty type proves nothing: a stale row, or
+      // the second device of a multi-device root that spans a whole disk, looks
+      // exactly like a raw disk. Only a candidate that mdadm identified, or that
+      // has children to judge instead, escapes.
+      if (
+        !blkidUsable && node.fstype === "" &&
+        (node.type !== "disk" || node.children.size === 0) &&
+        !(probe && probe.code === 0 && parseExamineUuid(probe.stdout))
+      ) {
+        return {
+          code: "unverifiable",
+          message:
+            "a candidate has no identifiable content and blkid could not vouch for it",
+          detail: { device: path, member: p },
+        };
+      }
       if (!probe && (node.type === "disk" || node.type === "part")) {
         return {
           code: "unverifiable",

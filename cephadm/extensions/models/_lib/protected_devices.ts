@@ -1193,21 +1193,20 @@ function conflict(
       }
       const node = graph.nodes.get(p)!;
       const probe = input.mdExamine[p];
-      // Without blkid, a candidate with no type that shares a disk with a
-      // protected device cannot be told from a stale row of something in use.
+      // Without a working blkid an empty type proves nothing: a stale row, or
+      // the second device of a multi-device root that spans a whole disk, looks
+      // exactly like a raw disk. Only a candidate that mdadm identified, or that
+      // has children to judge instead, escapes.
       if (
         !blkidUsable && node.fstype === "" &&
         (node.type === "part" ||
           (node.type === "disk" && node.children.size === 0)) &&
-        !(probe && probe.code === 0 && parseExamineUuid(probe.stdout)) &&
-        [...closure(graph, p, (n) => n.parents)].some((q) =>
-          q !== p && set.devices[q] !== undefined
-        )
+        !(probe && probe.code === 0 && parseExamineUuid(probe.stdout))
       ) {
         return {
           code: "unverifiable",
           message:
-            "a candidate partition has no identifiable content and shares a disk with a protected device",
+            "a candidate has no identifiable content and blkid could not vouch for it",
           detail: { device: path, member: p },
         };
       }

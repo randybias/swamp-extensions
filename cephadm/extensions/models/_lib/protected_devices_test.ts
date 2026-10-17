@@ -111,7 +111,11 @@ function plain(overrides: Partial<ProbeInputs> = {}): ProbeInputs {
     swaps: file(SWAP_HEADER),
     mdstat: { state: "absent" },
     links: ok(""),
-    blkid: missing,
+    // A working blkid that knows the root partition and nothing else, so a raw
+    // disk is "empty, unrelated". Tests that need it to fail say so.
+    blkid: ok(
+      '/dev/sda2: UUID="11111111-2222-3333-4444-555555555555" TYPE="ext4"\n',
+    ),
     zpool: missing,
     pvs: missing,
     mdExamine: {},
@@ -1728,30 +1732,32 @@ Deno.test("24a a free sibling is refused when blkid failed, however it failed", 
     refused({ ...input, blkid: failing }, ["/dev/sda2"], "unverifiable");
     refused({ ...input, blkid: failing }, ["/dev/sdb2"], "unverifiable");
   }
-  // A raw disk with no protected neighbour stays allowed without blkid.
+  // Even a raw disk with no protected neighbour is refused when blkid failed:
+  // an untyped disk cannot be told from the second device of a root.
   const alone = twinHost();
   alone.lsblk = lsblk(
-    ...[
-      {
-        name: "sda",
-        type: "disk",
-        children: [{
-          name: "sda1",
-          type: "part",
-          fstype: "ext4",
-          mounts: ["/"],
-        }],
-      },
-      { name: "sdc", type: "disk" },
-    ] as Dev[],
+    {
+      name: "sda",
+      type: "disk",
+      children: [{
+        name: "sda1",
+        type: "part",
+        fstype: "ext4",
+        mounts: ["/"],
+      }],
+    },
+    { name: "sdc", type: "disk" },
   );
   alone.findmnt = findmnt({ target: "/", source: "/dev/sda1", fstype: "ext4" });
   alone.fstab = file("");
   alone.mdstat = { state: "absent" };
   alone.links = ok("");
-  alone.blkid = missing;
   alone.mdExamine = {};
+  alone.blkid = ok('/dev/sda1: UUID="1111" TYPE="ext4"\n');
   safe(alone, ["/dev/sdc"]);
+  for (const failing of [missing, NO_SB, { code: 2, stdout: "" }]) {
+    refused({ ...alone, blkid: failing }, ["/dev/sdc"], "unverifiable");
+  }
 });
 
 Deno.test("24b btrfs root on sda1 with an untyped sda2: refused without blkid, allowed with it", () => {
@@ -1797,5 +1803,46 @@ Deno.test("24b btrfs root on sda1 with an untyped sda2: refused without blkid, a
   safe(
     { ...base, blkid: ok(`/dev/sda1: UUID="${BTRFS_UUID}" TYPE="btrfs"\n`) },
     ["/dev/sda2"],
+  );
+});
+
+Deno.test("24c btrfs root spanning sda1 and the whole disk sdc: sdc is judged by blkid, never by its empty type", () => {
+  const rows = lsblk(
+    {
+      name: "sda",
+      type: "disk",
+      children: [{
+        name: "sda1",
+        type: "part",
+        fstype: "btrfs",
+        uuid: BTRFS_UUID,
+        mounts: ["/"],
+      }],
+    },
+    // The second device of the root filesystem is a whole disk with no partition
+    // table, and this host shows no type for it.
+    { name: "sdc", type: "disk" },
+    { name: "sdd", type: "disk" },
+  );
+  const base = plain({
+    lsblk: rows,
+    findmnt: findmnt({ target: "/", source: "/dev/sda1", fstype: "btrfs" }),
+    fstab: file(""),
+  });
+  // blkid failing, however it failed: both whole disks are unverifiable.
+  for (const failing of [missing, NO_SB, { code: 2, stdout: "" }]) {
+    refused({ ...base, blkid: failing }, ["/dev/sdc"], "unverifiable");
+    refused({ ...base, blkid: failing }, ["/dev/sdd"], "unverifiable");
+  }
+  // blkid working and naming sdc as the other btrfs device: protected.
+  const names = ok(
+    `/dev/sda1: UUID="${BTRFS_UUID}" TYPE="btrfs"\n/dev/sdc: UUID="${BTRFS_UUID}" TYPE="btrfs"\n`,
+  );
+  refused({ ...base, blkid: names }, ["/dev/sdc"], "protected");
+  safe({ ...base, blkid: names }, ["/dev/sdd"]);
+  // blkid working and knowing nothing about sdc: empty, unrelated, allowed.
+  safe(
+    { ...base, blkid: ok(`/dev/sda1: UUID="${BTRFS_UUID}" TYPE="btrfs"\n`) },
+    ["/dev/sdc"],
   );
 });

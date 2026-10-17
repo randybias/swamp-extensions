@@ -1,0 +1,23 @@
+manifestVersion: 1
+name: "@randybias/host-net"
+version: "2026.10.17.1"
+description: "Configure Linux host networking over SSH — a bridge (Linux or OVS), a VLAN-tagged storage plane and jumbo MTU — under an automatic revert armed before anything is changed. Every interface, MAC, VLAN id, MTU and address is an input, and the host-key policy is required; one definition serves any host."
+license: Apache-2.0
+repository: https://github.com/randybias/swamp-extensions
+platforms: [darwin-aarch64, darwin-x86_64, linux-x86_64, linux-aarch64]
+labels: [
+  linux,
+  networking,
+  bridge,
+  openvswitch,
+  vlan,
+  mtu,
+  netplan,
+  ssh,
+  revert,
+  lockdown-safety,
+]
+additionalFiles: [README.md, LICENSE.txt]
+models:
+  - host_net.ts
+workflows: []

@@ -75,10 +75,12 @@ policy.
   separate argv words, remote XML lands in an allowlisted temp path and is
   removed in a `finally`.
 - **Serial console.** Rendered domains carry `<serial type='pty'>` +
-  `<console type='pty'>`; `console` runs
-  `virsh console <name> --force
-  --timeout <s>` so it can never block past the
-  timeout.
+  `<console type='pty'>`; `virsh console` has no `--timeout` and needs a pty, so
+  `console` runs
+  `timeout -s KILL <s> script -qec 'virsh ... console <name>
+  --force'` with a
+  local deadline backstop, and returns only `bytes`/`sha256` (the text stays in
+  the sensitive `console_capture` resource).
 
 ## Gates
 
@@ -86,6 +88,48 @@ policy.
 gates 7 (dry run) and 8 (adversarial review) are SKIP; live `virsh` cells need a
 KVM-capable target and are marked blocked.
 
-Unit tests (68 across `libvirt_test.ts` and the `_lib/*_test.ts` files) assemble
+Unit tests (77 across `libvirt_test.ts` and the `_lib/*_test.ts` files) assemble
 the exact `virsh` argv and parse `virsh` output with a fake transport; they
 never touch a real hypervisor.
+
+## Round 1 review fixes (head 95dec2e)
+
+Ledger: `reviews/libvirt/...` (lead). Every Critical/High/Medium item addressed;
+no release.yaml edit and no server-host in the branch (the lead owns
+release.yaml).
+
+- **BLOCKER** — rebased `lane/d4` onto `origin/main` so the diff is `libvirt/`
+  only: the server-host commits and the release.yaml edit are gone.
+- **HIGH** — `arch` was a free string injected into `<type arch='...'>`: it is
+  now a `z.enum` allowlist (`x86_64|aarch64|i686|ppc64le|s390x`) and
+  `renderDomainXml` asserts it (`assertArch`).
+- **HIGH** — `escapeXmlAttribute` left `'` unescaped while `dns_domain` is
+  written into a single-quoted attribute: `'` is now escaped to `&apos;`, and
+  `dns_domain` must match a DNS-name grammar (`assertDnsName`, `DNS_NAME_RE`).
+- **HIGH** — `define_network` destroyed and redefined a differing network even
+  with `replace=false`. Now only `replace=true` does; otherwise the network is
+  left untouched and the result reports `drift: true` (with a warning log). The
+  old test that asserted the bug was rewritten and a no-replace drift test
+  added.
+- **HIGH** — `console` returned the raw capture text in `result.text`, and swamp
+  has no sensitive result schema (RULINGS 4). The result now returns only
+  `target`, `domain`, `bytes` and `sha256`; the text stays in the sensitive
+  `console_capture` resource.
+- **HIGH** — `virsh console` has no `--timeout` and needs a controlling TTY.
+  `consoleArgv` now wraps it as
+  `timeout -s KILL <s> script -qec '<virsh ...
+  console>' /dev/null` (stdin is
+  the closed ssh channel), and the method adds a local `withDeadline` backstop.
+  The argv test now checks the real option names and the absence of `--timeout`.
+- **MEDIUM** — `net-info`/`dominfo`/`vol-info` treated every non-zero exit as
+  absent. They now use `isNotFound`, so only explicit not-found errors mean
+  absence and a broken URI/permission/libvirtd records a typed error instead.
+- **MEDIUM** — raw network `xml` was not checked against `name`. `<name>` is
+  parsed from the XML and must equal `name` before any undefine/define.
+- **MEDIUM** — `URI_RE` accepted `+ssh`/`+tls`/`+unix`, userinfo and query
+  params. It is now local schemes only (`qemu|test|xen|lxc|vbox|bhyve:///`),
+  which also rejects userinfo and query params; documented in the README.
+- **MEDIUM** — `devname` had only a length check; it now matches `NAME_RE`.
+- **MEDIUM** — method descriptions: `define_network`, `define_domain` and
+  `power` now start with the exact `DESTRUCTIVE.` prefix, and `define_domain`
+  was trimmed to three sentences.

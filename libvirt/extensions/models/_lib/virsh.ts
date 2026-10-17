@@ -9,6 +9,7 @@
 import {
   exec,
   type ExecResult,
+  quoteArgv,
   type SshDeps,
   type SshTarget,
   upload,
@@ -99,14 +100,48 @@ export async function removeFile(
   await exec(deps, target, ["rm", "-f", "--", path]).catch(() => undefined);
 }
 
-/** The argv that attaches to a domain's serial console with a hard timeout. */
+/** The argv that attaches to a domain's serial console under a hard bound. */
 export function consoleArgv(
   uri: string,
   name: string,
   timeoutS: number,
   devname?: string,
 ): string[] {
-  const args = ["console", name, "--force", "--timeout", String(timeoutS)];
+  const args = ["console", name, "--force"];
   if (devname !== undefined) args.push("--devname", devname);
-  return virshArgv(uri, args);
+  // `virsh console` has no --timeout option and needs a controlling TTY, so
+  // wrap it: `script` allocates a pty and `timeout -s KILL` is the real bound
+  // (its stdin is the ssh channel, which the transport closes).
+  const inner = quoteArgv(virshArgv(uri, args));
+  return [
+    "timeout",
+    "-s",
+    "KILL",
+    String(timeoutS),
+    "script",
+    "-qec",
+    inner,
+    "/dev/null",
+  ];
+}
+
+const NOT_FOUND: Record<string, RegExp> = {
+  network:
+    /failed to get network|network not found|no network with matching name/i,
+  domain: /failed to get domain|domain not found|no domain with matching name/i,
+  volume:
+    /failed to get vol|storage volume not found|no storage vol with matching name/i,
+};
+
+/**
+ * True when a non-zero `virsh` exit is an explicit not-found (the object is
+ * absent), as opposed to a hard error such as a refused connection or denied
+ * permission, which the caller must surface rather than read as absence.
+ */
+export function isNotFound(
+  result: ExecResult,
+  kind: "network" | "domain" | "volume",
+): boolean {
+  if (result.exit_code === 0) return false;
+  return NOT_FOUND[kind].test(`${result.stderr}\n${result.stdout}`);
 }

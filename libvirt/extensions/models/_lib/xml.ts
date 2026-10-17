@@ -8,6 +8,8 @@
  */
 
 import {
+  assertArch,
+  assertDnsName,
   assertIpv4,
   assertMac,
   assertName,
@@ -64,7 +66,8 @@ function escapeXmlAttribute(value: string): string {
     .replace(/&/g, "&amp;")
     .replace(/</g, "&lt;")
     .replace(/>/g, "&gt;")
-    .replace(/"/g, "&quot;");
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&apos;");
 }
 
 function indent(depth: number): string {
@@ -102,6 +105,7 @@ export function renderNetworkXml(spec: NetworkSpec): string {
         `${indent(3)}<range start='${spec.dhcpStart}' end='${spec.dhcpEnd}'/>`,
       );
       if (spec.domain !== undefined) {
+        assertDnsName(spec.domain);
         lines.push(`${indent(3)}<bootp/>`);
         lines.push(
           `${indent(3)}<domain name='${
@@ -122,6 +126,7 @@ export function renderDomainXml(spec: DomainSpec): string {
   assertName(spec.name, "domain name");
   assertName(spec.pool, "pool name");
   assertName(spec.volume, "volume name");
+  assertArch(spec.arch);
   if (spec.mac !== undefined) assertMac(spec.mac);
   const lines: string[] = [
     "<domain type='kvm'>",
@@ -175,7 +180,7 @@ export function renderDomainXml(spec: DomainSpec): string {
   return lines.join("\n") + "\n";
 }
 
-function firstTagText(xml: string, tag: string): string {
+export function firstTagText(xml: string, tag: string): string {
   const m = new RegExp(`<${tag}(?:\\s[^>]*)?>([^<]*)</${tag}>`).exec(xml);
   return m ? m[1].trim() : "";
 }

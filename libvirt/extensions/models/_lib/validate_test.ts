@@ -1,9 +1,13 @@
 import { assertEquals, assertThrows } from "jsr:@std/assert@1.0.19";
 import {
+  ARCHES,
+  assertArch,
+  assertDnsName,
   assertIpv4,
   assertMac,
   assertName,
   assertUri,
+  DNS_NAME_RE,
   isIpv4,
   LibvirtConfigError,
   NAME_RE,
@@ -32,14 +36,14 @@ Deno.test("name: allowlisted object names only", () => {
   }
 });
 
-Deno.test("uri: accepted libvirt schemes, no shell metacharacters", () => {
+Deno.test("uri: local schemes only, no nested ssh, userinfo or query", () => {
   for (
     const good of [
       "qemu:///system",
       "qemu:///session",
-      "qemu+ssh://root@192.0.2.10/system",
-      "qemu+tls://hv.example.com/system",
+      "qemu:///",
       "test:///default",
+      "lxc:///",
     ]
   ) {
     assertEquals(URI_RE.test(good), true, good);
@@ -52,10 +56,36 @@ Deno.test("uri: accepted libvirt schemes, no shell metacharacters", () => {
       "http://example.com",
       "qemu:///system`id`",
       "",
+      // A remote URI would open a second SSH/TLS session outside our policy.
+      "qemu+ssh://root@192.0.2.10/system",
+      "qemu+tls://hv.example.com/system",
+      "xen+ssh://root@192.0.2.10/",
+      // Userinfo and query parameters are refused too.
+      "qemu://root@host/system",
+      "qemu:///system?command=/bin/sh",
+      "qemu:///system?keyfile=/tmp/key",
+      "qemu:///system?no_verify=1",
       "qemu:///" + "x".repeat(240),
     ]
   ) {
     assertThrows(() => assertUri(bad), LibvirtConfigError);
+  }
+});
+
+Deno.test("arch: only the accepted guest architectures", () => {
+  for (const good of ARCHES) assertArch(good);
+  for (const bad of ["x86_64'> <script/>", "", "arm64", "amd64"]) {
+    assertThrows(() => assertArch(bad), LibvirtConfigError);
+  }
+});
+
+Deno.test("dns name: no quote or element injection", () => {
+  for (const good of ["example.test", "a.b.example.com", "host-1"]) {
+    assertEquals(DNS_NAME_RE.test(good), true, good);
+    assertDnsName(good);
+  }
+  for (const bad of ["a'b", "a b", "a<b>", "-lead", "trail-", ""]) {
+    assertThrows(() => assertDnsName(bad), LibvirtConfigError);
   }
 });
 

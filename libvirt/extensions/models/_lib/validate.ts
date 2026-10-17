@@ -21,31 +21,44 @@ export const NAME_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,62}$/;
 const MAC_RE = /^(?:[0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2}$/;
 const IPV4_RE =
   /^(?:(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)\.){3}(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)$/;
-const CIDR_SCHEME =
-  "(?:qemu|qemu\\+ssh|qemu\\+tls|qemu\\+unix|xen|xen\\+ssh|vbox|bhyve|lxc|lxc\\+ssh|test)";
-/** Grammar for an accepted libvirt connection URI. */
+const URI_SCHEME_PATTERN = "(?:qemu|test|xen|lxc|vbox|bhyve)";
+/**
+ * Grammar for an accepted libvirt connection URI. Local connection schemes
+ * only: a `+ssh`/`+tls` remote URI or a URI query parameter (`command=`,
+ * `keyfile=`, `no_verify=`, a userinfo section) would make the remote libvirt
+ * open a connection of its own, outside this extension's host-key policy, so
+ * those are rejected here.
+ */
 export const URI_RE = new RegExp(
-  `^${CIDR_SCHEME}://[A-Za-z0-9._~:@%/?=&#\\[\\]-]{0,200}$`,
+  `^${URI_SCHEME_PATTERN}:///[A-Za-z0-9._/-]{0,120}$`,
 );
 /** Grammar for a colon-separated MAC address. */
 export const MAC_ADDRESS_RE = MAC_RE;
 /** Grammar for a dotted-quad IPv4 address. */
 export const IPV4_ADDRESS_RE = IPV4_RE;
 
-/** Libvirt connection URI schemes this extension accepts. */
+/** Libvirt connection URI schemes this extension accepts (local only). */
 export const URI_SCHEMES = [
   "qemu",
-  "qemu+ssh",
-  "qemu+tls",
-  "qemu+unix",
+  "test",
   "xen",
-  "xen+ssh",
+  "lxc",
   "vbox",
   "bhyve",
-  "lxc",
-  "lxc+ssh",
-  "test",
 ] as const;
+
+/** Guest architectures accepted for a rendered domain's `<type arch='...'>`. */
+export const ARCHES = [
+  "x86_64",
+  "aarch64",
+  "i686",
+  "ppc64le",
+  "s390x",
+] as const;
+
+/** Grammar for a DNS domain written into a network's DHCP block. */
+export const DNS_NAME_RE =
+  /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)*$/;
 
 /** Forward modes accepted for a structured network definition. */
 export const NETWORK_MODES = ["nat", "route", "bridge", "none"] as const;
@@ -78,6 +91,24 @@ export function assertMac(s: string): void {
 export function assertIpv4(s: string): void {
   if (!IPV4_RE.test(s)) {
     throw new LibvirtConfigError(`Not an IPv4 address: ${s}`);
+  }
+}
+
+/** Throws unless `s` is one of the accepted guest architectures. */
+export function assertArch(s: string): void {
+  if (!(ARCHES as readonly string[]).includes(s)) {
+    throw new LibvirtConfigError(
+      `Not an accepted guest architecture: ${s} (expected one of ${
+        ARCHES.join(", ")
+      })`,
+    );
+  }
+}
+
+/** Throws unless `s` is a DNS name safe for a single-quoted XML attribute. */
+export function assertDnsName(s: string): void {
+  if (s.length > 253 || !DNS_NAME_RE.test(s)) {
+    throw new LibvirtConfigError(`Not a DNS name: ${s}`);
   }
 }
 

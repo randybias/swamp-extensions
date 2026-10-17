@@ -184,7 +184,9 @@ Deno.test("define_network: creates, starts and autostarts, then records state", 
     [
       "'net-info'",
       (n) =>
-        n === 0 ? { code: 1, stderr: "no such network" } : n === 1
+        n === 0
+          ? { code: 1, stderr: "error: failed to get network" }
+          : n === 1
           ? {
             code: 0,
             stdout: "Name: net-a\nActive: no\nAutostart: no\nUUID: u1\n",
@@ -259,7 +261,7 @@ Deno.test("define_network: an identical projection is a no-op", async () => {
   assertEquals(has(f, "'net-destroy'"), false);
 });
 
-Deno.test("define_network: a changed projection is replaced", async () => {
+Deno.test("define_network: a changed projection with replace=true is replaced", async () => {
   const existing = renderNetworkXml({
     name: "net-a",
     mode: "route",
@@ -287,6 +289,7 @@ Deno.test("define_network: a changed projection is replaced", async () => {
       mode: "nat",
       gateway: "192.0.2.1",
       prefix: 24,
+      replace: true,
     }),
     context,
   );
@@ -296,9 +299,130 @@ Deno.test("define_network: a changed projection is replaced", async () => {
   assertEquals(has(f, "'net-define'"), true);
 });
 
+Deno.test("define_network: a differing network without replace is left untouched", async () => {
+  const existing = renderNetworkXml({
+    name: "net-a",
+    mode: "route",
+    gateway: "192.0.2.1",
+    prefix: 24,
+  });
+  const f = fakeLibvirt(seq([
+    [
+      "'net-info'",
+      () => ({
+        code: 0,
+        stdout: "Name: net-a\nActive: yes\nAutostart: yes\nUUID: u1\n",
+      }),
+    ],
+    ["'net-dumpxml'", () => ({ code: 0, stdout: existing })],
+  ]));
+  const m = modelWith(f);
+  const { context } = createModelTestContext({ globalArgs: {} });
+  const out = await m.methods.define_network.execute(
+    m.methods.define_network.arguments.parse({
+      ...NET,
+      mode: "nat",
+      gateway: "192.0.2.1",
+      prefix: 24,
+    }),
+    context,
+  );
+  assertEquals(out.result.changed, false);
+  assertEquals(out.result.drift, true);
+  assertEquals(has(f, "'net-define'"), false);
+  assertEquals(has(f, "'net-destroy'"), false);
+  assertEquals(has(f, "'net-undefine'"), false);
+});
+
+Deno.test("define_network: raw xml must name the requested network", async () => {
+  const f = fakeLibvirt(seq([]));
+  const m = modelWith(f);
+  const { context } = createModelTestContext({ globalArgs: {} });
+  await assertRejects(
+    () =>
+      m.methods.define_network.execute(
+        m.methods.define_network.arguments.parse({
+          ...NET,
+          xml: "<network><name>other</name></network>",
+        }),
+        context,
+      ),
+    Error,
+    "names the network",
+  );
+  assertEquals(has(f, "'net-define'"), false);
+});
+
+Deno.test("schema: devname uses the name grammar; arch is enum-bound", () => {
+  const m = createModel();
+  assertEquals(
+    m.methods.console.arguments.safeParse({
+      ...SSH,
+      uri: URI,
+      name: "n",
+      devname: "serial0",
+    }).success,
+    true,
+  );
+  assertEquals(
+    m.methods.console.arguments.safeParse({
+      ...SSH,
+      uri: URI,
+      name: "n",
+      devname: "serial;0",
+    }).success,
+    false,
+  );
+  const domain = (arch: string) => ({
+    ...SSH,
+    uri: URI,
+    name: "n",
+    pool: "p",
+    volume: "v",
+    vcpus: 1,
+    memory_mib: 1024,
+    arch,
+  });
+  assertEquals(
+    m.methods.define_domain.arguments.safeParse(domain("x86_64")).success,
+    true,
+  );
+  assertEquals(
+    m.methods.define_domain.arguments.safeParse(domain("amd64")).success,
+    false,
+  );
+});
+
+Deno.test("networkInfo: a hard error is surfaced, not read as absent", async () => {
+  const f = fakeLibvirt(seq([
+    [
+      "'net-info'",
+      () => ({
+        code: 1,
+        stderr: "error: failed to connect to the hypervisor",
+      }),
+    ],
+  ]));
+  const m = modelWith(f);
+  const { context, getWrittenResources } = createModelTestContext({
+    globalArgs: {},
+  });
+  await assertRejects(
+    () =>
+      m.methods.undefine_network.execute(
+        m.methods.undefine_network.arguments.parse(NET),
+        context,
+      ),
+    Error,
+    "could not read network",
+  );
+  assertEquals(has(f, "'net-undefine'"), false);
+  assertEquals(getWrittenResources().length, 0);
+});
+
 Deno.test("undefine_network: absent is a no-op; active is stopped and undefined", async () => {
   const absent = fakeLibvirt(seq([
-    ["'net-info'", () => ({ code: 1, stderr: "no such network" })],
+    ["'net-info'", () => ({ code: 1, stderr: "error: failed to get network" })],
   ]));
   const absentModel = modelWith(absent);
   const ctxA = createModelTestContext({ globalArgs: {} });
@@ -343,7 +467,7 @@ Deno.test("clone_volume: clones once, then is a no-op on an existing target", as
     [
       "'node-a-root'",
       (n) =>
-        n === 0 ? { code: 1, stderr: "no such volume" } : {
+        n === 0 ? { code: 1, stderr: "error: Storage volume not found" } : {
           code: 0,
           stdout: "Name: node-a-root\nPath: /p/node-a-root\nCapacity: 20 GiB\n",
         },
@@ -370,7 +494,10 @@ Deno.test("clone_volume: clones once, then is a no-op on an existing target", as
 
 Deno.test("clone_volume: a missing golden volume is a typed error", async () => {
   const f = fakeLibvirt(seq([
-    ["'golden'", () => ({ code: 1, stderr: "no such volume" })],
+    [
+      "'golden'",
+      () => ({ code: 1, stderr: "error: Storage volume not found" }),
+    ],
   ]));
   const m = modelWith(f);
   const ctx = createModelTestContext({ globalArgs: {} });
@@ -402,7 +529,7 @@ Deno.test("define_domain: defines from the clone and starts when asked", async (
       "'dominfo'",
       (n) =>
         n === 0
-          ? { code: 1, stderr: "no domain" }
+          ? { code: 1, stderr: "error: failed to get domain" }
           : { code: 0, stdout: SHUT_OFF },
     ],
     ["'define'", () => ({ code: 0 })],
@@ -487,7 +614,7 @@ Deno.test("power: idempotent toward the state; destroy runs; reboot off refuses"
   );
 });
 
-Deno.test("console: bounded capture returns text and stores it sensitively", async () => {
+Deno.test("console: bounded capture stores the text and returns only its digest", async () => {
   const f = fakeLibvirt(seq([
     ["'dominfo'", () => ({ code: 0, stdout: RUNNING })],
     ["'console'", () => ({ code: 0, stdout: "boot log line\nlogin: " })],
@@ -503,11 +630,16 @@ Deno.test("console: bounded capture returns text and stores it sensitively", asy
     }),
     ctx.context,
   );
-  assertEquals(out.result.text, "boot log line\nlogin: ");
+  assertEquals(out.result.bytes, "boot log line\nlogin: ".length);
+  assertEquals(typeof out.result.sha256, "string");
+  assertEquals((out.result as Record<string, unknown>).text, undefined);
   assertEquals(has(f, "'console'"), true);
-  assertEquals(has(f, "--timeout"), true);
+  assertEquals(has(f, "'timeout'"), true);
+  assertEquals(has(f, "'script'"), true);
   assertEquals(has(f, "--force"), true);
   const written = ctx.getWrittenResources()[0];
+  assertEquals(written.data.text, "boot log line\nlogin: ");
+  assertEquals(written.data.sha256, out.result.sha256);
   const textMeta = (m.resources.console_capture.schema as unknown as {
     shape: Record<string, { meta: () => { sensitive?: boolean } }>;
   }).shape.text.meta();
@@ -517,7 +649,7 @@ Deno.test("console: bounded capture returns text and stores it sensitively", asy
 
 Deno.test("undefine_domain: absent no-op; running destroy + undefine with volumes", async () => {
   const absent = fakeLibvirt(seq([
-    ["'dominfo'", () => ({ code: 1, stderr: "no domain" })],
+    ["'dominfo'", () => ({ code: 1, stderr: "error: failed to get domain" })],
   ]));
   const am = modelWith(absent);
   const ac = createModelTestContext({ globalArgs: {} });
@@ -646,8 +778,9 @@ Deno.test("console: a timed-out capture returns the text so far, never hangs", a
     }),
     ctx.context,
   );
-  assertEquals(out.result.text, "partial boot log\n");
-  assertEquals(out.result.bytes, 17);
+  assertEquals(out.result.bytes, "partial boot log\n".length);
+  assertEquals((out.result as Record<string, unknown>).text, undefined);
+  assertEquals(ctx.getWrittenResources()[0].data.text, "partial boot log\n");
   assertEquals(ctx.getWrittenResources().length, 1);
 });
 

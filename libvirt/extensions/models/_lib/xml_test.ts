@@ -1,4 +1,5 @@
-import { assertEquals } from "jsr:@std/assert@1.0.19";
+import { assertEquals, assertThrows } from "jsr:@std/assert@1.0.19";
+import { LibvirtConfigError } from "./validate.ts";
 import {
   domainState,
   isOffState,
@@ -135,6 +136,38 @@ Deno.test("parsers: key-values, name lists and volume lists", () => {
       },
       { name: "golden", path: "/var/lib/libvirt/images/golden.qcow2" },
     ],
+  );
+});
+
+Deno.test("domain xml: an unaccepted arch is refused", () => {
+  assertThrows(
+    () =>
+      renderDomainXml({
+        name: "node-a",
+        pool: "pool-a",
+        volume: "node-a-root",
+        vcpus: 2,
+        memoryMib: 2048,
+        format: "qcow2",
+        arch: "x86_64'> <script/>",
+      }),
+    LibvirtConfigError,
+  );
+});
+
+Deno.test("network xml: a dns domain with a quote is refused", () => {
+  assertThrows(
+    () =>
+      renderNetworkXml({
+        name: "net-a",
+        mode: "nat",
+        gateway: "192.0.2.1",
+        prefix: 24,
+        dhcpStart: "192.0.2.10",
+        dhcpEnd: "192.0.2.99",
+        domain: "a'b",
+      }),
+    LibvirtConfigError,
   );
 });
 

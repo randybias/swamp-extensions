@@ -24,9 +24,11 @@ import {
   type SshTarget,
 } from "./_lib/ssh.ts";
 import {
+  ARCHES,
   assertName,
   assertUri,
   DISK_FORMATS,
+  DNS_NAME_RE,
   IPV4_ADDRESS_RE,
   LibvirtConfigError,
   MAC_ADDRESS_RE,
@@ -36,6 +38,7 @@ import {
 } from "./_lib/validate.ts";
 import {
   domainState,
+  firstTagText,
   isOffState,
   isPausedState,
   isRunningState,
@@ -50,6 +53,7 @@ import {
 import {
   consoleArgv,
   isBenign,
+  isNotFound,
   LibvirtError,
   removeFile,
   uploadXml,
@@ -124,7 +128,7 @@ const NetworkFields = {
     .describe("DHCP range start"),
   dhcp_end: z.string().min(1).max(15).regex(IPV4_ADDRESS_RE).optional()
     .describe("DHCP range end"),
-  dns_domain: z.string().min(1).max(253).optional().describe(
+  dns_domain: z.string().min(1).max(253).regex(DNS_NAME_RE).optional().describe(
     "DNS domain served by the DHCP block",
   ),
   start: z.boolean().default(true).describe(
@@ -134,7 +138,7 @@ const NetworkFields = {
     "Autostart the network on host boot",
   ),
   replace: z.boolean().default(false).describe(
-    "Replace an existing network when the config differs (structured) or always (raw XML)",
+    "Destroy and redefine an existing network; with replace=false a differing network is left untouched and the drift is reported",
   ),
 };
 
@@ -172,7 +176,7 @@ const DefineDomainArgs = z.strictObject({
     "Memory in MiB",
   ),
   format: z.enum(DISK_FORMATS).default("qcow2").describe("Disk driver format"),
-  arch: z.string().min(1).max(32).default("x86_64").describe("Guest arch"),
+  arch: z.enum(ARCHES).default("x86_64").describe("Guest architecture"),
   network: z.string().min(1).max(63).regex(NAME_RE).optional().describe(
     "libvirt network to attach",
   ),
@@ -211,7 +215,7 @@ const ConsoleArgs = z.strictObject({
   timeout_s: z.number().int().min(1).max(300).default(15).describe(
     "Seconds to capture before disconnecting, 1-300",
   ),
-  devname: z.string().min(1).max(63).optional().describe(
+  devname: z.string().min(1).max(63).regex(NAME_RE).optional().describe(
     "Console device name, when the domain has more than one",
   ),
 });
@@ -279,6 +283,7 @@ const ConsoleStateSchema = z.strictObject({
   text: z.string().meta({ sensitive: true }).describe(
     "Captured serial console text; may carry boot or login secrets",
   ),
+  sha256: z.string(),
   bytes: z.number().int(),
   observed_at: z.string(),
 });
@@ -427,7 +432,14 @@ async function networkInfo(
 > {
   const res = await virshTry(deps, t, uri, ["net-info", name]);
   if (res.exit_code !== 0) {
-    return { present: false, active: false, autostart: false, uuid: "" };
+    if (isNotFound(res, "network")) {
+      return { present: false, active: false, autostart: false, uuid: "" };
+    }
+    throw new LibvirtError(
+      `could not read network ${name} (exit ${res.exit_code}): ${
+        `${res.stderr || res.stdout}`.trim().slice(0, 300)
+      }`,
+    );
   }
   const kv = parseKeyValues(res.stdout);
   return {
@@ -445,7 +457,14 @@ async function domainInfo(
   name: string,
 ): Promise<Record<string, string>> {
   const res = await virshTry(deps, t, uri, ["dominfo", name]);
-  if (res.exit_code !== 0) return {};
+  if (res.exit_code !== 0) {
+    if (isNotFound(res, "domain")) return {};
+    throw new LibvirtError(
+      `could not read domain ${name} (exit ${res.exit_code}): ${
+        `${res.stderr || res.stdout}`.trim().slice(0, 300)
+      }`,
+    );
+  }
   return parseKeyValues(res.stdout);
 }
 
@@ -463,7 +482,13 @@ async function volumePresent(
     "--",
     name,
   ]);
-  return res.exit_code === 0;
+  if (res.exit_code === 0) return true;
+  if (isNotFound(res, "volume")) return false;
+  throw new LibvirtError(
+    `could not read volume ${name} in pool ${pool} (exit ${res.exit_code}): ${
+      `${res.stderr || res.stdout}`.trim().slice(0, 300)
+    }`,
+  );
 }
 
 function buildNetworkSpec(args: {
@@ -541,7 +566,7 @@ export function createModel(overrides: Partial<LibvirtDeps> = {}) {
     methods: {
       define_network: {
         description:
-          "Idempotent. Define a network from raw XML or structured inputs, then start and autostart it as asked. A structured network whose projection already matches is a no-op; a differing one is replaced only when replace is true.",
+          "DESTRUCTIVE. Define a network from raw XML or structured inputs, then start and autostart it as asked. With replace=true a differing existing network is destroyed and redefined; otherwise a differing network is left untouched and reported as drift, and an identical one is a no-op.",
         kind: "action" as const,
         arguments: DefineNetworkArgs,
         execute: async (
@@ -555,21 +580,23 @@ export function createModel(overrides: Partial<LibvirtDeps> = {}) {
               "give either xml or mode, not both",
             );
           }
+          if (args.xml !== undefined) {
+            const xmlName = firstTagText(args.xml, "name");
+            if (xmlName !== args.name) {
+              throw new LibvirtConfigError(
+                `raw xml names the network ${
+                  JSON.stringify(xmlName || "(none)")
+                }, expected ${JSON.stringify(args.name)}`,
+              );
+            }
+          }
           const xml = args.xml ?? renderNetworkXml(buildNetworkSpec(args));
           const t = targetOf(args);
           const before = await networkInfo(deps, t, args.uri, args.name);
           let changed = false;
+          let drift = false;
           if (before.present) {
-            let redefine = args.replace;
-            if (!redefine && args.xml === undefined) {
-              const dump = await virsh(deps, t, args.uri, [
-                "net-dumpxml",
-                args.name,
-              ]);
-              redefine = networkProjection(dump.stdout) !==
-                networkProjection(xml);
-            }
-            if (redefine) {
+            if (args.replace) {
               if (before.active) {
                 const stop = await virshTry(deps, t, args.uri, [
                   "net-destroy",
@@ -586,6 +613,19 @@ export function createModel(overrides: Partial<LibvirtDeps> = {}) {
               await virsh(deps, t, args.uri, ["net-undefine", args.name]);
               await defineFromXml(deps, t, args.uri, "net-define", xml);
               changed = true;
+            } else if (args.xml === undefined) {
+              const dump = await virsh(deps, t, args.uri, [
+                "net-dumpxml",
+                args.name,
+              ]);
+              drift = networkProjection(dump.stdout) !==
+                networkProjection(xml);
+              if (drift) {
+                context.logger.warning(
+                  "network {name} differs from the requested config; pass replace=true to change it",
+                  { name: args.name },
+                );
+              }
             }
           } else {
             await defineFromXml(deps, t, args.uri, "net-define", xml);
@@ -630,6 +670,7 @@ export function createModel(overrides: Partial<LibvirtDeps> = {}) {
               active: after.active,
               autostart: after.autostart,
               changed,
+              drift,
             },
           };
         },
@@ -787,7 +828,7 @@ export function createModel(overrides: Partial<LibvirtDeps> = {}) {
       },
       define_domain: {
         description:
-          "Idempotent. Define a KVM domain that boots from a pool volume, usually a clone of the golden volume, from rendered XML. An existing domain of the same name is a no-op unless replace is true; start is optional. The rendered XML wires a pty serial console.",
+          "DESTRUCTIVE. Define a KVM domain that boots from a pool volume, usually a clone of the golden volume, from rendered XML. An existing domain is a no-op unless replace=true, which destroys and redefines it; start is optional, and the rendered XML wires a pty serial console.",
         kind: "action" as const,
         arguments: DefineDomainArgs,
         execute: async (
@@ -875,7 +916,7 @@ export function createModel(overrides: Partial<LibvirtDeps> = {}) {
       },
       power: {
         description:
-          "DESTRUCTIVE when action is destroy (immediate power-off, loses guest state). Start, shut down, destroy, reboot, suspend or resume a domain, idempotent toward the desired state: a domain already in the target state is a no-op.",
+          "DESTRUCTIVE. Start, shut down, destroy, reboot, suspend or resume a domain, idempotent toward the desired state. destroy is an immediate power-off that loses guest state, and a domain already in the target state is a no-op.",
         kind: "action" as const,
         arguments: PowerArgs,
         execute: async (
@@ -977,7 +1018,7 @@ export function createModel(overrides: Partial<LibvirtDeps> = {}) {
       },
       console: {
         description:
-          "READ-ONLY. Attach to a domain's serial console with a hard timeout and return the captured text. Never blocks past timeout_s; the capture is stored as a sensitive resource because it can carry boot or login secrets.",
+          "READ-ONLY. Attach to a domain's serial console under a hard timeout and store the captured text as a sensitive resource. Never blocks past timeout_s; returns the byte count and SHA-256 of the capture, never the text itself.",
         arguments: ConsoleArgs,
         execute: async (
           args: z.infer<typeof ConsoleArgs>,
@@ -990,10 +1031,17 @@ export function createModel(overrides: Partial<LibvirtDeps> = {}) {
           if (Object.keys(info).length === 0) {
             throw new LibvirtError(`domain ${args.name} not found`);
           }
-          const res: ExecResult = await exec(
-            deps,
-            t,
-            consoleArgv(args.uri, args.name, args.timeout_s, args.devname),
+          const guardMs = (args.timeout_s + args.connect_timeout_s + 30) * 1000;
+          const res: ExecResult = await withDeadline(
+            exec(
+              deps,
+              t,
+              consoleArgv(args.uri, args.name, args.timeout_s, args.devname),
+            ),
+            guardMs,
+            `console capture for ${args.name} exceeded its ${
+              guardMs / 1000
+            }s local deadline`,
           );
           const text = res.stdout;
           if (res.exit_code !== 0 && text.trim() === "") {
@@ -1001,6 +1049,7 @@ export function createModel(overrides: Partial<LibvirtDeps> = {}) {
               `could not attach to the console of ${args.name} (exit ${res.exit_code})`,
             );
           }
+          const sha256 = await sha256Hex(text);
           const handle = await context.writeResource(
             "console_capture",
             instanceName("console", args, args.name),
@@ -1008,6 +1057,7 @@ export function createModel(overrides: Partial<LibvirtDeps> = {}) {
               target: targetKey(args),
               domain: args.name,
               text,
+              sha256,
               bytes: text.length,
               observed_at: new Date(deps.now()).toISOString(),
             },
@@ -1017,8 +1067,8 @@ export function createModel(overrides: Partial<LibvirtDeps> = {}) {
             result: {
               target: targetKey(args),
               domain: args.name,
-              text,
               bytes: text.length,
+              sha256,
             },
           };
         },
@@ -1126,6 +1176,29 @@ export function createModel(overrides: Partial<LibvirtDeps> = {}) {
       },
     },
   };
+}
+
+/**
+ * Rejects after `ms` when `work` has not settled. The remote `timeout` bound is
+ * the real one; this is a local backstop against a wedged ssh so a console
+ * capture can never block a run forever.
+ */
+async function withDeadline<T>(
+  work: Promise<T>,
+  ms: number,
+  message: string,
+): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      work,
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(() => reject(new LibvirtError(message)), ms);
+      }),
+    ]);
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+  }
 }
 
 async function collectHost(

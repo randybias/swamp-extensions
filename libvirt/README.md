@@ -18,12 +18,12 @@ operand are method arguments. State is keyed by the canonical
 
 | Method             | Kind   | Description                                                                                        |
 | ------------------ | ------ | -------------------------------------------------------------------------------------------------- |
-| `define_network`   | action | Define a network (raw XML or structured), start and autostart it; re-define only when it differs   |
+| `define_network`   | action | Define a network (raw XML or structured), start and autostart it; `replace=true` to redefine       |
 | `undefine_network` | action | Stop a network if active and undefine it; use this to remove the `default` network                 |
 | `clone_volume`     | action | Clone a golden volume or zvol in a pool to a new volume, via the pool driver (`vol-clone`)         |
 | `define_domain`    | action | Define a KVM domain that boots from a pool volume, with a pty serial console; optionally start it  |
 | `power`            | action | `start`, `shutdown`, `destroy`, `reboot`, `suspend`, `resume`; idempotent toward the desired state |
-| `console`          | query  | Attach to the serial console with a hard timeout and return the captured text                      |
+| `console`          | query  | Attach to the serial console under a hard timeout; returns `bytes` and `sha256`, not the text      |
 | `undefine_domain`  | action | Destroy the domain if running, then undefine it; `remove_volumes` deletes its managed volumes      |
 | `get`              | query  | Report networks, domains and pool volumes from `net-list`, `list` and `vol-list`                   |
 | `sync`             | query  | Probe the host and report drift between the last recorded inventory and the live state             |
@@ -50,14 +50,23 @@ exist, so it always follows a successful clone.
 
 ## Idempotency and safety
 
-- Every object name is checked against `^[A-Za-z0-9][A-Za-z0-9._-]{0,62}$` and
-  every URI against an allowlist of libvirt schemes, so no operand can inject a
-  shell word; operands are passed as argv words, never interpolated into a shell
-  string.
+- Every object name is checked against `^[A-Za-z0-9][A-Za-z0-9._-]{0,62}$`, the
+  guest architecture against an allowlist (`x86_64`, `aarch64`, `i686`,
+  `ppc64le`, `s390x`), a DHCP DNS domain against a DNS-name grammar, and the
+  libvirt URI against local schemes only (`qemu:///`, `test:///`, `xen:///`,
+  `lxc:///`, `vbox:///`, `bhyve:///`), so no operand can inject a shell word or
+  XML. A `+ssh`/`+tls` remote URI, a userinfo section or a URI query parameter
+  is refused: the URI runs on the hypervisor, so it would open a second
+  connection outside this extension's host-key policy.
 - `define_network` compares a stable projection of `net-dumpxml` against the
-  rendered XML; an identical network is a true no-op, and a differing one is
-  only replaced when `replace=true` (or when raw `xml` is given, where the
-  projection cannot be compared).
+  rendered XML; an identical network is a true no-op, a differing one is left
+  untouched and reported as `drift`, and only `replace=true` destroys and
+  redefines it. With raw `xml` the projection cannot be compared, so an existing
+  name is a no-op unless `replace=true`, and the XML's `<name>` must equal
+  `name`.
+- A `net-info`, `dominfo` or `vol-info` failure is only read as absence for an
+  explicit not-found; a refused connection or denied permission is a typed
+  error, so a broken URI can never record `present: false` or trigger a define.
 - `undefine_network` and `undefine_domain` treat an absent object as a clean
   no-op.
 - Remote XML for `*-define` is written to a temp file with an allowlist-checked
@@ -72,7 +81,12 @@ exist, so it always follows a successful clone.
   `host_keys`, and `insecure_tofu` is an explicit opt-in, never a default. There
   is no silent `accept-new`.
 - The `console` capture can carry boot or login secrets, so the
-  `console_capture` resource marks `text` sensitive.
+  `console_capture` resource marks `text` sensitive. The method returns only
+  `bytes` and `sha256`, never the text, because swamp has no sensitive result
+  channel; read the text from the sensitive resource. Capture is bounded by a
+  remote `timeout -s KILL` around `script -qec` (a pty, since `virsh console`
+  needs one and has no `--timeout`), with a local deadline as a backstop, and
+  `max_output_bytes` caps the bytes the transport returns.
 
 ## Install
 
@@ -86,7 +100,9 @@ swamp extension pull @randybias/libvirt
   which the transport uses.
 - A target running libvirtd with `virsh` reachable over SSH, and permission to
   manage the selected connection URI (for example `qemu:///system`, usually as
-  root or via a libvirt group).
+  root or via a libvirt group). The `console` method additionally needs
+  `timeout` and `script` (util-linux) on the target, because `virsh console`
+  needs a pty and has no `--timeout` of its own.
 - An SSH private key, passed as a sensitive argument; the host-key policy is
   required on every call.
 

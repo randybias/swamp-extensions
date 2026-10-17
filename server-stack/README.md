@@ -105,6 +105,34 @@ swamp workflow run @randybias/server-stack-teardown-host \
   --input cloudflare_token_key=dns-edit-token
 ```
 
+## NATS authentication (optional)
+
+Set `nats_auth_token_key` to a key in the `server-stack` vault that holds the
+token. The workflow writes it to Secret `nats-auth` (key `token`, override with
+`nats_auth_secret`) in the chart namespace before installing the chart. The
+chart values must read it from there; they hold a reference, never the token:
+
+```yaml
+nats_chart:
+  values:
+    container:
+      env:
+        NATS_TOKEN:
+          valueFrom:
+            secretKeyRef: { name: nats-auth, key: token }
+    config:
+      merge:
+        authorization:
+          token: "$NATS_TOKEN"
+```
+
+The probe presents the token and then checks that an anonymous connection is
+refused; the run fails if NATS does not enforce authentication. With the key
+unset nothing changes: NATS stays unauthenticated and the original probe runs.
+
+`mesh_handshake_wait_s` (default 60) bounds the wait for the first WireGuard
+handshake after the node joins the mesh; `0` skips the wait.
+
 ## How it works
 
 - `known_hosts` lines may be `<type> <key>` or `<host> <type> <key>`. A line

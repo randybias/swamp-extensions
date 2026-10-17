@@ -146,6 +146,34 @@ install: `config.merge: {host: <mesh address>, http: "0.0.0.0:8222"}` with
   record from the public address used on the first run; its steps are
   idempotent.
 
+## 2026.10.17.4 (handshake wait, optional NATS auth)
+
+- `check-mesh` ran 2 s after the join, before the first WireGuard handshake
+  (found on the ops1 run). A new `wait-mesh` step first tries a TCP connection
+  to the mesh address every 2 s for up to `mesh_handshake_wait_s` (default 60, 0
+  skips the step). Traffic makes WireGuard handshake at once; a control host
+  that is not a peer just waits out the bound for the peer's keepalive. The step
+  never fails: `check-mesh` stays the gate. `verify-mesh` names `join-mesh` as
+  well, so a skipped wait cannot stand in for a failed join.
+- Optional NATS auth: `nats_auth_token_key` (a key in the `server-stack` vault)
+  writes Secret `nats_auth_secret` (default `nats-auth`, key `token`) into the
+  chart namespace before the chart is installed, and `probe-nats-auth` presents
+  the token (env only, never argv) and then proves an anonymous connection is
+  refused; `check-nats` requires `auth_required`, a `+OK` and the refusal.
+  Unset, the three new steps are guarded off and the original `probe-nats` runs
+  unchanged.
+- Why the chart values are not generated: swamp CEL has no map merge and
+  `string(map)` fails, so the workflow cannot add the token reference to the
+  operator's `nats_chart.values`. The operator adds a reference (not the secret)
+  as in the README; a wrong or missing reference is caught because the probe
+  then sees no `auth_required`.
+- `vault.get(...)` is resolved before a ternary picks a branch, so an optional
+  secret needs a guarded step (as here), never `cond ? "" : vault.get(...)`.
+- The probe script's replies end in `\r`: assert on `"\n+OK"`, not `"\n+OK\n"`
+  (found by running the script against a real NATS server in the test).
+- Not done: TLS (server cert handling needs its own design), token rotation
+  (re-running with a new vault value rewrites the Secret; the pods need a roll).
+
 ## Preparing the first long-lived host
 
 - `publish_dns: false` could not be used with the Cloudflare inputs left out:

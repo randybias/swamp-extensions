@@ -246,6 +246,12 @@ inputs:
           via:
             type: string
             maxLength: 63
+    mesh_handshake_wait_s:
+      type: integer
+      description: Longest wait, in seconds, for the first WireGuard handshake before it is checked; 0 skips the wait
+      minimum: 0
+      maximum: 600
+      default: 60
     mesh_handshake_max_age_s:
       type: integer
       description: Reserved; not evaluated because swamp CEL has no clock function
@@ -374,6 +380,21 @@ inputs:
           maxLength: 63
         values:
           type: object
+    nats_auth_token_key:
+      type: string
+      description: >-
+        Vault key (in server-stack) holding a NATS auth token. When set, the
+        token is written to the Secret named by nats_auth_secret (key `token`)
+        before the chart is installed, the chart values must read it from
+        there (see the README), and the probe must see authentication enforced.
+        Unset leaves NATS unauthenticated.
+      default: null
+      maxLength: 256
+    nats_auth_secret:
+      type: string
+      description: Name of the Secret, in the NATS chart namespace, that receives the token
+      default: nats-auth
+      pattern: "^[a-z0-9](?:[a-z0-9.-]{0,251}[a-z0-9])?$"
     nats_probe_port:
       type: integer
       description: NATS client port reached over the mesh
@@ -617,12 +638,55 @@ jobs:
               host_key_policy: strict
               host_keys: '${{ inputs.known_hosts.map(line, {"type": line.split(" ")[size(line.split(" ")) - 2], "key": line.split(" ")[size(line.split(" ")) - 1]}) }}'
               private_key: ${{ vault.get("server-stack", inputs.ssh_private_key_key) }}
-      - name: verify-mesh
-        description: Read the node's WireGuard peers and handshakes via SSH
+      - name: wait-mesh
+        description: Wait, bounded, until the mesh address answers so the first handshake has happened
         dependsOn:
           - step: join-mesh
             condition:
               type: succeeded
+        guard: ${{ inputs.mesh_handshake_wait_s == 0 }}
+        task:
+          type: model_method
+          modelType: command/shell
+          modelName: mesh-wait
+          methodName: execute
+          inputs:
+            # Traffic to the mesh address makes WireGuard handshake at once
+            # instead of at the next keepalive. The step never fails: the
+            # handshake assertion below is the gate, and a control host that is
+            # not a peer simply waits out the bound for the peer's keepalive.
+            run: |
+              bash -c '
+                end=$((SECONDS + WAIT))
+                while ! timeout 3 bash -c "exec 3<>/dev/tcp/\$0/\$1" "$HOST" "$PORT" 2>/dev/null; do
+                  if [ "$SECONDS" -ge "$end" ]; then
+                    echo "no answer from $HOST:$PORT within ${WAIT}s"
+                    exit 0
+                  fi
+                  sleep 2
+                done
+                echo "answered $HOST:$PORT after ${SECONDS}s"
+              '
+            env:
+              HOST: ${{ inputs.mesh_node.address.split("/")[0] }}
+              PORT: ${{ string(inputs.ssh_port) }}
+              WAIT: ${{ string(inputs.mesh_handshake_wait_s) }}
+            timeout: ${{ (inputs.mesh_handshake_wait_s + 15) * 1000 }}
+            ignoreExitCode: true
+      - name: verify-mesh
+        description: Read the node's WireGuard peers and handshakes via SSH
+        dependsOn:
+          # join-mesh is named too: a skipped wait must not stand in for a
+          # failed join.
+          - step: join-mesh
+            condition:
+              type: succeeded
+          - step: wait-mesh
+            condition:
+              type: or
+              conditions:
+                - type: succeeded
+                - type: skipped
         task:
           type: model_method
           modelType: "@randybias/wireguard-mesh"
@@ -1007,10 +1071,41 @@ jobs:
             type: >-
               ${{ has(self.secret.type) ? self.secret.type : "Opaque" }}
             data: ${{ self.secret.data }}
+      - name: apply-nats-auth
+        description: Write the NATS auth token Secret from a vault value via kubectl stdin
+        dependsOn:
+          - step: apply-namespaces
+            condition:
+              type: or
+              conditions:
+                - type: succeeded
+                - type: skipped
+          - step: check-kubeconfig
+            condition:
+              type: succeeded
+        guard: ${{ inputs.nats_auth_token_key == null }}
+        task:
+          type: model_method
+          modelType: "@randybias/k8s-secret"
+          modelName: k8s-secret
+          methodName: apply
+          inputs:
+            kubeconfig: ${{ vault.get("server-stack", inputs.kubeconfig_key) }}
+            namespace: ${{ inputs.nats_chart.namespace }}
+            name: ${{ inputs.nats_auth_secret }}
+            type: Opaque
+            data:
+              token: ${{ vault.get("server-stack", inputs.nats_auth_token_key) }}
       - name: apply-nats
         description: Reconcile the NATS chart via the k0s Helm extension
         guard: ${{ size(inputs.cluster_secrets) > 0 }}
         dependsOn:
+          - step: apply-nats-auth
+            condition:
+              type: or
+              conditions:
+                - type: succeeded
+                - type: skipped
           - step: apply-namespaces
             condition:
               type: or
@@ -1044,6 +1139,12 @@ jobs:
         description: Reconcile the NATS chart via the k0s Helm extension
         guard: ${{ size(inputs.cluster_secrets) == 0 }}
         dependsOn:
+          - step: apply-nats-auth
+            condition:
+              type: or
+              conditions:
+                - type: succeeded
+                - type: skipped
           - step: apply-secrets
             condition:
               type: succeeded
@@ -1085,6 +1186,7 @@ jobs:
     steps:
       - name: probe-nats
         description: Read the NATS INFO banner over the mesh via a TCP probe
+        guard: ${{ inputs.nats_auth_token_key != null }}
         task:
           type: model_method
           modelType: command/shell
@@ -1105,12 +1207,55 @@ jobs:
               NATS_PORT: ${{ string(inputs.nats_probe_port) }}
             timeout: ${{ inputs.verify_timeout_s * 1000 }}
             ignoreExitCode: false
+      - name: probe-nats-auth
+        description: Probe NATS with the token, then prove a connection without it is refused
+        guard: ${{ inputs.nats_auth_token_key == null }}
+        task:
+          type: model_method
+          modelType: command/shell
+          modelName: nats-probe
+          methodName: execute
+          inputs:
+            # The token reaches the probe only through the environment.
+            run: |
+              bash -c '
+                exec 3<>/dev/tcp/"$NATS_HOST"/"$NATS_PORT" || exit 1
+                IFS= read -r info <&3
+                printf "%s\n" "$info"
+                token=${NATS_TOKEN//\\/\\\\}
+                token=${token//\"/\\\"}
+                printf "CONNECT {\"auth_token\":\"%s\"}\r\nPING\r\n" "$token" >&3
+                IFS= read -r pong <&3
+                printf "%s\n" "$pong"
+                exec 4<>/dev/tcp/"$NATS_HOST"/"$NATS_PORT" || exit 1
+                IFS= read -r _ <&4
+                printf "CONNECT {}\r\nPING\r\n" >&4
+                IFS= read -r denied <&4
+                printf "unauthenticated: %s\n" "$denied"
+              '
+            env:
+              NATS_HOST: ${{ inputs.mesh_node.address.split("/")[0] }}
+              NATS_PORT: ${{ string(inputs.nats_probe_port) }}
+              NATS_TOKEN: ${{ vault.get("server-stack", inputs.nats_auth_token_key) }}
+            timeout: ${{ inputs.verify_timeout_s * 1000 }}
+            ignoreExitCode: false
       - name: check-nats
-        description: Check the banner is NATS INFO with the expected server name
+        description: Check the banner is NATS INFO with the expected server name and, with auth on, that auth is enforced
         dependsOn:
+          # Exactly one probe runs (complementary guards); a failed probe
+          # fails the verify job, which blocks the publish job.
           - step: probe-nats
             condition:
-              type: succeeded
+              type: or
+              conditions:
+                - type: succeeded
+                - type: skipped
+          - step: probe-nats-auth
+            condition:
+              type: or
+              conditions:
+                - type: succeeded
+                - type: skipped
         task:
           type: assert
           expr: >-
@@ -1118,8 +1263,12 @@ jobs:
             data.latest("nats-probe", "result").attributes.stdout.contains("server_id") &&
             (inputs.nats_expect_server_name == null ||
             data.latest("nats-probe", "result").attributes.stdout.contains(
-              "\"server_name\":\"" + inputs.nats_expect_server_name + "\""))
-          message: The NATS INFO banner was not as expected
+              "\"server_name\":\"" + inputs.nats_expect_server_name + "\"")) &&
+            (inputs.nats_auth_token_key == null ||
+            (data.latest("nats-probe", "result").attributes.stdout.contains("\"auth_required\":true") &&
+            data.latest("nats-probe", "result").attributes.stdout.contains("\n+OK") &&
+            data.latest("nats-probe", "result").attributes.stdout.contains("unauthenticated: -ERR 'Authorization Violation'")))
+          message: The NATS INFO banner was not as expected, or auth is not enforced
           severity: high
   - name: publish
     description: Create and verify the host's A record only after NATS answers

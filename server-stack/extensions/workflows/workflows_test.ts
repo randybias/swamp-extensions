@@ -193,3 +193,84 @@ Deno.test("known_hosts lines may omit the host field: the mesh mapping reads the
     );
   }
 });
+
+Deno.test("check-mesh waits a bounded time for the first handshake and cannot be bypassed by a failed join", async () => {
+  const s = await read("server-stack-provision-host");
+  const wait = stepText(s, "wait-mesh");
+  assertStringIncludes(wait, "guard: ${{ inputs.mesh_handshake_wait_s == 0 }}");
+  assertStringIncludes(
+    wait,
+    "timeout: ${{ (inputs.mesh_handshake_wait_s + 15) * 1000 }}",
+  );
+  assertStringIncludes(wait, "ignoreExitCode: true");
+  // Skipping the wait is allowed; skipping past a failed join is not.
+  const verify = stepText(s, "verify-mesh");
+  assertStringIncludes(
+    verify,
+    "- step: join-mesh\n            condition:\n              type: succeeded\n",
+  );
+  assertStringIncludes(verify, "- step: wait-mesh");
+  // The assertion stays the gate.
+  assertStringIncludes(
+    stepText(s, "check-mesh"),
+    "message: No mesh peer handshake was recorded",
+  );
+});
+
+Deno.test("NATS auth is off by default: its steps are guarded and the plain probe is the unchanged one", async () => {
+  const s = await read("server-stack-provision-host");
+  assertStringIncludes(
+    s,
+    "    nats_auth_token_key:\n      type: string",
+  );
+  assertStringIncludes(s, "      default: null\n      maxLength: 256");
+  assertStringIncludes(
+    stepText(s, "apply-nats-auth"),
+    "guard: ${{ inputs.nats_auth_token_key == null }}",
+  );
+  assertStringIncludes(
+    stepText(s, "probe-nats-auth"),
+    "guard: ${{ inputs.nats_auth_token_key == null }}",
+  );
+  const plain = stepText(s, "probe-nats");
+  assertStringIncludes(
+    plain,
+    "guard: ${{ inputs.nats_auth_token_key != null }}",
+  );
+  assertEquals(plain.includes("NATS_TOKEN"), false);
+});
+
+Deno.test("the NATS token travels as a vault value in an environment variable or a Secret, never in a script or argv", async () => {
+  const s = await read("server-stack-provision-host");
+  const probe = stepText(s, "probe-nats-auth");
+  assertStringIncludes(
+    probe,
+    'NATS_TOKEN: ${{ vault.get("server-stack", inputs.nats_auth_token_key) }}',
+  );
+  const run = probe.slice(probe.indexOf("run: |"), probe.indexOf("env:"));
+  assertEquals(run.includes("vault.get"), false);
+  assertStringIncludes(
+    stepText(s, "apply-nats-auth"),
+    'token: ${{ vault.get("server-stack", inputs.nats_auth_token_key) }}',
+  );
+  for (const step of ["apply-nats", "apply-nats-after-secrets"]) {
+    assertStringIncludes(
+      stepText(s, step),
+      "- step: apply-nats-auth\n            condition:\n              type: or\n",
+    );
+  }
+});
+
+Deno.test("with auth on, check-nats requires an authenticated session and a refused anonymous one", async () => {
+  const s = await read("server-stack-provision-host");
+  const check = stepText(s, "check-nats");
+  for (
+    const need of [
+      '\\"auth_required\\":true',
+      '\\n+OK"',
+      "Authorization Violation",
+    ]
+  ) {
+    assertStringIncludes(check, need);
+  }
+});

@@ -146,15 +146,6 @@ export interface NormTable {
 
 const bitsOf = (family: 4 | 6) => (family === 4 ? 32 : 128);
 
-/** `family:network/prefix` as numbers; a bare address is a full-length prefix. */
-function normAddr(family: 4 | 6, text: string, len?: number): string {
-  const cidr = parseCidr(
-    text.includes("/") ? text : `${text}/${len ?? bitsOf(family)}`,
-  );
-  if (!cidr) return `raw:${text}${len === undefined ? "" : `/${len}`}`;
-  return `${cidr.family}:${cidr.network.toString(16)}/${cidr.prefix}`;
-}
-
 /** Sorts normalized elements: numbers first by value, then everything else. */
 function sortElems(elems: string[]): string[] {
   const num = (e: string) => (e.startsWith("n:") ? Number(e.slice(2)) : NaN);
@@ -207,7 +198,7 @@ function leftKey(left: unknown): { key: string; family?: 4 | 6 } {
   return { key: `raw:${stable(left)}` };
 }
 
-function elem(v: unknown, family?: 4 | 6): string {
+function elem(v: unknown): string {
   if (typeof v === "number") return `n:${v}`;
   if (typeof v === "string") return `s:${v}`;
   return `raw:${stable(v)}`;
@@ -287,7 +278,7 @@ function normRule(expr: Json[]): string {
         ? mergedSpans(family, set)
         : null;
       return `${key} ${op} ${
-        (spans ?? sortElems(set.map((x) => elem(x, family)))).join(",")
+        (spans ?? sortElems(set.map((x) => elem(x)))).join(",")
       }`;
     }
     if ("accept" in e) return "accept";

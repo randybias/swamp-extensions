@@ -50,7 +50,7 @@ const VLAN = (link: string, id = 100, extra: object = {}) => ({
 });
 
 const CASES: [string, NetConfig][] = [
-  // The management NIC also carries the provider VLAN 2429 on the real host;
+  // The management NIC also carries the provider VLAN on the real host;
   // that VLAN lives in another file, so ours only adds the storage VLAN.
   ["a keyless ethernet with a VLAN on it", {
     ...BASE,
@@ -193,8 +193,8 @@ const CLOUD_INIT = `network:
         macaddress: "02:00:00:00:00:07"
       set-name: enp7s0
   vlans:
-    enp7s0.2429:
-      id: 2429
+    enp7s0.2999:
+      id: 2999
       link: enp7s0
       addresses:
         - "203.0.113.5/29"

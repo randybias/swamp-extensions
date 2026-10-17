@@ -783,30 +783,46 @@ export function createModel(overrides: Partial<HostNetDeps> = {}) {
           if (!live.hasNetplan) {
             throw new HostNetConfigError("netplan is not present on the host");
           }
-          const stage = `/tmp/host-net-precheck-${token}`;
-          await run(
+          // netplan merges every file in /etc/netplan, so the pre-check must
+          // see the same merge the apply will: a copy of the whole live
+          // directory (names, order and modes kept), then the rendered file on
+          // top. Staging only ours would reject a VLAN whose link NIC is
+          // defined in another file (cloud-init's). The scratch root is a
+          // private (0700) mktemp directory; the script removes it itself if
+          // its own setup fails, and the caller removes it however the upload
+          // or the generate ends. A missing /etc/netplan is an empty copy.
+          const made = await run(
             deps,
             target,
             [
               "sh",
               "-c",
-              // netplan merges every file in /etc/netplan, so the pre-check
-              // must see the same merge the apply will: a copy of the whole
-              // live directory (names, order and modes kept), then the
-              // rendered file on top. Staging only ours would reject a VLAN
-              // whose link NIC is defined in another file (cloud-init's).
-              `rm -rf '${stage}' && mkdir -p '${stage}/etc/netplan' '${stage}/etc/cloud/cloud.cfg.d' && cp -a /etc/netplan/. '${stage}/etc/netplan/'`,
+              [
+                "set -eu",
+                "d=$(mktemp -d /tmp/host-net-precheck.XXXXXX)",
+                `trap 'rc=$?; if [ "$rc" -ne 0 ]; then rm -rf "$d"; fi' EXIT`,
+                'chmod 0700 "$d"',
+                'mkdir -p "$d/etc/netplan" "$d/etc/cloud/cloud.cfg.d"',
+                'if [ -d /etc/netplan ]; then cp -a /etc/netplan/. "$d/etc/netplan/"; fi',
+                `printf '%s\\n' "$d"`,
+              ].join("\n"),
             ],
             "the precheck setup",
           );
-          for (const file of render.files) {
-            await sshUpload(deps, target, {
-              path: `${stage}${file.path}`,
-              content: file.content,
-              mode: file.mode,
-            });
+          const stage = made.stdout.trim();
+          if (!/^\/tmp\/host-net-precheck\.[A-Za-z0-9]{6}$/.test(stage)) {
+            throw new HostNetConfigError(
+              "the precheck setup did not return a scratch directory",
+            );
           }
           try {
+            for (const file of render.files) {
+              await sshUpload(deps, target, {
+                path: `${stage}${file.path}`,
+                content: file.content,
+                mode: file.mode,
+              });
+            }
             await run(
               deps,
               target,

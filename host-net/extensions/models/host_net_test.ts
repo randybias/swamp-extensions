@@ -79,6 +79,13 @@ function fakeRun(
         stderr: "",
       });
     }
+    if (command.includes("mktemp -d /tmp/host-net-precheck")) {
+      return Promise.resolve({
+        code: 0,
+        stdout: "/tmp/host-net-precheck.AbC123\n",
+        stderr: "",
+      });
+    }
     if (command.includes("echo MISSING")) {
       return Promise.resolve({ code: 0, stdout: "MISSING\n", stderr: "" });
     }
@@ -682,33 +689,46 @@ Deno.test("a match_mac bridge member that resolves to management is refused", as
 
 Deno.test("host_key_policy is strict only and host_keys are required", () => {
   const model = createModel(denoHostNetDeps);
-  const parse = (over: Record<string, unknown>) =>
-    model.methods.apply.arguments.safeParse({ ...NET, ...over }).success;
-  assertEquals(parse({}), true);
-  assertEquals(parse({ host_key_policy: "insecure_tofu" }), false);
-  assertEquals(parse({ host_key_policy: undefined }), false);
-  assertEquals(parse({ host_keys: [] }), false);
-  assertEquals(parse({ host_keys: undefined }), false);
-  assertEquals(parse({ host_keys: null }), false);
-  for (const name of ["commit", "get", "sync", "remove", "revert_now"]) {
-    // deno-lint-ignore no-explicit-any
-    const schema = (model.methods as any)[name].arguments;
-    const base = { ...SSH, backend: "netplan", bridge_type: "linux" };
-    const without = { ...base, host_keys: undefined, token: "0".repeat(16) };
+  // deno-lint-ignore no-explicit-any
+  const methods = model.methods as any;
+  // For every method: a baseline that parses, then ONE change at a time, so a
+  // refusal can only be about that field.
+  const baselines: Record<string, Record<string, unknown>> = {
+    apply: NET,
+    commit: NET,
+    remove: NET,
+    get: {
+      ...SSH,
+      backend: "netplan",
+      bridge_type: "linux",
+      management_interface: "enp1s0",
+    },
+    sync: {
+      ...SSH,
+      backend: "netplan",
+      bridge_type: "linux",
+      management_interface: "enp1s0",
+    },
+    revert_now: { ...SSH, token: "0".repeat(16) },
+  };
+  for (const [name, base] of Object.entries(baselines)) {
+    const schema = methods[name].arguments;
+    assertEquals(schema.safeParse(base).success, true, `${name} baseline`);
+    const change = (patch: Record<string, unknown>) =>
+      schema.safeParse({ ...base, ...patch }).success;
     assertEquals(
-      schema.safeParse({ ...NET, ...without }).success,
+      change({ host_key_policy: "insecure_tofu" }),
       false,
-      `${name} requires host_keys`,
+      `${name} tofu`,
     );
     assertEquals(
-      schema.safeParse({
-        ...NET,
-        host_key_policy: "insecure_tofu",
-        token: "0".repeat(16),
-      }).success,
+      change({ host_key_policy: undefined }),
       false,
-      `${name} refuses insecure_tofu`,
+      `${name} policy`,
     );
+    assertEquals(change({ host_keys: [] }), false, `${name} empty keys`);
+    assertEquals(change({ host_keys: undefined }), false, `${name} no keys`);
+    assertEquals(change({ host_keys: null }), false, `${name} null keys`);
   }
 });
 
@@ -731,4 +751,84 @@ Deno.test("the netplan pre-check stages a copy of the live directory, not just t
     c.includes(".ssh-host-upload") && c.includes("host-net-precheck")
   );
   assertEquals(copy >= 0 && copy < upload && upload < generate, true);
+});
+
+Deno.test("the pre-check scratch root is a private mktemp directory removed however the pre-check ends", async () => {
+  // Normal path: created by the script, removed at the end.
+  const ok = fakeRun();
+  const model = modelWith(ok);
+  await model.methods.apply.execute(
+    model.methods.apply.arguments.parse(NET),
+    createModelTestContext({ globalArgs: {} }).context,
+  );
+  const setup = ok.calls.find((c) => c.includes("mktemp -d"))!;
+  assertEquals(
+    setup.includes("host-net-precheck-0000"),
+    false,
+    "no fixed name",
+  );
+  assertEquals(setup.includes("chmod 0700"), true);
+  assertEquals(
+    setup.includes("if [ -d /etc/netplan ]; then cp -a"),
+    true,
+    "a missing /etc/netplan is an empty copy, not a failure",
+  );
+  assertEquals(
+    setup.includes('rm -rf "$d"'),
+    true,
+    "its own failure cleans up",
+  );
+  assertEquals(
+    ok.calls.some((c) =>
+      c.includes("'rm' '-rf' '/tmp/host-net-precheck.AbC123'")
+    ),
+    true,
+  );
+
+  // A failing generate still removes the directory.
+  const gen = fakeRun();
+  const base = gen.run;
+  gen.run = (cmd, args, options) => {
+    const command = args[args.length - 1];
+    if (cmd === "ssh" && command.includes("'netplan' 'generate'")) {
+      gen.calls.push(command);
+      return Promise.resolve({ code: 1, stdout: "", stderr: "bad" });
+    }
+    return base(cmd, args, options);
+  };
+  await assertRejects(() =>
+    modelWith(gen).methods.apply.execute(
+      modelWith(gen).methods.apply.arguments.parse(NET),
+      createModelTestContext({ globalArgs: {} }).context,
+    )
+  );
+  assertEquals(
+    gen.calls.some((c) =>
+      c.includes("'rm' '-rf' '/tmp/host-net-precheck.AbC123'")
+    ),
+    true,
+  );
+
+  // A failing upload still removes it, and a setup that returns junk stops
+  // before anything is uploaded.
+  const junk = fakeRun();
+  const jbase = junk.run;
+  junk.run = (cmd, args, options) => {
+    const command = args[args.length - 1];
+    if (cmd === "ssh" && command.includes("mktemp -d")) {
+      junk.calls.push(command);
+      return Promise.resolve({ code: 0, stdout: "/etc/passwd\n", stderr: "" });
+    }
+    return jbase(cmd, args, options);
+  };
+  await assertRejects(
+    () =>
+      modelWith(junk).methods.apply.execute(
+        modelWith(junk).methods.apply.arguments.parse(NET),
+        createModelTestContext({ globalArgs: {} }).context,
+      ),
+    Error,
+    "scratch directory",
+  );
+  assertEquals(junk.calls.some((c) => c.includes(".ssh-host-upload")), false);
 });

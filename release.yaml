@@ -162,9 +162,10 @@ syncthing-peer:
   audience: general
   published:
     2026.10.17.1: abb4df5af6f0919cd9866a4d9f444a5038ad2cf02bf780c6825c4510d64f621a
+    2026.10.17.2: eda27f1913b9edccd55fefb8cfa52ad952400d631b654d157069814b5e903330
   notes:
     2026.10.17.1: 'First release, beta. Ensure a peer device and a shared folder on one Syncthing node through its REST API, reached locally or over SSH, and inspect or remove them; existing entries are updated with PATCH so fields the model does not manage survive, and repeats are no-ops. The API key is a vault reference that travels only in the X-API-Key header (over SSH, inside a curl config uploaded over stdin into a 0700 directory and removed in the same shell); plain HTTP is loopback-only and requests are bounded by timeout_s. sync records a node unreachable only for a connect, DNS or timeout failure. Live end to end on two VPS nodes with Syncthing 1.27.2: 10/10 cells, including a real file sync, a stalled API, a wrong key and an argv scan with 0 secret hits. Residual: curl''s stderr is cut to its last line in errors; no spec yet.'
-    2026.10.17.2: 'Re-vendors the canonical SSH transport (ssh-host 2026.10.17.3) and drops the remote temp-file workaround: a remote call now streams the whole curl config, API key included, to curl --config - on stdin, so no secret byte ever touches remote disk. Remote steps carry a timeoutMs. Inputs and the REST behaviour are unchanged (no-op upgrade entry).'
+    2026.10.17.2: 'Re-vendors the canonical SSH transport (ssh-host 2026.10.17.3) and drops the remote temp-file workaround: a remote call now streams the whole curl config, API key included, to curl --config - on stdin, so no secret byte ever touches remote disk. Remote steps carry a timeoutMs. Inputs and the REST behaviour are unchanged (no-op upgrade entry). Live end to end on two VPS nodes with Syncthing 1.27.2: 12/12 cells, including no remote file written (no cache directory, curl config or upload temp file), the only remote command being curl -q --config -, a hostile folder label stored verbatim with every request to the loopback, and an argv scan with 0 secret hits. Residual: after a local timeout the remote curl keeps running until its own max-time stops it.'
 
 host-net:
   channel: beta

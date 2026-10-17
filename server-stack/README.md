@@ -118,7 +118,10 @@ swamp workflow run @randybias/server-stack-teardown-host \
   never passes through step outputs, logs or `--json`. Teardown leaves that
   vault key in place, a documented residual.
 - DNS is created only after NATS answers over the mesh, and teardown removes DNS
-  first so the name never points at a released address.
+  first so the name never points at a released address. Set `publish_dns: false`
+  to skip every Cloudflare DNS step in both workflows, for example to prove NATS
+  answers before a zone is chosen; the server teardown still proceeds because a
+  step succeeds when DNS is disabled.
 - The firewall is expected to own its own nftables table and never flush the
   whole ruleset, so a later re-apply does not wipe the cluster's CNI and
   kube-proxy rules.

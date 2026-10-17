@@ -83,6 +83,10 @@ inputs:
       type: string
       description: Vault key of a Cloudflare DNS edit token
       maxLength: 256
+    publish_dns:
+      type: boolean
+      description: Remove the A record; false skips every Cloudflare DNS step
+      default: true
 jobs:
   - name: teardown
     description: Remove DNS, reset k0s, delete the server, and verify both APIs
@@ -121,6 +125,7 @@ jobs:
           severity: high
       - name: find-record
         description: List the host's A record via the Cloudflare API
+        guard: ${{ inputs.publish_dns == false }}
         dependsOn:
           - step: check-ownership
             condition:
@@ -138,6 +143,7 @@ jobs:
             name: ${{ inputs.dns_record_name }}
       - name: check-record
         description: Refuse a record without this host's ownership marker
+        guard: ${{ inputs.publish_dns == false }}
         dependsOn:
           - step: find-record
             condition:
@@ -151,13 +157,38 @@ jobs:
               "managed-by=provision-server-host host=" + inputs.hostname))
           message: The record exists without this host's ownership marker; refusing
           severity: high
+      - name: dns-safety-ok
+        description: Assert the DNS safety gate passed when DNS is enabled
+        dependsOn:
+          - step: find-record
+            condition:
+              type: or
+              conditions:
+                - type: succeeded
+                - type: skipped
+          - step: check-record
+            condition:
+              type: or
+              conditions:
+                - type: succeeded
+                - type: skipped
+        task:
+          type: assert
+          expr: >-
+            !inputs.publish_dns ||
+            (steps["find-record"].status == "succeeded" &&
+            steps["check-record"].status == "succeeded")
+          message: The DNS safety check did not pass; refusing to touch the server
+          severity: high
       - name: delete-record
         description: Delete the host's A record via the Cloudflare API
         dependsOn:
           - step: check-record
             condition:
               type: succeeded
-        guard: ${{ data.latest("host-dns", "main").attributes.records.size() == 0 }}
+        guard: >-
+          ${{ inputs.publish_dns == false ||
+              data.latest("host-dns", "main").attributes.records.size() == 0 }}
         task:
           type: model_method
           modelType: "@webframp/cloudflare/dns"
@@ -174,10 +205,7 @@ jobs:
           - step: check-ownership
             condition:
               type: succeeded
-          - step: find-record
-            condition:
-              type: succeeded
-          - step: check-record
+          - step: dns-safety-ok
             condition:
               type: succeeded
           - step: delete-record
@@ -207,10 +235,7 @@ jobs:
       - name: delete-server
         description: Delete the server after hostname and project checks
         dependsOn:
-          - step: find-record
-            condition:
-              type: succeeded
-          - step: check-record
+          - step: dns-safety-ok
             condition:
               type: succeeded
           - step: delete-record
@@ -262,6 +287,7 @@ jobs:
           severity: high
       - name: verify-dns
         description: List the zone's A records to confirm none match this name
+        guard: ${{ inputs.publish_dns == false }}
         dependsOn:
           - step: check-cherry
             condition:
@@ -279,6 +305,7 @@ jobs:
             name: ${{ inputs.dns_record_name }}
       - name: check-dns
         description: Check no record with this name remains in the zone
+        guard: ${{ inputs.publish_dns == false }}
         dependsOn:
           - step: verify-dns
             condition:

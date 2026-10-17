@@ -397,6 +397,10 @@ inputs:
       minimum: 60
       maximum: 86400
       default: 300
+    publish_dns:
+      type: boolean
+      description: Publish the A record; false skips every Cloudflare DNS step
+      default: true
 jobs:
   - name: preflight
     description: Check inputs and probe Cherry and Cloudflare before anything is created
@@ -426,6 +430,7 @@ jobs:
           methodName: list
       - name: check-cloudflare-token
         description: Read the zone via the Cloudflare API to prove the token works
+        guard: ${{ inputs.publish_dns == false }}
         dependsOn:
           - step: probe-server
             condition:
@@ -441,10 +446,14 @@ jobs:
             zoneId: ${{ inputs.cloudflare_zone_id }}
       - name: probe-record
         description: List the target A record via the Cloudflare API
+        guard: ${{ inputs.publish_dns == false }}
         dependsOn:
           - step: check-cloudflare-token
             condition:
-              type: succeeded
+              type: or
+              conditions:
+                - type: succeeded
+                - type: skipped
         task:
           type: model_method
           modelType: "@webframp/cloudflare/dns"
@@ -464,14 +473,17 @@ jobs:
               type: succeeded
           - step: probe-record
             condition:
-              type: succeeded
+              type: or
+              conditions:
+                - type: succeeded
+                - type: skipped
         task:
           type: assert
           expr: >-
             inputs.adopt ||
             ((data.latest(inputs.server_model, inputs.hostname) == null ||
             data.latest(inputs.server_model, inputs.hostname).attributes.status in ["deleted", "not_found"]) &&
-            data.latest("host-dns", "main").attributes.records.size() == 0)
+            (!inputs.publish_dns || data.latest("host-dns", "main").attributes.records.size() == 0))
           message: A server or record already exists; set adopt to true to own it
           severity: high
   - name: host
@@ -1061,7 +1073,9 @@ jobs:
     steps:
       - name: create-record
         description: Create the host's A record via the Cloudflare API
-        guard: ${{ data.latest("host-dns", "main").attributes.records.size() > 0 }}
+        guard: >-
+          ${{ inputs.publish_dns == false ||
+              data.latest("host-dns", "main").attributes.records.size() > 0 }}
         task:
           type: model_method
           modelType: "@webframp/cloudflare/dns"
@@ -1082,6 +1096,7 @@ jobs:
             comment: ${{ "managed-by=provision-server-host host=" + inputs.hostname }}
       - name: verify-record
         description: Re-list the record and check it points at the host
+        guard: ${{ inputs.publish_dns == false }}
         dependsOn:
           - step: create-record
             condition:
@@ -1102,6 +1117,7 @@ jobs:
             name: ${{ inputs.dns_record_name }}
       - name: check-record
         description: Check the record points at the host and carries the marker
+        guard: ${{ inputs.publish_dns == false }}
         dependsOn:
           - step: verify-record
             condition:

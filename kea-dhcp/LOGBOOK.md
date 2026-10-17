@@ -42,6 +42,11 @@ followed; where it does not, the simplest safe option was taken:
 8. **Factory export.** The spec asks for a factory with overridable deps; the
    registry requires a plain `export const model`. The plain literal is used,
    and `setDeps` overrides the seams for tests.
+9. **`classless-static-route` (option 121).** Out of scope: the stock Kea 2.4
+   option set does not take it in the typed form this model renders, so it is
+   not offered (round 1).
+10. **Remote user.** Must be `root`; no `sudo` is used (apt, systemd, `/etc/kea`
+    and the revert directory all need it).
 
 ## Notes
 
@@ -233,3 +238,72 @@ passes `kea-dhcp4 -t`.
 
 Re-validated in the container after the change: the full `sh -eu` harness, the
 running-Kea restore, and the config-set shape all still pass.
+
+## 2026-10-17 live e2e (2026.10.17.1): 11 pass, 0 fail, 0 blocked
+
+Receipts: `~/code/swamp-e2e/receipts/kea-dhcp.md`. Target: one throwaway VPS
+`<vps1>` (Ubuntu 24.04, `kea-dhcp4-server 2.4.1`), SSH as root with strict
+pinned host keys and a vault `ssh_key_ref`. Containment: every apply named only
+`veth-kea0` (198.51.100.1/24), paired with `veth-kea1` in netns `keacli`, where
+`busybox udhcpc` was the client. A `tcpdump -Q out` guard on eth0 and the
+provider private NIC ran for both runs: **0 DHCP packets on the real NICs**.
+
+First run at 540be3c: 10 pass, 1 fail (render/action results not visible), with
+findings F1 (HIGH, one data name for config/observation/leases), F2 (MEDIUM,
+false drift after a fired revert), F3 (socket peer instead of local address) and
+F4 (bare 2.4 version string). All fixed in fddc66d (see "Live round" above).
+
+Re-run at fddc66d (refactor a3c1c2b plus the live fixes):
+
+| Cell                                       | Result |
+| ------------------------------------------ | ------ |
+| 1 install                                  | PASS   |
+| 2 render (persisted `render-<sha256>`)     | PASS   |
+| 3 apply + commit, client lease             | PASS   |
+| 4 leases (memfile)                         | PASS   |
+| 5 uncommitted apply reverts (120 s timer)  | PASS   |
+| 6 identical re-apply is a no-op            | PASS   |
+| 7 bad render refused before any change     | PASS   |
+| 8 refuses to serve the SSH interface       | PASS   |
+| 9 get / sync persisted, no false drift     | PASS   |
+| 10 remove + commit, second remove a no-op  | PASS   |
+| 11 argv scan (0 private-key hits, 2 sides) | PASS   |
+
+Cleanup: Kea, its packages, `_kea`, the netns, the veth pair, the guards and the
+samplers were removed; the `<vps1>` dpkg list, links and units match the
+baseline. Merge-prep added a behaviour-preserving quality pass (36e8081: a
+`recordCancelled` helper, `armRevert` takes the spread opts, inlined deps, one
+matcher loop in the test runner, a stale duplicate doc comment dropped); 73
+tests green.
+
+## Residuals (2026.10.17.1, not blocking beta)
+
+- A malformed `active.json` is read as "no revert armed".
+- No unit test drives `commit` through a failing gate (dead socket, missing
+  `kea_hash`, `enable` rc != 0, a failed verify field).
+- A no-op apply logs `(token )` and writes an `apply-<key>` record with an empty
+  token, while a no-op remove writes none.
+- The timer fires about 35 s after the recorded `expires_at` (systemd accuracy
+  plus arming after `armed_at`).
+- `remove` restores the stock config as `root:_kea 0640`, not the package's
+  `root:root 0644`.
+- Restore lock timeout: `restore.sh` waits `flock -w 30`; an external holder
+  past about 35 s records fail plus `recovery.txt` and clears `active.json`
+  without reverting (fails loud; `commit` refuses).
+- The first `sync` after a fired revert skips drift while the pending record is
+  still `pending`, and a fired revert's `result` (pass/fail) is no longer
+  surfaced in the observation; `recovery.txt` and the next `sync` cover it.
+- r3 Mediums (540be3c), unchanged:
+  - `commitScript` stops the timer before the drift check, so a third-party
+    change inside the window says "still armed" with the timer already stopped.
+  - `commit` runs `systemctl enable` before the lock; a revert that completes in
+    that window ends with the service enabled although `prior_enabled=false`.
+  - The service-active/hash re-check is outside the lock (operator TOCTOU only).
+  - After the claim, `serviceEnabled`/`writeResource` sit outside the cleanup
+    try, and `abortClaim` marks cancelled even if remote cleanup failed.
+  - `disarmAndRestore` says "timer left armed" on a failed restore, but
+    `restore.sh` already cleared `active.json`, so a re-fire is a no-op.
+  - `restoreScript` copies over the live file non-atomically (cp, not cp+mv).
+  - LOW: `prior.json` is written but unused; `is-enabled` is reduced to a
+    boolean (static/enabled-runtime); restore-asset prep is duplicated in
+    apply/remove.

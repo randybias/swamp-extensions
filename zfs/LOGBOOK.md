@@ -267,3 +267,86 @@ a stock `/swap.img` on `/dev/sda1` does not refuse a pool on another disk; a
 swap file on a pool dataset refuses (destroy_pool and export_pool); a swap file
 on `/dev/dm-0` stacked on a pool zvol refuses; an unresolvable swap file and an
 unknown swap type fail closed. 157 tests.
+
+## 2026-10-17 live e2e
+
+Supersedes "Live end-to-end status" above. Folded from the run receipts
+(`sp-20261017`); real addresses, hostnames, disk serials and ids are redacted
+(`<bm1>` is the target). Every head was installed from `git archive` (tests
+excluded) into a separate repo. Target `<bm1>`: Cherry bare metal, Ubuntu 24.04,
+OpenZFS 2.2.2, root on md0 (sda2 + sdb2) with BIOS-boot partitions sda1/sdb1 and
+the stock swap file `/swap.img`. Spare space only: a 2 GiB partition 3 at the
+unallocated tail of each disk. Key as a vault reference, strict host keys,
+`--input-file` only, no `--json` capture. `lsblk` was identical before and after
+every run.
+
+### First run on the pre-lifecycle head (superseded)
+
+61 cells, 59 pass, 2 fail. Passing: create_pool re-run no-op (by-id and kernel
+names) and differing vdev set refused; create_dataset with properties, re-run
+no-op, single property change; create_zvol sparse, re-run no-op, byte-equal
+volsize no-op, differing volsize refused; snapshot and re-run; clone, re-run,
+missing snapshot and non-clone target refused; rollback latest, refused with
+later snapshots, `destroy_later_snapshots`; get and sync (no drift, drift,
+refresh); destroy of clone, snapshot, zvol and dataset plus every destroy-again
+no-op, and typed refusals for dependents; injection refusals on every
+remote-bound input (name, `$(...)`, `..`, property values, destroy target,
+snapshot tag, vdev, option injection; `/tmp/e2e-pwn` absent afterwards);
+transport refusals (wrong pin, wrong pin on a destructive call, pins for another
+host only; no state written). Failed: create_pool on free partitions of an
+md-root host (shared guard: `mdadm --examine --` rejected every device) and no
+pool destroy/export method. The offline replay also found an unprotected GPT
+BIOS-boot partition. All three were fixed: the shared guard (final, vendored)
+and the pool lifecycle above; the by-id `:` grammar and stderr-free failure
+reasons were fixed in the same round.
+
+### Run on bc7ec1d (superseded)
+
+| Cell                                                          | Result  | Detail                                                                                           |
+| ------------------------------------------------------------- | ------- | ------------------------------------------------------------------------------------------------ |
+| guard: create_pool `/dev/sda` (kernel name and by-id) refused | PASS    | "the device backs the running or bootable system; no pool created"                               |
+| guard: create_pool `/dev/sda1` (BIOS boot) refused            | PASS    | backs the bootable system                                                                        |
+| guard: create_pool `/dev/sda2` and `/dev/md0` refused         | PASS    | backs the running system                                                                         |
+| guard: create_pool mixed by-id set refused                    | PASS    | a candidate is not in lsblk, safety unknown                                                      |
+| guard: create_pool part3 + `/dev/sdb2` (root md member)       | PASS    | refused on sdb2                                                                                  |
+| injection: pool name, vdev                                    | PASS    | schema refusal; `/tmp/zpwn` absent                                                               |
+| create_pool sda3 + sdb3, then re-run                          | PASS    | pool ONLINE on both by-id part3 paths; re-run no-op                                              |
+| create_dataset a, a/b; snapshot a@s1                          | PASS    | present                                                                                          |
+| destroy_pool / export_pool on a plain pool, stock swap on     | FAIL    | every call refused: `lsblk -s` on the swap file `/swap.img` exits 32 and the guard fails closed  |
+| (swap off) destroy_pool with children, not recursive          | PASS    | refused; pool kept                                                                               |
+| (swap off) export_pool; plain `zpool import`; get             | PASS    | pool and datasets reflected                                                                      |
+| system pool cells (mount at `/boot/efi`, bootfs) x4           | INVALID | setup error: `create_dataset` takes no mountpoint, so no system mount existed; redone on dfc3124 |
+| (swap off) destroy_pool recursive; again                      | PASS    | pool gone; again a clean no-op                                                                   |
+
+17 pass, 1 fail (the swap-file bug, fixed in dfc3124 above), 4 invalid.
+
+### Final matrix on dfc3124 (stock swap file on)
+
+| Cell                                                             | Result | Detail                                                            |
+| ---------------------------------------------------------------- | ------ | ----------------------------------------------------------------- |
+| create_pool sda3 + sdb3                                          | PASS   | pool ONLINE                                                       |
+| destroy_pool with datasets, not recursive                        | PASS   | refused for the children, not for swap                            |
+| [earlier fail] export_pool with the swap file on                 | PASS   | pool exported                                                     |
+| plain `zpool import`, then get                                   | PASS   | pool and datasets reflected                                       |
+| system pool: destroy_pool with a dataset mounted at `/boot/efi`  | PASS   | "/boot/efi is mounted from e2etank/sysefi"                        |
+| system pool: export_pool with a dataset mounted at `/boot/efi`   | PASS   | same refusal                                                      |
+| system pool: destroy_pool with bootfs set                        | PASS   | "bootfs is e2etank/a; this pool boots the system"                 |
+| system pool: export_pool with bootfs set                         | PASS   | same refusal                                                      |
+| [earlier fail] destroy_pool recursive on the plain pool, swap on | PASS   | pool gone                                                         |
+| destroy_pool again (absent)                                      | PASS   | clean no-op                                                       |
+| cleanup                                                          | PASS   | no pools, part3 removed on both disks, swap on, `lsblk` identical |
+
+11 pass, 0 fail.
+
+### Residuals (accepted for beta)
+
+- The extension has no pool import method, and `create_dataset` takes no
+  `mountpoint` property; the live run used plain `zpool import` and
+  `zfs set mountpoint` / `zpool set bootfs` to set up those cells.
+- Only exact system mount paths are protected (`/`, `/boot`, `/boot/efi`,
+  `/usr`, `/var`, `/var/lib`, `/var/log`); a pool mounted at any other path,
+  such as `/var/lib/docker` or `/home`, is not refused (documented in the
+  README).
+- A pool zvol with no `/dev/zvol` link (`volmode=none`) makes the system-pool
+  guard refuse (fails closed on the readlink).
+- The system-pool guard costs one ssh round trip per zvol (`readlink -f`).

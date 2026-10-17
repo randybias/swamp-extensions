@@ -61,17 +61,7 @@ import {
   ZPOOL_PROPERTIES,
   zvolCreateArgv,
 } from "./_lib/zfs.ts";
-import {
-  assertProtectedRefsResolvable,
-  assertVdevsSafe,
-  collectProtectedRefs,
-  computeProtectedDevices,
-  parseFstab,
-  parseLsblk,
-  parseMdstatMembers,
-  parseMounts,
-  parseSwapSources,
-} from "./_lib/safety.ts";
+import { assessProtected } from "./_lib/safety.ts";
 
 // deno-lint-ignore no-explicit-any
 type Ctx = any;
@@ -287,48 +277,6 @@ function toPropertyMap(
   );
 }
 
-/** Raw host facts the boot-disk guard is decided from. */
-interface HostProbe {
-  /** `lsblk -J` tree. */
-  lsblk: string;
-  /** `/proc/mounts`. */
-  mounts: string;
-  /** `/etc/fstab`, or empty when confirmed absent. */
-  fstab: string;
-  /** `/proc/mdstat`, or empty when confirmed absent. */
-  mdstat: string;
-  /** `/proc/swaps`. */
-  swaps: string;
-  /** `zpool status -P` (empty when no pools are available). */
-  zpoolStatus: string;
-  /** `blkid` output, to resolve tags on hosts without a udev db. */
-  blkid: string;
-  /** `mdadm --examine` per candidate vdev, for unassembled members. */
-  mdadmExamine: { vdev: string; exit_code: number; stdout: string }[];
-}
-
-/** Reads a host file, allowing only an explicit not-exists to read as empty. */
-async function readFileFact(
-  deps: ZfsDeps,
-  target: SshTarget,
-  path: string,
-): Promise<string> {
-  const result = await exec(deps.ssh, target, ["cat", path]);
-  if (result.exit_code === 0) return result.stdout;
-  const exists = await exec(deps.ssh, target, ["test", "-e", path]);
-  if (exists.exit_code === 0) {
-    throw new Error(
-      `could not read ${path} (exit ${result.exit_code}); refusing to create a pool`,
-    );
-  }
-  // Only exit 1 from `test -e` means "does not exist"; 2/126/127 are probe
-  // failures and must not be read as an absent file.
-  if (exists.exit_code === 1) return "";
-  throw new Error(
-    `could not confirm whether ${path} exists (test -e exited ${exists.exit_code}); refusing to create a pool`,
-  );
-}
-
 /** Resolves a validated `/dev/...` path to its kernel device path, or refuses. */
 async function resolveDevice(
   deps: ZfsDeps,
@@ -341,112 +289,6 @@ async function resolveDevice(
     throw new Error(`could not resolve ${path}; refusing to create a pool`);
   }
   return link.stdout.trim();
-}
-
-/**
- * Runs every read the boot-disk guard needs. Each fact fails closed: a read
- * that cannot be performed refuses rather than reading as "nothing to protect".
- * `blkid` and per-candidate `mdadm --examine` are captured so the shared
- * protected-device module can resolve tags and unassembled array members.
- */
-async function runHostProbes(
-  deps: ZfsDeps,
-  target: SshTarget,
-  vdevs: string[],
-): Promise<HostProbe> {
-  const lsblk = await exec(deps.ssh, target, [
-    "lsblk",
-    "-J",
-    "-o",
-    "NAME,PATH,TYPE,MOUNTPOINT,FSTYPE,PKNAME,UUID,PARTUUID,LABEL",
-  ]);
-  if (lsblk.exit_code !== 0) {
-    throw new Error(
-      "could not read the block-device tree (lsblk); refusing to create a pool",
-    );
-  }
-  const mounts = await exec(deps.ssh, target, ["cat", "/proc/mounts"]);
-  if (mounts.exit_code !== 0) {
-    throw new Error(
-      `could not read /proc/mounts (exit ${mounts.exit_code}); refusing to create a pool`,
-    );
-  }
-  const swaps = await exec(deps.ssh, target, ["cat", "/proc/swaps"]);
-  if (swaps.exit_code !== 0) {
-    throw new Error(
-      `could not read /proc/swaps (exit ${swaps.exit_code}); refusing to create a pool`,
-    );
-  }
-  const fstab = await readFileFact(deps, target, "/etc/fstab");
-  const mdstat = await readFileFact(deps, target, "/proc/mdstat");
-  const status = await exec(deps.ssh, target, ["zpool", "status", "-P"]);
-  if (
-    status.exit_code !== 0 &&
-    !/no pools available/i.test(status.stdout + status.stderr)
-  ) {
-    throw new Error(
-      `could not read the existing ZFS pools (exit ${status.exit_code}); refusing to create a pool`,
-    );
-  }
-  const blkid = await exec(deps.ssh, target, ["blkid"]);
-  const mdadmExamine: HostProbe["mdadmExamine"] = [];
-  for (const vdev of vdevs) {
-    const examine = await exec(deps.ssh, target, ["mdadm", "--examine", vdev]);
-    mdadmExamine.push({
-      vdev,
-      exit_code: examine.exit_code,
-      stdout: examine.stdout,
-    });
-  }
-  return {
-    lsblk: lsblk.stdout,
-    mounts: mounts.stdout,
-    fstab,
-    mdstat,
-    swaps: swaps.stdout,
-    zpoolStatus: status.stdout,
-    blkid: blkid.stdout,
-    mdadmExamine,
-  };
-}
-
-/** Refuses candidate vdevs that carry the running system. */
-async function assertDevicesSafe(
-  deps: ZfsDeps,
-  target: SshTarget,
-  vdevs: string[],
-): Promise<Map<string, string>> {
-  const probe = await runHostProbes(deps, target, vdevs);
-  const devices = parseLsblk(probe.lsblk);
-  const mounts = parseMounts(probe.mounts);
-  const fstab = parseFstab(probe.fstab);
-  const mdMembers = parseMdstatMembers(probe.mdstat);
-  const swaps = parseSwapSources(probe.swaps);
-  const zfsVdevs = parsePoolVdevs(probe.zpoolStatus);
-  // Resolve every protected `/dev/` reference before building the set, so a
-  // by-id/by-uuid vdev or fstab entry protects the disk behind it. The set is
-  // computed once and every candidate is checked against it.
-  const refs = collectProtectedRefs(mounts, fstab, zfsVdevs, swaps);
-  const resolvedLinks = new Map<string, string>();
-  for (const ref of refs) {
-    resolvedLinks.set(ref, await resolveDevice(deps, target, ref));
-  }
-  assertProtectedRefsResolvable(refs, resolvedLinks, devices);
-  const protectedSet = computeProtectedDevices(
-    devices,
-    mounts,
-    fstab,
-    mdMembers,
-    zfsVdevs,
-    swaps,
-    resolvedLinks,
-  );
-  const resolved = new Map<string, string>();
-  for (const vdev of vdevs) {
-    resolved.set(vdev, await resolveDevice(deps, target, vdev));
-  }
-  assertVdevsSafe(vdevs, resolved, devices, protectedSet);
-  return resolved;
 }
 
 async function listPools(deps: ZfsDeps, target: SshTarget): Promise<string[]> {
@@ -725,15 +567,14 @@ function buildZfsModel(deps: ZfsDeps) {
               },
             };
           }
-          const resolved = await assertDevicesSafe(
-            deps,
-            target,
-            args.vdevs,
-          );
+          const previous = await assessProtected(deps.ssh, target, args.vdevs);
           context.logger.info(
             "Creating pool {pool} from {count} vdev(s) on {host}",
             { pool: args.pool, count: args.vdevs.length, host: target.host },
           );
+          // Re-read immediately before the destructive step; the previous set
+          // can only grow, never shrink.
+          await assessProtected(deps.ssh, target, args.vdevs, previous);
           requireOk(
             await exec(
               deps.ssh,
@@ -761,7 +602,7 @@ function buildZfsModel(deps: ZfsDeps) {
             dataHandles: [handle],
             result: {
               pool: args.pool,
-              vdevs: [...resolved.values()],
+              vdevs,
               guid: state.guid,
               changed: true,
             },

@@ -9,6 +9,7 @@ import {
   type CommandRunner,
   SshError,
 } from "./_lib/ssh.ts";
+import { DeviceGuardError } from "./_lib/safety.ts";
 import { instanceKey } from "./_lib/zfs.ts";
 import { createModel, type ZfsDeps } from "./zfs.ts";
 
@@ -30,24 +31,43 @@ const LSBLK = JSON.stringify({
     {
       name: "sda",
       path: "/dev/sda",
+      pkname: null,
       type: "disk",
+      fstype: null,
+      uuid: null,
+      partuuid: null,
+      label: null,
+      mountpoints: [null],
       children: [{
         name: "sda1",
         path: "/dev/sda1",
-        type: "part",
         pkname: "sda",
-        mountpoint: "/",
+        type: "part",
         fstype: "ext4",
         uuid: "ROOT-UUID",
+        partuuid: null,
+        label: null,
+        mountpoints: ["/"],
       }],
     },
-    { name: "sdb", path: "/dev/sdb", type: "disk" },
+    {
+      name: "sdb",
+      path: "/dev/sdb",
+      pkname: null,
+      type: "disk",
+      fstype: null,
+      uuid: null,
+      partuuid: null,
+      label: null,
+      mountpoints: [null],
+    },
   ],
 });
-
-const MOUNTS = "/dev/sda1 / ext4 rw,relatime 0 0\nproc /proc proc rw 0 0\n";
+const FINDMNT = JSON.stringify({
+  filesystems: [{ target: "/", source: "/dev/sda1", fstype: "ext4" }],
+});
 const FSTAB = "UUID=ROOT-UUID / ext4 defaults 0 1\n";
-const MDSTAT = "Personalities : [raid1]\nunused devices: <none>\n";
+const MDSTAT = "Personalities :\nunused devices: <none>\n";
 const SWAPS = "Filename Type Size Used Priority\n";
 
 const POOL_ROW = "tank\t10G\t1G\t9G\tONLINE\t777\n";
@@ -92,12 +112,11 @@ const P = {
   rollback: "'zfs' 'rollback'",
   destroy: "'zfs' 'destroy'",
   origin: "'origin'",
-  lsblk: "'lsblk'",
+  lsblk: "lsblk -J -b -o",
   readlink: "'readlink'",
-  mounts: "'/proc/mounts'",
-  fstab: "'/etc/fstab'",
-  mdstat: "'/proc/mdstat'",
-  swaps: "'/proc/swaps'",
+  fstab: "/etc/fstab",
+  mdstat: "/proc/mdstat",
+  swaps: "/proc/swaps",
 };
 
 interface RouteResult {
@@ -151,25 +170,71 @@ function model(route: Route) {
   return createModel(deps(route));
 }
 
-/** Facts shared by every create_pool guard call; the pool does not exist. */
-function guardRoute(
-  readlinkTarget: string,
-  overrides: Route = () => undefined,
-) {
-  return (remote: string): RouteResult | undefined => {
+/** Raw probe outputs for one synthetic host. */
+interface GuardFixture {
+  lsblk?: string;
+  findmnt?: string;
+  fstab?: string;
+  swaps?: string;
+  mdstat?: string;
+  links?: string;
+  blkid?: string;
+  zpool?: string;
+  pvs?: string;
+  mdExamine?: Record<string, RouteResult>;
+}
+
+/** Serves the shared guard's probes from a fixture; `zpool` defaults to none. */
+function guardProbeRoute(fixture: GuardFixture = {}): Route {
+  return (remote) => {
     if (has(remote, P.poolProbe)) return NO_POOLS;
-    if (has(remote, P.lsblk)) return { code: 0, stdout: LSBLK };
-    if (has(remote, P.mounts)) return { code: 0, stdout: MOUNTS };
-    if (has(remote, P.fstab)) return { code: 0, stdout: FSTAB };
-    if (has(remote, P.mdstat)) return { code: 0, stdout: MDSTAT };
-    if (has(remote, P.swaps)) return { code: 0, stdout: SWAPS };
-    if (has(remote, P.poolStatus)) {
-      return { code: 1, stdout: "no pools available\n" };
+    if (has(remote, "lsblk -J -b -o")) {
+      return { code: 0, stdout: fixture.lsblk ?? LSBLK };
     }
-    if (has(remote, P.readlink)) {
-      return { code: 0, stdout: `${readlinkTarget}\n` };
+    if (has(remote, "find /dev")) {
+      return { code: 0, stdout: fixture.links ?? "" };
     }
-    return overrides(remote);
+    if (has(remote, "blkid")) return { code: 0, stdout: fixture.blkid ?? "" };
+    if (has(remote, "findmnt -J")) {
+      return { code: 0, stdout: fixture.findmnt ?? FINDMNT };
+    }
+    if (has(remote, "/etc/fstab")) {
+      return { code: 0, stdout: fixture.fstab ?? FSTAB };
+    }
+    if (has(remote, "/proc/swaps")) {
+      return { code: 0, stdout: fixture.swaps ?? SWAPS };
+    }
+    if (has(remote, "/proc/mdstat")) {
+      return { code: 0, stdout: fixture.mdstat ?? MDSTAT };
+    }
+    if (has(remote, "mdadm --examine")) {
+      for (const key of Object.keys(fixture.mdExamine ?? {})) {
+        if (has(remote, key)) return fixture.mdExamine![key];
+      }
+      return {
+        code: 1,
+        stderr: "mdadm: No md superblock detected on /dev/x.\n",
+      };
+    }
+    if (has(remote, "zpool status -P")) {
+      return { code: 0, stdout: fixture.zpool ?? "no pools available\n" };
+    }
+    if (has(remote, "pvs --noheadings")) {
+      return { code: 0, stdout: fixture.pvs ?? "" };
+    }
+    return undefined;
+  };
+}
+
+/** A guard route plus a successful `zpool create`/read for the spare path. */
+function fullCreateRoute(fixture: GuardFixture = {}): Route {
+  const guard = guardProbeRoute(fixture);
+  return (remote) => {
+    if (has(remote, P.poolProbe)) return NO_POOLS;
+    if (has(remote, P.poolStatusTank)) return { code: 0, stdout: POOL_STATUS };
+    if (has(remote, P.poolList)) return { code: 0, stdout: POOL_ROW };
+    if (has(remote, P.poolCreate)) return { code: 0 };
+    return guard(remote);
   };
 }
 
@@ -177,7 +242,9 @@ Deno.test("create_pool refuses a vdev in the boot family", async () => {
   const commands: string[] = [];
   const zfs = model((remote) => {
     commands.push(remote);
-    return guardRoute("/dev/sda")(remote);
+    return guardProbeRoute({
+      links: "/dev/disk/by-id/wwn-boot /dev/sda\n",
+    })(remote);
   });
   const args = zfs.methods.create_pool.arguments.parse({
     ssh: SSH,
@@ -185,11 +252,12 @@ Deno.test("create_pool refuses a vdev in the boot family", async () => {
     vdevs: ["/dev/disk/by-id/wwn-boot"],
   });
   const { context, getWrittenResources } = createModelTestContext();
-  await assertRejects(
+  const error = await assertRejects(
     () => zfs.methods.create_pool.execute(args, context),
-    Error,
-    "protected device set",
+    DeviceGuardError,
   );
+  assertEquals(error.code, "boot-protected");
+  assertEquals(error.message.includes("/dev/sda"), true);
   assertEquals(commands.some((c) => has(c, P.poolCreate)), false);
   assertEquals(getWrittenResources().length, 0);
 });
@@ -199,7 +267,9 @@ Deno.test("create_pool creates a pool on a spare disk", async () => {
   const zfs = model((remote) => {
     commands.push(remote);
     if (has(remote, P.poolStatusTank)) return { code: 0, stdout: POOL_STATUS };
-    const guard = guardRoute("/dev/sdb")(remote);
+    const guard = guardProbeRoute({
+      links: "/dev/disk/by-id/wwn-spare /dev/sdb\n",
+    })(remote);
     if (guard) return guard;
     if (has(remote, P.poolCreate)) return { code: 0 };
     if (has(remote, P.poolList)) return { code: 0, stdout: POOL_ROW };
@@ -219,6 +289,282 @@ Deno.test("create_pool creates a pool on a spare disk", async () => {
   assertEquals(
     commands.some((c) => has(c, P.poolCreate) && c.includes("ashift=12")),
     true,
+  );
+});
+
+/** A compact lsblk device spec for the guard fixtures. */
+interface DevSpec {
+  name: string;
+  type: string;
+  fstype?: string;
+  uuid?: string;
+  label?: string;
+  mounts?: string[];
+  path?: string;
+  children?: DevSpec[];
+}
+
+function devRow(d: DevSpec): Record<string, unknown> {
+  const path = d.path ??
+    (d.type === "lvm" || d.type === "crypt"
+      ? `/dev/mapper/${d.name}`
+      : `/dev/${d.name}`);
+  return {
+    name: d.name,
+    path,
+    pkname: null,
+    type: d.type,
+    fstype: d.fstype ?? null,
+    uuid: d.uuid ?? null,
+    partuuid: null,
+    label: d.label ?? null,
+    mountpoints: d.mounts ?? [null],
+    ...(d.children ? { children: d.children.map(devRow) } : {}),
+  };
+}
+
+function lsblkJson(...devs: DevSpec[]): string {
+  return JSON.stringify({ blockdevices: devs.map(devRow) });
+}
+
+/** A `findmnt -J` body. */
+function findmntJson(
+  ...mounts: { target: string; source: string; fstype: string }[]
+): string {
+  return JSON.stringify({ filesystems: mounts });
+}
+
+const MD_ARRAY_UUID = "7a0d6e3f:11112222:33334444:55556666";
+const MD_EXAMINE =
+  `/dev/x:\n          Magic : a92b4efc\n        Version : 1.2\n     Array UUID : ${MD_ARRAY_UUID}\n           Name : host:0\n`;
+
+Deno.test("create_pool refuses a root-on-ZFS disk named by-id", async () => {
+  const zfs = model(guardProbeRoute({
+    lsblk: lsblkJson(
+      {
+        name: "sda",
+        type: "disk",
+        children: [
+          {
+            name: "sda1",
+            type: "part",
+            fstype: "vfat",
+            uuid: "ABCD-1234",
+            mounts: ["/boot/efi"],
+          },
+          { name: "sda3", type: "part", fstype: "zfs_member", label: "rpool" },
+        ],
+      },
+      {
+        name: "sdb",
+        type: "disk",
+        children: [{
+          name: "sdb3",
+          type: "part",
+          fstype: "zfs_member",
+          label: "rpool",
+        }],
+      },
+      { name: "sdc", type: "disk" },
+    ),
+    findmnt: findmntJson(
+      { target: "/", source: "rpool/ROOT/debian", fstype: "zfs" },
+      { target: "/boot/efi", source: "/dev/sda1", fstype: "vfat" },
+    ),
+    fstab: "UUID=ABCD-1234 /boot/efi vfat umask=0077 0 1\n",
+    links: "/dev/disk/by-id/ata-A-part3 /dev/sda3\n" +
+      "/dev/disk/by-id/ata-B-part3 /dev/sdb3\n",
+    zpool: "  pool: rpool\n state: ONLINE\nconfig:\n\n" +
+      "\tNAME  STATE\n\trpool ONLINE\n\t  mirror-0  ONLINE\n" +
+      "\t    /dev/disk/by-id/ata-A-part3  ONLINE\n" +
+      "\t    /dev/disk/by-id/ata-B-part3  ONLINE\n\n" +
+      "errors: No known data errors\n",
+  }));
+  const args = zfs.methods.create_pool.arguments.parse({
+    ssh: SSH,
+    pool: "tank",
+    vdevs: ["/dev/disk/by-id/ata-A-part3"],
+  });
+  const { context } = createModelTestContext();
+  const error = await assertRejects(
+    () => zfs.methods.create_pool.execute(args, context),
+    DeviceGuardError,
+  );
+  assertEquals(error.code, "boot-protected");
+});
+
+Deno.test("create_pool refuses a disk named only by an fstab UUID", async () => {
+  const zfs = model(guardProbeRoute({
+    lsblk: lsblkJson(
+      {
+        name: "sda",
+        type: "disk",
+        children: [{
+          name: "sda1",
+          type: "part",
+          fstype: "ext4",
+          mounts: ["/"],
+        }],
+      },
+      {
+        name: "sdb",
+        type: "disk",
+        children: [{
+          name: "sdb1",
+          type: "part",
+          fstype: "ext4",
+          uuid: "22222222-3333-4444-5555-666666666666",
+        }],
+      },
+      { name: "sdc", type: "disk" },
+    ),
+    findmnt: findmntJson({
+      target: "/",
+      source: "/dev/sda1",
+      fstype: "ext4",
+    }),
+    fstab: "/dev/sda1 / ext4 defaults 0 1\n" +
+      "UUID=22222222-3333-4444-5555-666666666666 /var/lib/data ext4 noauto 0 2\n",
+  }));
+  const args = zfs.methods.create_pool.arguments.parse({
+    ssh: SSH,
+    pool: "tank",
+    vdevs: ["/dev/sdb"],
+  });
+  const { context } = createModelTestContext();
+  const error = await assertRejects(
+    () => zfs.methods.create_pool.execute(args, context),
+    DeviceGuardError,
+  );
+  assertEquals(error.code, "boot-protected");
+});
+
+Deno.test("create_pool refuses either parent of a multi-parent LV", async () => {
+  const spanning: DevSpec = {
+    name: "vg1-data",
+    type: "lvm",
+    fstype: "xfs",
+    mounts: ["/srv"],
+  };
+  const route = fullCreateRoute({
+    lsblk: lsblkJson(
+      {
+        name: "sda",
+        type: "disk",
+        children: [{
+          name: "sda1",
+          type: "part",
+          fstype: "ext4",
+          mounts: ["/"],
+        }],
+      },
+      {
+        name: "sdb",
+        type: "disk",
+        fstype: "LVM2_member",
+        children: [spanning],
+      },
+      {
+        name: "sdc",
+        type: "disk",
+        fstype: "LVM2_member",
+        children: [spanning],
+      },
+      { name: "sdd", type: "disk" },
+    ),
+    findmnt: findmntJson(
+      { target: "/", source: "/dev/sda1", fstype: "ext4" },
+      { target: "/srv", source: "/dev/mapper/vg1-data", fstype: "xfs" },
+    ),
+    fstab: "/dev/sda1 / ext4 defaults 0 1\n",
+    links: "/dev/mapper/vg1-data /dev/dm-3\n",
+    pvs: "  /dev/sdb  vg1\n  /dev/sdc  vg1\n",
+  });
+  for (const vdev of ["/dev/sdb", "/dev/sdc"]) {
+    const error = await assertRejects(
+      () =>
+        model(route).methods.create_pool.execute(
+          model(route).methods.create_pool.arguments.parse({
+            ssh: SSH,
+            pool: "tank",
+            vdevs: [vdev],
+          }),
+          createModelTestContext().context,
+        ),
+      DeviceGuardError,
+      vdev,
+    );
+    assertEquals(error.code, "boot-protected", vdev);
+  }
+  const args = model(route).methods.create_pool.arguments.parse({
+    ssh: SSH,
+    pool: "tank",
+    vdevs: ["/dev/sdd"],
+  });
+  await model(route).methods.create_pool.execute(
+    args,
+    createModelTestContext().context,
+  );
+});
+
+Deno.test("create_pool refuses a faulty md member with combined flags", async () => {
+  const route = fullCreateRoute({
+    lsblk: lsblkJson(
+      {
+        name: "sda",
+        type: "disk",
+        children: [{
+          name: "sda1",
+          type: "part",
+          fstype: "linux_raid_member",
+          children: [{
+            name: "md0",
+            type: "raid1",
+            fstype: "ext4",
+            mounts: ["/"],
+          }],
+        }],
+      },
+      {
+        name: "sdc",
+        type: "disk",
+        children: [{ name: "sdc1", type: "part", fstype: "linux_raid_member" }],
+      },
+      { name: "sdd", type: "disk" },
+    ),
+    findmnt: findmntJson({
+      target: "/",
+      source: "/dev/md0",
+      fstype: "ext4",
+    }),
+    fstab: "",
+    mdstat: "md0 : active raid1 sdc1[2](W)(F) sda1[0]\n",
+    mdExamine: {
+      "/dev/sda1": { code: 0, stdout: MD_EXAMINE },
+      "/dev/sdc1": { code: 0, stdout: MD_EXAMINE },
+    },
+  });
+  const error = await assertRejects(
+    () =>
+      model(route).methods.create_pool.execute(
+        model(route).methods.create_pool.arguments.parse({
+          ssh: SSH,
+          pool: "tank",
+          vdevs: ["/dev/sdc"],
+        }),
+        createModelTestContext().context,
+      ),
+    DeviceGuardError,
+  );
+  assertEquals(error.code, "boot-protected");
+  const args = model(route).methods.create_pool.arguments.parse({
+    ssh: SSH,
+    pool: "tank",
+    vdevs: ["/dev/sdd"],
+  });
+  await model(route).methods.create_pool.execute(
+    args,
+    createModelTestContext().context,
   );
 });
 
@@ -598,14 +944,8 @@ Deno.test("create_zvol is a no-op when the existing size matches in bytes", asyn
 Deno.test("create_pool refuses when the fact probe itself fails", async () => {
   const zfs = model((remote) => {
     if (has(remote, P.poolProbe)) return NO_POOLS;
-    if (has(remote, P.lsblk)) return { code: 0, stdout: LSBLK };
-    if (has(remote, P.mounts)) return { code: 0, stdout: MOUNTS };
-    if (has(remote, P.swaps)) return { code: 0, stdout: SWAPS };
-    // `cat` fails, then `test -e` fails with exit 2 (a probe failure), which
-    // must not be read as a confirmed-absent file.
-    if (has(remote, "'test'")) return { code: 2 };
-    if (has(remote, P.fstab)) return { code: 1, stderr: "I/O error" };
-    return { code: 0 };
+    if (has(remote, "/etc/fstab")) return { code: 2, stderr: "I/O error" };
+    return guardProbeRoute()(remote);
   });
   const args = zfs.methods.create_pool.arguments.parse({
     ssh: SSH,
@@ -613,23 +953,21 @@ Deno.test("create_pool refuses when the fact probe itself fails", async () => {
     vdevs: ["/dev/sdb"],
   });
   const { context } = createModelTestContext();
-  await assertRejects(
+  const error = await assertRejects(
     () => zfs.methods.create_pool.execute(args, context),
-    Error,
-    "could not confirm whether /etc/fstab exists",
+    DeviceGuardError,
   );
+  assertEquals(error.code, "boot-unverifiable");
 });
 
 Deno.test("create_pool refuses when a safety fact cannot be read", async () => {
   const commands: string[] = [];
   const zfs = model((remote) => {
     commands.push(remote);
-    if (has(remote, P.poolProbe)) return NO_POOLS;
-    if (has(remote, P.lsblk)) return { code: 0, stdout: LSBLK };
-    if (has(remote, P.mounts)) {
-      return { code: 1, stderr: "permission denied" };
+    if (has(remote, "lsblk -J -b -o")) {
+      return { code: 1, stderr: "lsblk: failed" };
     }
-    return { code: 0 };
+    return guardProbeRoute()(remote);
   });
   const args = zfs.methods.create_pool.arguments.parse({
     ssh: SSH,
@@ -639,8 +977,7 @@ Deno.test("create_pool refuses when a safety fact cannot be read", async () => {
   const { context } = createModelTestContext();
   await assertRejects(
     () => zfs.methods.create_pool.execute(args, context),
-    Error,
-    "refusing to create a pool",
+    DeviceGuardError,
   );
   assertEquals(commands.some((c) => has(c, P.poolCreate)), false);
 });

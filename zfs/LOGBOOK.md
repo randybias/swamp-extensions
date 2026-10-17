@@ -151,3 +151,26 @@ and only the probe-running code kept. The guard was NOT rewritten here.
   `readlink -f` before `vdevsMatch`.
 - MEDIUM `resolveDevice` passed host-fact paths to `readlink` unchecked. It now
   applies `assertDevicePath` first and fails closed on a grammar mismatch.
+
+## Shared boot-disk guard (signed off)
+
+- The four round-2 CRITICALs are fixed by the shared guard, not by local logic.
+  `_lib/protected_devices.ts` and `_lib/protected_devices_test.ts` are vendored
+  byte-identical from `b2/cephadm` at commit `73a786b` (the signed-off shared
+  module, also vendored by cephadm). `git hash-object` of the module is
+  `f63a27f9eb8e3aa16b7f3b9d20a81d86e6118ae4`; it is not edited here.
+- `_lib/safety.ts` now holds only the probe runner. `collectProbes` runs the
+  module's fixed probe set over the vendored `_lib/ssh.ts`; `lsblk`, `blkid`,
+  `mdadm --examine`, `zpool status -P` and `pvs` run privileged with
+  `sudo -n --`, while `findmnt`, the device-link table and the file reads do
+  not. A sudo refusal is a typed `boot-unverifiable` error. `assessProtected`
+  calls `assess(probeInputs, candidates, previous?)` and maps any refusal to a
+  typed `DeviceGuardError` naming the device.
+- `create_pool` runs `assessProtected` and then re-runs it immediately before
+  `zpool create`, passing the previous set so it can only grow. The model has no
+  boot-disk decision logic of its own.
+- Model-level `create_pool` refusal tests drive the shared module end to end:
+  boot disk by-id, root-on-ZFS by-id (`rpool`), an fstab `UUID=` disk, a
+  multi-parent LV, and a faulty md member with combined `(W)(F)` flags, plus a
+  spare-disk allow. The shared module's own vendored test file also runs in the
+  gate.

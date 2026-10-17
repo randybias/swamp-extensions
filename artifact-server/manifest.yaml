@@ -1,0 +1,12 @@
+manifestVersion: 1
+name: "@randybias/artifact-server"
+version: "2026.10.17.1"
+description: "Serve a directory of pinned artifacts over HTTP(S) from one host, fetched by content hash, and manage that directory over SSH: nginx site config, upload, host-side fetch, bundles, refs, listing, verification and prune. One generic model type with no host, path or credential baked in; every method takes its target and root as arguments and strict host-key pins are required."
+license: Apache-2.0
+repository: https://github.com/randybias/swamp-extensions
+platforms: [darwin-aarch64, darwin-x86_64, linux-x86_64, linux-aarch64]
+labels: [artifacts, nginx, http, provisioning, hashes, ssh, infrastructure]
+additionalFiles: [README.md, LICENSE.txt]
+models:
+  - artifact_server.ts
+workflows: []

@@ -11,11 +11,11 @@ against the OpenSSH client shipped with Ubuntu 24.04 and macOS.
 One generic SSH transport. The definition holds no host and no credential; every
 method takes its target as arguments.
 
-| Method            | Description                                                                            |
-| ----------------- | -------------------------------------------------------------------------------------- |
-| `exec`            | Run one argv vector over SSH and return stdout, stderr and exit code                   |
-| `upload`          | DESTRUCTIVE. Write bytes to a file over stdin, atomically; unchanged bytes are a no-op |
-| `wait_connection` | READ-ONLY. Poll until the host answers SSH with acceptable host keys, read-only        |
+| Method            | Description                                                                                     |
+| ----------------- | ----------------------------------------------------------------------------------------------- |
+| `exec`            | Run one argv vector over SSH; return the exit code and output hashes, not the raw output        |
+| `upload`          | DESTRUCTIVE. Write bytes to a file over stdin, atomically; unchanged bytes and mode are a no-op |
+| `wait_connection` | READ-ONLY. Poll until the host answers SSH with acceptable host keys, read-only                 |
 
 ## Install
 
@@ -94,14 +94,18 @@ swamp CLI echoes method arguments, sensitive ones included, in `--json` output
   reachability protection (locking down a host, reverting a config) belongs in
   the extension that owns that workflow. A non-zero remote exit code is returned
   as data; an unreachable host, rejected credential or host-key mismatch is an
-  error that names the host. Persisted `stdout` and `stderr` are
-  sensitive-marked.
+  error that names the host. The result carries only `exit_code` and the
+  `stdout_sha256`/`stderr_sha256` hashes: captured output is persisted in the
+  sensitive-marked `execution` resource and returned in the result only when
+  `return_output` is set. Because the swamp CLI prints method results in
+  `--json`, do not set `return_output` and capture `--json` together.
 - `upload` writes a temporary file in the destination directory from stdin,
   applies `mode`, then renames it over the destination, so the destination is
-  never half-written and an unwritable path leaves no partial file. It reads the
-  destination's SHA-256 first: identical bytes mean no write, no rename and no
-  new resource version. It returns the path, byte count, SHA-256 and whether the
-  file changed.
+  never half-written and an unwritable path or a destination that is a directory
+  is an error. It converges on bytes and mode: identical bytes and mode mean no
+  write, no rename and no new resource version, while the same bytes under a
+  different mode get a `chmod` only. It returns the path, byte count, SHA-256
+  and whether anything changed.
 - Credentials never touch the command line. A private key is loaded into a
   short-lived `ssh-agent` over stdin; a password goes through a temporary
   askpass helper and an environment variable. Neither appears in a spawned argv.

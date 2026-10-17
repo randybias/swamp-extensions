@@ -142,8 +142,16 @@ const TargetShape = {
 
 const ExecArgsSchema = z.strictObject({
   ...TargetShape,
-  argv: z.array(z.string().max(131072)).min(1).max(1024).describe(
-    "Command and arguments. Each element is passed as one literal argv word over SSH.",
+  argv: z.array(
+    z.string().max(131072).refine(
+      (word) => !word.includes("\u0000"),
+      "argv elements must not contain a NUL byte",
+    ),
+  ).min(1).max(1024).describe(
+    "Command and arguments. Each element is passed as one literal argv word over SSH; none may contain a NUL byte.",
+  ),
+  return_output: z.boolean().default(false).describe(
+    "When true, include stdout and stderr in the method result. Off by default because the swamp CLI prints method results in --json; captured output is always persisted in the sensitive-marked execution resource.",
   ),
 });
 
@@ -191,6 +199,8 @@ const ExecutionSchema = z.strictObject({
   argv_sha256: z.string(),
   stdout: z.string().meta({ sensitive: true }),
   stderr: z.string().meta({ sensitive: true }),
+  stdout_sha256: z.string(),
+  stderr_sha256: z.string(),
   exit_code: z.number().int(),
   ran_at: z.string(),
 });
@@ -234,6 +244,7 @@ interface TargetArgs {
 
 interface ExecArgs extends TargetArgs {
   argv: string[];
+  return_output?: boolean;
 }
 
 interface UploadArgs extends TargetArgs {
@@ -427,7 +438,7 @@ export function createModel(deps: SshDeps = denoDeps): SshHostModel {
       exec: {
         kind: "action",
         description:
-          "DESTRUCTIVE. Run one argv vector on the host over SSH and return its stdout, stderr and exit code; each element is a literal argv word, never interpolated into a shell string, but argv can change or break the host and exec cannot roll that back. A non-zero remote exit is data while an unreachable host, rejected credential or host-key mismatch is an error. Never put a secret in argv; stored stdout and stderr are sensitive-marked.",
+          "DESTRUCTIVE. Run one argv vector on the host over SSH and return the exit code plus output hashes; each element is a literal argv word, never interpolated into a shell string, but argv can change or break the host and exec cannot roll that back. A non-zero remote exit is data while an unreachable host, rejected credential or host-key mismatch is an error. Never put a secret in argv; stdout and stderr are persisted sensitive-marked and returned only when return_output is set.",
         arguments: ExecArgsSchema,
         execute: async (
           rawArgs: unknown,
@@ -439,6 +450,8 @@ export function createModel(deps: SshDeps = denoDeps): SshHostModel {
           // The host is proven only now; a failed auth or key change left no
           // durable trust behind.
           await commitPin(deps, context, args, pending);
+          const stdoutSha = await sha256Hex(result.stdout);
+          const stderrSha = await sha256Hex(result.stderr);
           const handle = await context.writeResource(
             "execution",
             `exec-${instanceSuffix(args)}`,
@@ -449,6 +462,8 @@ export function createModel(deps: SshDeps = denoDeps): SshHostModel {
               argv_sha256: await sha256Hex(args.argv.join("\u0000")),
               stdout: result.stdout,
               stderr: result.stderr,
+              stdout_sha256: stdoutSha,
+              stderr_sha256: stderrSha,
               exit_code: result.exit_code,
               ran_at: new Date(deps.now()).toISOString(),
             }),
@@ -461,14 +476,23 @@ export function createModel(deps: SshDeps = denoDeps): SshHostModel {
               exit_code: result.exit_code,
             },
           );
-          return { dataHandles: [handle], result };
+          const methodResult: Record<string, unknown> = {
+            exit_code: result.exit_code,
+            stdout_sha256: stdoutSha,
+            stderr_sha256: stderrSha,
+          };
+          if (args.return_output === true) {
+            methodResult.stdout = result.stdout;
+            methodResult.stderr = result.stderr;
+          }
+          return { dataHandles: [handle], result: methodResult };
         },
       },
 
       upload: {
         kind: "action",
         description:
-          "DESTRUCTIVE. Push bytes to an absolute path on the host over stdin, atomically: a temporary file in the destination directory is written, chmod'ed and renamed over the destination, overwriting it. Idempotent by bytes: an unchanged file is not rewritten and no new resource version is written. Returns the path, byte count, SHA-256 and whether it changed; an unwritable path is an error and leaves no partial file.",
+          "DESTRUCTIVE. Push bytes to an absolute path on the host over stdin, atomically: a temporary file in the destination directory is written, chmod'ed and renamed over the destination, overwriting it. Converges on bytes and mode: an unchanged file is not rewritten and no new resource version is written, while a mode-only difference is a chmod. Returns the path, byte count, SHA-256 and whether anything changed; an unwritable path or a destination that is a directory is an error and leaves no partial file.",
         arguments: UploadArgsSchema,
         execute: async (
           rawArgs: unknown,

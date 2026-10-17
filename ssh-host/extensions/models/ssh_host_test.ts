@@ -276,12 +276,19 @@ Deno.test("exec runs the argv, writes a host-keyed resource, returns data", asyn
   const { context, written } = testContext();
   const args = { ...STRICT, argv: ["echo", "hi"] };
   const result = await m.methods.exec.execute(args, context);
-  assertEquals(result.result, { stdout: "hi\n", stderr: "", exit_code: 0 });
+  // The result carries only exit code and output hashes by default; the raw
+  // output stays in the sensitive-marked resource.
+  const value = result.result as Record<string, unknown>;
+  assertEquals(value.exit_code, 0);
+  assertEquals(value.stdout_sha256, await sha256Hex("hi\n"));
+  assertEquals(value.stderr_sha256, await sha256Hex(""));
+  assertEquals("stdout" in value, false);
   assertEquals(written.length, 1);
   assertEquals(written[0].specName, "execution");
   assertEquals(written[0].name, `exec-${SUFFIX}`);
   assertEquals(written[0].data.exit_code, 0);
   assertEquals(written[0].data.stdout, "hi\n");
+  assertEquals(written[0].data.stdout_sha256, await sha256Hex("hi\n"));
   assertEquals(
     written[0].data.argv_sha256,
     await sha256Hex("echo\u0000hi"),
@@ -291,6 +298,34 @@ Deno.test("exec runs the argv, writes a host-keyed resource, returns data", asyn
   for (const call of calls) {
     assertEquals(call.args.join(" ").includes(PRIVATE_KEY), false);
   }
+});
+
+Deno.test("exec returns captured output only when return_output is set", async () => {
+  const calls: Call[] = [];
+  const deps = fakeDeps(fakeRun(calls));
+  const m = createModel(deps);
+  const { context } = testContext();
+  const withOutput = await m.methods.exec.execute(
+    { ...STRICT, argv: ["printenv"], return_output: true },
+    context,
+  );
+  assertEquals((withOutput.result as { stdout: string }).stdout, "hi\n");
+  const withoutOutput = await m.methods.exec.execute(
+    { ...STRICT, argv: ["printenv"] },
+    context,
+  );
+  assertEquals("stdout" in (withoutOutput.result as object), false);
+});
+
+Deno.test("schemas reject a NUL byte in argv", () => {
+  assertEquals(
+    execArgsSchema.safeParse({ ...STRICT, argv: ["echo", "a\u0000b"] }).success,
+    false,
+  );
+  assertEquals(
+    execArgsSchema.safeParse({ ...STRICT, argv: ["echo", "ok"] }).success,
+    true,
+  );
 });
 
 Deno.test("exec passes shell metacharacters as literal argv words", async () => {
@@ -337,7 +372,10 @@ Deno.test("a non-zero remote exit is data, not an error", async () => {
     { ...STRICT, argv: ["false"] },
     context,
   );
-  assertEquals(result.result, { stdout: "", stderr: "nope\n", exit_code: 2 });
+  const value = result.result as Record<string, unknown>;
+  assertEquals(value.exit_code, 2);
+  assertEquals(value.stderr_sha256, await sha256Hex("nope\n"));
+  assertEquals("stderr" in value, false);
 });
 
 Deno.test("strict without pinned keys and two credentials are config errors", async () => {
@@ -364,15 +402,26 @@ Deno.test("strict without pinned keys and two credentials are config errors", as
   );
 });
 
-Deno.test("upload writes a host-keyed resource and is idempotent", async () => {
+Deno.test("upload writes once and the second run is a true no-op", async () => {
   const calls: Call[] = [];
   let seen: Uint8Array | undefined;
+  let stored: { sha: string; mode: string } | null = null;
+  const content = "placeholder\n";
+  const contentSha = await sha256Hex(content);
   const deps = fakeDeps(fakeRun(calls, {
-    ssh: (_args, options) => {
-      seen = typeof options.stdin === "string"
-        ? new TextEncoder().encode(options.stdin)
-        : options.stdin;
-      return { code: 0, stdout: "", stderr: "" };
+    ssh: (args, options) => {
+      const remote = args.at(-1) ?? "";
+      if (remote.includes("mktemp")) {
+        seen = typeof options.stdin === "string"
+          ? new TextEncoder().encode(options.stdin)
+          : options.stdin;
+        stored = { sha: contentSha, mode: "600" };
+        return { code: 0, stdout: "", stderr: "" };
+      }
+      // Convergence probe against the retained remote state.
+      return stored
+        ? { code: 0, stdout: `${stored.sha} ${stored.mode}\n`, stderr: "" }
+        : { code: 0, stdout: "MISSING\n", stderr: "" };
     },
   }));
   const m = createModel(deps);
@@ -380,17 +429,19 @@ Deno.test("upload writes a host-keyed resource and is idempotent", async () => {
   const args = {
     ...STRICT,
     path: "/etc/wireguard/wg0.conf",
-    content: "placeholder\n",
+    content,
     mode: "0600",
   };
   const first = await m.methods.upload.execute(args, context);
   const second = await m.methods.upload.execute(args, context);
-  assertEquals(first.result, second.result);
-  assertEquals(new TextDecoder().decode(seen), "placeholder\n");
+  assertEquals((first.result as { changed: boolean }).changed, true);
+  assertEquals((second.result as { changed: boolean }).changed, false);
+  assertEquals(written.length, 1);
+  assertEquals(new TextDecoder().decode(seen), content);
   assertEquals(written[0].specName, "upload");
   assertEquals(written[0].name, `upload-${SUFFIX}`);
   assertEquals(written[0].data.bytes, 12);
-  assertEquals(written[0].data.sha256, await sha256Hex("placeholder\n"));
+  assertEquals(written[0].data.sha256, contentSha);
   for (const call of calls) {
     assertEquals(call.args.join(" ").includes("placeholder"), false);
   }
@@ -548,7 +599,7 @@ Deno.test("insecure_tofu records the first keys and pins them on later runs", as
   const m = createModel(deps);
   const { context, written } = testContext();
   const first = await m.methods.exec.execute(args, context);
-  assertEquals(first.result, { stdout: "hi\n", stderr: "", exit_code: 0 });
+  assertEquals((first.result as { exit_code: number }).exit_code, 0);
   // First use scanned and recorded the keys, then pinned them for the run.
   assertEquals(calls.some((c) => c.cmd === "ssh-keyscan"), true);
   const connection = written.find((w) => w.specName === "connection");

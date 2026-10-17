@@ -204,6 +204,11 @@ Deno.test("quoteArgv and buildRemoteCommand only emit quoted words", () => {
   assertThrows(() => quoteArgv([]), SshConfigError);
   assertThrows(() => quoteArgv(["a", 1 as unknown as string]), SshConfigError);
   assertThrows(
+    () => quoteArgv(["echo", "a\u0000b"]),
+    SshConfigError,
+    "NUL",
+  );
+  assertThrows(
     () => buildRemoteCommand([["a"], ["b"]], []),
     SshConfigError,
     "operator",
@@ -484,6 +489,9 @@ Deno.test("upload streams bytes over stdin and renames atomically", async () => 
   assertStringIncludes(remote, "chmod '0640'");
   assertStringIncludes(remote, `mv -f \"$t\" \"$f\"`);
   assertStringIncludes(remote, `f='/etc/wireguard/wg0.conf'`);
+  // No-target-directory rename on Linux and a post-move verification.
+  assertStringIncludes(remote, "mv -T");
+  assertStringIncludes(remote, `[ "$h" = '${result.sha256}' ]`);
   for (const call of calls) {
     assertEquals(call.args.join(" ").includes("placeholder config"), false);
   }

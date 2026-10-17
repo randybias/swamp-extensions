@@ -242,6 +242,11 @@ export function quoteArgv(argv: string[]): string {
     if (typeof word !== "string") {
       throw new SshConfigError("every argv element must be a string");
     }
+    // A NUL cannot be carried in a process argument at all, so refuse it here
+    // with a typed error rather than letting the spawn fail opaquely.
+    if (word.includes("\u0000")) {
+      throw new SshConfigError("argv elements must not contain a NUL byte");
+    }
   }
   return argv.map(posixQuote).join(" ");
 }
@@ -795,14 +800,20 @@ export async function upload(
   const dir = options.path.slice(0, options.path.lastIndexOf("/")) || "/";
   const script = [
     `f=${file}`,
-    `[ -d "$f" ] && exit 1`,
     `d=${posixQuote(dir)}`,
     `t=$(mktemp "$d/.ssh-host-upload.XXXXXX") || exit 1`,
     `trap 'rm -f "$t"' EXIT HUP INT TERM`,
     `cat > "$t" || exit 1`,
     `chmod ${posixQuote(mode)} "$t" || exit 1`,
-    `[ ! -d "$f" ] || exit 1`,
-    `mv -f "$t" "$f" || exit 1`,
+    `[ -d "$f" ] && exit 1`,
+    // GNU mv -T has rename(2) no-target-directory semantics: it replaces a
+    // symlink or file but never descends into a directory. BSD/macOS mv lacks
+    // -T, so guard with the directory test and verify the result below.
+    `case "$(uname -s)" in Linux) mv -T "$t" "$f" || exit 1;; *) mv -f "$t" "$f" || exit 1;; esac`,
+    `[ -f "$f" ] && [ ! -d "$f" ] || exit 1`,
+    // Verify the destination really holds these bytes before reporting success.
+    `h=$( { sha256sum "$f" 2>/dev/null || shasum -a 256 "$f" 2>/dev/null; } | awk '{print $1}' )`,
+    `[ "$h" = ${posixQuote(sha256)} ] || exit 1`,
   ].join("\n");
   const res = await runRemote(deps, target, script, bytes);
   if (res.exit_code !== 0) {

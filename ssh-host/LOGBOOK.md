@@ -110,3 +110,22 @@ for this round.
   `upload`. This is a generic transport primitive; a forced rollback on every
   exec breaks normal use. Reachability protection lives in the higher-level
   extensions, and `DESTRUCTIVE.` plus the README note is the right treatment.
+
+## Review ledger: round 4 (codex astra + terra on 78cc26a)
+
+- HIGH-1 (exec result leaked secrets): `exec` no longer returns raw stdout or
+  stderr. The default result is `{ exit_code, stdout_sha256, stderr_sha256 }`;
+  captured output is persisted in the sensitive-marked `execution` resource and
+  only included in the result when the new `return_output` input is set. README
+  warns never to combine `return_output` with captured `--json`.
+- HIGH-2 (upload final-target race): the write script now uses `mv -T`
+  (rename(2) no-target-directory semantics) on Linux, a directory guard with
+  plain `mv` elsewhere, and verifies the destination is a regular file whose
+  SHA-256 matches before reporting success.
+- MEDIUM-3 (argv NUL): `quoteArgv` and the `exec` schema both reject a NUL byte
+  with a typed error before any spawn.
+- LOW-4: README and the `upload` description now say convergence is bytes AND
+  mode, matching the chmod-only branch.
+- LOW-5: the upload idempotence test keeps remote state (sha + mode) and asserts
+  the second run writes nothing and returns `changed: false`.
+- REFUTED, kept: terra's armed-revert-on-exec; see the round-3 disposition.

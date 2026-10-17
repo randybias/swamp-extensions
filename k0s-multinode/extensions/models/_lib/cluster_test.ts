@@ -13,8 +13,7 @@ import {
   drainArgs,
   etcdLeaveArgs,
   etcdMemberListArgs,
-  isJoinToken,
-  joinTokenId,
+  joinTokenIdFromCreate,
   newTokenIds,
   nodeListArgs,
   nodePodListArgs,
@@ -98,20 +97,14 @@ Deno.test("parseClusterNodes reads the k0s version label and tolerates junk", ()
   assertEquals(parseClusterNodes("{}"), []);
 });
 
-Deno.test("parseEtcdMembers reads both the map and array envelopes", () => {
-  const map = JSON.stringify({
-    members: {
-      "ctrl-1": {
-        name: "ctrl-1",
-        peerURLs: ["https://192.0.2.11:2380"],
-        clientURLs: ["https://192.0.2.11:2379"],
-      },
-    },
+Deno.test("parseEtcdMembers reads the real name->peerURL map", () => {
+  const real = JSON.stringify({
+    members: { "ctrl-1": "https://192.0.2.11:2380" },
   });
-  assertEquals(parseEtcdMembers(map), [{
+  assertEquals(parseEtcdMembers(real), [{
     name: "ctrl-1",
     peer_urls: ["https://192.0.2.11:2380"],
-    client_urls: ["https://192.0.2.11:2379"],
+    client_urls: [],
   }]);
   const arr = JSON.stringify([{ name: "w", peerURLs: [], clientURLs: [] }]);
   assertEquals(parseEtcdMembers(arr).length, 1);
@@ -128,12 +121,8 @@ Deno.test("parseJoinTokens reads the table and a JSON list", () => {
     { id: "abc123", role: "worker", expiry: "2026-10-18T00:00:00Z" },
     { id: "def456", role: "controller", expiry: "2026-10-18T01:00:00Z" },
   ]);
-  const json = JSON.stringify([
-    { id: "aaa", role: "worker", expiry: "x" },
-  ]);
-  assertEquals(parseJoinTokens(json), [
-    { id: "aaa", role: "worker", expiry: "x" },
-  ]);
+  // A JSON blob must not be read as tokens (it could carry a secret).
+  assertEquals(parseJoinTokens('[{"id":"abcdef","role":"worker"}]'), []);
   assertEquals(parseJoinTokens(""), []);
 });
 
@@ -143,11 +132,26 @@ Deno.test("token diff finds only the new id", () => {
   assertEquals(newTokenIds(before, after), ["def456"]);
 });
 
-Deno.test("join token shape and id", () => {
-  assertEquals(isJoinToken("abc123.0123456789abcdef"), true);
-  assertEquals(isJoinToken("no-dot"), false);
-  assertEquals(joinTokenId("abc123.0123456789abcdef"), "abc123");
+Deno.test("joinTokenIdFromCreate decodes the kubeconfig and refuses junk", async () => {
+  assertEquals(
+    await joinTokenIdFromCreate(await fakeJoinToken("abc123")),
+    "abc123",
+  );
+  assertEquals(await joinTokenIdFromCreate("not-base64"), null);
+  assertEquals(await joinTokenIdFromCreate(btoa("abc123.secret")), null);
 });
+
+/** Builds a real-shaped `k0s token create` payload: base64(gzip(kubeconfig)). */
+async function fakeJoinToken(id: string): Promise<string> {
+  const yaml =
+    `apiVersion: v1\nkind: Config\nusers:\n- name: k0s\n  user:\n    token: ${id}.0123456789abcdef\n`;
+  const stream = new Blob([new TextEncoder().encode(yaml)]).stream()
+    .pipeThrough(new CompressionStream("gzip"));
+  const bytes = new Uint8Array(await new Response(stream).arrayBuffer());
+  let binary = "";
+  for (const byte of bytes) binary += String.fromCharCode(byte);
+  return btoa(binary);
+}
 
 Deno.test("command builders name no token value on argv", () => {
   assertEquals(nodeListArgs(), [

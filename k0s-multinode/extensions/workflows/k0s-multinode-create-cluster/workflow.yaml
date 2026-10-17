@@ -1,0 +1,407 @@
+id: k0s-multinode-create-cluster
+name: "@randybias/k0s-multinode-create-cluster"
+version: 1
+description: >-
+  Create a multi-node k0s cluster: install the first controller, then join each
+  extra controller and worker with a short-lived token minted into a vault key
+  and invalidated as soon as the node has joined. Per-node work is delegated to
+  k0s-cluster; the cluster-scope work (tokens, membership, ordering) is
+  k0s-multinode. Every mint is paired with an invalidate that runs on success or
+  failure.
+vaults:
+  - k0s-multinode
+  - default
+inputs:
+  type: object
+  additionalProperties: false
+  required:
+    - cluster
+    - controller
+    - nodes
+    - token_key_prefix
+  properties:
+    cluster:
+      type: object
+      additionalProperties: false
+      required:
+        - cluster_name
+        - k0s_version
+        - k0s_binary_sha256
+        - pod_cidr
+        - service_cidr
+      properties:
+        cluster_name:
+          type: string
+          pattern: "^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$"
+        k0s_version:
+          type: string
+        k0s_binary_sha256:
+          type: string
+          pattern: "^[0-9a-f]{64}$"
+        pod_cidr:
+          type: string
+        service_cidr:
+          type: string
+        storage_type:
+          type: string
+          enum: [etcd, kine]
+          default: etcd
+        api_address:
+          type: [string, "null"]
+          default: null
+        api_port:
+          type: integer
+          default: 6443
+        external_address:
+          type: [string, "null"]
+          default: null
+        node_local_load_balancing:
+          type: boolean
+          default: false
+        etcd_peer_address:
+          type: [string, "null"]
+          default: null
+        api_sans:
+          type: array
+          items:
+            type: string
+          default: []
+        control_plane_load_balancing:
+          type: [object, "null"]
+          default: null
+    controller:
+      type: object
+      additionalProperties: false
+      required:
+        - name
+        - ssh_host
+        - private_address
+        - ssh_user
+        - host_key_policy
+        - known_hosts
+        - ssh_private_key_key
+      properties:
+        name:
+          type: string
+        ssh_host:
+          type: string
+        private_address:
+          type: string
+        ssh_user:
+          type: string
+          default: root
+        ssh_port:
+          type: integer
+          default: 22
+        host_key_policy:
+          type: string
+          enum: [strict]
+        known_hosts:
+          type: array
+          items:
+            type: string
+          default: []
+        ssh_private_key_key:
+          type: string
+    nodes:
+      type: array
+      minItems: 1
+      items:
+        type: object
+        additionalProperties: false
+        required:
+          - name
+          - role
+          - ssh_host
+          - private_address
+          - ssh_user
+          - host_key_policy
+          - known_hosts
+          - ssh_private_key_key
+        properties:
+          name:
+            type: string
+          role:
+            type: string
+            enum: [controller, controller_worker, worker]
+          ssh_host:
+            type: string
+          private_address:
+            type: string
+          ssh_user:
+            type: string
+            default: root
+          ssh_port:
+            type: integer
+            default: 22
+          host_key_policy:
+            type: string
+            enum: [strict]
+          known_hosts:
+            type: array
+            items:
+              type: string
+            default: []
+          ssh_private_key_key:
+            type: string
+          no_taints:
+            type: boolean
+            default: false
+    token_key_prefix:
+      type: string
+      pattern: "^[A-Za-z0-9_.-]{0,100}$"
+      default: "join-token-"
+    token_expiry:
+      type: string
+      pattern: '^\d{1,3}(m|h)$'
+      default: "1h"
+    ha_mode:
+      type: string
+      enum: [none, external_lb, cplb_vip, node_local_lb]
+      default: node_local_lb
+    allow_even_controllers:
+      type: boolean
+      default: false
+    joined_timeout_s:
+      type: integer
+      default: 600
+jobs:
+  - name: plan
+    description: Record the ordered step list and refuse a bad topology before touching a host
+    steps:
+      - name: plan
+        description: Plan create; refuses an even controller count or a missing HA endpoint
+        task:
+          type: model_method
+          modelType: "@randybias/k0s-multinode"
+          modelName: k0s-multinode
+          methodName: plan
+          inputs:
+            cluster_name: ${{ inputs.cluster.cluster_name }}
+            nodes: >-
+              ${{ [{"name": inputs.controller.name, "ssh_host": inputs.controller.ssh_host, "role": "controller", "private_address": inputs.controller.private_address}].concat(inputs.nodes.map(n, {"name": n.name, "ssh_host": n.ssh_host, "role": n.role, "private_address": n.private_address})) }}
+            k0s_version: ${{ inputs.cluster.k0s_version }}
+            ha_mode: ${{ inputs.ha_mode }}
+            external_address: ${{ inputs.cluster.external_address }}
+            allow_even_controllers: ${{ inputs.allow_even_controllers }}
+            token_expiry: ${{ inputs.token_expiry }}
+  - name: bootstrap
+    description: Install the first controller and wait for it to be Ready before any token is minted
+    dependsOn:
+      - job: plan
+        condition:
+          type: succeeded
+    steps:
+      - name: install-first-controller
+        description: Install k0s on the first controller with the shared k0s.yaml
+        task:
+          type: model_method
+          modelType: "@randybias/k0s-cluster"
+          modelName: k0s-cluster-${{ inputs.controller.name }}
+          methodName: install
+          inputs:
+            ssh:
+              host: ${{ inputs.controller.ssh_host }}
+              user: ${{ inputs.controller.ssh_user }}
+              port: ${{ inputs.controller.ssh_port }}
+              host_key_policy: ${{ inputs.controller.host_key_policy }}
+              host_keys: ${{ inputs.controller.known_hosts }}
+              private_key: ${{ vault.get("k0s-multinode", inputs.controller.ssh_private_key_key) }}
+            role: controller
+            k0s_version: ${{ inputs.cluster.k0s_version }}
+            k0s_binary_sha256: ${{ inputs.cluster.k0s_binary_sha256 }}
+            cluster_name: ${{ inputs.cluster.cluster_name }}
+            pod_cidr: ${{ inputs.cluster.pod_cidr }}
+            service_cidr: ${{ inputs.cluster.service_cidr }}
+            storage_type: ${{ inputs.cluster.storage_type }}
+            api_address: ${{ inputs.cluster.api_address }}
+            api_port: ${{ inputs.cluster.api_port }}
+            external_address: ${{ inputs.cluster.external_address }}
+            node_local_load_balancing: ${{ inputs.cluster.node_local_load_balancing }}
+            etcd_peer_address: ${{ inputs.cluster.etcd_peer_address }}
+            api_sans: ${{ inputs.cluster.api_sans }}
+            control_plane_load_balancing: ${{ inputs.cluster.control_plane_load_balancing }}
+      - name: wait-first-controller
+        description: Wait for the first controller to be Ready and an etcd member
+        dependsOn:
+          - step: install-first-controller
+            condition:
+              type: succeeded
+        task:
+          type: model_method
+          modelType: "@randybias/k0s-multinode"
+          modelName: k0s-multinode
+          methodName: wait_joined
+          inputs:
+            cluster_name: ${{ inputs.cluster.cluster_name }}
+            ssh:
+              host: ${{ inputs.controller.ssh_host }}
+              user: ${{ inputs.controller.ssh_user }}
+              port: ${{ inputs.controller.ssh_port }}
+              host_key_policy: ${{ inputs.controller.host_key_policy }}
+              host_keys: ${{ inputs.controller.known_hosts }}
+              private_key: ${{ vault.get("k0s-multinode", inputs.controller.ssh_private_key_key) }}
+            node: ${{ inputs.controller.name }}
+            role: controller
+            timeout_s: ${{ inputs.joined_timeout_s }}
+  - name: join
+    description: Join each extra node with a short-lived token, one at a time
+    dependsOn:
+      - job: bootstrap
+        condition:
+          type: succeeded
+    concurrency: 1
+    steps:
+      - name: mint-${{ self.node.name }}
+        description: Mint a role token for this node into its vault key
+        forEach:
+          item: node
+          in: ${{ inputs.nodes }}
+        concurrency: 1
+        task:
+          type: model_method
+          modelType: "@randybias/k0s-multinode"
+          modelName: k0s-multinode
+          methodName: mint_join_token
+          inputs:
+            cluster_name: ${{ inputs.cluster.cluster_name }}
+            ssh:
+              host: ${{ inputs.controller.ssh_host }}
+              user: ${{ inputs.controller.ssh_user }}
+              port: ${{ inputs.controller.ssh_port }}
+              host_key_policy: ${{ inputs.controller.host_key_policy }}
+              host_keys: ${{ inputs.controller.known_hosts }}
+              private_key: ${{ vault.get("k0s-multinode", inputs.controller.ssh_private_key_key) }}
+            role: '${{ self.node.role == "worker" ? "worker" : "controller" }}'
+            token_expiry: ${{ inputs.token_expiry }}
+            token_vault:
+              vault: k0s-multinode
+              key: ${{ inputs.token_key_prefix + self.node.name }}
+      - name: install-${{ self.node.name }}
+        description: Join this node with the minted token
+        forEach:
+          item: node
+          in: ${{ inputs.nodes }}
+        dependsOn:
+          - step: mint-${{ self.node.name }}
+            condition:
+              type: succeeded
+        task:
+          type: model_method
+          modelType: "@randybias/k0s-cluster"
+          modelName: k0s-cluster-${{ self.node.name }}
+          methodName: install
+          inputs:
+            ssh:
+              host: ${{ self.node.ssh_host }}
+              user: ${{ self.node.ssh_user }}
+              port: ${{ self.node.ssh_port }}
+              host_key_policy: ${{ self.node.host_key_policy }}
+              host_keys: ${{ self.node.known_hosts }}
+              private_key: ${{ vault.get("k0s-multinode", self.node.ssh_private_key_key) }}
+            role: ${{ self.node.role }}
+            no_taints: ${{ self.node.no_taints }}
+            join_token: ${{ vault.get("k0s-multinode", inputs.token_key_prefix + self.node.name) }}
+            k0s_version: ${{ inputs.cluster.k0s_version }}
+            k0s_binary_sha256: ${{ inputs.cluster.k0s_binary_sha256 }}
+            cluster_name: ${{ inputs.cluster.cluster_name }}
+            pod_cidr: ${{ inputs.cluster.pod_cidr }}
+            service_cidr: ${{ inputs.cluster.service_cidr }}
+            storage_type: ${{ inputs.cluster.storage_type }}
+            api_address: ${{ inputs.cluster.api_address }}
+            api_port: ${{ inputs.cluster.api_port }}
+            external_address: ${{ inputs.cluster.external_address }}
+            node_local_load_balancing: ${{ inputs.cluster.node_local_load_balancing }}
+            etcd_peer_address: ${{ inputs.cluster.etcd_peer_address }}
+            api_sans: ${{ inputs.cluster.api_sans }}
+            control_plane_load_balancing: ${{ inputs.cluster.control_plane_load_balancing }}
+      - name: wait-${{ self.node.name }}
+        description: Wait for this node to join before the next one starts
+        forEach:
+          item: node
+          in: ${{ inputs.nodes }}
+        dependsOn:
+          - step: install-${{ self.node.name }}
+            condition:
+              type: succeeded
+        task:
+          type: model_method
+          modelType: "@randybias/k0s-multinode"
+          modelName: k0s-multinode
+          methodName: wait_joined
+          inputs:
+            cluster_name: ${{ inputs.cluster.cluster_name }}
+            ssh:
+              host: ${{ inputs.controller.ssh_host }}
+              user: ${{ inputs.controller.ssh_user }}
+              port: ${{ inputs.controller.ssh_port }}
+              host_key_policy: ${{ inputs.controller.host_key_policy }}
+              host_keys: ${{ inputs.controller.known_hosts }}
+              private_key: ${{ vault.get("k0s-multinode", inputs.controller.ssh_private_key_key) }}
+            node: ${{ self.node.name }}
+            role: '${{ self.node.role == "worker" ? "worker" : "controller" }}'
+            timeout_s: ${{ inputs.joined_timeout_s }}
+      - name: invalidate-${{ self.node.name }}
+        description: Invalidate the token whether or not the join succeeded
+        forEach:
+          item: node
+          in: ${{ inputs.nodes }}
+        dependsOn:
+          - step: mint-${{ self.node.name }}
+            condition:
+              type: completed
+          - step: wait-${{ self.node.name }}
+            condition:
+              type: completed
+        task:
+          type: model_method
+          modelType: "@randybias/k0s-multinode"
+          modelName: k0s-multinode
+          methodName: invalidate_join_token
+          inputs:
+            cluster_name: ${{ inputs.cluster.cluster_name }}
+            ssh:
+              host: ${{ inputs.controller.ssh_host }}
+              user: ${{ inputs.controller.ssh_user }}
+              port: ${{ inputs.controller.ssh_port }}
+              host_key_policy: ${{ inputs.controller.host_key_policy }}
+              host_keys: ${{ inputs.controller.known_hosts }}
+              private_key: ${{ vault.get("k0s-multinode", inputs.controller.ssh_private_key_key) }}
+            token_vault:
+              vault: k0s-multinode
+              key: ${{ inputs.token_key_prefix + self.node.name }}
+  - name: verify
+    description: Read back the membership
+    dependsOn:
+      - job: join
+        condition:
+          type: completed
+    steps:
+      - name: get
+        description: Record nodes, etcd members and outstanding tokens
+        task:
+          type: model_method
+          modelType: "@randybias/k0s-multinode"
+          modelName: k0s-multinode
+          methodName: get
+          inputs:
+            cluster_name: ${{ inputs.cluster.cluster_name }}
+            ssh:
+              host: ${{ inputs.controller.ssh_host }}
+              user: ${{ inputs.controller.ssh_user }}
+              port: ${{ inputs.controller.ssh_port }}
+              host_key_policy: ${{ inputs.controller.host_key_policy }}
+              host_keys: ${{ inputs.controller.known_hosts }}
+              private_key: ${{ vault.get("k0s-multinode", inputs.controller.ssh_private_key_key) }}
+      - name: check
+        description: Every desired node must be present and Ready
+        dependsOn:
+          - step: get
+            condition:
+              type: succeeded
+        task:
+          type: assert
+          expr: >-
+            data.latest('k0s-multinode', inputs.cluster.cluster_name + '-status').attributes.nodes.filter(n, n.ready).size() >= inputs.nodes.size() + 1
+          message: Not every desired node joined and became Ready
+          severity: high

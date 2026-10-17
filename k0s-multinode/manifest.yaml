@@ -9,3 +9,5 @@ labels: [k0s, kubernetes, multinode, ha, etcd, join-token, orchestration]
 additionalFiles: [README.md, LICENSE.txt]
 models:
   - k0s_multinode.ts
+workflows:
+  - k0s-multinode-create-cluster/workflow.yaml

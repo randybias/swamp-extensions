@@ -20,11 +20,13 @@ import {
   etcdLeaveArgs,
   type EtcdMember,
   etcdMemberListArgs,
-  isJoinToken,
-  joinTokenId,
+  hasNonDaemonSetPods,
+  type JoinToken,
+  joinTokenIdFromCreate,
   newTokenIds,
   nodeListArgs,
   nodePodListArgs,
+  ok,
   parseClusterNodes,
   parseEtcdMembers,
   parseItemNames,
@@ -35,7 +37,6 @@ import {
   tokenListArgs,
   uncordonArgs,
 } from "./_lib/cluster.ts";
-import { ok } from "./_lib/k0s.ts";
 import {
   type ExecResult,
   HOST_RE,
@@ -44,12 +45,14 @@ import {
 } from "./_lib/ssh.ts";
 import { createSshTransport, type SshTransport } from "./_lib/transport.ts";
 import {
+  inferOperation,
   type NodeSpec,
   plan,
   type PlanInput,
   PlanInputSchema,
   planRemove,
   type PlanStep,
+  SUBDOMAIN_RE,
 } from "./_lib/plan.ts";
 
 // deno-lint-ignore no-explicit-any
@@ -69,11 +72,11 @@ const SSH = z.strictObject({
   ),
   user: z.string().regex(USER_RE).describe("Remote user, typically root."),
   port: z.number().int().min(1).max(65535).default(22).describe("SSH port."),
-  host_key_policy: z.enum(["strict", "insecure_tofu"]).describe(
-    "strict pins host_keys and refuses a mismatch; insecure_tofu records them on first use. There is no silent default.",
+  host_key_policy: z.enum(["strict"]).describe(
+    "strict pins host_keys and refuses a mismatch; this model offers no trust-on-first-use, so keys must be pinned up front.",
   ),
-  host_keys: z.array(z.string().max(4096)).max(64).nullish().describe(
-    "Pinned host keys in ssh-keyscan format; required when host_key_policy is strict.",
+  host_keys: z.array(z.string().max(4096)).min(1).max(64).describe(
+    "Pinned host keys in ssh-keyscan format; required.",
   ),
   private_key: z.string().max(32768).meta({ sensitive: true }).describe(
     "PEM private key, delivered to ssh-agent over stdin; never placed on a command line.",
@@ -81,10 +84,7 @@ const SSH = z.strictObject({
   connect_timeout_s: z.number().int().min(1).max(120).default(15).describe(
     "SSH connection timeout in seconds.",
   ),
-}).refine(
-  (ssh) => ssh.host_key_policy !== "strict" || (ssh.host_keys?.length ?? 0) > 0,
-  { message: "host_key_policy strict requires host_keys", path: ["host_keys"] },
-);
+});
 
 /** A caller-named vault key. */
 const VaultRefSchema = z.strictObject({
@@ -122,24 +122,30 @@ const MintArgs = ClusterArgs.extend({
   token_vault: VaultRefSchema,
 });
 const InvalidateArgs = ClusterArgs.extend({
-  token_id: TOKEN_ID,
+  token_id: TOKEN_ID.nullish().describe(
+    "Token ID to invalidate; when omitted, the newest live token for token_vault is used.",
+  ),
   token_vault: VaultRefSchema,
 });
 const WaitArgs = ClusterArgs.extend({
-  node: z.string().max(253).describe("Node name to wait for."),
+  node: z.string().max(253).regex(SUBDOMAIN_RE, "not a DNS-1123 subdomain")
+    .describe("Node name to wait for."),
   role: z.enum(["controller", "worker"]).describe("Role it joins as."),
   timeout_s: z.number().int().min(10).max(7200).default(600),
   poll_interval_s: z.number().int().min(1).max(300).default(10),
 });
 const DrainArgs = ClusterArgs.extend({
-  node: z.string().max(253).describe("Node name to drain."),
+  node: z.string().max(253).regex(SUBDOMAIN_RE, "not a DNS-1123 subdomain")
+    .describe("Node name to drain."),
   drain_timeout_s: z.number().int().min(30).max(3600).default(300),
 });
 const UncordonArgs = ClusterArgs.extend({
-  node: z.string().max(253).describe("Node name to uncordon."),
+  node: z.string().max(253).regex(SUBDOMAIN_RE, "not a DNS-1123 subdomain")
+    .describe("Node name to uncordon."),
 });
 const DetachArgs = ClusterArgs.extend({
-  node: z.string().max(253).describe("Node name to detach."),
+  node: z.string().max(253).regex(SUBDOMAIN_RE, "not a DNS-1123 subdomain")
+    .describe("Node name to detach."),
   peer_address: z.string().max(45).nullish().describe(
     "The leaving controller's etcd peer address; derived from etcd member-list when omitted.",
   ),
@@ -232,7 +238,7 @@ export class ClusterCommandError extends Error {
       `k0s command failed on the controller (${
         argv.slice(0, 3).join(" ")
       }, exit ${result.exit_code}): ${
-        (result.stderr || result.stdout).trim().slice(0, 400) || "no output"
+        result.stderr.trim().slice(0, 400) || "no stderr"
       }`,
     );
     this.name = "ClusterCommandError";
@@ -291,7 +297,7 @@ function targetOf(ssh: z.infer<typeof SSH>): SshTarget {
     port: ssh.port,
     user: ssh.user,
     host_key_policy: ssh.host_key_policy,
-    host_keys: ssh.host_keys ?? undefined,
+    host_keys: ssh.host_keys,
     private_key: ssh.private_key,
     connect_timeout_s: ssh.connect_timeout_s,
   };
@@ -346,12 +352,6 @@ function peerHostOf(member: EtcdMember | undefined): string | null {
   }
 }
 
-/** The operation a plan input describes. */
-function operationFor(input: PlanInput): PlanState["operation"] {
-  if (input.target_version) return "upgrade";
-  return input.observed.length > 0 ? "add" : "create";
-}
-
 /** Builds the model with overridable dependencies. */
 export function createModel(deps: Partial<Deps> = {}) {
   const d: Deps = {
@@ -376,6 +376,16 @@ export function createModel(deps: Partial<Deps> = {}) {
     return { dataHandles: [handle] };
   };
 
+  /** Lists tokens per role; k0s refuses a role-less `token list`. */
+  const listTokens = async (target: SshTarget): Promise<JoinToken[]> => [
+    ...parseJoinTokens(
+      (await run(d, target, tokenListArgs("controller"))).stdout,
+    ),
+    ...parseJoinTokens(
+      (await run(d, target, tokenListArgs("worker"))).stdout,
+    ),
+  ];
+
   /** Reads the live cluster in one pass. */
   const observe = async (target: SshTarget) => {
     const nodes = parseClusterNodes(
@@ -384,9 +394,7 @@ export function createModel(deps: Partial<Deps> = {}) {
     const etcd_members = parseEtcdMembers(
       (await run(d, target, etcdMemberListArgs())).stdout,
     );
-    const tokens = parseJoinTokens(
-      (await run(d, target, tokenListArgs())).stdout,
-    );
+    const tokens = await listTokens(target);
     return { nodes, etcd_members, tokens };
   };
 
@@ -426,21 +434,30 @@ export function createModel(deps: Partial<Deps> = {}) {
         (await run(d, target, nodeListArgs())).stdout,
       );
       const observed = nodes.find((n) => n.name === nodeName);
-      let joined = observed?.ready === true;
-      if (joined && role === "controller") {
+      if (role === "controller") {
+        // A dedicated controller may have no Node object; membership is the
+        // etcd member list plus the ControlNode, not a Ready Node.
         const members = parseEtcdMembers(
           (await run(d, target, etcdMemberListArgs())).stdout,
         );
         const controlNodes = parseItemNames(
           (await run(d, target, controlNodeListArgs())).stdout,
         );
-        joined = members.some((m) => m.name === nodeName) &&
-          controlNodes.includes(nodeName);
-      }
-      if (joined && observed) {
+        if (
+          members.some((m) => m.name === nodeName) &&
+          controlNodes.includes(nodeName)
+        ) {
+          return {
+            joined: true,
+            ready: observed?.ready ?? true,
+            roles: "controller" as const,
+            kubelet_version: observed?.kubelet_version ?? null,
+          };
+        }
+      } else if (observed?.ready === true) {
         return {
           joined: true,
-          ready: observed.ready,
+          ready: true,
           roles: observed.role,
           kubelet_version: observed.kubelet_version,
         };
@@ -491,7 +508,12 @@ export function createModel(deps: Partial<Deps> = {}) {
           context: Ctx,
         ) => {
           const input = PlanInputSchema.parse(args);
-          return await store(context, input, operationFor(input), plan(input));
+          return await store(
+            context,
+            input,
+            inferOperation(input),
+            plan(input),
+          );
         },
       },
       plan_remove: {
@@ -504,16 +526,20 @@ export function createModel(deps: Partial<Deps> = {}) {
           args: z.input<typeof PlanInputSchema> & { node: string },
           context: Ctx,
         ) => {
-          const input = PlanInputSchema.parse(args);
+          const parsed = PlanInputSchema.extend({
+            node: z.string().regex(SUBDOMAIN_RE, "not a DNS-1123 subdomain"),
+          }).parse(args);
+          const input = PlanInputSchema.parse(parsed);
           return await store(
             context,
             input,
             "remove",
-            planRemove(input, args.node),
+            planRemove(input, parsed.node),
           );
         },
       },
       mint_join_token: {
+        kind: "action" as const,
         description:
           "On a controller, mint a short-lived join token, write it to a caller-named vault key and return only its ID, role and expiry. Refuses to proceed without a vault service, so the token never falls back into the output.",
         arguments: MintArgs,
@@ -530,18 +556,39 @@ export function createModel(deps: Partial<Deps> = {}) {
             tokenCreateArgs(parsed.role, parsed.token_expiry),
           );
           const token = created.stdout.trim();
-          if (!isJoinToken(token)) {
+          const tokenId = await joinTokenIdFromCreate(token);
+          if (!tokenId) {
             throw new TokenError(
-              "k0s token create did not return a usable token; nothing was stored",
+              "k0s token create did not return a kubeconfig carrying a token; nothing was stored",
             );
           }
-          const after = parseJoinTokens(
-            (await run(d, target, tokenListArgs(parsed.role))).stdout,
-          );
+          // Corroborate the minted id with the token list; never trust the
+          // raw payload text, and invalidate on any doubt.
+          let after: JoinToken[];
+          try {
+            after = parseJoinTokens(
+              (await run(d, target, tokenListArgs(parsed.role))).stdout,
+            );
+          } catch (error) {
+            await d.transport.exec(target, tokenInvalidateArgs(tokenId));
+            throw error;
+          }
           const fresh = newTokenIds(before, after);
-          const tokenId = fresh.length === 1 ? fresh[0] : joinTokenId(token);
-          await vaultPut(context, parsed.token_vault, token);
-          const expires_at = expiresAt(d.now(), parsed.token_expiry);
+          if (fresh.length > 0 && !fresh.includes(tokenId)) {
+            await d.transport.exec(target, tokenInvalidateArgs(tokenId));
+            throw new TokenError(
+              "k0s token list did not corroborate the minted token; invalidated it",
+            );
+          }
+          try {
+            await vaultPut(context, parsed.token_vault, token);
+          } catch (error) {
+            await d.transport.exec(target, tokenInvalidateArgs(tokenId));
+            throw error;
+          }
+          const expires_at =
+            after.find((entry) => entry.id === tokenId)?.expiry ??
+              expiresAt(d.now(), parsed.token_expiry);
           const record = await context.readResource(
             `${parsed.cluster_name}-tokens`,
           );
@@ -588,28 +635,46 @@ export function createModel(deps: Partial<Deps> = {}) {
         },
       },
       invalidate_join_token: {
+        kind: "action" as const,
         description:
           "Invalidate a join token by ID and overwrite its vault key with a non-secret tombstone. Idempotent: an unknown or already-expired ID is a no-op on the cluster side.",
         arguments: InvalidateArgs,
         execute: async (args: z.input<typeof InvalidateArgs>, context: Ctx) => {
           const parsed = InvalidateArgs.parse(args);
-          const target = targetOf(parsed.ssh);
-          const result = await d.transport.exec(
-            target,
-            tokenInvalidateArgs(parsed.token_id),
-          );
-          const invalidated = ok(result);
-          await vaultPut(context, parsed.token_vault, TOKEN_TOMBSTONE);
           const record = await context.readResource(
             `${parsed.cluster_name}-tokens`,
           );
-          const tokens = Array.isArray(record?.tokens)
-            ? record.tokens.map((entry: { token_id?: string }) =>
-              entry.token_id === parsed.token_id
-                ? { ...entry, invalidated_at: d.now().toISOString() }
-                : entry
-            )
-            : [];
+          const stored: {
+            token_id: string;
+            vault: string;
+            key: string;
+            invalidated_at: string | null;
+          }[] = Array.isArray(record?.tokens) ? record.tokens : [];
+          const tokenId = parsed.token_id ??
+            stored.find((entry) =>
+              entry.vault === parsed.token_vault.vault &&
+              entry.key === parsed.token_vault.key &&
+              entry.invalidated_at === null
+            )?.token_id;
+          if (!tokenId) {
+            return {
+              dataHandles: [],
+              result: {
+                token_id: null,
+                invalidated: false,
+                vault: parsed.token_vault,
+              },
+            };
+          }
+          const target = targetOf(parsed.ssh);
+          await run(d, target, tokenInvalidateArgs(tokenId));
+          const invalidated = true;
+          await vaultPut(context, parsed.token_vault, TOKEN_TOMBSTONE);
+          const tokens = stored.map((entry) =>
+            entry.token_id === tokenId
+              ? { ...entry, invalidated_at: d.now().toISOString() }
+              : entry
+          );
           const handle = await context.writeResource(
             "tokens",
             `${parsed.cluster_name}-tokens`,
@@ -622,7 +687,7 @@ export function createModel(deps: Partial<Deps> = {}) {
           return {
             dataHandles: [handle],
             result: {
-              token_id: parsed.token_id,
+              token_id: tokenId,
               invalidated,
               vault: parsed.token_vault,
             },
@@ -649,6 +714,7 @@ export function createModel(deps: Partial<Deps> = {}) {
         },
       },
       drain_node: {
+        kind: "action" as const,
         description:
           "Cordon and drain a node, honoring PodDisruptionBudgets (never --disable-eviction). Idempotent. A budget block is a typed error and the node stays cordoned.",
         arguments: DrainArgs,
@@ -684,6 +750,7 @@ export function createModel(deps: Partial<Deps> = {}) {
         },
       },
       uncordon_node: {
+        kind: "action" as const,
         description: "Uncordon a node, returning it to service. Idempotent.",
         arguments: UncordonArgs,
         execute: async (args: z.input<typeof UncordonArgs>, _context: Ctx) => {
@@ -696,6 +763,7 @@ export function createModel(deps: Partial<Deps> = {}) {
         },
       },
       detach_node: {
+        kind: "action" as const,
         description:
           "DESTRUCTIVE. Remove a drained node from the cluster: for a controller an etcd leave plus ControlNode delete, for a worker a Node delete. Refuses an undrained node or a controller removal that would lose etcd quorum unless confirm is the node name. Does not touch the host.",
         arguments: DetachArgs,
@@ -706,22 +774,47 @@ export function createModel(deps: Partial<Deps> = {}) {
             (await run(d, target, nodeListArgs())).stdout,
           );
           const node = nodes.find((n) => n.name === parsed.node);
-          if (!node) {
+          const members = parseEtcdMembers(
+            (await run(d, target, etcdMemberListArgs())).stdout,
+          );
+          const controlNodes = parseItemNames(
+            (await run(d, target, controlNodeListArgs())).stdout,
+          );
+          const member = members.find((m) => m.name === parsed.node);
+          // Controller-ness comes from the cluster (etcd membership and the
+          // ControlNode), not the Node label: a dedicated controller has no
+          // Node object at all.
+          const isController = member !== undefined ||
+            controlNodes.includes(parsed.node);
+          if (member !== undefined && node?.role === "worker") {
+            throw new DetachRefusedError(
+              `${parsed.node} is an etcd member but is labelled a worker; refusing`,
+            );
+          }
+          if (!node && !isController) {
             return {
               dataHandles: [],
               result: { node: parsed.node, detached: false },
             };
           }
-          if (!node.cordoned && parsed.confirm !== parsed.node) {
-            throw new DetachRefusedError(
-              `${parsed.node} is not drained; set confirm to ${parsed.node} to detach it anyway`,
-            );
+          if (parsed.confirm !== parsed.node) {
+            if (node && !node.cordoned) {
+              throw new DetachRefusedError(
+                `${parsed.node} is not drained; set confirm to ${parsed.node} to detach it anyway`,
+              );
+            }
+            if (
+              hasNonDaemonSetPods(
+                (await run(d, target, nodePodListArgs(parsed.node))).stdout,
+              )
+            ) {
+              throw new DetachRefusedError(
+                `${parsed.node} still has schedulable pods; drain it or set confirm to ${parsed.node}`,
+              );
+            }
           }
           let etcdLeft = false;
-          if (node.role === "controller") {
-            const members = parseEtcdMembers(
-              (await run(d, target, etcdMemberListArgs())).stdout,
-            );
+          if (isController) {
             if (members.length <= 1) {
               throw new DetachRefusedError(
                 "cannot remove the last controller; use reset-cluster",
@@ -734,16 +827,31 @@ export function createModel(deps: Partial<Deps> = {}) {
                 } etcd members; set confirm to ${parsed.node}`,
               );
             }
-            const member = members.find((m) => m.name === parsed.node);
-            const peer = parsed.peer_address ?? peerHostOf(member);
-            if (!peer) {
-              throw new DetachRefusedError(
-                `cannot find the etcd peer address for ${parsed.node}; pass peer_address`,
-              );
+            if (member !== undefined) {
+              const memberPeer = peerHostOf(member);
+              if (
+                parsed.peer_address && memberPeer &&
+                parsed.peer_address !== memberPeer
+              ) {
+                throw new DetachRefusedError(
+                  `peer_address ${parsed.peer_address} is not ${parsed.node}'s etcd peer`,
+                );
+              }
+              const peer = parsed.peer_address ?? memberPeer;
+              if (!peer) {
+                throw new DetachRefusedError(
+                  `cannot find the etcd peer address for ${parsed.node}; pass peer_address`,
+                );
+              }
+              if (peer === target.host) {
+                throw new DetachRefusedError(
+                  `refusing to detach ${parsed.node} through its own host ${target.host}; run through a surviving controller`,
+                );
+              }
+              await run(d, target, etcdLeaveArgs(peer));
+              etcdLeft = true;
             }
-            await run(d, target, etcdLeaveArgs(peer));
             await run(d, target, deleteControlNodeArgs(parsed.node));
-            etcdLeft = true;
           }
           await run(d, target, deleteNodeArgs(parsed.node));
           return {

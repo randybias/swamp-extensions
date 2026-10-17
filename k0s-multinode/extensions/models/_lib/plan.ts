@@ -25,7 +25,7 @@ import { z } from "npm:zod@4.3.6";
 /** DNS-1123 label (cluster and namespace names). */
 const LABEL_RE = /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/;
 /** DNS-1123 subdomain (node names). */
-const SUBDOMAIN_RE = /^[a-z0-9](?:[a-z0-9.-]{0,251}[a-z0-9])?$/;
+export const SUBDOMAIN_RE = /^[a-z0-9](?:[a-z0-9.-]{0,251}[a-z0-9])?$/;
 const HOST_RE =
   /^(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)*$|^[0-9a-fA-F:.]{2,45}$/;
 const VERSION_RE = /^v?\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?$/;
@@ -148,7 +148,7 @@ function joinSteps(fromController: string, node: NodeSpec): PlanStep[] {
 }
 
 /** Infers the operation; `plan` has no explicit selector input. */
-function inferOperation(input: PlanInput): PlanOperation {
+export function inferOperation(input: PlanInput): PlanOperation {
   if (input.target_version) return "upgrade";
   return input.observed.length > 0 ? "add" : "create";
 }
@@ -184,6 +184,14 @@ function assertTopology(input: PlanInput): NodeSpec[] {
   if (controllers > 1 && input.ha_mode === "none" && !input.external_address) {
     throw new PlanError(
       "more than one controller needs an HA endpoint (ha_mode or external_address) before tokens are minted",
+    );
+  }
+  if (
+    (input.ha_mode === "external_lb" || input.ha_mode === "cplb_vip") &&
+    !input.external_address
+  ) {
+    throw new PlanError(
+      `${input.ha_mode} requires external_address before tokens are minted`,
     );
   }
   return input.nodes;
@@ -235,9 +243,8 @@ function removePlan(input: PlanInput, node: NodeSpec): PlanStep[] {
   const controllers =
     input.observed.filter((o) => o.role === "controller").length ||
     input.nodes.filter((n) => n.role !== "worker").length;
-  const removingController = node.role !== "worker";
-  if (removingController) {
-    if (input.nodes.length <= 1) {
+  if (node.role !== "worker") {
+    if (controllers <= 1) {
       throw new PlanError(
         "cannot remove the last controller; use reset-cluster",
       );

@@ -19,7 +19,8 @@ import {
 const SSH = {
   host: "192.0.2.10",
   user: "root",
-  host_key_policy: "insecure_tofu" as const,
+  host_key_policy: "strict" as const,
+  host_keys: ["192.0.2.10 ssh-ed25519 PLACEHOLDER-HOST-KEY"],
   private_key: "PLACEHOLDER-PRIVATE-KEY-NOT-REAL",
 };
 
@@ -38,6 +39,18 @@ const NODE_JSON = JSON.stringify({
     },
   ],
 });
+
+/** Builds a real-shaped `k0s token create` payload: base64(gzip(kubeconfig)). */
+async function fakeJoinToken(id: string): Promise<string> {
+  const yaml =
+    `apiVersion: v1\nkind: Config\nusers:\n- name: k0s\n  user:\n    token: ${id}.0123456789abcdef\n`;
+  const stream = new Blob([new TextEncoder().encode(yaml)]).stream()
+    .pipeThrough(new CompressionStream("gzip"));
+  const bytes = new Uint8Array(await new Response(stream).arrayBuffer());
+  let binary = "";
+  for (const byte of bytes) binary += String.fromCharCode(byte);
+  return btoa(binary);
+}
 
 function makeTransport(
   handler: (argv: string[]) => Partial<ExecResult> | undefined,
@@ -73,7 +86,7 @@ function deps(
 
 Deno.test("mint_join_token stores the token in vault and returns only its id", async () => {
   let lists = 0;
-  const joinTokenValue = "abc123.placeholder-value";
+  const joinTokenValue = await fakeJoinToken("abc123");
   const transport = makeTransport((argv) => {
     if (argv[1] === "token" && argv[2] === "list") {
       lists += 1;
@@ -144,9 +157,7 @@ Deno.test("mint_join_token refuses without a vault service and never mints", asy
 
 Deno.test("invalidate_join_token tombstones the vault key and is idempotent", async () => {
   const transport = makeTransport((argv) =>
-    argv[2] === "invalidate"
-      ? { exit_code: 1, stderr: "unknown token" }
-      : undefined
+    argv[2] === "invalidate" ? {} : undefined
   );
   const model = createModel(deps(transport));
   const puts: [string, string, string][] = [];
@@ -165,7 +176,7 @@ Deno.test("invalidate_join_token tombstones the vault key and is idempotent", as
     token_vault: { vault: "cluster", key: "join-worker-1" },
   });
   const out = await model.methods.invalidate_join_token.execute(args, context);
-  assertEquals(out.result.invalidated, false);
+  assertEquals(out.result.invalidated, true);
   assertEquals(puts[0][2].includes("invalidated"), true);
 });
 
@@ -282,7 +293,7 @@ Deno.test("detach_node leaves etcd for a cordoned controller with confirm", asyn
   const execs: string[][] = [];
   const transport = makeTransport((argv) => {
     execs.push(argv);
-    if (argv[2] === "get") return { stdout: cordoned };
+    if (argv[3] === "nodes") return { stdout: cordoned };
     if (argv[1] === "etcd") return { stdout: members };
     return undefined;
   });
@@ -328,7 +339,7 @@ Deno.test("detach_node refuses a 3->2 controller removal without confirm", async
     },
   });
   const transport = makeTransport((argv) => {
-    if (argv[2] === "get") return { stdout: cordoned };
+    if (argv[3] === "nodes") return { stdout: cordoned };
     if (argv[1] === "etcd") return { stdout: members };
     return undefined;
   });

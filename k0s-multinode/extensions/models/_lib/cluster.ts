@@ -8,6 +8,13 @@
  * @module
  */
 
+import type { ExecResult } from "./ssh.ts";
+
+/** True when a remote command succeeded. */
+export function ok(result: ExecResult): boolean {
+  return result.exit_code === 0;
+}
+
 /** A node as the cluster reports it. */
 export interface ClusterNode {
   /** Node name. */
@@ -233,23 +240,33 @@ export function parseEtcdMembers(text: string): EtcdMember[] {
   const container = isPlain(parsed) && parsed.members !== undefined
     ? parsed.members
     : parsed;
-  const entries: [string, Record<string, unknown>][] = [];
+  const members: EtcdMember[] = [];
   if (Array.isArray(container)) {
     for (const item of container) {
-      if (isPlain(item)) {
-        entries.push([stringOf(item.name), item]);
-      }
+      if (!isPlain(item)) continue;
+      const name = stringOf(item.name);
+      if (name === "") continue;
+      members.push({
+        name,
+        peer_urls: stringList(item.peerURLs),
+        client_urls: stringList(item.clientURLs),
+      });
     }
   } else if (isPlain(container)) {
+    // Real v1.36 output maps each member name to its peer URL string.
     for (const [key, value] of Object.entries(container)) {
-      if (isPlain(value)) entries.push([key, value]);
+      if (typeof value === "string") {
+        members.push({ name: key, peer_urls: [value], client_urls: [] });
+      } else if (isPlain(value)) {
+        members.push({
+          name: stringOf(value.name) || key,
+          peer_urls: stringList(value.peerURLs),
+          client_urls: stringList(value.clientURLs),
+        });
+      }
     }
   }
-  return entries.map(([key, value]) => ({
-    name: stringOf(value.name) || key,
-    peer_urls: stringList(value.peerURLs),
-    client_urls: stringList(value.clientURLs),
-  })).filter((member) => member.name !== "");
+  return members.filter((member) => member.name !== "");
 }
 
 /** A token ID is the part before the first dot, if a dotted token string. */
@@ -271,32 +288,15 @@ function tokenRoleOf(value: string): JoinToken["role"] {
  * tab/space separated table k0s prints, skipping the header row.
  */
 export function parseJoinTokens(text: string): JoinToken[] {
-  const parsed = parseJson(text);
-  if (parsed !== null) {
-    const items: Record<string, unknown>[] = [];
-    if (Array.isArray(parsed)) {
-      items.push(...parsed.filter(isPlain));
-    } else if (isPlain(parsed)) {
-      for (const [key, value] of Object.entries(parsed)) {
-        if (isPlain(value)) items.push({ id: key, ...value });
-      }
-    }
-    if (items.length > 0) {
-      return items.map((item) => ({
-        id: stringOf(item.id ?? item.ID ?? item.token),
-        role: tokenRoleOf(stringOf(item.role ?? item.Role)),
-        expiry: stringOf(item.expiry ?? item.Expiry) || null,
-      })).filter((token) => token.id !== "");
-    }
-  }
   const tokens: JoinToken[] = [];
   for (const raw of text.split("\n")) {
     const line = raw.trim();
     if (line === "") continue;
     const fields = line.split(/\s+/);
     const id = tokenIdFromField(fields[0]);
-    // Skip the header and any line whose id is not a plain token id.
-    if (id === "" || !/^[A-Za-z0-9_-]+$/.test(id) || id === "ID") continue;
+    // Only a bare 6-character token id; the header and any JSON/token text
+    // (which could carry a secret) are rejected.
+    if (!TOKEN_ID_RE.test(id)) continue;
     tokens.push({
       id,
       role: tokenRoleOf(fields[1] ?? ""),
@@ -315,6 +315,28 @@ export function newTokenIds(
   return after.map((token) => token.id).filter((id) => !seen.has(id));
 }
 
+/**
+ * True when a pod list has a pod that is neither a mirror pod nor owned by a
+ * DaemonSet, so a cordoned node is not yet fully drained.
+ */
+export function hasNonDaemonSetPods(text: string): boolean {
+  const parsed = parseJson(text);
+  if (!isPlain(parsed) || !Array.isArray(parsed.items)) return false;
+  return parsed.items.filter(isPlain).some((item) => {
+    const meta = isPlain(item.metadata) ? item.metadata : undefined;
+    const annotations = isPlain(meta?.annotations)
+      ? meta.annotations
+      : undefined;
+    if (typeof annotations?.["kubernetes.io/config.mirror"] === "string") {
+      return false;
+    }
+    const owners = Array.isArray(meta?.ownerReferences)
+      ? meta.ownerReferences.filter(isPlain)
+      : [];
+    return !owners.some((o) => o.kind === "DaemonSet");
+  });
+}
+
 /** Names from a `kubectl ... -o json` list. */
 export function parseItemNames(text: string): string[] {
   const parsed = parseJson(text);
@@ -325,14 +347,46 @@ export function parseItemNames(text: string): string[] {
   }).filter((name) => name !== "");
 }
 
-/** True when `text` looks like a k0s join token (`id.secret`). */
-export function isJoinToken(text: string): boolean {
-  return /^[^\s]+\.[^\s]+$/.test(text.trim());
+/** Token IDs k0s prints are a bare 6-character lowercase id. */
+const TOKEN_ID_RE = /^[a-z0-9]{6}$/;
+
+function base64Decode(value: string): Uint8Array {
+  const binary = atob(value);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+  return bytes;
 }
 
-/** The ID half of a k0s join token. */
-export function joinTokenId(token: string): string {
-  const value = token.trim();
-  const dot = value.indexOf(".");
-  return dot > 0 ? value.slice(0, dot) : value;
+/**
+ * The token ID inside a `k0s token create` payload. The payload is a
+ * base64-encoded gzipped kubeconfig, and the bootstrap token lives in
+ * `users[].user.token` as `<id>.<secret>`. Returns null (never a raw-token
+ * guess) when the payload is not a kubeconfig carrying such a token, so a
+ * secret can never be mistaken for an ID.
+ */
+export async function joinTokenIdFromCreate(
+  token: string,
+): Promise<string | null> {
+  let bytes: Uint8Array;
+  try {
+    bytes = base64Decode(token.trim());
+  } catch {
+    return null;
+  }
+  let text: string;
+  try {
+    const stream = new Blob([bytes as unknown as BlobPart]).stream()
+      .pipeThrough(
+        new DecompressionStream("gzip"),
+      );
+    text = new TextDecoder().decode(
+      new Uint8Array(await new Response(stream).arrayBuffer()),
+    );
+  } catch {
+    return null;
+  }
+  const match = /^\s*token:\s*(\S+)\s*$/m.exec(text);
+  if (!match) return null;
+  const id = match[1].split(".")[0];
+  return TOKEN_ID_RE.test(id) ? id : null;
 }

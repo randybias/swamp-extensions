@@ -4,11 +4,13 @@
  * for the request log the model reads over SSH.
  *
  * Nothing here spawns a process or opens a socket, so the module is exercised
- * offline. The model in `apt_cache.ts` is a thin orchestration layer over these
- * functions plus the vendored SSH transport.
+ * offline. The methods in `server_methods.ts` and `client_methods.ts`
+ * orchestrate these functions over the vendored SSH transport.
  *
  * @module
  */
+
+import { posixQuote } from "./ssh.ts";
 
 /** An input that fails its allowlist grammar or a cross-field rule. */
 export class AptConfigError extends Error {
@@ -27,7 +29,7 @@ export type HttpsPolicy = "direct" | "passthrough" | "https_backends";
  * `https_backends` so an earlier `.*` (the debconf tunnel prompt) cannot stay
  * in force.
  */
-export const DEFAULT_PASSTHROUGH_PATTERN =
+const DEFAULT_PASSTHROUGH_PATTERN =
   "^(bugs\\.debian\\.org|changelogs\\.ubuntu\\.com):443$";
 
 /** Every accepted HTTPS policy, in table order. */
@@ -72,7 +74,7 @@ export function managedBackendName(key: string): string {
 }
 
 /** Absolute path of a managed backend file for a distribution key. */
-export function managedBackendPath(key: string): string {
+function managedBackendPath(key: string): string {
   return `${ACNG_CONF_DIR}/${managedBackendName(key)}`;
 }
 
@@ -111,7 +113,7 @@ export function remapPrefixes(key: string): string[] {
 }
 
 /** One rendered backend file. */
-export interface RenderedBackend {
+interface RenderedBackend {
   /** Distribution key. */
   key: string;
   /** Absolute remote path (built-in file for shadowed keys, else the managed file). */
@@ -133,7 +135,7 @@ export function renderBackendFiles(
 }
 
 /** DNS-1123 hostname, lower case, one or more labels. */
-export const PASSTHROUGH_HOST_RE =
+const PASSTHROUGH_HOST_RE =
   /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)*$/;
 
 /** Dotted-quad IPv4 literal. */
@@ -164,6 +166,12 @@ const FORBIDDEN_CACHE_ROOTS = new Set([
   "sys",
   "usr",
 ]);
+
+/**
+ * Whole paths that must never be a cache directory: replacing or deleting any
+ * of these breaks the package manager or the system log store.
+ */
+const FORBIDDEN_CACHE_PATHS = new Set(["/var/lib", "/var/log", "/var/cache"]);
 
 /** True for a dotted-quad IPv4 literal. */
 export function isIpv4(s: string): boolean {
@@ -222,14 +230,14 @@ export function assertCacheDir(path: string): void {
   if (
     !CACHE_DIR_RE.test(path) || path.endsWith("/") || path.includes("//") ||
     parts.includes(".") || parts.includes("..") || parts.length < 2 ||
-    FORBIDDEN_CACHE_ROOTS.has(parts[0])
+    FORBIDDEN_CACHE_ROOTS.has(parts[0]) || FORBIDDEN_CACHE_PATHS.has(path)
   ) {
     throw new AptConfigError(`Not a valid cache directory: ${path}`);
   }
 }
 
 /** A parsed `http://<host>:<port>` proxy URL. */
-export interface ProxyUrl {
+interface ProxyUrl {
   /** Host as written, without brackets for IPv6. */
   address: string;
   /** Host exactly as written (bracketed for IPv6). */
@@ -308,7 +316,7 @@ export function isBackendUrl(s: string, scheme: "http" | "https"): boolean {
 }
 
 /** Throws unless `s` is a backend mirror base URL for `scheme`. */
-export function assertBackendUrl(s: string, scheme: "http" | "https"): void {
+function assertBackendUrl(s: string, scheme: "http" | "https"): void {
   if (!isBackendUrl(s, scheme)) {
     throw new AptConfigError(
       `Not a valid ${scheme} backend URL: ${JSON.stringify(s)}`,
@@ -479,12 +487,6 @@ export function renderClientSnippet(input: ClientRenderInput): string {
   return lines.join("\n") + "\n";
 }
 
-/** Single-quotes `value` as one POSIX shell word. */
-function shQuote(value: string): string {
-  if (value === "") return "''";
-  return `'${value.replace(/'/g, "'\\''")}'`;
-}
-
 /**
  * Renders the static auto-detect script. It is tiny and runs as root on every
  * apt invocation, so it contains only a fixed `timeout`/`bash` probe and the
@@ -499,9 +501,9 @@ export function renderDetectScript(proxy_url: string): string {
     "# Managed by @randybias/apt-cache. Static and tiny; runs as root.",
     "# Prints the proxy URL when a TCP connect succeeds within 2s, else DIRECT.",
     `if timeout 2 bash -c 'exec 3<>/dev/tcp/"$1"/"$2"' _ ${
-      shQuote(proxy.address)
-    } ${shQuote(String(proxy.port))} 2>/dev/null; then`,
-    `  printf '%s\\n' ${shQuote(proxy.url)}`,
+      posixQuote(proxy.address)
+    } ${posixQuote(String(proxy.port))} 2>/dev/null; then`,
+    `  printf '%s\\n' ${posixQuote(proxy.url)}`,
     "else",
     "  printf '%s\\n' 'DIRECT'",
     "fi",
@@ -521,7 +523,7 @@ export function renderSecurityConf(auth: string): string {
 }
 
 /** The summary `stats` returns. */
-export interface StatsTotals {
+interface StatsTotals {
   /** Total requests (`max(I, O)`), the report's "Total". */
   requests: number;
   /** Requests served without going upstream (`max(I, O) - I`). */
@@ -654,15 +656,18 @@ export function proxyValuesOf(
  * (`size 10M`, `rotate 7`, `delaycompress`). Exits 3 when no log file exists.
  */
 export function renderLogReadScript(logPath: string): string {
-  const l = shQuote(logPath);
+  const l = posixQuote(logPath);
   return [
     `L=${l}`,
     "read_any=0",
-    `for f in "$L" "$L.1" "$L".*.gz; do`,
+    // `.1` is uncompressed (delaycompress); the compressed set starts at `.2`
+    // so a stray `.1.gz` beside `.1` cannot be counted twice.
+    `for f in "$L" "$L.1" "$L".[2-9].gz "$L".[1-9][0-9].gz; do`,
     '  [ -f "$f" ] || continue',
     "  read_any=1",
     '  case "$f" in',
-    '    *.gz) gzip -dc "$f" 2>/dev/null || zcat "$f" 2>/dev/null ;;',
+    // A corrupt rotation must fail the whole read, not silently undercount.
+    '    *.gz) gzip -dc "$f" 2>/dev/null || zcat "$f" 2>/dev/null || { echo "corrupt log $f" >&2; exit 4; } ;;',
     '    *) cat "$f" ;;',
     "  esac",
     "done",

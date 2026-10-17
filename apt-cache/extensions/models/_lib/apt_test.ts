@@ -443,6 +443,9 @@ Deno.test("cache directory grammar rejects traversal, shallow and system roots",
       "/etc/apt",
       "/home/x",
       "/var//cache",
+      "/var/lib",
+      "/var/log",
+      "/var/cache",
     ]
   ) {
     assertThrows(() => assertCacheDir(bad), AptConfigError, undefined, bad);
@@ -496,20 +499,41 @@ Deno.test("redactProxyValue drops userinfo for any scheme and double @", () => {
   assertEquals(redactProxyValue("http://host:3142"), "http://host:3142");
 });
 
-Deno.test("log read script covers rotations and is valid sh", async () => {
-  const script = renderLogReadScript("/var/log/apt-cacher-ng/apt-cacher.log");
-  assertEquals(script.includes(".1"), true);
-  assertEquals(script.includes(".gz"), true);
-  assertEquals(script.includes("gzip -dc"), true);
-  const check = await new Deno.Command("sh", {
-    args: ["-n"],
-    stdin: "piped",
-    stdout: "null",
-    stderr: "piped",
-  });
-  const child = check.spawn();
-  const writer = child.stdin.getWriter();
-  await writer.write(new TextEncoder().encode(script));
-  await writer.close();
-  assertEquals((await child.status).code, 0);
+async function gzipBytes(text: string): Promise<Uint8Array> {
+  const stream = new Blob([text]).stream().pipeThrough(
+    new CompressionStream("gzip"),
+  );
+  return new Uint8Array(await new Response(stream).arrayBuffer());
+}
+
+Deno.test("log read script reads rotations, never double-counts, fails on a corrupt gz", async () => {
+  const dir = await Deno.makeTempDir({ prefix: "apt-cache-log-" });
+  try {
+    const log = `${dir}/apt-cacher.log`;
+    const script = renderLogReadScript(log);
+    const run = async () => {
+      const out = await new Deno.Command("sh", {
+        args: ["-c", script],
+        stdout: "piped",
+        stderr: "piped",
+      }).output();
+      return { code: out.code, stdout: new TextDecoder().decode(out.stdout) };
+    };
+    await Deno.writeTextFile(log, "1|I|5\n");
+    await Deno.writeTextFile(`${log}.1`, "2|O|7\n");
+    // A `.1` and a `.1.gz` both present: only `.1` may be read.
+    await Deno.writeFile(`${log}.1.gz`, await gzipBytes("3|I|9\n"));
+    await Deno.writeFile(`${log}.2.gz`, await gzipBytes("2|I|11\n"));
+    const ok = await run();
+    assertEquals(ok.code, 0);
+    assertEquals(ok.stdout.includes("1|I|5"), true);
+    assertEquals(ok.stdout.includes("2|O|7"), true);
+    assertEquals(ok.stdout.includes("3|I|9"), false, "read a .1.gz beside .1");
+    assertEquals(ok.stdout.includes("2|I|11"), true, "missed a valid rotation");
+    // A corrupt rotation must fail the whole read.
+    await Deno.writeTextFile(`${log}.3.gz`, "not gzip at all");
+    assertEquals((await run()).code, 4);
+  } finally {
+    await Deno.remove(dir, { recursive: true });
+  }
 });

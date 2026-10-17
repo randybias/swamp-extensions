@@ -4,16 +4,19 @@ import {
   assertThrows,
 } from "jsr:@std/assert@1.0.19";
 import { createModelTestContext } from "jsr:@swamp-club/swamp-testing@0.20261014.55";
-import { type CommandRunner, SshError } from "./_lib/ssh.ts";
+import { SshError } from "./_lib/ssh.ts";
 import { renderBackendFiles, renderServerFragment } from "./_lib/apt.ts";
+import { createModel, model, setDeps } from "./apt_cache.ts";
 import {
-  model,
-  parseAptConfigDump,
-  parseSsListen,
-  setDeps,
-} from "./apt_cache.ts";
+  fakeApt,
+  has,
+  hasTok,
+  type Resp,
+  TEST_NOW,
+  useFake,
+} from "./_lib/test_support.ts";
 
-const NOW = 1_700_000_000_000;
+const NOW = TEST_NOW;
 const SSH = {
   host: "192.0.2.20",
   port: 22,
@@ -40,99 +43,6 @@ const CLIENT = {
   verify_update: false,
 };
 
-interface Resp {
-  code?: number;
-  stdout?: string;
-  stderr?: string;
-}
-type Respond = (command: string) => Resp;
-
-interface Fake {
-  run: CommandRunner;
-  commands: string[];
-  uploads: { path: string; content: string }[];
-  removed: string[];
-}
-
-function parseUploadPath(command: string): string {
-  return /^f='([^']+)'/m.exec(command)?.[1] ?? "";
-}
-
-/** A transport fake that records remote commands and simulates uploads. */
-function fakeApt(respond: Respond): Fake {
-  const commands: string[] = [];
-  const uploads: { path: string; content: string }[] = [];
-  const removed: string[] = [];
-  const run: CommandRunner = async (cmd, args, options = {}) => {
-    if (cmd === "ssh-agent") {
-      return args[0] === "-s"
-        ? {
-          code: 0,
-          stdout:
-            "SSH_AUTH_SOCK=/tmp/a.sock; export SSH_AUTH_SOCK;\nSSH_AGENT_PID=1; export SSH_AGENT_PID;\n",
-          stderr: "",
-        }
-        : { code: 0, stdout: "", stderr: "" };
-    }
-    if (cmd === "ssh-add") return { code: 0, stdout: "", stderr: "" };
-    if (cmd !== "ssh") return { code: 0, stdout: "", stderr: "" };
-    const command = args[args.length - 1];
-    commands.push(command);
-    // Record real `rm` invocations (not the upload script's own trap).
-    if (/^'rm' /.test(command)) {
-      const m = /'([^']+)'\s*$/.exec(command);
-      if (m) removed.push(m[1]);
-    }
-    if (command.includes(".ssh-host-upload")) {
-      const bytes = options.stdin === undefined
-        ? new Uint8Array()
-        : typeof options.stdin === "string"
-        ? new TextEncoder().encode(options.stdin)
-        : options.stdin;
-      uploads.push({
-        path: parseUploadPath(command),
-        content: new TextDecoder().decode(bytes),
-      });
-      const digest = await sha256HexLocal(bytes);
-      const mode = /chmod '([0-7]{3,4})'/.exec(command)?.[1] ?? "0644";
-      return { code: 0, stdout: `${digest} ${mode}\n`, stderr: "" };
-    }
-    const r = respond(command);
-    return {
-      code: r.code ?? 0,
-      stdout: r.stdout ?? "",
-      stderr: r.stderr ?? "",
-    };
-  };
-  return { run, commands, uploads, removed };
-}
-
-async function sha256HexLocal(bytes: Uint8Array): Promise<string> {
-  const input = new Uint8Array(bytes);
-  const digest = await crypto.subtle.digest("SHA-256", input.buffer);
-  return Array.from(new Uint8Array(digest))
-    .map((b) => b.toString(16).padStart(2, "0")).join("");
-}
-
-/** Installs a fake transport plus a resolved vault secret. */
-function useFake(fake: Fake, now = NOW): void {
-  setDeps({
-    run: fake.run,
-    now: () => now,
-    sleep: () => Promise.resolve(),
-    resolveSecret: () => Promise.resolve("PLACEHOLDER-KEY"),
-  });
-}
-
-function has(fake: Fake, sub: string): boolean {
-  return fake.commands.some((c) => c.includes(sub));
-}
-
-/** True when one recorded command contains every token (remote argv is quoted). */
-function hasTok(fake: Fake, ...tokens: string[]): boolean {
-  return fake.commands.some((c) => tokens.every((t) => c.includes(t)));
-}
-
 function ctx(
   options: Record<string, unknown> = {},
   extraContext: Record<string, unknown> = {},
@@ -154,6 +64,10 @@ function ctx(
 function serverArgs(overrides: Record<string, unknown> = {}) {
   return Object.assign({}, SERVER, overrides);
 }
+
+Deno.test("createModel returns the model", () => {
+  assertEquals(createModel().type, "@randybias/apt-cache");
+});
 
 // --- schema and in-method preconditions -------------------------------------
 
@@ -512,10 +426,6 @@ Deno.test("remove_server no-op when absent; purges when present", async () => {
   assertEquals(has(noAck, "apt-get remove"), true);
   assertEquals(has(noAck, "apt-get purge"), false);
   assertEquals(noAck.removed.includes("/var/cache/apt-cacher-ng"), false);
-  assertEquals(
-    noAck.removed.includes("/etc/apt-cacher-ng/zzzz-apt-cache.conf"),
-    true,
-  );
 
   // With ack: apt-get purge and the cache directory is deleted.
   const present = fakeApt((command) => installed(command) ?? { code: 0 });
@@ -1050,28 +960,6 @@ Deno.test("a transport failure is typed and writes no state", async () => {
     SshError,
   );
   assertEquals(c.getWrittenResources().length, 0);
-});
-
-Deno.test("parseSsListen and parseAptConfigDump read real tool shapes", () => {
-  assertEquals(
-    parseSsListen(
-      "State Recv-Q Send-Q Local Address:Port Peer Address:Port\nLISTEN 0 4096 192.0.2.20:3142 0.0.0.0:*\nLISTEN 0 4096 [::1]:3142 [::]:*\n",
-    ),
-    {
-      listen: ["192.0.2.20", "::1"],
-      ports: [3142],
-      pairs: [
-        { address: "192.0.2.20", port: 3142 },
-        { address: "::1", port: 3142 },
-      ],
-    },
-  );
-  assertEquals(
-    parseAptConfigDump(`Acquire::http::Proxy "http://192.0.2.20:3142";\n`),
-    {
-      "Acquire::http::Proxy": "http://192.0.2.20:3142",
-    },
-  );
 });
 
 // --- real-tool route check (docker) -----------------------------------------

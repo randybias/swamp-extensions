@@ -190,6 +190,46 @@ behavioural regressions that motivated the review were reproduced live first.
   treats `deinstall ok config-files` as present so a later call with
   `purge_cache_ack` purges the package and deletes the cache.
 
+## Quality pass and round-2 follow-ups (2026-10-17)
+
+**Split by concern.** `apt_cache.ts` fell from 1624 to a 158-line registry; the
+code now lives in `_lib/schemas.ts` (argument and state shapes),
+`_lib/remote.ts` (dependency seam, naming, host read/write, parsers),
+`_lib/server_methods.ts`, `_lib/client_methods.ts`, and the pure `_lib/apt.ts`.
+Every file is under 800 lines and every function under 80. Test doubles moved to
+`_lib/test_support.ts`, shared by the model tests and the new
+`_lib/remote_test.ts`.
+
+**One quoting helper.** The private `shQuote` in `apt.ts` was replaced by the
+vendored transport's `posixQuote`; every remote shell string now uses it.
+
+**Managed backend files are backed up and restored.** `apply_server` now writes
+every managed file through `writeManagedFile`, which saves a pre-existing file
+to `<path>.apt-cache.bak` once and records the SHA-256 of the bytes written in
+the server resource's `managed_files`. `remove_server` calls
+`removeOrRestoreManaged`: it restores the backup or deletes the file only when
+the current digest still equals the recorded one, and otherwise leaves the file
+untouched (an admin edit) and warns. So overwriting the package's
+`backends_debian`/`backends_ubuntu` is reversible, and a file the model did not
+write is never deleted.
+
+**README.** The routing section now states that `security.ubuntu.com` is not a
+`Remap-uburep` prefix, so under `https_backends` a proxy-style request for it
+still goes upstream on plain HTTP (:80) and is not cached.
+
+**Cache guard.** `assertCacheDir` also refuses the whole paths `/var/lib`,
+`/var/log` and `/var/cache` as the configured server path, in addition to the
+system top-level roots.
+
+**Log rotations.** `renderLogReadScript` reads the current log, `.1`, and the
+compressed `.2.gz`… set (so a stray `.1.gz` beside `.1` is never double counted)
+and exits non-zero on a corrupt gzip, so `stats` fails closed instead of
+silently undercounting. Covered by a test that writes real and gzipped
+rotations.
+
+**Client restore.** `restoreClient` checks the exit status of its `rm`, like its
+uploads.
+
 ## Fixtures
 
 - All addresses are RFC 5737 (`192.0.2.0/24`, `198.51.100.0/24`) or the IPv6

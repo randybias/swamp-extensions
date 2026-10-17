@@ -69,6 +69,11 @@ remaps, because a second `Remap-` for a key only appends to that repo:
 - `ubuntu-ports` has no built-in remap, so the model renders
   `Remap-ubuntu-ports: /ubuntu-ports ports.ubuntu.com/ubuntu-ports ; file:...`
   with both the path and the client host+path prefix.
+- `security.ubuntu.com` (the Ubuntu security pocket) is not one of the
+  `Remap-uburep` prefixes, so it cannot be remapped. Under `https_backends` a
+  proxy-style request for it still goes upstream on plain HTTP (:80) and is not
+  cached; use `passthrough` with it in `passthrough_hosts` if it must be
+  tunnelled.
 - `debian-security` is **refused**: the package's built-in `Remap-secdeb`
   already owns every `debian-security` prefix with inline `http` backends, and a
   managed mirror would be silently ignored. Configure it in the package's own
@@ -176,7 +181,10 @@ fragment.
   left in `deinstall ok config-files` by an earlier remove is still purged. The
   cache is deleted only with the ack, only when it is a real directory (a
   symlink is refused), only when its path matches the server's recorded or live
-  `CacheDir`, and never for a system top-level directory.
+  `CacheDir`, and never for a system top-level directory. The package's
+  `backends_debian` and `backends_ubuntu` are backed up before the first
+  overwrite and restored on removal; a managed file whose bytes no longer match
+  what the model wrote (an admin edit) is left in place.
 - A failed `configure_client` restores the prior managed files instead of
   deleting them, and a key mismatch or a failed `apt-get update` is always a
   failure, even with `fallback_direct`.

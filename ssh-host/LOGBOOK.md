@@ -39,5 +39,10 @@ extension) so it can be copied byte-identical into the consuming lanes' `_lib/`.
   requires pinned `host_keys` and `denoDeps` disables the operator's ssh config
   (`-F /dev/null`, `IdentityFile=none`). Stored data is keyed by host:
   `exec-<host>`, `upload-<host>`, `connection-<host>`.
-- 2026-10-17: offline gates 0-6 pass. Live e2e matrix and adversarial review are
-  run by the lead; record every finding and fix here.
+- 2026-10-17: `4117d67` offline-green (`scripts/gates.sh --offline ssh-host`,
+  gates 0-6 pass, 7-8 skipped offline). Live e2e matrix and adversarial review
+  are run by the lead; record every finding and fix here.
+- 2026-10-17: gitleaks' `generic-api-key` rule flagged the synthetic base64 host
+  keys and a placeholder password as secrets. The fixtures now use low-entropy
+  valid base64 blobs (`QUFBQUFB`, `QkJCQkJC`, `Q0NDQ0ND`) whose fingerprints are
+  recomputed in the tests; no suppression comments were needed.

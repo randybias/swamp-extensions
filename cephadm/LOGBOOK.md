@@ -809,3 +809,107 @@ extension therefore stands alone.
   against its method's strict schema.
 - `HostKeysSchema` is bounded; the release note cites blob 8f132c43 and notes
   `-F /dev/null` ignores `~/.ssh/config`.
+
+## 2026-10-17 live e2e: transport convergence (2026.10.17.3)
+
+Scope: `wipeDiskToRaw` only, on the bare-metal host `<bm1>` (Ubuntu 24.04),
+extension installed from a git archive of lane/d1-cephadm-ssh a792f41 (the
+canonical ssh-host 2026.10.17.3 transport, `_lib/ssh.ts` blob 8f132c43). Strict
+pins in `[host]:port` form, or `insecure_tofu` with persisted pins; the SSH key
+by vault reference, loaded into a short-lived ssh-agent. Substitutions, as in
+the 2026.10.17.2 guard run: the destructive cells use two RAM-backed
+`scsi_debug` disks (`sdc` serial 16000, `sdd` serial 18000, 64 MB,
+`per_host_store=1`); the OS disks `sda`/`sdb` (root md RAID1 + BIOS boot) run
+with `dryRun: true` only. Cluster cells are still `blocked`: a cephadm cluster
+needs three or more hosts with free whole disks (the 2026.10.17.1 blocked table
+stands unchanged apart from `wipeDiskToRaw`).
+
+Receipt = first 16 hex of the sha256 of the console output with timestamps
+stripped. Host address and OS-disk serials are redacted. Result: 12/13 pass plus
+1 observation.
+
+| Cell                                                                          | Result      | Receipt          |
+| ----------------------------------------------------------------------------- | ----------- | ---------------- |
+| G1 OS disk `sda` (dryRun) refused (`wipe.in-use`, `/`)                        | PASS        | 003241134519ffa1 |
+| G2 OS disk `sdb` (md member + BIOS boot, dryRun) refused                      | PASS        | e0272a6b13c47308 |
+| G3 zeroed disk: `alreadyRaw`, nothing written                                 | PASS        | 332ede6a886d91e4 |
+| G4 disk with an ext4 filesystem: wiped, blkid and wipefs empty                | PASS        | 0b95899bcc3698e1 |
+| G5a GRUB-style sector 0 (55aa + code): `wipe.boot-partition`, untouched       | PASS        | c610919c58b89c6e |
+| G5b same disk, ack for its own serial: wiped, sector 0 zero, wipefs empty     | PASS        | ec02314acef4cf2a |
+| G6 ack for disk 18000 does not cover disk 16000, neither touched              | PASS        | 229364a6ba4bdb84 |
+| a2 wrong pin: host-key verification refused before any remote command         | PASS        | ccbcb7d084563ea7 |
+| b `insecure_tofu`: run 1 learns and persists the pin, run 2 reuses it (v1)    | PASS        | 04fd41d5eb7f5a4b |
+| c a bare key line (no host field) is refused at argument validation           | PASS        | c589224fc18a7c14 |
+| d legacy `strictHostKeyChecking` input: error lists `host_key_policy`         | PASS        | 4af9ac00acaf6644 |
+| d2 `strict` without `host_keys` after a TOFU run                              | OBSERVATION | 003241134519ffa1 |
+| e ps/argv scan during a call: no key text, no `-i`, no key path (agent-based) | PASS        | -                |
+
+- The G cells ran under `strict` with supplied pins; G1/G2/G3/G5a/G6 receipts
+  match the 2026.10.17.2 run, so the guard output is unchanged by the swap.
+- Cell b: `ssh-keyscan` was never called (PATH shim log empty); the pin is
+  learned through ssh itself. The `hostkeys-<bm1>-22` resource was created by
+  run 1 and not rewritten by run 2.
+- Cell e: the ssh line is
+  `ssh -F /dev/null -o IdentityFile=none
+  -o StrictHostKeyChecking=yes -o UserKnownHostsFile=<temp> ...
+  -o IdentityAgent=<per-call agent> -o BatchMode=yes ...`;
+  no key-like file appeared in /tmp.
+- Observation d2: after the `insecure_tofu` run, a `strict` call without
+  `host_keys` connected with the persisted per-host:port pin (the guard then
+  refused `sda`). This is intended: `resolvePins` uses supplied pins first, then
+  the persisted record, and `strict` with neither is refused before connecting.
+  The README now says so.
+
+### Breaking input rename (2026.10.17.3)
+
+`strictHostKeyChecking` is gone from every SSH method; use `host_key_policy`
+(`strict` | `insecure_tofu`) plus `host_keys` (ssh-keyscan lines, each naming
+its host). `multiplex` is dropped. The 25 bundled workflows were updated to pass
+`host_key_policy`/`host_keys` (catalog test checks every step input against the
+method's strict schema). A caller still passing `strictHostKeyChecking` gets
+`Unknown method input(s): strictHostKeyChecking. Valid inputs are: ...
+host_key_policy, host_keys ...`
+(live cell d). The model migration is identity, because these were method
+inputs, never stored attributes.
+
+### Prior art
+
+Unchanged from the sweep above: none. No published Swamp package covers cephadm,
+Rook or Ceph cluster operations.
+
+## Review ledger: 2026.10.17.3 merge prep
+
+- 132d036 routed with 3 High (all fixed in 1af45cc): message-text retry
+  classification re-sent outcome-unknown commands; the bundled workflows still
+  passed `strictHostKeyChecking`; a call without `budgetMs` had no timeout.
+- 1af45cc CLEAN: 3200 distinct remote commands and stdin bodies byte-identical
+  to the pre-swap code, no resend on outcome-unknown, the 35s default budget,
+  TOFU persisted and reused. Refuted: terra HIGH "pin write before the result"
+  (no unsafe resend: a failed persist surfaces as an error and nothing is
+  re-sent; a792f41 now sets `persisted` only after the write); terra/GLM
+  "truncated output returned as valid" (the session never passes the canonical
+  `truncate` option, so over-cap stdout throws); astra "keyPath violates the
+  vault rule" (by spec; keys on disk are the user's own files).
+- a792f41 quality dedupe: `sessionFor` projects the shared SSH fields through
+  one `sshRequest` helper (host/port overrides for `adminHost` and per-entry
+  distribution ports, where `port` is required), persist-after-write, workflow
+  `host_keys` `maxItems: 64`. Recorded commands identical per the lane harness.
+  Self-reviewed against TRIAGE 4b-4h: no change.
+- `_lib/ssh.ts` blob 8f132c43 (canonical), `_lib/protected_devices.ts` blob
+  62743884, `_lib/wipe.ts` differs from 2026.10.17.2 only in its 2 import lines.
+- Known residuals (none block beta):
+  - MEDIUM: the stored `hostkeys` record is read with a cast and not
+    re-validated against `HostKeysSchema` on read (GLM).
+  - MEDIUM: a typed timeout is classified `aborted` and is re-sent only by
+    `resend: "any"` steps; a pre-auth retry needs a typed pre-auth kind upstream
+    in ssh-host.
+  - LOW: `timeoutMs` is `budgetMs` + 5s grace, so the effective kill is 5s later
+    than the stated budget.
+  - LOW: the migration description and identity function duplicate
+    `MODEL_UPGRADES`; the cephadm_test ready-host router is duplicated between
+    the prep and TOFU tests and keeps an obsolete `-O exit` branch.
+  - LOW: `toTransportError` reads `.message` from non-Error throws.
+  - Carried from 2026.10.17.2: the EFI/efibootmgr gap, catalog_test edge
+    tightness, L-9a/L-9b, `subtree()` recomputation, probe-cleanup fallback,
+    `stackOf` duplication, `cephadmUrl` accepts http.
+  - Cluster cells blocked (three or more hosts needed).

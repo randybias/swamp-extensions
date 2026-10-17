@@ -72,7 +72,8 @@ The catalog runs against a model definition named `cephadm`. Every mutating
 workflow asks for approval, then proves its effect with an independent read-back
 and reports a failure without remediating. Every workflow requires an explicit
 `port` and a `host_key_policy` of `strict` or `insecure_tofu`; `strict` also
-needs `host_keys` (ssh-keyscan lines, each naming its host).
+needs `host_keys` (ssh-keyscan lines, each naming its host) unless an earlier
+`insecure_tofu` run persisted a pin for that host:port.
 
 | Workflow                        | Description                                                              |
 | ------------------------------- | ------------------------------------------------------------------------ |
@@ -162,7 +163,11 @@ swamp behavior run cephadm cephHostPrep --input host=node1.example.com \
   short-lived ssh-agent over stdin. Nothing secret is on disk or argv, and there
   is no ControlMaster/multiplex. Host-key checking is `strict` (pinned
   `host_keys`) or `insecure_tofu` (learn and pin the first key per host:port in
-  the `hostkeys` resource); every pinned line must name its host.
+  the `hostkeys` resource); every pinned line must name its host. Supplied
+  `host_keys` win over a persisted pin. After an `insecure_tofu` run,
+  `host_key_policy: strict` without `host_keys` uses the pin persisted for that
+  host:port; a `strict` call with neither supplied nor persisted pins is refused
+  before connecting.
 - The host-key policy and port are accepted by every SSH method. A lost session
   is classified: a drop before authentication proves the command never ran and
   may be re-sent, while a mid-session loss is never re-sent blindly.

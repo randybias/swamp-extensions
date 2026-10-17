@@ -488,3 +488,26 @@ Deno.test("classifyControllerExecStart reads the argv[] field of the real system
     assertEquals(threw, true, bad);
   }
 });
+
+Deno.test("HA config inputs render only when set, leaving the base byte-identical", () => {
+  const base = renderK0sConfig(BASE);
+  assertEquals(base.includes("externalAddress"), false);
+  assertEquals(base.includes("nodeLocalLoadBalancing"), false);
+  assertEquals(base.includes("controlPlaneLoadBalancing"), false);
+  const nllb = renderK0sConfig({ ...BASE, node_local_load_balancing: true });
+  assertEquals(
+    nllb.includes("nodeLocalLoadBalancing:\n      enabled: true"),
+    true,
+  );
+  const cplb = renderK0sConfig({
+    ...BASE,
+    control_plane_load_balancing: {
+      virtual_ip: "192.0.2.10",
+      auth_pass: "abc12345",
+    },
+  });
+  assertEquals(cplb.includes("controlPlaneLoadBalancing:"), true);
+  assertEquals(cplb.includes("authPass: abc12345"), true);
+  const ext = renderK0sConfig({ ...BASE, external_address: "192.0.2.10" });
+  assertEquals(ext.includes('externalAddress: "192.0.2.10"'), true);
+});

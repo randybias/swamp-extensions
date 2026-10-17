@@ -185,6 +185,19 @@ const clusterFields = {
   telemetry_enabled: z.boolean().default(false).describe(
     "Whether anonymous telemetry is enabled.",
   ),
+  external_address: z.string().max(253).describe(
+    "Advertised API address for clients, for example an external load balancer or VIP; written to spec.api.externalAddress. Do not combine with node_local_load_balancing.",
+  ).nullish(),
+  node_local_load_balancing: z.boolean().default(false).describe(
+    "Enable k0s node-local load balancing (EnvoyProxy) so every node reaches the API locally; off keeps the previous behaviour.",
+  ),
+  control_plane_load_balancing: z.strictObject({
+    virtual_ip: z.string().max(45).refine(isIp, "must be an IP address")
+      .describe("VIP shared by the controllers (keepalived)."),
+    auth_pass: z.string().min(1).max(8).meta({ sensitive: true }).describe(
+      "keepalived VRRP auth password, at most 8 characters; wire with a vault reference.",
+    ),
+  }).describe("Control-plane keepalived VIP; omit for none.").nullish(),
 };
 
 const RenderArgs = z.strictObject({
@@ -588,6 +601,12 @@ function renderInput(args: {
   service_cidr: string;
   storage_type: "etcd" | "kine";
   telemetry_enabled: boolean;
+  external_address?: string | null;
+  node_local_load_balancing?: boolean;
+  control_plane_load_balancing?: {
+    virtual_ip: string;
+    auth_pass: string;
+  } | null;
   helm: z.infer<typeof HELM_CHART>[];
 }): K0sConfigInput {
   return {
@@ -599,6 +618,15 @@ function renderInput(args: {
     service_cidr: args.service_cidr,
     storage_type: args.storage_type,
     telemetry_enabled: args.telemetry_enabled,
+    ...(args.external_address
+      ? { external_address: args.external_address }
+      : {}),
+    ...(args.node_local_load_balancing
+      ? { node_local_load_balancing: true }
+      : {}),
+    ...(args.control_plane_load_balancing
+      ? { control_plane_load_balancing: args.control_plane_load_balancing }
+      : {}),
     helm: args.helm.map((chart) => ({
       chart: chart.chart,
       repo: chart.repo,
@@ -895,12 +923,18 @@ async function cleanupK0sResidue(
 function buildK0sModel(deps: K0sDeps) {
   return {
     type: "@randybias/k0s-cluster",
-    version: "2026.10.17.2",
+    version: "2026.10.17.3",
     upgrades: [
       {
         toVersion: "2026.10.17.2",
         description:
           "reset now also removes /etc/k0s and the k0s binary it installed; stored attributes are unchanged",
+        upgradeAttributes: (old: Record<string, unknown>) => old,
+      },
+      {
+        toVersion: "2026.10.17.3",
+        description:
+          "optional HA config inputs (external_address, node_local_load_balancing, control_plane_load_balancing); stored attributes are unchanged",
         upgradeAttributes: (old: Record<string, unknown>) => old,
       },
     ],
@@ -2057,5 +2091,5 @@ export function createModel(deps: K0sDeps): K0sClusterModel {
 export const model = {
   ...buildK0sModel(defaultK0sDeps),
   type: "@randybias/k0s-cluster",
-  version: "2026.10.17.2",
+  version: "2026.10.17.3",
 } satisfies K0sClusterModel;

@@ -81,6 +81,12 @@ export interface K0sConfigInput {
   storage_type: "etcd" | "kine";
   /** Whether anonymous telemetry is enabled. */
   telemetry_enabled: boolean;
+  /** Advertised API address for clients (VIP or external LB); omit for none. */
+  external_address?: string;
+  /** Enable node-local load balancing; omit or false keeps the default. */
+  node_local_load_balancing?: boolean;
+  /** Control-plane keepalived VIP; omit for none. */
+  control_plane_load_balancing?: { virtual_ip: string; auth_pass: string };
   /** Helm extensions to declare. */
   helm: HelmChartInput[];
 }
@@ -407,6 +413,9 @@ export function renderK0sConfig(input: K0sConfigInput): string {
     lines.push(`    address: ${yamlScalar(input.api_address)}`);
   }
   lines.push(`    port: ${input.api_port}`);
+  if (input.external_address) {
+    lines.push(`    externalAddress: ${yamlScalar(input.external_address)}`);
+  }
   // The API address is always a SAN, or clients on that address would fail
   // certificate verification.
   const sans = input.api_address && !input.api_sans.includes(input.api_address)
@@ -421,6 +430,25 @@ export function renderK0sConfig(input: K0sConfigInput): string {
   lines.push("  network:");
   lines.push(`    podCIDR: ${yamlScalar(input.pod_cidr)}`);
   lines.push(`    serviceCIDR: ${yamlScalar(input.service_cidr)}`);
+  if (input.control_plane_load_balancing) {
+    lines.push("    controlPlaneLoadBalancing:");
+    lines.push("      enabled: true");
+    lines.push("      type: Keepalived");
+    lines.push(
+      `      virtualIP: ${
+        yamlScalar(input.control_plane_load_balancing.virtual_ip)
+      }`,
+    );
+    lines.push(
+      `      authPass: ${
+        yamlScalar(input.control_plane_load_balancing.auth_pass)
+      }`,
+    );
+  }
+  if (input.node_local_load_balancing) {
+    lines.push("    nodeLocalLoadBalancing:");
+    lines.push("      enabled: true");
+  }
   lines.push("  storage:");
   lines.push(`    type: ${yamlScalar(input.storage_type)}`);
   lines.push("  telemetry:");

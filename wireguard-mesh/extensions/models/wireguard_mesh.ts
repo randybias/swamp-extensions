@@ -16,16 +16,15 @@ import {
   deleteScript,
   getScript,
   parseDump,
-  parseKnownHosts,
   parseRollbackDir,
   sha256Hex,
-  type Spawner,
   type SshTarget,
   sshTransport,
   type Transport,
   TransportError,
   type TransportResult,
 } from "./_lib/push.ts";
+import { denoDeps, type SshDeps } from "./_lib/ssh.ts";
 import {
   IFACE_RE,
   KeySchema,
@@ -37,25 +36,26 @@ import {
 
 const GlobalArgsSchema = z.strictObject({});
 
-const HostKeySchema = z.strictObject({
-  type: z.string().regex(/^[a-z0-9@.-]{1,40}$/),
-  key: z.string().regex(/^[A-Za-z0-9+/=]{1,2048}$/),
-});
-
 const SshSchema = z.strictObject({
   host: z.string().min(1).max(253),
   user: z.string().regex(/^[a-z_][a-z0-9_-]{0,31}$/),
   port: z.number().int().min(1).max(65535).default(22),
-  host_key_policy: z.enum(["strict", "accept-new", "insecure"]).describe(
-    "How the node's SSH host key is checked; there is no default.",
+  host_key_policy: z.enum(["strict", "insecure_tofu"]).describe(
+    "How the node's SSH host key is checked; there is no default. insecure_tofu learns the first keys seen and pins them for later steps.",
   ),
-  host_keys: z.array(HostKeySchema).max(64).default([]).describe(
-    "Pinned host keys; required for strict.",
+  host_keys: z.array(z.string().max(8192)).max(64).default([]).describe(
+    "Pinned ssh-keyscan-format lines; required for strict.",
   ),
-  private_key: z.string().max(16384).meta({ sensitive: true }).optional()
+  private_key: z.string().max(65536).meta({ sensitive: true }).optional()
     .describe(
       "SSH private key, loaded into a temporary ssh-agent over stdin. Pass a vault reference.",
     ),
+  connect_timeout_s: z.number().int().min(1).max(120).default(15).describe(
+    "Connection timeout in seconds.",
+  ),
+  max_output_bytes: z.number().int().min(1).max(104857600).optional().describe(
+    "Cap in bytes on captured output.",
+  ),
 });
 
 const IfaceSchema = z.string().regex(IFACE_RE).default("wg0");
@@ -104,7 +104,7 @@ const HostKeysSchema = z.strictObject({
   node: z.string(),
   host: z.string(),
   port: z.number().int(),
-  host_keys: z.array(HostKeySchema).max(64),
+  host_keys: z.array(z.string().max(8192)).max(64),
   observed_at: z.string(),
 });
 
@@ -113,38 +113,13 @@ export type NodeState = z.infer<typeof StateSchema>;
 
 /** Overridable dependencies. */
 export interface Deps {
-  /** Spawns local processes (ssh, ssh-agent, ssh-add). */
-  spawn: Spawner;
+  /** The canonical vendored SSH transport dependencies (the spawner seam). */
+  ssh: SshDeps;
   /** Current time. */
   now: () => Date;
   /** Builds the transport for a target; replaces ssh entirely in tests. */
   transport?: (t: SshTarget, sshKey?: string) => Transport;
 }
-
-/** Default spawner backed by `Deno.Command`. */
-export const denoSpawner: Spawner = async (cmd, args, options = {}) => {
-  // Only ssh, ssh-agent and ssh-add are run; arguments are built from
-  // validated values and secrets travel on stdin.
-  // swamp-quality-ignore deno-command
-  const child = new Deno.Command(cmd, {
-    args,
-    stdin: options.stdin === undefined ? "null" : "piped",
-    stdout: "piped",
-    stderr: "piped",
-    env: options.env,
-  }).spawn();
-  if (options.stdin !== undefined) {
-    const w = child.stdin.getWriter();
-    await w.write(new TextEncoder().encode(options.stdin));
-    await w.close();
-  }
-  const out = await child.output();
-  return {
-    code: out.code,
-    stdout: new TextDecoder().decode(out.stdout),
-    stderr: new TextDecoder().decode(out.stderr),
-  };
-};
 
 // deno-lint-ignore no-explicit-any
 type Ctx = any;
@@ -180,15 +155,26 @@ export const type = "@randybias/wireguard-mesh";
 /** Builds the model with overridable dependencies. */
 export function createModel(deps: Partial<Deps> = {}) {
   const d: Deps = {
-    spawn: deps.spawn ?? denoSpawner,
+    ssh: deps.ssh ?? denoDeps,
     now: deps.now ?? (() => new Date()),
     transport: deps.transport,
   };
   const transportFor = (ssh: z.infer<typeof SshSchema>): Transport => {
-    const { private_key, ...target } = ssh;
-    return d.transport
-      ? d.transport(target, private_key)
-      : sshTransport(target, d.spawn, { ssh_private_key: private_key });
+    const target: SshTarget = {
+      host: ssh.host,
+      user: ssh.user,
+      port: ssh.port,
+      host_key_policy: ssh.host_key_policy,
+      host_keys: ssh.host_keys,
+      ...(ssh.private_key !== undefined
+        ? { private_key: ssh.private_key }
+        : {}),
+      connect_timeout_s: ssh.connect_timeout_s,
+      ...(ssh.max_output_bytes !== undefined
+        ? { max_output_bytes: ssh.max_output_bytes }
+        : {}),
+    };
+    return d.transport ? d.transport(target) : sshTransport(target, d.ssh);
   };
   const renderOf = async (mesh: Mesh) => {
     const r = renderNode(mesh);
@@ -275,7 +261,7 @@ export function createModel(deps: Partial<Deps> = {}) {
       remember: (res: TransportResult) => Promise<z.infer<typeof SshSchema>>;
     }
   > => {
-    if (ssh.host_key_policy !== "accept-new") {
+    if (ssh.host_key_policy !== "insecure_tofu") {
       return { target: ssh, remember: () => Promise.resolve(ssh) };
     }
     const stored = await context.readResource(`${name}-hostkeys`) as
@@ -302,7 +288,8 @@ export function createModel(deps: Partial<Deps> = {}) {
     return {
       target: ssh,
       remember: async (res) => {
-        const keys = parseKnownHosts(res.known_hosts ?? "");
+        const keys = (res.known_hosts ?? "").split(/\r?\n/)
+          .map((line) => line.trim()).filter((line) => line !== "");
         if (keys.length === 0) {
           // Without the accepted key there is nothing to pin the later steps
           // of this operation to, so none may run on trust-on-first-use.
@@ -325,7 +312,7 @@ export function createModel(deps: Partial<Deps> = {}) {
 
   return {
     type,
-    version: "2026.10.17.4",
+    version: "2026.10.17.5",
     description:
       "Render one WireGuard node's wg0.conf from mesh data and apply it to that node over SSH. One generic model for any node of any mesh; the private key is delivered over stdin and never appears in the config text.",
     upgrades: [
@@ -345,6 +332,12 @@ export function createModel(deps: Partial<Deps> = {}) {
         toVersion: "2026.10.17.4",
         description:
           "Route reconciliation, generation-guarded rollback under the lock, and fresh-connection confirmation; no stored-attribute changes",
+        upgradeAttributes: (old: Record<string, unknown>) => old,
+      },
+      {
+        toVersion: "2026.10.17.5",
+        description:
+          "Replaced the local SSH transport with the canonical vendored ssh.ts (typed exit-255 error, authoritative host-key pins, no content digest on argv); host_key_policy is strict|insecure_tofu; no stored-attribute changes",
         upgradeAttributes: (old: Record<string, unknown>) => old,
       },
     ],
@@ -518,5 +511,5 @@ export function createModel(deps: Partial<Deps> = {}) {
 export const model = {
   ...createModel(),
   type: "@randybias/wireguard-mesh",
-  version: "2026.10.17.4",
+  version: "2026.10.17.5",
 } satisfies ReturnType<typeof createModel>;

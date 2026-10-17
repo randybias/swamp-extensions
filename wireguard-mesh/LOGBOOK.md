@@ -271,3 +271,42 @@ byte-identical to the one reviewed.
   (dry-run uncatalogued-model); no behaviour change.
 - Transport: this extension keeps its own SSH push transport rather than the
   vendored `_lib/ssh.ts`; accepted by the lead.
+
+## Transport convergence (2026.10.17.5)
+
+Audit of the local transport in `_lib/push.ts` against the three canonical
+properties and TRIAGE 4h:
+
+- **No content digest on argv or script text (TRIAGE 4h) — already held.** The
+  config and the private key travel on ssh stdin; `sha256Hex` is only computed
+  locally and never reaches an argv or a script. No digest appeared on argv.
+- **exit 255 is a typed error — held, with a gap.** `sshTransport` mapped
+  `res.code === 255` through `classifySshFailure`, but the fallback classified
+  an unrecognized 255 as `reason: "remote"` (a remote script failure) rather
+  than a transport failure, and it classified by stderr text. The canonical
+  transport treats _any_ 255 as a typed `SshError` with a `kind`/`sessionCause`
+  before the caller sees it.
+- **Supplied non-applicable pins refused — did NOT hold.** For `accept-new` the
+  local transport wrote the supplied pins to `known_hosts` but still passed
+  `StrictHostKeyChecking=accept-new`, so a pin set that applied to no host fell
+  back to accepting a new key; `insecure` used `/dev/null` and ignored pins
+  entirely. Only `strict` refused.
+
+Replaced the local transport with a **byte-identical** copy of
+`ssh-host/extensions/models/_lib/ssh.ts` from `origin/main` (git hash-object
+`fe0139f08c42e3fdae0061b9688fb5c534174957`) plus its `ssh_test.ts`. The
+`Transport` seam and every script (armed revert, host-side `flock`, generation
+guards) are unchanged; only delivery changed:
+
+- `sshTransport(target, deps)` builds the canonical `SshTarget` and runs the
+  script through `exec`. `stdin` (key + config) is uploaded to a remote temp
+  file (mode 0600) and piped into the script, so nothing sensitive is on argv.
+- A first `insecure_tofu` call learns the keys with `waitConnection`, returns
+  them as `known_hosts` for the model to pin, and uses them for the rest of the
+  operation; the model's TOFU flow is otherwise unchanged.
+- `host_key_policy` is now `strict | insecure_tofu` (the local `accept-new` and
+  `insecure` values are gone); `ssh.host_keys` is ssh-keyscan-format lines.
+- The model's spawner seam became the canonical `SshDeps`; tests drive it with a
+  fake `CommandRunner`.
+
+99 tests pass (3 env-gated netns tests ignored).

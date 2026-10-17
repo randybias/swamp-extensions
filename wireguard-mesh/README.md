@@ -130,10 +130,12 @@ echoes method arguments, so pass the key as a vault reference only.
 - Rendering one node echoes that node's own `endpoint` back as `node_endpoint`,
   ready to paste into the other nodes' peer entries.
 - SSH host keys are pinned (`strict`) or handled through `host_key_policy`,
-  which has no default. `strict` requires `ssh.host_keys`. With `accept-new`,
+  which has no default. `strict` requires `ssh.host_keys`. With `insecure_tofu`,
   the first accepted key is stored under `<node>-hostkeys` and pinned as
   `strict` on every later run, so a key that changes is refused rather than
-  retrusted; `insecure` never records keys.
+  retrusted. The transport is the canonical vendored `_lib/ssh.ts`: an ssh exit
+  255 is a typed error, supplied pins that apply to no host are refused, and no
+  config, key or digest is ever placed on `argv`.
 - Data is stored under the node name, e.g.
   `data.latest("wg-node", "spoke-1").attributes.config_sha256`.
 

@@ -7,13 +7,14 @@ import {
 import { createModelTestContext } from "jsr:@swamp-club/swamp-testing@0.20261014.55";
 import { fullMesh, hubSelf, hubSpoke, key } from "./_lib/fixtures.ts";
 import {
-  type CommandResult,
-  sshArgv,
+  sha256Hex,
   type SshTarget,
+  sshTransport,
   type Transport,
   TransportError,
   type TransportResult,
 } from "./_lib/push.ts";
+import type { CommandRunner, SshDeps } from "./_lib/ssh.ts";
 import { MeshSchema } from "./_lib/render.ts";
 import { createModel, model, type as modelType } from "./wireguard_mesh.ts";
 
@@ -23,7 +24,9 @@ const SSH = {
   user: "root",
   port: 22,
   host_key_policy: "strict" as const,
-  host_keys: [{ type: "ssh-ed25519", key: "AAAAC3NzaC1lZDI1NTE5AAAAIEXAMPLE" }],
+  host_keys: [
+    "198.51.100.20 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIEXAMPLE",
+  ],
 };
 const NOW = new Date("2026-10-17T00:00:00Z");
 
@@ -301,26 +304,23 @@ Deno.test("delete is an action, requires the risk acknowledgement, and is a clea
 
 const ACCEPT_NEW = {
   ...SSH,
-  host_key_policy: "accept-new" as const,
+  host_key_policy: "insecure_tofu" as const,
   host_keys: [],
 };
-const ACCEPTED_HOSTKEY = {
-  type: "ssh-ed25519",
-  key: "AAAAC3NzaC1lZDI1NTE5AAAAIFIRSTHOSTKEY",
-};
+const ACCEPTED_HOSTKEY =
+  "198.51.100.20 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFIRSTHOSTKEY";
 
-Deno.test("accept-new is real TOFU: the first key is accepted, pinned, and enforced later", async () => {
+Deno.test("insecure_tofu is real TOFU: the first key is accepted, pinned, and enforced later", async () => {
   const first = stub({
     stdout: "changed=0\n",
-    known_hosts:
-      `198.51.100.20 ${ACCEPTED_HOSTKEY.type} ${ACCEPTED_HOSTKEY.key}\n`,
+    known_hosts: `${ACCEPTED_HOSTKEY}\n`,
   });
   const ctx1 = createModelTestContext({ globalArgs: {} });
   await first.m.methods.apply.execute(
     { ...applyArgs(), ssh: ACCEPT_NEW },
     ctx1.context,
   );
-  assertEquals(first.calls[0].target.host_key_policy, "accept-new");
+  assertEquals(first.calls[0].target.host_key_policy, "insecure_tofu");
   const recorded = ctx1.getWrittenResources().find((r) =>
     r.name === "spoke-1-hostkeys"
   );
@@ -351,21 +351,12 @@ Deno.test("accept-new is real TOFU: the first key is accepted, pinned, and enfor
   assertEquals(second.calls[0].target.host_keys, [ACCEPTED_HOSTKEY]);
 });
 
-Deno.test("insecure never records host keys", async () => {
-  const { m } = stub({
-    known_hosts:
-      `198.51.100.20 ${ACCEPTED_HOSTKEY.type} ${ACCEPTED_HOSTKEY.key}\n`,
-  });
+Deno.test("strict never records host keys", async () => {
+  const { m } = stub({ known_hosts: `${ACCEPTED_HOSTKEY}\n` });
   const { context, getWrittenResources } = createModelTestContext({
     globalArgs: {},
   });
-  await m.methods.apply.execute(
-    {
-      ...applyArgs(),
-      ssh: { ...SSH, host_key_policy: "insecure", host_keys: [] },
-    },
-    context,
-  );
+  await m.methods.apply.execute({ ...applyArgs(), ssh: SSH }, context);
   assertEquals(
     getWrittenResources().some((r) => r.name.endsWith("-hostkeys")),
     false,
@@ -373,10 +364,10 @@ Deno.test("insecure never records host keys", async () => {
 });
 
 Deno.test("schema bounds ssh host keys and relay lists", () => {
-  const tooManyKeys = Array.from({ length: 65 }, (_, i) => ({
-    type: "ssh-ed25519",
-    key: `key${i}`,
-  }));
+  const tooManyKeys = Array.from(
+    { length: 65 },
+    (_, i) => `198.51.100.20 ssh-ed25519 AAAAkey${i}`,
+  );
   assertEquals(
     model.methods.apply.arguments.safeParse({
       ...applyArgs(),
@@ -404,7 +395,7 @@ Deno.test("methods carry the documented description prefixes", () => {
   assertStringIncludes(model.methods.get.description, "READ-ONLY.");
   assertStringIncludes(model.methods.delete.description, "DESTRUCTIVE.");
   assertStringIncludes(model.description, "WireGuard");
-  assertEquals(model.version, "2026.10.17.4");
+  assertEquals(model.version, "2026.10.17.5");
   assertEquals(model.type, modelType);
 });
 
@@ -414,7 +405,7 @@ Deno.test("packaging: the manifest and license describe this extension", async (
   );
   assertStringIncludes(manifest, 'name: "@randybias/wireguard-mesh"');
   assertStringIncludes(manifest, "license: Apache-2.0");
-  assertStringIncludes(manifest, 'version: "2026.10.17.4"');
+  assertStringIncludes(manifest, 'version: "2026.10.17.5"');
   assertStringIncludes(manifest, "README.md");
   assertStringIncludes(manifest, "LICENSE.txt");
   const license = await Deno.readTextFile(
@@ -423,38 +414,105 @@ Deno.test("packaging: the manifest and license describe this extension", async (
   assertStringIncludes(license, "Apache License");
 });
 
-Deno.test("ssh argv: host-key policy, no secret, no option injection", () => {
-  const kh = "/tmp/kh";
-  const a = sshArgv(SSH, "script", kh);
-  assertEquals(a.includes("StrictHostKeyChecking=yes"), true);
-  assertEquals(a.includes(`UserKnownHostsFile=${kh}`), true);
-  assertEquals(a.at(-2), "198.51.100.20");
-  assertEquals(a.indexOf("--") < a.indexOf("198.51.100.20"), true);
-  const ins = sshArgv({ ...SSH, host_key_policy: "insecure" }, "s", kh);
-  assertEquals(ins.includes("StrictHostKeyChecking=no"), true);
-  for (const host of ["-oProxyCommand=x", "a b", "h;x", "h$(x)"]) {
-    try {
-      sshArgv({ ...SSH, host }, "s", kh);
-      throw new Error(`accepted ${host}`);
-    } catch (e) {
-      assertEquals(e instanceof TransportError, true, host);
+/** Records ssh invocations and answers the canonical upload/exec probes. */
+function recordSsh(): {
+  deps: SshDeps;
+  calls: { cmd: string; args: string[]; stdin?: string }[];
+} {
+  const calls: { cmd: string; args: string[]; stdin?: string }[] = [];
+  const run: CommandRunner = (cmd, args, o = {}) => {
+    const stdin = typeof o.stdin === "string"
+      ? o.stdin
+      : o.stdin instanceof Uint8Array
+      ? new TextDecoder().decode(o.stdin)
+      : undefined;
+    calls.push({ cmd, args, stdin });
+    if (cmd === "ssh-agent") {
+      return Promise.resolve(
+        args[0] === "-s"
+          ? {
+            code: 0,
+            stdout:
+              "SSH_AUTH_SOCK=/tmp/a.sock;\nexport SSH_AUTH_SOCK;\nSSH_AGENT_PID=1;\nexport SSH_AGENT_PID;\n",
+            stderr: "",
+          }
+          : { code: 0, stdout: "", stderr: "" },
+      );
     }
+    if (cmd === "ssh-add") {
+      return Promise.resolve({ code: 0, stdout: "", stderr: "" });
+    }
+    if (cmd !== "ssh") {
+      return Promise.resolve({ code: 0, stdout: "", stderr: "" });
+    }
+    const remote = args[args.length - 1] ?? "";
+    if (remote.includes("echo MISSING")) {
+      return Promise.resolve({ code: 0, stdout: "MISSING\n", stderr: "" });
+    }
+    if (remote.includes(".ssh-host-upload")) {
+      const mode = /chmod '([0-7]{3,4})'/.exec(remote)?.[1] ?? "0600";
+      return sha256Hex(stdin ?? "").then((h) => ({
+        code: 0,
+        stdout: `${h} ${mode}\n`,
+        stderr: "",
+      }));
+    }
+    return Promise.resolve({
+      code: 0,
+      stdout: "changed=1\nrb=/etc/wireguard/.wg0.rollback.X\n",
+      stderr: "",
+    });
+  };
+  return {
+    deps: { run, now: () => 0, sleep: () => Promise.resolve() },
+    calls,
+  };
+}
+
+const STRICT_TARGET: SshTarget = {
+  host: "198.51.100.20",
+  user: "root",
+  port: 22,
+  host_key_policy: "strict",
+  host_keys: [
+    "198.51.100.20 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIEXAMPLE",
+  ],
+};
+
+Deno.test("sshTransport: stdin is uploaded, never on argv; non-applicable pins are refused", async () => {
+  const rec = recordSsh();
+  const t = sshTransport(STRICT_TARGET, rec.deps);
+  const res = await t("echo hi", "TOPSECRET\n");
+  assertEquals(res.code, 0);
+  for (const c of rec.calls) {
+    assertEquals(c.args.join(" ").includes("TOPSECRET"), false, c.cmd);
   }
+  const upload = rec.calls.find((c) =>
+    c.args.at(-1)?.includes(".ssh-host-upload")
+  );
+  assertEquals(upload?.stdin?.includes("TOPSECRET"), true);
+  // A supplied pin that applies to no host is refused, not silently accepted.
+  const bad = sshTransport(
+    { ...STRICT_TARGET, host_keys: ["203.0.113.9 ssh-ed25519 AAAA"] },
+    rec.deps,
+  );
+  const e = await assertRejects(() => bad("echo hi"), TransportError);
+  assertEquals(e.reason, "host-key");
 });
 
-Deno.test("the real ssh transport: strict needs pinned keys, ssh 255 is typed, key goes to ssh-add stdin", async () => {
+Deno.test("the canonical transport: ssh 255 is typed, the key goes to ssh-add stdin", async () => {
   const seen: { cmd: string; args: string[]; stdin?: string }[] = [];
-  const spawn = (
-    cmd: string,
-    args: string[],
-    o?: { stdin?: string },
-  ): Promise<CommandResult> => {
-    seen.push({ cmd, args, stdin: o?.stdin });
+  const run: CommandRunner = (cmd, args, o = {}) => {
+    seen.push({
+      cmd,
+      args,
+      stdin: typeof o.stdin === "string" ? o.stdin : undefined,
+    });
     if (cmd === "ssh-agent" && args[0] === "-s") {
       return Promise.resolve({
         code: 0,
         stdout:
-          "SSH_AUTH_SOCK=/tmp/agent.sock; export SSH_AUTH_SOCK;\nSSH_AGENT_PID=42; export SSH_AGENT_PID;\n",
+          "SSH_AUTH_SOCK=/tmp/agent.sock;\nexport SSH_AUTH_SOCK;\nSSH_AGENT_PID=42;\nexport SSH_AGENT_PID;\n",
         stderr: "",
       });
     }
@@ -468,7 +526,9 @@ Deno.test("the real ssh transport: strict needs pinned keys, ssh 255 is typed, k
     }
     return Promise.resolve({ code: 0, stdout: "", stderr: "" });
   };
-  const m = createModel({ spawn });
+  const m = createModel({
+    ssh: { run, now: () => 0, sleep: () => Promise.resolve() },
+  });
   const { context } = createModelTestContext({ globalArgs: {} });
   const e = await assertRejects(
     () =>
@@ -510,8 +570,7 @@ Deno.test("first-use TOFU: the confirmation connection is pinned to the key the 
             code: 0,
             stdout: "changed=1\nrb=/etc/wireguard/.wg0.rollback.TESTRUN\n",
             stderr: "",
-            known_hosts:
-              `198.51.100.20 ${ACCEPTED_HOSTKEY.type} ${ACCEPTED_HOSTKEY.key}\n`,
+            known_hosts: `${ACCEPTED_HOSTKEY}\n`,
           },
       );
     },
@@ -522,7 +581,7 @@ Deno.test("first-use TOFU: the confirmation connection is pinned to the key the 
     context,
   );
   assertEquals(targets.length, 2);
-  assertEquals(targets[0].host_key_policy, "accept-new");
+  assertEquals(targets[0].host_key_policy, "insecure_tofu");
   // The second step may not trust a fresh key: it must match the first.
   assertEquals(targets[1].host_key_policy, "strict");
   assertEquals(targets[1].host_keys, [ACCEPTED_HOSTKEY]);

@@ -1,0 +1,88 @@
+{
+  "extension": "@randybias/server-host",
+  "version": "2026.10.17.3",
+  "reviewedAt": "2026-10-17T15:55:03Z",
+  "dimensions": [
+    {
+      "id": "credentials-secrets",
+      "verdict": "pass",
+      "note": "The SSH private key is named by ssh_key_ref (vault + key) and resolved at execution through context.vaultService.get (the runtime object shape, driven by a plain-object context in tests); it reaches ssh-agent over stdin and never appears on argv, in logs or in results. Authorized keys travel to the host on stdin. No content-derived hash on any argv or remote script text. README examples use vault references only and never --json (swamp-club lab 3555)."
+    },
+    {
+      "id": "logging-quality",
+      "verdict": "pass",
+      "note": "One structured log line per method (host, phase, changed operations, revert token/expiry); no key material, command text or remote output in log fields."
+    },
+    {
+      "id": "error-handling",
+      "verdict": "pass",
+      "note": "Every plan step is checked: nft -c failure stops before nft -f, a failing table listing aborts arm instead of emptying the snapshot, commit after expiry and stacking while armed are typed refusals (live cells 13, 14). The revoke step is fail-closed: an account lookup that is neither found nor absent, a failing id -nG, or sudo still listed after gpasswd exits non-zero with the marker kept and the account left on pending_revoke. Residual MEDIUM (astra, filed High, downgraded): getent exit 2 also covers an unavailable NSS backend; markers exist only for local /etc/passwd accounts (usermod -aG refuses others), so only a remote-NSS account's keys file can be dropped from pending during an outage. Residual MEDIUM (terra, filed High, downgraded): keys removal precedes sudo removal, so an account that makes its own ~/.ssh unwritable stops the step before gpasswd; the run fails loudly and stays pending. Both are LOGBOOK follow-ups. 2026.10.17.3: the trusted_interfaces uplink probe runs without sudo (sudo env_reset stripped SSH_CLIENT; fixed after review) and fails closed on a missing ip, no default route or no session route; ECMP nexthops are read."
+    },
+    {
+      "id": "testing-completeness",
+      "verdict": "pass",
+      "note": "173 tests: unit, golden-render and shell tests (server_host, nftables incl. real nft -c, a double apply and the JSON read-back on nftables 1.0.9 in a container, armed_revert real-sh harness, base_shell, plans, validate, ssh); the uplink probe script runs in a real shell (exit 3 with SSH_CLIENT empty or under sudo -n). Mutation checks: disabling the widening guard or the identity check fails 3 tests. Live 2026.10.17.1: 19/21 plus 12/12 re-run cells on a VPS. Live 2026.10.17.3 inside the server stack (Parts 1-4): one fresh uninterrupted run with k0s Ready and no manual rule, an adopt re-run where firewall and lockdown are no-ops and public :22 was never open (0 of 57 probes), forget on teardown, teardown twice; 8/8. Not live: a mismatching identity (tests only) and a rebuilt host given a deleted host's address."
+    },
+    {
+      "id": "idempotency-resilience",
+      "verdict": "pass",
+      "note": "apply_base with identical inputs emits no remote command (live 83 ms); an identical firewall re-apply arms no new timer (live). A host-side systemd timer armed before any change restores the previous managed table (or removes it) and leaves foreign tables intact; only the generation that armed it can disarm it. Residual LOW (terra, filed High, downgraded under the single-orchestrator ruling): an account recreated by another root actor between the lookup and the marker removal keeps sudo with no marker. 2026.10.17.3: an identical live ruleset is a no-op on adopt (live), and apply_firewall refuses to widen a management-only SSH rule to anywhere without allow_widening_ssh_exposure (live: 0/57 public :22 probes open). Residuals: forget is not idempotent and can be left half-written; a deliberate ssh_port change can bypass the widening guard."
+    },
+    {
+      "id": "api-contracts",
+      "verdict": "pass",
+      "note": "nftables JSON read-back is the comparison source (never the render text); merge-aware address sets, table flags and sets; add+delete of the managed table instead of a destroy. Requires a Debian/Ubuntu target with nft, systemd, runuser and the shadow tools."
+    },
+    {
+      "id": "resource-management",
+      "verdict": "pass",
+      "note": "Remote temp files are created with mktemp beside their destination and renamed or removed; the revert timer and its state directory are removed on commit or after firing (live cell 21/30). Accepted debt: server-host keeps its own vendored transport rather than the canonical ssh-host blob; strict-only host keys. The vendored _lib/ssh.ts is still not the canonical transport (convergence debt, 7860bb0)."
+    },
+    {
+      "id": "published-surface-hygiene",
+      "verdict": "pass",
+      "note": "Manifest: @randybias/server-host, two-sentence description, Apache-2.0, additionalFiles README.md and LICENSE.txt. Mutating methods start DESTRUCTIVE, render/get/sync start READ-ONLY. README examples include the required host_keys and vault references only. Fixtures use RFC 5737 CIDRs and example.com/.test; leak scan, gitleaks and fixture guard pass; live receipts folded into the LOGBOOK with real addresses redacted."
+    },
+    {
+      "id": "schema-strictness",
+      "verdict": "pass",
+      "note": "All arguments are strict objects; host, port, user, CIDRs, ports and package names carry grammars and bounds; host_keys required (1-16); host_key_policy accepts only strict (insecure_tofu removed under ruling 4g). 0.0.0.0/0 or equivalent halves are refused without an explicit acknowledgement, and lockdown never allows SSH from anywhere (live 16-18). trusted_interfaces: up to 16 names or prefix* patterns, at least two literal characters before *, no leading -, lo refused; entries matching the default-route or SSH-session interface are refused before arming. identity is an optional anchored string."
+    },
+    {
+      "id": "lifetime-gc",
+      "verdict": "pass",
+      "note": "host_state and observation: infinite, GC 20/5; revert and firewall_render: 1d, GC 5."
+    },
+    {
+      "id": "crud-completeness",
+      "verdict": "pass",
+      "note": "Phase methods apply_base, apply_firewall, lockdown and commit are actions; render_firewall, get and sync are read-only. Changing admin_user revokes the previous account's managed keys and tool-granted sudo, deferring when the run logs in as that account (pending_revoke). New forget action empties a gone machine's records (live on teardown)."
+    },
+    {
+      "id": "preflight-checks",
+      "verdict": "pass",
+      "note": "Inputs, CIDR safety and host-key pins are validated before any spawn; nft -c pre-checks every ruleset before it is applied; a revert is armed before any firewall change."
+    },
+    {
+      "id": "instance-names",
+      "verdict": "pass",
+      "note": "Per-host instances state-, revert-, observation- and render-<host> with unsafe characters mapped to underscores, so one definition serves many hosts. 2026.10.17.3: records carry an optional identity (the provider server id) and a record for another identity is refused, so a rebuilt host that receives a deleted host's address does not inherit its state. Residuals: revert records drop the identity when it is omitted, and records without an identity are adopted silently and stamped."
+    },
+    {
+      "id": "data-access",
+      "verdict": "pass",
+      "note": "Methods read only this model's own resources for the host; every target arrives as method arguments. get/sync persist their findings in the observation resource (readable via swamp data), resolving the earlier live PARTIALs."
+    },
+    {
+      "id": "version-upgrades",
+      "verdict": "pass",
+      "note": "2026.10.17.1 records upgrade with no attribute change (identity, allow_widening_ssh_exposure and forget are additive); records without an identity are accepted and stamped on first use. trusted_interfaces unset renders byte-identically to 2026.10.17.1. 2026.10.17.2 was never published."
+    }
+  ],
+  "panel": {
+    "codex-astra": "codex gpt-6-astra conformance seat over the fd3716d delta (base cec6bfd): 1 High (the widening guard checks only the requested SSH port, so a management-only rule on 22 can become public SSH on another port) downgraded to MEDIUM at merge prep: it needs a deliberate ssh_port change by the operator, recorded as a LOGBOOK residual; Mediums: revert records omit identity when the caller omits it, forget checks only the host-state identity before cancelling a revert (both LOGBOOK residuals); 2 Lows in tests. Earlier deltas 16f38c5 and cec6bfd were routed and fixed on fd3716d.",
+    "codex-terra": "codex gpt-5.6-terra adversarial seat over the fd3716d delta: 1 High (the uplink probe and the apply are separate, so a routing change between them could move the session onto a trusted interface) downgraded to LOW: the TOCTOU window is small, accepted and documented; 3 Mediums on forget (not idempotent, can be left half-written, does not validate the revert record identity), all LOGBOOK residuals.",
+    "merge-prep": "Merged on main as ad681ad from lane/b3 fd3716d (server-host/ only) after zfs. 2026.10.17.2 was never published; this goes straight to 2026.10.17.3. No code change at merge prep; gates 0-7 passed without changes. Live: server-stack receipts Parts 1-4 folded into the LOGBOOK with addresses redacted; Part 4 8/8 on fd3716d.",
+    "ocr-llm": "OCR sonnet5 and glm seats were not run"
+  }
+}

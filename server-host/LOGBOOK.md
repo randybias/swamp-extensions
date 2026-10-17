@@ -71,20 +71,73 @@ Maintainer notes. Not shipped; not listed in `additionalFiles`.
 
 ## Live matrix
 
-| Cell                      | Status   |
-| ------------------------- | -------- |
-| apply_base                | untested |
-| apply_base idempotent     | untested |
-| render_firewall           | untested |
-| apply_firewall            | untested |
-| commit                    | untested |
-| revert fires              | untested |
-| lockdown + commit         | untested |
-| lockdown no-commit revert | untested |
-| get/sync                  | untested |
-| injection literal         | untested |
+Live e2e 2026-10-17 (folded from the run receipts; real addresses, hostnames and
+ids redacted: `<vps1>` target, `<vps2>` outside probe source, `<control-egress>`
+the control host's egress /32; the other CIDRs are the RFC 5737 / test values
+actually used). Every head was installed from `git archive` into a separate
+repo, never the working tree. Target `<vps1>` (root, key via `ssh_key_ref` from
+a local vault, strict pins), nftables 1.0.9, kernel 6.8. Management CIDRs always
+included `<control-egress>`; `revert_after_s` 60-90. Outside-source probes ran
+from `<vps2>` (`/dev/tcp` to `<vps1>`:22). All runs through
+`swamp model method run` (no `--json` except get/sync, whose arguments carry no
+secret); no private key in any output. A foreign table `inet foreign_test` (a
+rule on tcp 9999) was present for the revert cells.
 
-Not `stable` while any cell is `untested`.
+Earlier run on bc9992d (superseded): the revert cell passed, but commit reported
+failure and the committed table did not survive (the render-vs-live comparison
+bug fixed in 749819d/e7dc3f3).
+
+### Final matrix on e17a609
+
+| Cell                                                          | Result                    | Detail                                                                                                                                                |
+| ------------------------------------------------------------- | ------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 1 apply_base                                                  | PASS                      | user ops (sudo group), authorized_keys written, sysctl drop-in applied (`tcp_syncookies = 1`), curl present, timezone UTC                             |
+| 2 apply_base identical                                        | PASS                      | 83 ms, no remote command issued                                                                                                                       |
+| 3 admin_user change with an empty key list                    | PASS (superseded by 3')   | ops2 created with a 0-byte keys file; the previous account kept its keys and sudo (fixed in f66c8d0)                                                  |
+| 4 single CIDR: apply, commit, identical re-apply              | PASS                      | live `ip saddr <control-egress>`; timer armed then 0 after commit; re-apply armed no new timer                                                        |
+| 5 a /32 plus a second /32                                     | PASS                      | live `ip saddr { <control-egress>, 192.0.2.7 }`                                                                                                       |
+| 6 numeric-vs-lexical pair plus ports                          | PASS                      | `198.51.100.64/26` + `198.51.100.128/25` listed by nft as `198.51.100.64-198.51.100.255`, ports `{ 80, 443 }`; apply verified, commit and re-apply ok |
+| 7 overlapping (/16 containing a /24)                          | PASS                      | nft listed `198.51.0.0/16` only                                                                                                                       |
+| 8 adjacent (two /25s -> /24)                                  | PASS                      | nft listed `203.0.113.0/24`                                                                                                                           |
+| 9 lockdown                                                    | PASS                      | armed window: `<vps2>` -> :22 blocked, timer armed                                                                                                    |
+| 10 fresh-connection verify                                    | PASS                      | a new process and SSH connection (`get`) works during the armed window                                                                                |
+| 11 commit, survives past revert_after_s                       | PASS                      | timer cancelled; after 100 s the table is present and `<vps2>` still blocked                                                                          |
+| 12 revert FIRES, apply_firewall no commit                     | PASS                      | previous managed table back, foreign table and rule intact, timer inactive, state dir clean                                                           |
+| 13 stacking refused while armed                               | PASS                      | `An earlier armed revert is still active or firing`; one timer, live table unchanged                                                                  |
+| 14 commit after expiry                                        | PASS                      | `The armed revert ... expired at ...; nothing to cancel`                                                                                              |
+| 15 revert FIRES, lockdown no commit (no managed table before) | PASS                      | managed table gone, foreign table intact, :22 open from `<vps2>` again                                                                                |
+| 16 `0.0.0.0/0` refused                                        | PASS                      | refused before any contact                                                                                                                            |
+| 17 two /1 halves refused                                      | PASS                      | same refusal                                                                                                                                          |
+| 18 lockdown with allow_ssh_from_anywhere refused              | PASS                      | refused before any contact                                                                                                                            |
+| 19 get                                                        | PARTIAL (resolved by 19') | result not readable through the CLI                                                                                                                   |
+| 20 sync                                                       | PARTIAL (resolved by 20') | same                                                                                                                                                  |
+| 21 final state                                                | PASS                      | no managed or foreign table, no timers, no state dir, test users and drop-ins removed                                                                 |
+
+19 pass, 0 fail, 2 partial.
+
+### Re-run cells on f66c8d0, 2aade6d, 0cfe601
+
+| Cell                                                                   | Result | Detail                                                                                                   | Head    |
+| ---------------------------------------------------------------------- | ------ | -------------------------------------------------------------------------------------------------------- | ------- |
+| 19' get persists an observation (armed window)                         | PASS   | `swamp data query` shows revert_armed=true with token and expiry, drift [], ssh_exposure management-only | f66c8d0 |
+| 20' sync persists an observation (after the revert fired)              | PASS   | revert_armed=false, drift ["ruleset","revert_fired"]; after a commit managed_table=true, drift []        | f66c8d0 |
+| 3' admin_user change revokes the previous account                      | PASS   | old account: keys file removed, sudo and marker removed, account kept; new account: keys, sudo, marker   | f66c8d0 |
+| 22 only `strict` accepted, host_keys required                          | PASS   | `insecure_tofu` and missing host_keys rejected by validation; nothing contacted                          | 2aade6d |
+| 23 logging in AS the previous admin defers the revoke                  | PASS   | old admin keeps keys and sudo for now; state records pending_revoke                                      | 2aade6d |
+| 24 the next run completes it                                           | PASS   | root login: keys, sudo, marker removed, pending list cleared; old admin can no longer log in             | 2aade6d |
+| 25 symlinked ~/.ssh is left alone                                      | PASS   | decoy file intact, sudo still removed, account stays pending                                             | 2aade6d |
+| 26 observation lists pending_revoke, ssh_exposure unknown on drift     | PASS   | `{"drift":["ruleset","revert_fired"],"ssh_exposure":"unknown","pending_revoke":[...]}`                   | 2aade6d |
+| 27 firewall smoke: apply + commit + identical re-apply                 | PASS   | range + ports listed by nft; re-apply armed no timer                                                     | 2aade6d |
+| 28 lockdown no commit -> revert fires                                  | PASS   | previous table restored, no timers                                                                       | 2aade6d |
+| 29 revoke removes keys as the account (runuser), verified sudo removal | PASS   | old admin groups [self], keys none, marker none                                                          | 0cfe601 |
+| 30 final state                                                         | PASS   | no managed or foreign table, no test users, no server-host state, :22 open                               | 0cfe601 |
+
+12 pass, 0 fail. The two earlier PARTIALs are resolved by the persisted
+observation resource.
+
+Untested live: a failing `gpasswd`, a failing `id -nG` and a failing account
+lookup on the revoke path (covered only by tests under `sh` with failing stubs).
+Not stable until those are exercised or ruled out.
 
 ## Review findings
 
@@ -324,3 +377,27 @@ Round 13 (delta review of 2aade6d):
 - MEDIUM README lockdown and commit examples lacked the now-required
   `host_keys`. Added.
 - LOW comment about the revoke steps corrected.
+
+Round 14 (merge-prep delta review of 0cfe601, base 2aade6d; codex astra and
+terra seats): 0 Critical/High after verification at 0cfe601. Residuals, not
+blocking beta:
+
+- MEDIUM (astra, filed High) `getent` exits 2 whenever the lookup returns no
+  entry, including an unavailable NSS backend, so the comment's "only for no
+  such entry" is too strong. Downgraded: the sudo marker is only written after
+  `usermod -aG sudo` succeeds, and usermod refuses accounts that are not in the
+  local /etc/passwd, so every marker belongs to a local account that the `files`
+  source answers. Residual: an account from a remote NSS source that got a
+  managed keys file is treated as gone during a backend outage and dropped from
+  pending_revoke while its keys file remains. Follow-up: on exit 2 keep the
+  account pending unless /etc/passwd also lacks it, and fix the comment.
+- MEDIUM (terra, filed High) the keys removal runs before the sudo removal; if
+  the revoked account makes its own `~/.ssh` unwritable, `runuser ... rm` fails
+  and the step stops before `gpasswd`. Downgraded: the run fails loudly with the
+  account kept pending (fail-closed), and the premise is an account that still
+  holds sudo, which can defeat any revoke. Follow-up: revoke and verify sudo
+  first, then the keys.
+- LOW (terra, filed High) an account recreated by another root actor between the
+  lookup and the marker removal keeps a sudo membership with no marker.
+  Downgraded under the run rulings: concurrent account management on the target
+  is outside the single-orchestrator model.

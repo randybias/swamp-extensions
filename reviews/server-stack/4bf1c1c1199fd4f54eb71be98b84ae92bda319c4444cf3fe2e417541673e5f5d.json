@@ -1,0 +1,89 @@
+{
+  "extension": "@randybias/server-stack",
+  "version": "2026.10.17.4",
+  "reviewedAt": "2026-10-17T18:40:00Z",
+  "dimensions": [
+    {
+      "id": "credentials-secrets",
+      "verdict": "pass",
+      "note": "Workflows only. Every secret (Cherry and Cloudflare tokens, the SSH private key, the WireGuard private key, host user data, the kubeconfig) is read from the fixed vault server-stack by key name with vault.get and handed to the composed models' sensitive-marked arguments; no literal secret is a workflow input, and README examples pass vault key names only and never --json. Terra filed Critical (vault values become ordinary model arguments that the CLI can print): refuted under ruling 3 as the platform limitation swamp-club lab 3555, mitigated by sensitive-marked fields and vault-reference-only examples. 2026.10.17.4 adds an optional NATS auth token: read with vault.get only inside guarded steps, checked for shape in a shell that receives it through its environment, passed to the probe by env only, and written into the Secret on the host through k0s-cluster apply_manifests (sensitive input, only its hash recorded). Live: the token never appeared in local or remote argv samples, run logs or repo files. Astra Highs on probes_test.ts passing a random test token on docker argv: test-only throwaway values, not routed."
+    },
+    {
+      "id": "logging-quality",
+      "verdict": "pass",
+      "note": "No logging of its own; each step logs through the composed model. Step descriptions name the safety each gate provides. The stored kubeconfig record and NATS banner mask the host, so the log line is the evidence of the mesh address (documented)."
+    },
+    {
+      "id": "error-handling",
+      "verdict": "pass",
+      "note": "Every safety gate is a succeeded-only dependency, and every destructive step (delete-record, reset-k0s, delete-server) depends directly on every gate that protects it (2b09a5b, proven with mock APIs: a failing gate leaves everything downstream skipped). Bad Cloudflare token stops in preflight; a wrong k0s sha256 is refused with nothing changed (both live). 2026.10.17.4: check-nats-token refuses a token outside [A-Za-z0-9._~+=-]{16,256} before any manifest; with auth on check-nats requires auth_required, an authenticated +OK and a refused anonymous connection; verify-mesh depends on join-mesh succeeded so a skipped wait-mesh cannot stand in for a failed join."
+    },
+    {
+      "id": "testing-completeness",
+      "verdict": "pass",
+      "note": "21 tests: workflow structure (dependency edges, guard polarity, gate coverage), the real check-inputs expression evaluated with cel-js (NATS namespace must be listed with auth on), and probes_test.ts running the workflow's own probe and token-check scripts against a real NATS server in docker, with the README chart values rendered by helm template (the 64045c9 High, a quoted $NATS_TOKEN taken literally, fixed in 4cc1eb2 and proven by this test). Live 2026.10.17.4: a fresh throwaway host with NATS auth on, 13/15; one FAIL fixed in c7a115e (the Secret is now written on the host), the other a k0s-cluster 2026.10.17.2 reset bug fixed in k0s-cluster 2026.10.17.3. wait-mesh's give-up path was tested offline only. Earlier releases: Part 4 8/8 on e8aad54."
+    },
+    {
+      "id": "idempotency-resilience",
+      "verdict": "pass",
+      "note": "Provision with adopt re-uses the tagged server and owned record (no second order or record, live), and firewall/lockdown are no-ops on a locked-down host (live). Teardown is re-runnable: a second run skips every delete and passes the verify steps (live, three times). A rebuilt host given a deleted host's address no longer inherits records: steps pass the Cherry server id as identity and teardown forgets both records."
+    },
+    {
+      "id": "api-contracts",
+      "verdict": "pass",
+      "note": "Composes @randybias/cherry-servers, ssh-host, wireguard-mesh, server-host 2026.10.17.3, k0s-cluster, k8s-secret, @swamp/cloudflare/dns and @webframp/cloudflare at their current output contracts; DNS absence uses list (empty records), never an error. Residual MEDIUM: DNS checks read only records[0], so a second A record for the name is not checked."
+    },
+    {
+      "id": "resource-management",
+      "verdict": "pass",
+      "note": "Teardown deletes the DNS record, resets k0s and deletes the server, then proves absence against both providers; forget empties the server-host records. A wedged NATS Helm release needs the documented manual recovery. Teardown's reset-k0s needs k0s-cluster 2026.10.17.3; on the published 2026.10.17.2 it fails and the server is not deleted (README and LOGBOOK). Token rotation and TLS are not done."
+    },
+    {
+      "id": "published-surface-hygiene",
+      "verdict": "pass",
+      "note": "Manifest: @randybias/server-stack 2026.10.17.4, workflows only (models: []), Apache-2.0, additionalFiles README.md and LICENSE.txt. Examples use example values and vault key names; the LOGBOOK redacts every real address, hostname, DNS name and provider id. Leak scan, gitleaks and fixture guard pass. Astra LOW: deno.json check targets model directories this package does not have."
+    },
+    {
+      "id": "schema-strictness",
+      "verdict": "pass",
+      "note": "Workflow inputs are typed with length bounds; confirm_hostname must equal hostname; publish_dns true requires the three Cloudflare inputs. Residual MEDIUMs: remote-bound usernames and addresses have length limits but no grammar at the workflow layer (the composed models validate them); nats_chart.values is unconstrained; the mesh steps accept a bare <type> <key> known_hosts line that pins the key for every address, and the input description still describes the host-field form. 2026.10.17.4: nats_chart.namespace takes the DNS-1123 pattern of cluster_namespaces and, with auth on, must be listed there (merge-prep quality pass, closing the GLM advisory on interpolating it into the host manifest); nats_auth_secret has the DNS-1123 subdomain pattern."
+    },
+    {
+      "id": "lifetime-gc",
+      "verdict": "pass",
+      "note": "No resources of its own; lifetimes are those of the composed models."
+    },
+    {
+      "id": "crud-completeness",
+      "verdict": "pass",
+      "note": "server-stack-provision-host (preflight, order or adopt, wait-ready, base, mesh, firewall, lockdown, k0s, kubeconfig, NATS, DNS) and server-stack-teardown-host (record, k0s, server, forget, provider verification)."
+    },
+    {
+      "id": "preflight-checks",
+      "verdict": "pass",
+      "note": "check-inputs, the Cloudflare token check and the ownership/adopt checks run before any order; provision refuses an existing server or record without adopt (live). Teardown refuses a server without the ownership tag and a record without this host's marker before any delete. Residuals (filed High on e8aad54, downgraded at triage to MEDIUM): teardown's project_id is declared but unused (the server definition carries its own project and the ownership tag gates delete); mesh_address for the k0s reset is operator input not bound to the owned server (strict pins and confirm_host still apply)."
+    },
+    {
+      "id": "instance-names",
+      "verdict": "pass",
+      "note": "Uses the operator's definition names (server_model) and the composed models' per-host instance names; one pair of workflows serves any host."
+    },
+    {
+      "id": "data-access",
+      "verdict": "pass",
+      "note": "Reads only the composed models' latest data for the given hostname and record name, and the fixed server-stack vault by key name."
+    },
+    {
+      "id": "version-upgrades",
+      "verdict": "pass",
+      "note": "2026.10.17.3 is published (beta). 2026.10.17.4 adds optional inputs only (mesh_handshake_wait_s default 60, nats_auth_token_key default null, nats_auth_secret default nats-auth); with auth unset the original probe runs unchanged. New check: nats_chart.namespace must be DNS-1123, which any working Kubernetes namespace already is."
+    }
+  ],
+  "panel": {
+    "codex-astra": "codex gpt-6-astra conformance seat over 64045c9: routed with 1 High (README documented a quoted \"$NATS_TOKEN\" that NATS takes literally), fixed in 4cc1eb2 and proven by a helm-template plus real-NATS test. Over c7a115e: 2 Highs on test-only random tokens on docker argv, not routed (throwaway test values). CLEAN.",
+    "codex-terra": "codex gpt-5.6-terra adversarial seat over c7a115e: PASS, no findings.",
+    "tightness-astra": "COULD-BE-TIGHTER, about 2 removable lines (single-use REPO constant), applied at merge prep.",
+    "adversarial-glm": "advisory GLM seat over c7a115e: HIGH on interpolating inputs into the host manifest addressed at merge prep (namespace DNS-1123 pattern, secret name already patterned; the token shape is checked first); Mediums and Lows (namespace not enforced, test token on argv, rotation) addressed or recorded as LOGBOOK residuals.",
+    "merge-prep": "Quality pass a493a21 on lane/b3-stack-4: nats_chart.namespace DNS-1123 pattern and a check-inputs clause requiring it in cluster_namespaces when NATS auth is on, with a cel-js test; README notes the k0s-cluster 2026.10.17.3 dependency of teardown and the disabled cluster_secrets path; single-use REPO constant dropped. Live 17.4 receipts folded into the LOGBOOK with addresses redacted."
+  }
+}

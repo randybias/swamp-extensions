@@ -34,6 +34,20 @@ export const SAFE_FILENAME_RE = /^[A-Za-z0-9._-]{1,255}$/;
 /** HTTPS URL with no shell metacharacters. */
 export const SAFE_URL_RE = /^https:\/\/[A-Za-z0-9][A-Za-z0-9._~:/!()*,=%+-]*$/;
 
+/** True for a well-formed IPv6 literal: at most one `::`, hextets of 1-4 hex digits. */
+export function isIpv6(address: string): boolean {
+  if (!/^[0-9a-fA-F:]+$/.test(address)) return false;
+  const doubles = address.split("::").length - 1;
+  if (doubles > 1 || address.includes(":::")) return false;
+  const hextets = (part: string) => part === "" ? [] : part.split(":");
+  const [head, tail] = address.includes("::")
+    ? address.split("::")
+    : [address, ""];
+  const groups = [...hextets(head), ...hextets(tail)];
+  if (!groups.every((h) => /^[0-9a-fA-F]{1,4}$/.test(h))) return false;
+  return doubles === 1 ? groups.length <= 7 : groups.length === 8;
+}
+
 /** True for an IPv4 or IPv6 CIDR with an in-range prefix. */
 export function isCidr(value: string): boolean {
   const slash = value.indexOf("/");
@@ -42,10 +56,7 @@ export function isCidr(value: string): boolean {
   const prefix = value.slice(slash + 1);
   if (!/^\d{1,3}$/.test(prefix)) return false;
   const bits = Number(prefix);
-  if (address.includes(":")) {
-    if (!/^[0-9a-fA-F:]+$/.test(address)) return false;
-    return bits >= 0 && bits <= 128;
-  }
+  if (address.includes(":")) return bits <= 128 && isIpv6(address);
   const octets = address.split(".");
   if (octets.length !== 4) return false;
   return octets.every((octet) =>

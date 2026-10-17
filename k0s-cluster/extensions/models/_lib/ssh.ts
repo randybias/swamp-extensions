@@ -34,6 +34,8 @@ export interface RunOptions {
   stdin?: Uint8Array | string;
   /** Extra environment variables; merged with the inherited environment. */
   env?: Record<string, string>;
+  /** Cap in bytes on each captured stream; the runner throws when exceeded. */
+  maxOutputBytes?: number;
 }
 
 /** Runs an external command; injectable so tests spawn no process. */
@@ -71,6 +73,8 @@ export interface SshTarget {
   password?: string;
   /** Connection timeout in seconds, 1 to 120. */
   connect_timeout_s?: number;
+  /** Cap in bytes on captured stdout/stderr, 1 to 104857600. */
+  max_output_bytes?: number;
 }
 
 /** Result of running a remote command. */
@@ -371,9 +375,25 @@ function applicableKeys(target: NormalizedTarget): HostKey[] {
   return keysForHost(parsed, target.host, target.port);
 }
 
+/**
+ * The pinned keys that apply to `target`, refusing a supplied set that matches
+ * nothing. A caller that hands over `host_keys` means it, so a set that does
+ * not apply to this host/port is a configuration error, never a silent
+ * fallback to trust-on-first-use.
+ */
+function pinnedKeys(target: NormalizedTarget): HostKey[] {
+  const applicable = applicableKeys(target);
+  if ((target.host_keys?.length ?? 0) > 0 && applicable.length === 0) {
+    throw new SshConfigError(
+      `host_keys were supplied but none apply to ${target.host}:${target.port}`,
+    );
+  }
+  return applicable;
+}
+
 /** Resolves the pinned keys for `target`, refusing an empty or inapplicable set. */
 function expectedKeys(target: NormalizedTarget): HostKey[] {
-  const applicable = applicableKeys(target);
+  const applicable = pinnedKeys(target);
   if (applicable.length === 0) {
     throw new SshConfigError(
       `host_key_policy strict requires pinned host keys for ${target.host}:${target.port}`,
@@ -443,6 +463,37 @@ export async function scanHostKeys(
   return parseHostKeys(res.stdout);
 }
 
+/** Reads a stream into one Uint8Array, throwing when it exceeds `cap` bytes. */
+async function readCappedStream(
+  stream: ReadableStream<Uint8Array>,
+  cap: number,
+  label: string,
+): Promise<Uint8Array> {
+  const reader = stream.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      total += value.byteLength;
+      if (total > cap) {
+        throw new SshError(`${label} exceeded the ${cap}-byte capture limit`);
+      }
+      chunks.push(value);
+    }
+  } finally {
+    await reader.cancel().catch(() => undefined);
+  }
+  const out = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    out.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return out;
+}
+
 /** Default command runner backed by `Deno.Command`. */
 export const denoRunner: CommandRunner = async (cmd, args, options = {}) => {
   // Only ssh, ssh-agent, ssh-add and ssh-keyscan are run, with arguments
@@ -464,7 +515,8 @@ export const denoRunner: CommandRunner = async (cmd, args, options = {}) => {
     }
     throw e;
   }
-  if (options.stdin !== undefined) {
+  const stdin = (async (): Promise<void> => {
+    if (options.stdin === undefined) return;
     const writer = child.stdin.getWriter();
     await writer.write(
       typeof options.stdin === "string"
@@ -472,13 +524,41 @@ export const denoRunner: CommandRunner = async (cmd, args, options = {}) => {
         : options.stdin,
     );
     await writer.close();
+  })();
+  const cap = options.maxOutputBytes;
+  if (cap === undefined) {
+    await stdin;
+    const out = await child.output();
+    return {
+      code: out.code,
+      stdout: new TextDecoder().decode(out.stdout),
+      stderr: new TextDecoder().decode(out.stderr),
+    };
   }
-  const out = await child.output();
-  return {
-    code: out.code,
-    stdout: new TextDecoder().decode(out.stdout),
-    stderr: new TextDecoder().decode(out.stderr),
-  };
+  const stdout = readCappedStream(child.stdout, cap, `${cmd} stdout`);
+  const stderr = readCappedStream(child.stderr, cap, `${cmd} stderr`);
+  try {
+    const [, stdoutBytes, stderrBytes] = await Promise.all([
+      stdin,
+      stdout,
+      stderr,
+    ]);
+    const status = await child.status;
+    return {
+      code: status.code,
+      stdout: new TextDecoder().decode(stdoutBytes),
+      stderr: new TextDecoder().decode(stderrBytes),
+    };
+  } catch (e) {
+    try {
+      child.kill();
+    } catch {
+      // already gone
+    }
+    await Promise.allSettled([stdin, stdout, stderr]);
+    await child.status.catch(() => undefined);
+    throw e;
+  }
 };
 
 /** Production dependencies: the real command runner, clock and sleep. */
@@ -498,6 +578,7 @@ interface NormalizedTarget {
   private_key?: string;
   password?: string;
   connect_timeout_s: number;
+  max_output_bytes: number;
 }
 
 /** Validates a target and fills its defaults. */
@@ -525,6 +606,14 @@ function normalizeTarget(target: SshTarget): NormalizedTarget {
       `connect_timeout_s must be an integer from 1 to 120, got ${timeout}`,
     );
   }
+  const maxOutput = target.max_output_bytes ?? 10_485_760;
+  if (
+    !Number.isInteger(maxOutput) || maxOutput < 1 || maxOutput > 104_857_600
+  ) {
+    throw new SshConfigError(
+      `max_output_bytes must be an integer from 1 to 104857600, got ${maxOutput}`,
+    );
+  }
   return {
     host: target.host,
     port: target.port,
@@ -534,6 +623,7 @@ function normalizeTarget(target: SshTarget): NormalizedTarget {
     private_key: target.private_key,
     password: target.password,
     connect_timeout_s: timeout,
+    max_output_bytes: maxOutput,
   };
 }
 
@@ -621,12 +711,12 @@ function transportFailure(
   ) {
     return new SshError(`could not connect to ${target.host}:${target.port}`);
   }
-  if (/^(?:ssh|ssh-agent): /m.test(e)) {
-    return new SshError(
-      `ssh transport failed for ${target.host}:${target.port} (exit 255)`,
-    );
-  }
-  return null;
+  // OpenSSH reserves exit 255 for its own failures, so any unrecognized 255
+  // is a transport failure, not a remote exit code. A remote command that
+  // itself exits 255 is therefore reported as a transport error.
+  return new SshError(
+    `ssh transport failed for ${target.host}:${target.port} (exit 255)`,
+  );
 }
 
 /**
@@ -655,11 +745,16 @@ async function runRemote(
   const env: Record<string, string> = {};
   const args: string[] = ["-F", "/dev/null", "-o", "IdentityFile=none"];
   try {
-    const pinned = applicableKeys(t);
+    const pinned = pinnedKeys(t);
     if (t.host_key_policy === "strict") {
+      if (pinned.length === 0) {
+        throw new SshConfigError(
+          `host_key_policy strict requires pinned host keys for ${t.host}:${t.port}`,
+        );
+      }
       await Deno.writeTextFile(
         knownHosts,
-        buildKnownHosts(t.host, t.port, expectedKeys(t)),
+        buildKnownHosts(t.host, t.port, pinned),
       );
       args.push("-o", "StrictHostKeyChecking=yes");
     } else if (pinned.length > 0) {
@@ -701,9 +796,23 @@ async function runRemote(
     }
 
     args.push("-p", String(t.port), "-l", t.user, t.host, remoteCommand);
-    const res = await deps.run("ssh", args, { stdin, env });
+    const res = await deps.run("ssh", args, {
+      stdin,
+      env,
+      maxOutputBytes: t.max_output_bytes,
+    });
     const failure = transportFailure(t, res);
     if (failure) throw failure;
+    // Defense in depth for an injected runner: a production runner enforces
+    // the cap while streaming, so this only fires for one that does not.
+    if (
+      utf8Length(res.stdout) > t.max_output_bytes ||
+      utf8Length(res.stderr) > t.max_output_bytes
+    ) {
+      throw new SshError(
+        `output from ${t.host}:${t.port} exceeded the ${t.max_output_bytes}-byte capture limit`,
+      );
+    }
     return { stdout: res.stdout, stderr: res.stderr, exit_code: res.code };
   } finally {
     for (const cleanup of cleanups.reverse()) await cleanup();
@@ -723,6 +832,21 @@ export async function exec(
   return await runRemote(deps, target, quoteArgv(argv));
 }
 
+/** Returns the UTF-8 byte length of `text` without allocating a buffer. */
+function utf8Length(text: string): number {
+  let total = 0;
+  for (let i = 0; i < text.length; i++) {
+    const code = text.charCodeAt(i);
+    if (code < 0x80) total += 1;
+    else if (code < 0x800) total += 2;
+    else if (code >= 0xd800 && code <= 0xdbff) {
+      total += 4;
+      i++;
+    } else total += 3;
+  }
+  return total;
+}
+
 /** Normalizes an octal mode for comparison: `0600` and `600` are the same. */
 function normalizeMode(mode: string): string {
   const trimmed = mode.replace(/^0+/, "");
@@ -734,9 +858,10 @@ function normalizeMode(mode: string): string {
  * destination directory is written from stdin, chmod'ed, and renamed over the
  * destination, so the destination is never partially written. Converges on
  * bytes and mode: identical bytes and mode mean no write, no rename and no new
- * resource version; identical bytes under a different mode get only a chmod. A
- * destination that is a directory is refused. Returns the destination, byte
- * count, SHA-256 and whether anything changed.
+ * resource version, while a mode-only difference is replaced through the same
+ * temp-file path (never chmod-in-place, which would follow a symlink). A
+ * destination that is a directory or a symlink is refused. Returns the
+ * destination, byte count, SHA-256 and whether anything changed.
  */
 export async function upload(
   deps: SshDeps,
@@ -751,15 +876,17 @@ export async function upload(
     : options.content;
   const sha256 = await sha256Hex(bytes);
   const file = posixQuote(options.path);
+  const UNSUPPORTED_PLATFORM =
+    "ssh-host: upload requires a Linux target with mv -T";
   // Convergence probe: read the destination's SHA-256 and mode first, and
-  // refuse a directory. Portability: sha256sum on GNU, shasum -a 256 on macOS;
-  // stat -c on GNU, stat -f on BSD. If none exists the probe yields `none` and
-  // the write proceeds.
+  // refuse a symlink or directory (both tested without following). Portability:
+  // sha256sum on GNU, shasum -a 256 on macOS; stat -c on GNU, stat -f on BSD.
+  // If none exists the probe yields `none` and the write proceeds.
   const check = await runRemote(
     deps,
     target,
     `f=${file}\n` +
-      `if [ -d "$f" ]; then echo DIRECTORY; elif [ -f "$f" ]; then\n` +
+      `if [ -L "$f" ]; then echo SYMLINK; elif [ -d "$f" ]; then echo DIRECTORY; elif [ -f "$f" ]; then\n` +
       `  h=$( { sha256sum "$f" 2>/dev/null || shasum -a 256 "$f" 2>/dev/null; } | awk '{print $1}' )\n` +
       `  m=$( { stat -c %a "$f" 2>/dev/null || stat -f %Lp "$f" 2>/dev/null; } )\n` +
       `  printf '%s %s\n' "\${h:-none}" "\${m:-none}"\n` +
@@ -767,6 +894,11 @@ export async function upload(
   );
   if (check.exit_code === 0) {
     const tokens = check.stdout.trim().split(/\s+/);
+    if (tokens[0] === "SYMLINK") {
+      throw new SshError(
+        `upload destination ${target.user}@${target.host}:${options.path} is a symlink; refusing to follow it`,
+      );
+    }
     if (tokens[0] === "DIRECTORY") {
       throw new SshError(
         `upload destination ${target.user}@${target.host}:${options.path} is a directory`,
@@ -774,6 +906,8 @@ export async function upload(
     }
     const bytesMatch = tokens[0] === sha256;
     const modeMatch = normalizeMode(tokens[1] ?? "") === normalizeMode(mode);
+    // A mode-only difference falls through to the temp-file replacement, so
+    // permissions are set on the new file, never chmod'ed through a symlink.
     if (bytesMatch && modeMatch) {
       return {
         path: options.path,
@@ -781,20 +915,6 @@ export async function upload(
         sha256,
         changed: false,
       };
-    }
-    if (bytesMatch) {
-      // Same content, different permissions: apply only the mode.
-      const chmod = await runRemote(
-        deps,
-        target,
-        `chmod ${posixQuote(mode)} ${file}`,
-      );
-      if (chmod.exit_code !== 0) {
-        throw new SshError(
-          `chmod on ${target.user}@${target.host}:${options.path} failed (exit ${chmod.exit_code})`,
-        );
-      }
-      return { path: options.path, bytes: bytes.length, sha256, changed: true };
     }
   }
   const dir = options.path.slice(0, options.path.lastIndexOf("/")) || "/";
@@ -805,18 +925,25 @@ export async function upload(
     `trap 'rm -f "$t"' EXIT HUP INT TERM`,
     `cat > "$t" || exit 1`,
     `chmod ${posixQuote(mode)} "$t" || exit 1`,
-    `[ -d "$f" ] && exit 1`,
+    `if [ -L "$f" ] || [ -d "$f" ]; then exit 1; fi`,
     // GNU mv -T has rename(2) no-target-directory semantics: it replaces a
-    // symlink or file but never descends into a directory. BSD/macOS mv lacks
-    // -T, so guard with the directory test and verify the result below.
-    `case "$(uname -s)" in Linux) mv -T "$t" "$f" || exit 1;; *) mv -f "$t" "$f" || exit 1;; esac`,
-    `[ -f "$f" ] && [ ! -d "$f" ] || exit 1`,
+    // symlink or file but never descends into a directory. No other platform
+    // gives that guarantee, so fail closed rather than race a dir check.
+    `case "$(uname -s)" in Linux) mv -T "$t" "$f" || exit 1;; *) echo ${
+      posixQuote(UNSUPPORTED_PLATFORM)
+    }; exit 1;; esac`,
+    `[ -f "$f" ] && [ ! -d "$f" ] && [ ! -L "$f" ] || exit 1`,
     // Verify the destination really holds these bytes before reporting success.
     `h=$( { sha256sum "$f" 2>/dev/null || shasum -a 256 "$f" 2>/dev/null; } | awk '{print $1}' )`,
     `[ "$h" = ${posixQuote(sha256)} ] || exit 1`,
   ].join("\n");
   const res = await runRemote(deps, target, script, bytes);
   if (res.exit_code !== 0) {
+    if (res.stdout.includes(UNSUPPORTED_PLATFORM)) {
+      throw new SshConfigError(
+        "upload requires a Linux target with mv -T (a no-target-directory rename)",
+      );
+    }
     throw new SshError(
       `upload to ${target.user}@${target.host}:${options.path} failed (exit ${res.exit_code})`,
     );
@@ -852,7 +979,7 @@ export async function waitConnection(
   // in which case this poll verifies against it instead of trusting anew.
   const expected = t.host_key_policy === "strict"
     ? expectedKeys(t)
-    : applicableKeys(t);
+    : pinnedKeys(t);
   const deadline = deps.now() + timeoutS * 1000;
   const scanTimeout = Math.min(Math.max(t.connect_timeout_s, 1), 10);
   while (true) {

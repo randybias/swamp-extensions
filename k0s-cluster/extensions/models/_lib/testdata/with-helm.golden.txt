@@ -22,7 +22,7 @@ spec:
           url: "https://charts.example.com"
       charts:
         - name: nginx
-          chartname: example/nginx
+          chartname: charts-example-com/nginx
           version: "1.2.3"
           namespace: default
           values: |

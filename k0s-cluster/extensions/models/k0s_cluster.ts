@@ -28,6 +28,7 @@ import {
   archFromUname,
   type BinaryFetcher,
   chartBaseName,
+  type ChartStatus,
   defaultFetcher,
   downloadUrl,
   type HelmRelease,
@@ -42,6 +43,7 @@ import {
   type K0sConfigInput,
   type NodeStatus,
   ok,
+  parseCharts,
   parseHelmReleases,
   parseKubeconfigServer,
   parseNameList,
@@ -68,14 +70,14 @@ const K0S_CONFIG_DIR = "/etc/k0s";
 /** Mode for every upload that can carry a secret: root-only. */
 const SECRET_MODE = "0600";
 
-const VERSION = z.string().regex(K0S_VERSION_RE).describe(
+const VERSION = z.string().max(64).regex(K0S_VERSION_RE).describe(
   "Pinned k0s release, e.g. v1.31.2+k0s.0.",
 );
 const SHA256 = z.string().regex(SHA256_RE).describe(
   "Required SHA-256 of the release binary; install refuses on a mismatch.",
 );
 const NAME = z.string().regex(NAME_RE).describe("DNS-1123 label.");
-const URL = z.string().regex(SAFE_URL_RE).refine(
+const URL = z.string().max(2048).regex(SAFE_URL_RE).refine(
   (value) => !hasUrlCredentials(value),
   "URL must not carry user info, a query or a fragment; wire credentials as separate sensitive inputs",
 ).describe("HTTPS URL with no user info, query or fragment.");
@@ -111,7 +113,9 @@ const SSH = z.strictObject({
 const HELM_CHART = z.strictObject({
   chart: z.string().regex(
     /^[a-z0-9](?:[a-z0-9._-]{0,62})(?:\/[a-z0-9](?:[a-z0-9._-]{0,62}))?$/,
-  ).describe("Chart reference k0s writes to chartname, e.g. repo/chart."),
+  ).describe(
+    "Chart name, optionally written repo/chart; k0s is always given the generated repository name as the prefix.",
+  ),
   repo: URL.describe("HTTPS chart repository URL."),
   version: z.string().regex(/^[A-Za-z0-9][A-Za-z0-9.+-]{0,63}$/).describe(
     "Chart version.",
@@ -157,9 +161,10 @@ const clusterFields = {
   cluster_name: NAME.default("k0s").describe(
     "Cluster name written to metadata.name.",
   ),
-  api_sans: z.array(z.string().regex(HOST_RE)).max(64).default([]).describe(
-    "API server certificate SANs: hostnames or IP literals.",
-  ),
+  api_sans: z.array(z.string().max(253).regex(HOST_RE)).max(64).default([])
+    .describe(
+      "API server certificate SANs: hostnames or IP literals.",
+    ),
   api_port: z.number().int().min(1).max(65535).default(6443).describe(
     "API server port.",
   ),
@@ -633,6 +638,91 @@ async function remotePods(
   return ok(result) ? parsePods(result.stdout) : [];
 }
 
+async function remoteCharts(
+  deps: K0sDeps,
+  target: SshTarget,
+): Promise<ChartStatus[]> {
+  const result = await deps.ssh.exec(target, [
+    K0S_BINARY_PATH,
+    "kubectl",
+    "get",
+    "charts.helm.k0sproject.io",
+    "-n",
+    "kube-system",
+    "-o",
+    "json",
+  ]);
+  return ok(result) ? parseCharts(result.stdout) : [];
+}
+
+/**
+ * Whether a systemd unit exists. Only systemd's explicit "no such unit"
+ * answer counts as absent; any other failure (a bus error, a dropped
+ * connection) is raised, never read as "not installed".
+ */
+async function unitExists(
+  deps: K0sDeps,
+  target: SshTarget,
+  unit: string,
+): Promise<boolean> {
+  const result = await deps.ssh.exec(target, ["systemctl", "cat", unit]);
+  if (ok(result)) return true;
+  if (
+    result.exit_code === 1 &&
+    /No files found|not found|could not be found|No such file/i.test(
+      `${result.stderr}\n${result.stdout}`,
+    )
+  ) {
+    return false;
+  }
+  throw new Error(
+    `could not tell whether ${unit} exists on ${target.host} (systemctl cat exit ${result.exit_code})`,
+  );
+}
+
+/**
+ * Uploads k0s.yaml and, when it changed, restarts the unit and waits for it to
+ * be healthy. If the restart fails, the previous file is put back and the unit
+ * restarted again on a best-effort basis, so a bad config does not stay on the
+ * host. Returns whether the file changed.
+ */
+async function applyConfig(
+  deps: K0sDeps,
+  target: SshTarget,
+  service: string,
+  yaml: string,
+): Promise<boolean> {
+  await ensurePrivateDir(deps, target, K0S_CONFIG_DIR);
+  const before = await deps.ssh.exec(target, ["cat", K0S_CONFIG_PATH]);
+  const previous = ok(before) ? before.stdout : null;
+  const put = await deps.ssh.upload(target, {
+    path: K0S_CONFIG_PATH,
+    content: encoder.encode(yaml),
+    mode: SECRET_MODE,
+  });
+  if (!put.changed) return false;
+  try {
+    await restartAndVerify(deps, target, service);
+  } catch (error) {
+    let note = "the previous k0s.yaml could not be restored";
+    if (previous !== null) {
+      try {
+        await deps.ssh.upload(target, {
+          path: K0S_CONFIG_PATH,
+          content: encoder.encode(previous),
+          mode: SECRET_MODE,
+        });
+        await deps.ssh.exec(target, ["systemctl", "restart", service]);
+        note = "the previous k0s.yaml was restored";
+      } catch {
+        // keep the note above; the original failure is what matters
+      }
+    }
+    throw new Error(`${(error as Error).message}; ${note}`);
+  }
+  return true;
+}
+
 /** Reads everything `get` and `sync` report. */
 async function readLive(
   deps: K0sDeps,
@@ -657,7 +747,13 @@ async function readLive(
     system_pods: pods,
     config_file_sha256: installed ? await remoteConfigSha(deps, target) : null,
     stacks: installed ? await remoteStacks(deps, target) : [],
-    helm_releases: installed ? await remoteHelmReleases(deps, target) : [],
+    helm_releases: installed
+      ? (await remoteHelmReleases(deps, target)).map((release) => ({
+        name: release.name,
+        namespace: release.namespace,
+        status: release.status,
+      }))
+      : [],
     observed_at: iso(now),
   });
 }
@@ -812,9 +908,7 @@ function buildK0sModel(deps: K0sDeps) {
 
           // Look at both role units before touching anything: a controller
           // re-applied as a worker must not get a second, competing role.
-          const otherInstalled = ok(
-            await deps.ssh.exec(target, ["systemctl", "cat", otherService]),
-          );
+          const otherInstalled = await unitExists(deps, target, otherService);
           let migrating = false;
           if (otherInstalled) {
             if (
@@ -840,7 +934,11 @@ function buildK0sModel(deps: K0sDeps) {
               }),
             ),
           );
-          const alreadyActive = !migrating && ok(
+          // A unit that exists but is stopped is adopted and started, not
+          // reinstalled over: `k0s install` would fail on it.
+          const unitPresent = !migrating &&
+            await unitExists(deps, target, service);
+          const alreadyActive = unitPresent && ok(
             await deps.ssh.exec(target, ["systemctl", "is-active", service]),
           );
           const result = {
@@ -850,7 +948,7 @@ function buildK0sModel(deps: K0sDeps) {
             config_sha256: configSha,
           };
 
-          if (alreadyActive && !args.force_reinstall) {
+          if (unitPresent && !args.force_reinstall) {
             const remoteBinary = parseSha256(
               (await deps.ssh.exec(target, ["sha256sum", K0S_BINARY_PATH]))
                 .stdout,
@@ -874,16 +972,29 @@ function buildK0sModel(deps: K0sDeps) {
               );
             }
             let adopted = true;
-            await ensurePrivateDir(deps, target, K0S_CONFIG_DIR);
-            const put = await deps.ssh.upload(target, {
-              path: K0S_CONFIG_PATH,
-              content: encoder.encode(yaml),
-              mode: SECRET_MODE,
-            });
-            if (put.changed) {
+            if (!alreadyActive) {
+              await ensurePrivateDir(deps, target, K0S_CONFIG_DIR);
+              await deps.ssh.upload(target, {
+                path: K0S_CONFIG_PATH,
+                content: encoder.encode(yaml),
+                mode: SECRET_MODE,
+              });
+              const started = await deps.ssh.exec(target, [
+                "systemctl",
+                "enable",
+                "--now",
+                service,
+              ]);
+              if (!ok(started)) {
+                throw new Error(
+                  `could not start ${service} on ${target.host} (exit ${started.exit_code})`,
+                );
+              }
+              await waitUnitHealthy(deps, target, service, 60);
+              adopted = false;
+            } else if (await applyConfig(deps, target, service, yaml)) {
               // A failed restart means the new config never loaded: fail
               // here, before any state claims it did.
-              await restartAndVerify(deps, target, service);
               adopted = false;
             }
             context.logger.info(
@@ -1029,17 +1140,23 @@ function buildK0sModel(deps: K0sDeps) {
             // The old role is already gone and cannot be restored: say so
             // and record that nothing is installed, rather than leaving a
             // state that still claims the old role.
+            let newUnit = false;
+            try {
+              newUnit = await unitExists(deps, target, service);
+            } catch {
+              // unknown: record nothing installed, the safer claim
+            }
             await context.writeResource(
               "state",
               targetId(target),
               StateSchema.parse({
                 ...whoOf(target),
-                role: null,
+                role: newUnit ? args.role : null,
                 k0s_version: null,
                 binary_sha256: null,
                 config_sha256: null,
                 config_file_sha256: null,
-                service: null,
+                service: newUnit ? service : null,
                 installed: false,
                 adopted: false,
                 observed_at: iso(now),
@@ -1048,7 +1165,11 @@ function buildK0sModel(deps: K0sDeps) {
             throw new Error(
               `${
                 (error as Error).message
-              }; the previous ${otherService} role had already been reset and could not be restored, so no k0s role is installed on ${target.host}. Re-run install to finish the migration.`,
+              }; the previous ${otherService} role had already been reset and could not be restored. ${
+                newUnit
+                  ? `The new ${service} unit exists but did not come up`
+                  : "No k0s role is installed"
+              } on ${target.host}. Re-run install to finish the migration.`,
             );
           }
           context.logger.info(
@@ -1218,11 +1339,14 @@ function buildK0sModel(deps: K0sDeps) {
             "-type",
             "f",
           ]);
-          const existing = ok(listing)
-            ? parseNameList(listing.stdout).map((path) =>
-              path.startsWith(`${dir}/`) ? path.slice(dir.length + 1) : path
-            )
-            : [];
+          if (!ok(listing)) {
+            throw new Error(
+              `could not list ${dir} on ${target.host} (exit ${listing.exit_code}); nothing was changed`,
+            );
+          }
+          const existing = parseNameList(listing.stdout).map((path) =>
+            path.startsWith(`${dir}/`) ? path.slice(dir.length + 1) : path
+          );
           const desired = new Map(
             stack.files.map((file) => [
               normalizeManifestPath(file.path),
@@ -1236,6 +1360,7 @@ function buildK0sModel(deps: K0sDeps) {
               normalizeManifestPath(b.path),
             )
           );
+          const landed: string[] = [];
           for (const file of sorted) {
             const relative = normalizeManifestPath(file.path);
             const content = encoder.encode(file.content);
@@ -1244,20 +1369,33 @@ function buildK0sModel(deps: K0sDeps) {
             // Always go through upload: it converges bytes and mode, so a
             // file that already holds these bytes under a looser mode is
             // still tightened to 0600.
-            await ensurePrivateDir(
-              deps,
-              target,
-              `${dir}/${relative}`.slice(
-                0,
-                `${dir}/${relative}`.lastIndexOf("/"),
-              ),
-            );
-            const put = await deps.ssh.upload(target, {
-              path: `${dir}/${relative}`,
-              content,
-              mode: SECRET_MODE,
-            });
-            if (put.changed) applied = true;
+            try {
+              await ensurePrivateDir(
+                deps,
+                target,
+                `${dir}/${relative}`.slice(
+                  0,
+                  `${dir}/${relative}`.lastIndexOf("/"),
+                ),
+              );
+              const put = await deps.ssh.upload(target, {
+                path: `${dir}/${relative}`,
+                content,
+                mode: SECRET_MODE,
+              });
+              if (put.changed) applied = true;
+              landed.push(relative);
+            } catch (error) {
+              // The stack is applied file by file, so say which files made
+              // it: k0s may already be deploying a partial stack.
+              throw new Error(
+                `${
+                  (error as Error).message
+                }; stack ${stack.name} is partly applied on ${target.host}: ${landed.length} of ${sorted.length} files uploaded (${
+                  landed.join(", ") || "none"
+                }), failed at ${relative}. Re-run apply_manifests to finish.`,
+              );
+            }
           }
           for (const found of existing) {
             const relative = normalizeManifestPath(found);
@@ -1327,18 +1465,14 @@ function buildK0sModel(deps: K0sDeps) {
             args.ssh,
           );
           const yaml = renderK0sConfig(renderInput(args));
-          let applied = false;
-          await ensurePrivateDir(deps, target, K0S_CONFIG_DIR);
-          const put = await deps.ssh.upload(target, {
-            path: K0S_CONFIG_PATH,
-            content: encoder.encode(yaml),
-            mode: SECRET_MODE,
-          });
-          if (put.changed) {
-            // A restart that failed means the chart config never loaded.
-            await restartAndVerify(deps, target, "k0scontroller");
-            applied = true;
-          }
+          // A restart that failed means the chart config never loaded; the
+          // previous config is put back.
+          const applied = await applyConfig(
+            deps,
+            target,
+            "k0scontroller",
+            yaml,
+          );
           const wanted = new Map(
             args.helm.map((chart) => [
               `${chart.namespace}/${chartBaseName(chart.chart)}`,
@@ -1348,27 +1482,46 @@ function buildK0sModel(deps: K0sDeps) {
           const deadline = deps.now() + args.reconcile_timeout_s * 1000;
           let releases: HelmRelease[] = [];
           let reconciled = false;
-          while (deps.now() < deadline) {
+          let pending: string[] = [];
+          while (true) {
             releases = await remoteHelmReleases(deps, target);
-            const present = new Set(
-              releases.map((release) => `${release.namespace}/${release.name}`),
-            );
-            if ([...wanted.keys()].every((key) => present.has(key))) {
+            const known = await remoteCharts(deps, target);
+            pending = [];
+            for (const [key, chart] of wanted) {
+              const release = releases.find((r) =>
+                `${r.namespace}/${r.name}` === key
+              );
+              const resource = known.find((c) =>
+                `${c.namespace}/${c.name}` === key
+              );
+              if (release?.status === "failed") {
+                throw new Error(
+                  `Helm release ${key} failed on ${target.host}`,
+                );
+              }
+              if (!release) {
+                pending.push(`${key} (no release yet)`);
+              } else if (release.status !== "deployed") {
+                pending.push(`${key} (status ${release.status})`);
+              } else if (resource?.version !== chart.version) {
+                pending.push(
+                  `${key} (chart version ${
+                    resource?.version ?? "unknown"
+                  }, wanted ${chart.version})`,
+                );
+              }
+            }
+            if (pending.length === 0) {
               reconciled = true;
               break;
             }
+            if (deps.now() >= deadline) break;
             await deps.sleep(args.poll_interval_s * 1000);
           }
           if (!reconciled) {
-            const present = new Set(
-              releases.map((release) => `${release.namespace}/${release.name}`),
-            );
-            const missing = [...wanted.keys()].filter((key) =>
-              !present.has(key)
-            );
             throw new Error(
               `Helm extensions did not reconcile on ${target.host} within ${args.reconcile_timeout_s}s: ${
-                missing.join(", ")
+                pending.join(", ")
               }`,
             );
           }
@@ -1514,19 +1667,9 @@ function buildK0sModel(deps: K0sDeps) {
               `confirm_host ${args.confirm_host} does not match the SSH host ${target.host}`,
             );
           }
-          const unitInstalled = ok(
-            await deps.ssh.exec(target, [
-              "systemctl",
-              "cat",
-              serviceName("single"),
-            ]),
-          ) || ok(
-            await deps.ssh.exec(target, [
-              "systemctl",
-              "cat",
-              serviceName("worker"),
-            ]),
-          );
+          const unitInstalled =
+            await unitExists(deps, target, serviceName("single")) ||
+            await unitExists(deps, target, serviceName("worker"));
           if (!unitInstalled) {
             context.logger.info(
               "No k0s service on {host}; reset is a no-op",

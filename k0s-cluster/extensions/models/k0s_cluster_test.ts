@@ -136,6 +136,8 @@ function primary<T extends { specName: string }>(rows: T[], all?: true) {
   return all ? kept : kept[0];
 }
 
+const ABSENT = { code: 1, stderr: "Unit could not be found." };
+
 const installed = { value: false };
 
 function installRouter(argv: string[]) {
@@ -144,7 +146,7 @@ function installRouter(argv: string[]) {
   if (argv[0] === "systemctl" && argv[1] === "is-active") {
     return { code: installed.value ? 0 : 3, stdout: "" };
   }
-  if (argv[0] === "systemctl" && argv[1] === "cat") return { code: 1 };
+  if (argv[0] === "systemctl" && argv[1] === "cat") return ABSENT;
   if (argv[0] === "uname") return { code: 0, stdout: "x86_64\n" };
   return { code: 0, stdout: "", stderr: "" };
 }
@@ -152,9 +154,12 @@ function installRouter(argv: string[]) {
 function adoptRouter(
   configSha: string,
   binarySha: string = PAYLOAD_SHA,
+  presentUnit = "k0scontroller",
 ): (argv: string[]) => { code?: number; stdout?: string } {
   return (argv) => {
-    if (argv[0] === "systemctl" && argv[1] === "cat") return { code: 1 };
+    if (argv[0] === "systemctl" && argv[1] === "cat") {
+      return argv[2] === presentUnit ? { code: 0 } : ABSENT;
+    }
     if (argv[0] === "systemctl" && argv[1] === "is-active") {
       return { code: 0, stdout: "active\n" };
     }
@@ -184,6 +189,13 @@ const READY_PODS = JSON.stringify({
       phase: "Running",
       conditions: [{ type: "Ready", status: "True" }],
     },
+  }],
+});
+const HELM_CHARTS = JSON.stringify({
+  items: [{
+    metadata: { name: "k0s-addon-chart-nginx" },
+    spec: { namespace: "default" },
+    status: { releaseName: "nginx", version: "1.2.3", namespace: "default" },
   }],
 });
 const HELM_SECRETS = JSON.stringify({
@@ -568,6 +580,9 @@ Deno.test("apply_helm reconciles a declared chart", async () => {
   const fake = makeDeps({
     uploadChanged: () => false,
     exec: (argv) => {
+      if (argv.includes("charts.helm.k0sproject.io")) {
+        return { code: 0, stdout: HELM_CHARTS };
+      }
       if (argv.includes("secrets")) return { code: 0, stdout: HELM_SECRETS };
       return { code: 0, stdout: "" };
     },
@@ -632,6 +647,9 @@ Deno.test("get reports live cluster state", async () => {
         return { code: 0, stdout: `${"b".repeat(64)}  ${K0S_CONFIG_PATH}\n` };
       }
       if (argv[0] === "ls") return { code: 0, stdout: "example\n" };
+      if (argv.includes("charts.helm.k0sproject.io")) {
+        return { code: 0, stdout: HELM_CHARTS };
+      }
       if (argv.includes("secrets")) return { code: 0, stdout: HELM_SECRETS };
       return { code: 0, stdout: "" };
     },
@@ -668,9 +686,7 @@ Deno.test("sync reports drift and refreshes status", async () => {
 Deno.test("reset is a clean no-op when no k0s service exists", async () => {
   const fake = makeDeps({
     exec: (argv) => {
-      if (argv[0] === "systemctl" && argv[1] === "cat") {
-        return { code: 1, stdout: "", stderr: "Unit not found\n" };
-      }
+      if (argv[0] === "systemctl" && argv[1] === "cat") return ABSENT;
       return { code: 0, stdout: "" };
     },
   });
@@ -694,9 +710,7 @@ Deno.test("reset stops and resets an installed cluster", async () => {
       ) {
         return { code: 0, stdout: "unit\n" };
       }
-      if (argv[0] === "systemctl" && argv[1] === "cat") {
-        return { code: 1, stdout: "" };
-      }
+      if (argv[0] === "systemctl" && argv[1] === "cat") return ABSENT;
       return { code: 0, stdout: "" };
     },
   });
@@ -884,7 +898,7 @@ Deno.test("reset fails and stores no state when cleanup fails", async () => {
         return { code: 0, stdout: "unit\n" };
       }
       if (argv[0] === "systemctl" && argv[1] === "cat") {
-        return { code: 1, stdout: "" };
+        return { code: 1, stdout: "", stderr: "Unit could not be found." };
       }
       if (argv[0] === "rm") return { code: 1, stdout: "" };
       return { code: 0, stdout: "" };
@@ -951,7 +965,7 @@ Deno.test("the manifest packages README and LICENSE but not LOGBOOK", async () =
 
 const ACTIVE_CONTROLLER = (argv: string[]) => {
   if (argv[0] === "systemctl" && argv[1] === "cat") {
-    return { code: argv[2] === "k0scontroller" ? 0 : 1 };
+    return argv[2] === "k0scontroller" ? { code: 0 } : ABSENT;
   }
   if (argv[0] === "systemctl" && argv[1] === "is-active") {
     return { code: argv[2] === "k0scontroller" ? 0 : 3 };
@@ -1021,7 +1035,9 @@ Deno.test("allow_role_change stops and resets the old role before installing", a
 Deno.test("a failed k0s stop during force_reinstall is not ignored", async () => {
   const fake = makeDeps({
     exec: (argv) => {
-      if (argv[0] === "systemctl" && argv[1] === "cat") return { code: 1 };
+      if (argv[0] === "systemctl" && argv[1] === "cat") {
+        return argv[2] === "k0scontroller" ? { code: 0 } : ABSENT;
+      }
       if (argv[0] === "systemctl" && argv[1] === "is-active") {
         return { code: 0 };
       }
@@ -1049,11 +1065,12 @@ Deno.test("a failed k0s stop during force_reinstall is not ignored", async () =>
 Deno.test("the join token goes up only on a fresh worker install", async () => {
   const fake = makeDeps({
     exec: (argv) => {
-      if (argv[0] === "systemctl" && argv[1] === "cat") return { code: 1 };
+      if (argv[0] === "systemctl" && argv[1] === "cat") {
+        return argv[2] === "k0sworker" ? { code: 0 } : ABSENT;
+      }
       if (argv[0] === "systemctl" && argv[1] === "is-active") {
         return { code: 0 };
       }
-      if (argv[1] === "sha256sum") return undefined;
       return undefined;
     },
   });
@@ -1441,4 +1458,207 @@ Deno.test("an existing looser mode is tightened even when the bytes match", asyn
   );
   assertEquals(out.result.applied, true);
   assertEquals(fake.uploads.every((u) => u.mode === "0600"), true);
+});
+
+Deno.test("apply_helm keeps waiting while the chart is still the old version", async () => {
+  const fake = makeDeps({
+    exec: (argv) => {
+      if (argv.includes("charts.helm.k0sproject.io")) {
+        return {
+          code: 0,
+          stdout: HELM_CHARTS.replace('"1.2.3"', '"1.0.0"'),
+        };
+      }
+      if (argv.includes("secrets")) return { code: 0, stdout: HELM_SECRETS };
+      return undefined;
+    },
+    uploadChanged: () => false,
+  });
+  const model = createModel(fake.deps);
+  const { context, getWrittenResources } = createModelTestContext();
+  await assertRejects(
+    () =>
+      model.methods.apply_helm.execute(
+        model.methods.apply_helm.arguments.parse({
+          ssh: SSH,
+          ...CLUSTER,
+          reconcile_timeout_s: 10,
+          poll_interval_s: 1,
+          helm: [{
+            chart: "example/nginx",
+            repo: "https://charts.example.com",
+            version: "1.2.3",
+            namespace: "default",
+          }],
+        }),
+        context,
+      ),
+    Error,
+    "chart version 1.0.0, wanted 1.2.3",
+  );
+  assertEquals(primary(getWrittenResources(), true).length, 0);
+});
+
+Deno.test("apply_helm fails at once on a failed release", async () => {
+  const fake = makeDeps({
+    exec: (argv) => {
+      if (argv.includes("secrets")) {
+        return {
+          code: 0,
+          stdout: HELM_SECRETS.replace('"deployed"', '"failed"'),
+        };
+      }
+      if (argv.includes("charts.helm.k0sproject.io")) {
+        return { code: 0, stdout: HELM_CHARTS };
+      }
+      return undefined;
+    },
+    uploadChanged: () => false,
+  });
+  const model = createModel(fake.deps);
+  const { context } = createModelTestContext();
+  await assertRejects(
+    () =>
+      model.methods.apply_helm.execute(
+        model.methods.apply_helm.arguments.parse({
+          ssh: SSH,
+          ...CLUSTER,
+          helm: [{
+            chart: "example/nginx",
+            repo: "https://charts.example.com",
+            version: "1.2.3",
+            namespace: "default",
+          }],
+        }),
+        context,
+      ),
+    Error,
+    "failed",
+  );
+  assertEquals(fake.clock.value, Date.UTC(2026, 9, 17, 12, 0, 0));
+});
+
+Deno.test("a failed manifest listing stops before any upload or delete", async () => {
+  const fake = makeDeps({
+    exec: (argv) => argv[0] === "find" ? { code: 1 } : undefined,
+  });
+  const model = createModel(fake.deps);
+  const { context } = createModelTestContext();
+  await assertRejects(
+    () =>
+      model.methods.apply_manifests.execute(
+        model.methods.apply_manifests.arguments.parse({
+          ssh: SSH,
+          stack: { name: "s", files: [{ path: "a.yaml", content: "x: 1\n" }] },
+        }),
+        context,
+      ),
+    Error,
+    "could not list",
+  );
+  assertEquals(fake.uploads.length, 0);
+});
+
+Deno.test("a mid-stack upload failure names the files that landed", async () => {
+  const fake = makeDeps({});
+  const base = fake.deps.ssh.upload;
+  let n = 0;
+  fake.deps.ssh.upload = (target, file) =>
+    ++n === 2 ? Promise.reject(new SshError("boom")) : base(target, file);
+  const model = createModel(fake.deps);
+  const { context } = createModelTestContext();
+  await assertRejects(
+    () =>
+      model.methods.apply_manifests.execute(
+        model.methods.apply_manifests.arguments.parse({
+          ssh: SSH,
+          stack: {
+            name: "s",
+            files: [
+              { path: "a.yaml", content: "x: 1\n" },
+              { path: "b.yaml", content: "x: 2\n" },
+            ],
+          },
+        }),
+        context,
+      ),
+    Error,
+    "1 of 2 files uploaded (a.yaml), failed at b.yaml",
+  );
+});
+
+Deno.test("reset fails closed when systemctl cat gives an unexplained error", async () => {
+  const fake = makeDeps({
+    exec: (argv) =>
+      argv[0] === "systemctl" && argv[1] === "cat"
+        ? { code: 255, stderr: "Failed to connect to bus" }
+        : undefined,
+  });
+  const model = createModel(fake.deps);
+  const { context, getWrittenResources } = createModelTestContext();
+  await assertRejects(
+    () =>
+      model.methods.reset.execute(
+        model.methods.reset.arguments.parse({ ssh: SSH, confirm_host: HOST }),
+        context,
+      ),
+    Error,
+    "could not tell whether",
+  );
+  assertEquals(primary(getWrittenResources(), true).length, 0);
+});
+
+Deno.test("an installed but stopped unit is started, not reinstalled over", async () => {
+  let started = false;
+  const fake = makeDeps({
+    exec: (argv) => {
+      if (argv[0] === "systemctl" && argv[1] === "cat") {
+        return argv[2] === "k0scontroller" ? { code: 0 } : ABSENT;
+      }
+      if (argv[0] === "systemctl" && argv[1] === "enable") started = true;
+      if (argv[0] === "systemctl" && argv[1] === "is-active") {
+        return { code: started ? 0 : 3 };
+      }
+      return adoptRouter("0".repeat(64))(argv);
+    },
+  });
+  const model = createModel(fake.deps);
+  const { context } = createModelTestContext();
+  const out = await model.methods.install.execute(installArgs(), context);
+  assertEquals(out.result.role, "single");
+  assertEquals(fake.execs.some((argv) => argv[1] === "install"), false);
+  assertEquals(started, true);
+});
+
+Deno.test("a failed restart puts the previous k0s.yaml back", async () => {
+  const fake = makeDeps({
+    exec: (argv) => {
+      if (argv[0] === "cat") return { code: 0, stdout: "previous: config\n" };
+      if (argv[0] === "systemctl" && argv[1] === "restart") return { code: 1 };
+      return undefined;
+    },
+  });
+  const model = createModel(fake.deps);
+  const { context } = createModelTestContext();
+  await assertRejects(
+    () =>
+      model.methods.apply_helm.execute(
+        model.methods.apply_helm.arguments.parse({
+          ssh: SSH,
+          ...CLUSTER,
+          helm: [{
+            chart: "example/nginx",
+            repo: "https://charts.example.com",
+            version: "1.2.3",
+            namespace: "default",
+          }],
+        }),
+        context,
+      ),
+    Error,
+    "previous k0s.yaml was restored",
+  );
+  const last = fake.uploads.at(-1)!;
+  assertEquals(new TextDecoder().decode(last.content), "previous: config\n");
+  assertEquals(last.mode, "0600");
 });

@@ -407,7 +407,13 @@ export function renderK0sConfig(input: K0sConfigInput): string {
     );
     for (const chart of charts) {
       lines.push(`        - name: ${yamlScalar(chartBaseName(chart.chart))}`);
-      lines.push(`          chartname: ${yamlScalar(chart.chart)}`);
+      // k0s resolves chartname as `<repository name>/<chart>`, so the prefix
+      // is always the generated repository name, whatever the caller wrote.
+      lines.push(
+        `          chartname: ${
+          yamlScalar(`${repoSlug(chart.repo)}/${chartBaseName(chart.chart)}`)
+        }`,
+      );
       lines.push(`          version: ${yamlScalar(chart.version)}`);
       lines.push(`          namespace: ${yamlScalar(chart.namespace)}`);
       if (chart.values !== undefined && Object.keys(chart.values).length > 0) {
@@ -458,6 +464,20 @@ export interface HelmRelease {
   namespace: string;
   /** Helm status label, e.g. `deployed`. */
   status: string;
+  /** Release revision (the `vN` suffix of the release secret). */
+  revision: number;
+}
+
+/** A k0s Helm Chart resource as reported by the cluster. */
+export interface ChartStatus {
+  /** Release name. */
+  name: string;
+  /** Release namespace. */
+  namespace: string;
+  /** Chart version the controller last reconciled, if any. */
+  version: string | null;
+  /** Reconcile error text, if any. */
+  error: string | null;
 }
 
 function parseJson(text: string): Record<string, unknown> | null {
@@ -532,24 +552,65 @@ export function systemPodsHealthy(pods: PodStatus[]): boolean {
   );
 }
 
-/** Parses Helm release secrets from `kubectl get secrets -A -o json`. */
+/**
+ * Parses Helm release secrets from `kubectl get secrets -A -o json`, keeping
+ * only the latest revision of each release: an older revision's secret stays
+ * behind during an upgrade and must not stand in for the new one.
+ */
 export function parseHelmReleases(text: string): HelmRelease[] {
-  const releases: HelmRelease[] = [];
+  const latest = new Map<string, HelmRelease>();
   for (const item of jsonItems(text)) {
     if (item.type !== "helm.sh/release.v1") continue;
     const meta = isPlain(item.metadata) ? item.metadata : undefined;
     const secretName = typeof meta?.name === "string" ? meta.name : "";
-    const match = /^sh\.helm\.release\.v1\.(.+)\.v\d+$/.exec(secretName);
+    const match = /^sh\.helm\.release\.v1\.(.+)\.v(\d+)$/.exec(secretName);
     if (!match) continue;
-    releases.push({
+    const release: HelmRelease = {
       name: match[1],
       namespace: typeof meta?.namespace === "string" ? meta.namespace : "",
       status: labelOf(meta, "status") || "unknown",
-    });
+      revision: Number(match[2]),
+    };
+    const key = `${release.namespace}/${release.name}`;
+    const seen = latest.get(key);
+    if (!seen || release.revision > seen.revision) latest.set(key, release);
   }
-  return releases.sort((a, b) =>
+  return [...latest.values()].sort((a, b) =>
     a.namespace.localeCompare(b.namespace) || a.name.localeCompare(b.name)
   );
+}
+
+/** Parses k0s `Chart` resources from `kubectl get charts.helm.k0sproject.io -o json`. */
+export function parseCharts(text: string): ChartStatus[] {
+  const charts: ChartStatus[] = [];
+  for (const item of jsonItems(text)) {
+    const status = isPlain(item.status) ? item.status : {};
+    const spec = isPlain(item.spec) ? item.spec : {};
+    const meta = isPlain(item.metadata) ? item.metadata : {};
+    const metaName = typeof meta.name === "string"
+      ? meta.name.replace(/^k0s-addon-chart-/, "")
+      : "";
+    const name = typeof status.releaseName === "string" && status.releaseName
+      ? status.releaseName
+      : metaName;
+    const namespace = typeof status.namespace === "string" && status.namespace
+      ? status.namespace
+      : typeof spec.namespace === "string"
+      ? spec.namespace
+      : "";
+    if (!name) continue;
+    charts.push({
+      name,
+      namespace,
+      version: typeof status.version === "string" && status.version
+        ? status.version
+        : null,
+      error: typeof status.error === "string" && status.error
+        ? status.error
+        : null,
+    });
+  }
+  return charts;
 }
 
 /** Extracts the first 64-hex token of a `sha256sum` line, if present. */

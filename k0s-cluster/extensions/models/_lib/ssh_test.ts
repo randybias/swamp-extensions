@@ -407,12 +407,28 @@ Deno.test("exec returns a non-zero remote exit as data, not an error", async () 
   });
 });
 
-Deno.test("exec returns an unexplained 255 as data", async () => {
+Deno.test("exec enforces the output capture cap with a typed error", async () => {
+  const calls: Call[] = [];
+  const deps = fakeDeps(fakeRun(calls, {
+    ssh: () => ({ code: 0, stdout: "0123456789", stderr: "" }),
+  }));
+  await assertRejects(
+    () => exec(deps, { ...STRICT_TARGET, max_output_bytes: 4 }, ["true"]),
+    SshError,
+    "capture limit",
+  );
+});
+
+Deno.test("exec treats any ssh exit 255 as a transport error, not data", async () => {
   const calls: Call[] = [];
   const deps = fakeDeps(fakeRun(calls, {
     ssh: () => ({ code: 255, stdout: "", stderr: "remote said no\n" }),
   }));
-  assertEquals((await exec(deps, STRICT_TARGET, ["./script"])).exit_code, 255);
+  await assertRejects(
+    () => exec(deps, STRICT_TARGET, ["./script"]),
+    SshError,
+    "transport failed",
+  );
 });
 
 Deno.test("strict needs pinned keys and rejects two credentials at once", async () => {
@@ -487,11 +503,11 @@ Deno.test("upload streams bytes over stdin and renames atomically", async () => 
   const remote = sshCalls[1].args.at(-1) ?? "";
   assertStringIncludes(remote, "mktemp");
   assertStringIncludes(remote, "chmod '0640'");
-  assertStringIncludes(remote, `mv -f \"$t\" \"$f\"`);
   assertStringIncludes(remote, `f='/etc/wireguard/wg0.conf'`);
-  // No-target-directory rename on Linux and a post-move verification.
+  // No-target-directory rename on Linux only, then a post-move verification.
   assertStringIncludes(remote, "mv -T");
   assertStringIncludes(remote, `[ "$h" = '${result.sha256}' ]`);
+  assertEquals(remote.includes("mv -f "), false);
   for (const call of calls) {
     assertEquals(call.args.join(" ").includes("placeholder config"), false);
   }
@@ -514,7 +530,7 @@ Deno.test("upload is idempotent: matching bytes and mode mean no write", async (
   assertEquals(sshCalls[0].stdin, undefined);
 });
 
-Deno.test("upload applies a mode change when only permissions differ", async () => {
+Deno.test("upload replaces through the temp path on a mode-only difference", async () => {
   const calls: Call[] = [];
   const content = "same bytes\n";
   const sha = await sha256Hex(content);
@@ -529,8 +545,44 @@ Deno.test("upload applies a mode change when only permissions differ", async () 
   assertEquals(result.changed, true);
   const sshCalls = calls.filter((c) => c.cmd === "ssh");
   assertEquals(sshCalls.length, 2);
-  assertEquals(sshCalls[1].args.at(-1), "chmod '0600' '/etc/x'");
-  assertEquals(sshCalls[1].stdin, undefined);
+  const remote = sshCalls[1].args.at(-1) ?? "";
+  assertStringIncludes(remote, "mktemp");
+  assertStringIncludes(remote, "chmod '0600'");
+  assertStringIncludes(remote, "mv -T");
+  // Never a chmod-in-place on the destination.
+  assertEquals(remote.includes("chmod '0600' '/etc/x'"), false);
+  assertEquals(sshCalls[1].stdin !== undefined, true);
+});
+
+Deno.test("upload refuses a symlink destination without following it", async () => {
+  const calls: Call[] = [];
+  const deps = fakeDeps(fakeRun(calls, {
+    ssh: () => ({ code: 0, stdout: "SYMLINK\n", stderr: "" }),
+  }));
+  await assertRejects(
+    () => upload(deps, STRICT_TARGET, { path: "/etc/x", content: "x" }),
+    SshError,
+    "symlink",
+  );
+  assertEquals(calls.filter((c) => c.cmd === "ssh").length, 1);
+});
+
+Deno.test("upload fails closed on a target without a no-target-directory rename", async () => {
+  const calls: Call[] = [];
+  const marker = "ssh-host: upload requires a Linux target with mv -T";
+  const deps = fakeDeps(fakeRun(calls, {
+    ssh: (args) => {
+      const remote = args.at(-1) ?? "";
+      return remote.includes("mktemp")
+        ? { code: 1, stdout: `${marker}\n`, stderr: "" }
+        : { code: 0, stdout: "MISSING\n", stderr: "" };
+    },
+  }));
+  await assertRejects(
+    () => upload(deps, STRICT_TARGET, { path: "/etc/x", content: "x" }),
+    SshConfigError,
+    "Linux target",
+  );
 });
 
 Deno.test("upload refuses a destination that is a directory", async () => {
@@ -649,6 +701,36 @@ Deno.test("waitConnection insecure_tofu accepts the first keys observed", async 
     host_key_policy: "insecure_tofu",
   });
   assertEquals(result.host_keys[0].key, OTHER.key);
+});
+
+Deno.test("a supplied pin that matches no host refuses instead of accept-new", async () => {
+  const deps = fakeDeps(fakeRun([]));
+  await assertRejects(
+    () =>
+      exec(deps, {
+        ...STRICT_TARGET,
+        host_key_policy: "insecure_tofu",
+        host_keys: [
+          `other.example.com ${KEY.type} ${KEY.key}`,
+        ],
+      }, ["true"]),
+    SshConfigError,
+    "none apply",
+  );
+  // The same supplied set also refuses in waitConnection.
+  const waitDeps = fakeDeps(fakeRun([]));
+  await assertRejects(
+    () =>
+      waitConnection(waitDeps, {
+        host: HOST,
+        port: 22,
+        user: "root",
+        host_key_policy: "strict",
+        host_keys: [`other.example.com ${KEY.type} ${KEY.key}`],
+      }, { timeout_s: 1 }),
+    SshConfigError,
+    "none apply",
+  );
 });
 
 Deno.test("waitConnection verifies a recorded tofu pin and refuses a change", async () => {

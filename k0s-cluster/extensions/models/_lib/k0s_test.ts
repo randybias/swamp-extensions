@@ -13,6 +13,7 @@ import {
   instanceName,
   isBoundedJsonValue,
   type K0sConfigInput,
+  parseCharts,
   parseHelmReleases,
   parseKubeconfigServer,
   parseNameList,
@@ -251,7 +252,71 @@ Deno.test("parseHelmReleases extracts release names and status", () => {
     name: "nginx",
     namespace: "default",
     status: "deployed",
+    revision: 3,
   }]);
+});
+
+Deno.test("parseHelmReleases keeps only the latest revision of a release", () => {
+  const secret = (rev: number, status: string) => ({
+    type: "helm.sh/release.v1",
+    metadata: {
+      name: `sh.helm.release.v1.nginx.v${rev}`,
+      namespace: "default",
+      labels: { status },
+    },
+  });
+  const releases = parseHelmReleases(
+    JSON.stringify({
+      items: [
+        secret(2, "failed"),
+        secret(1, "deployed"),
+        secret(3, "deployed"),
+      ],
+    }),
+  );
+  assertEquals(releases.length, 1);
+  assertEquals([releases[0].revision, releases[0].status], [3, "deployed"]);
+});
+
+Deno.test("parseCharts reads the reconciled version and error", () => {
+  const charts = parseCharts(JSON.stringify({
+    items: [{
+      metadata: { name: "k0s-addon-chart-nginx" },
+      spec: { namespace: "default" },
+      status: { releaseName: "nginx", version: "1.2.3", namespace: "default" },
+    }, {
+      metadata: { name: "k0s-addon-chart-bad" },
+      spec: { namespace: "web" },
+      status: { error: "chart not found" },
+    }],
+  }));
+  assertEquals(charts, [
+    { name: "nginx", namespace: "default", version: "1.2.3", error: null },
+    { name: "bad", namespace: "web", version: null, error: "chart not found" },
+  ]);
+});
+
+Deno.test("isCidr rejects malformed IPv6", () => {
+  for (
+    const bad of [
+      "::::/64",
+      "2001:db8:3:4:5:6:7:8:9/64",
+      "2001:db8::2::3/64",
+      ":1/64",
+    ]
+  ) {
+    assertEquals(isCidr(bad), false, bad);
+  }
+  for (
+    const good of [
+      "2001:db8:1::/64",
+      "2001:db8::/32",
+      "::/0",
+      "2001:db8:0:0:0:0:0:1/128",
+    ]
+  ) {
+    assertEquals(isCidr(good), true, good);
+  }
 });
 
 Deno.test("parseSha256 and parseNameList read command output", () => {

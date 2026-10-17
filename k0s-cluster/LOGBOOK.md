@@ -140,3 +140,15 @@ Low findings fixed as noted.
   verifies the replacement before stopping or resetting anything and needs
   `confirm_role_change` to equal the host; a failure after the reset cannot
   restore the old role, so it is reported and state records nothing installed.
+- 2026-10-17 conformance round: Helm charts are now written with the generated
+  repository name as the chartname prefix (it did not resolve before).
+  `apply_helm` waits until the latest release revision is `deployed` and the k0s
+  `Chart` resource reports the requested chart version, and fails at once on a
+  `failed` release; the Chart `status.version` field is read from the CRD and is
+  unverified against a live cluster. Also: a failed manifest listing stops the
+  call, a partial stack upload names the files that landed, `reset` and
+  `install` treat only systemd's "not found" as an absent unit, an installed but
+  stopped unit is started rather than reinstalled, a failed restart puts the
+  previous k0s.yaml back, IPv6 CIDRs are parsed strictly, and remote-bound
+  strings have length caps. Residual: manifest stacks are not applied
+  atomically. Transport resynced to ssh.ts cb61c4ad.

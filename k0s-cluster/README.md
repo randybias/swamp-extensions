@@ -160,6 +160,11 @@ manifest where possible.
   `confirm_role_change` to the host name to stop and reset the old role, which
   is irreversible and happens only after the replacement binary has been
   downloaded and verified. Config, token and manifest uploads are mode 0600.
+- `apply_helm` writes the declared Helm repositories and charts into `k0s.yaml`,
+  and `install` renders `k0s.yaml` from its own inputs. Re-running `install`
+  without the `helm` block after `apply_helm` rewrites `k0s.yaml` without the
+  previously applied Helm extensions and restarts the controller, so always pass
+  the full desired `helm` set to both.
 - `wait_ready` returns `ready: false` after `ready_timeout_s`; a connection,
   authentication or host-key failure is raised instead, because it is not the
   same as a cluster that has not finished starting. `get` and `sync` reflect
@@ -167,7 +172,9 @@ manifest where possible.
 - `reset` is declared an action, not a model `delete`, because one definition
   holds many hosts; it verifies that `k0s stop`, `k0s reset` and the config
   removal all succeed before recording the host as reset, and is a clean no-op
-  on a host with no k0s unit.
+  on a host with no k0s unit. It removes the systemd unit, `k0s.yaml`,
+  `/var/lib/k0s` and the running k0s process, but leaves the k0s binary and
+  k0s's own `/etc/k0s/containerd*` placeholder files on the host.
 - Every caller-supplied value that reaches the remote shell is validated against
   an allowlist grammar and quoted as a single argv element; remote exit codes
   are returned as data, except a local `ssh` failure (exit 255), which is raised

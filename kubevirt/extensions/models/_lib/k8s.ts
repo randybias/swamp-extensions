@@ -36,6 +36,7 @@ export type {
 /** Why a KubeVirt call failed. */
 export type KubevirtErrorCode =
   | "invalid_input"
+  | "invalid_response"
   | "unreachable"
   | "unauthorized"
   | "not_found"
@@ -208,15 +209,76 @@ export async function withCluster<T>(
     kubectl: (args: string[], stdin?: string) => Promise<KubectlResult>,
   ) => Promise<T>,
 ): Promise<T> {
+  // An error thrown by `fn` itself (a parse or validation failure on what the
+  // cluster returned) is not a kubectl process failure: it must not be
+  // flattened into a fixed "kubectl failed". Only the vendored wrapper's own
+  // errors are rewrapped.
+  let inner: { error: unknown } | undefined;
   try {
     return await withKubectl(
       { run: d.run, files: d.files, now: d.now },
       { kubeconfig, context, namespace, name: "unused" },
-      fn,
+      async (kubectl) => {
+        try {
+          return await fn(kubectl);
+        } catch (e) {
+          inner = { error: e };
+          throw e;
+        }
+      },
     );
   } catch (e) {
+    if (inner !== undefined && inner.error === e) throw describeInnerError(e);
     mapSecretError(e);
   }
+}
+
+/**
+ * A typed, non-secret error for something thrown by a method body: a
+ * {@link KubevirtError} as is; a zod validation failure as `invalid_response`
+ * naming only the issue paths and codes (never the offending values); anything
+ * else as its error name.
+ */
+function describeInnerError(e: unknown): Error {
+  if (e instanceof KubevirtError) return e;
+  if (e instanceof z.ZodError) {
+    const issues = e.issues.slice(0, 5).map((i) =>
+      `${i.path.join(".") || "(root)"}: ${i.code}`
+    ).join("; ");
+    return new KubevirtError(
+      "invalid_response",
+      `the cluster returned an object this model could not read (${issues})`,
+    );
+  }
+  const name = e instanceof Error ? e.name : "error";
+  return new KubevirtError("kubectl_failed", `unexpected ${name}`);
+}
+
+/**
+ * Projects the observed conditions of a Kubernetes object to the fields this
+ * model keeps. External objects carry more (`lastProbeTime`,
+ * `lastTransitionTime`, ...) and are never parsed with a strict schema.
+ */
+export function projectConditions(
+  list: unknown,
+): { type?: string; status?: string; reason?: string; message?: string }[] {
+  if (!Array.isArray(list)) return [];
+  const str = (v: unknown) => typeof v === "string" ? v : undefined;
+  return list.flatMap((c) => {
+    if (c === null || typeof c !== "object") return [];
+    const o = c as Record<string, unknown>;
+    const out: {
+      type?: string;
+      status?: string;
+      reason?: string;
+      message?: string;
+    } = {};
+    for (const key of ["type", "status", "reason", "message"] as const) {
+      const v = str(o[key]);
+      if (v !== undefined) out[key] = v.slice(0, 2048);
+    }
+    return [out];
+  });
 }
 
 /**

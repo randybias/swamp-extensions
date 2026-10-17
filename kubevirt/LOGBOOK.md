@@ -211,3 +211,13 @@ schema/secret checks, and the failure-mode table above.
 - HIGH: `get` on a cluster without KubeVirt returned an error. It now records
   and returns `status: not_found` (the spec's only absent status; the spec has
   no `not_installed`), like `sync`.
+- Live fix 3: `ConditionSchema` is strict and the state was built from the CR's
+  raw conditions, so a settled CR (conditions with `lastProbeTime`,
+  `lastTransitionTime`) failed install-adopt, get and sync. Observed Kubernetes
+  objects are never parsed with a strict schema now: conditions are projected to
+  `type/status/reason/message` (strings only) when the state is built; strict
+  schemas stay for inputs and for the model's own records. `withCluster` no
+  longer flattens an error thrown by a method body into "kubectl failed": a
+  validation failure is `invalid_response` naming issue paths and codes only,
+  anything else its error name; only the vendored wrapper's own failures are
+  rewrapped. Fixtures now carry real condition shapes.

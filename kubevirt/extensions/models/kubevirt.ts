@@ -32,6 +32,7 @@ import {
   operatorStateKey,
   POLL_INTERVAL_MS,
   pollUntil,
+  projectConditions,
   sha256Hex,
   TargetShape,
   timeoutField,
@@ -460,7 +461,7 @@ async function waitOperatorReady(
       const cr = await readCr(kubectl);
       const nodes = await readNodes(kubectl);
       const cdi = installCdi ? await readCdi(kubectl) : null;
-      const conditions = cr?.status?.conditions ?? [];
+      const conditions = projectConditions(cr?.status?.conditions);
       const observed = cr?.status?.observedKubeVirtVersion;
       const ready = cr?.status?.phase === "Deployed" &&
         conditionTrue(conditions, "Available") &&
@@ -525,7 +526,7 @@ function stateOf(
       ? { cdi_operator_sha256: extra.cdi_operator_sha256 }
       : {}),
     ...(cr?.status?.phase ? { phase: cr.status.phase } : {}),
-    conditions: cr?.status?.conditions ?? [],
+    conditions: projectConditions(cr?.status?.conditions),
     ...(extra.use_emulation !== undefined
       ? { use_emulation: extra.use_emulation }
       : {}),

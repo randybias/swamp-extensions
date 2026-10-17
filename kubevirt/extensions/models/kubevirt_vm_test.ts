@@ -63,7 +63,18 @@ const vmJson = (
         },
       },
     },
-    status: { printableStatus: opts.printable ?? "Stopped", conditions: [] },
+    status: {
+      printableStatus: opts.printable ?? "Stopped",
+      // Real conditions carry timestamps, reason and message too.
+      conditions: [{
+        type: "Ready",
+        status: "False",
+        lastProbeTime: null,
+        lastTransitionTime: "2026-10-17T12:00:00Z",
+        reason: "VMINotExists",
+        message: "VMI does not exist",
+      }],
+    },
   });
 
 const vmiJson = (

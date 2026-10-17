@@ -1,14 +1,19 @@
 import { assert, assertEquals, assertRejects } from "jsr:@std/assert@1.0.19";
+import { z } from "npm:zod@4.3.6";
 import { createModelTestContext } from "jsr:@swamp-club/swamp-testing@0.20261014.55";
 import { model } from "./kubevirt.ts";
 import {
   clusterFingerprint16,
+  currentDeps,
   fieldManager,
   type KubectlResult,
+  kubectlText,
   KubevirtError,
   operatorStateKey,
+  projectConditions,
   setDeps,
   vmStateKey,
+  withCluster,
 } from "./_lib/k8s.ts";
 
 const KC = `apiVersion: v1
@@ -65,10 +70,32 @@ const crJson = (
       phase: opts.phase ?? "Deployed",
       observedKubeVirtVersion: opts.version ?? "v1.2.3",
       outdatedVirtualMachineInstanceWorkloads: opts.outdated ?? 0,
+      // Real conditions carry more than type and status.
       conditions: [
-        { type: "Available", status: opts.available ?? "True" },
-        { type: "Progressing", status: opts.progressing ?? "False" },
-        { type: "Degraded", status: opts.degraded ?? "False" },
+        {
+          type: "Available",
+          status: opts.available ?? "True",
+          lastProbeTime: "2026-10-17T12:00:00Z",
+          lastTransitionTime: "2026-10-17T11:59:00Z",
+          reason: "AllComponentsReady",
+          message: "All components are ready.",
+        },
+        {
+          type: "Progressing",
+          status: opts.progressing ?? "False",
+          lastProbeTime: "2026-10-17T12:00:00Z",
+          lastTransitionTime: "2026-10-17T11:59:00Z",
+          reason: "AllComponentsReady",
+          message: "All components are ready.",
+        },
+        {
+          type: "Degraded",
+          status: opts.degraded ?? "False",
+          lastProbeTime: null,
+          lastTransitionTime: "2026-10-17T11:59:00Z",
+          reason: "AllComponentsReady",
+          message: "All components are ready.",
+        },
       ],
     },
   });
@@ -1346,4 +1373,97 @@ Deno.test("every resource name the models write passes swamp's data-name rule", 
     await vmStateKey(KC, undefined, "a", "b"),
   ]);
   assertEquals(keys.size, 4);
+});
+
+Deno.test("a settled CR with real condition shapes: install adopts, get and sync read it, extras are not stored", async () => {
+  const h = harness(getRoute(crJson()), { fetch: kvFetch() });
+  try {
+    const ctx = testCtx();
+    await model.methods.install.execute(INSTALL, ctx.context);
+    const got = await model.methods.get.execute(
+      { kubeconfig: KC },
+      ctx.context,
+    ) as {
+      result: { conditions: Record<string, unknown>[] };
+    };
+    await model.methods.sync.execute({ kubeconfig: KC }, ctx.context);
+    assertEquals(got.result.conditions.length, 3);
+    for (const c of got.result.conditions) {
+      assertEquals(
+        Object.keys(c).every((k) =>
+          ["type", "status", "reason", "message"].includes(k)
+        ),
+        true,
+        JSON.stringify(c),
+      );
+    }
+  } finally {
+    h.restore();
+  }
+});
+
+Deno.test("projectConditions keeps only the four string fields and drops the rest", () => {
+  assertEquals(
+    projectConditions([
+      {
+        type: "Ready",
+        status: "True",
+        lastProbeTime: null,
+        lastTransitionTime: "x",
+        reason: 5,
+        message: "ok",
+        extra: { a: 1 },
+      },
+      null,
+      "junk",
+    ]),
+    [{ type: "Ready", status: "True", message: "ok" }],
+  );
+  assertEquals(projectConditions(undefined), []);
+  assertEquals(projectConditions({ not: "a list" }), []);
+});
+
+Deno.test("an error from a method body is not flattened into 'kubectl failed'", async () => {
+  const h = harness(() => ({}));
+  try {
+    const d = currentDeps();
+    // A validation failure on what the cluster returned.
+    const bad = await assertRejects(() =>
+      withCluster(d, KC, undefined, "kubevirt", () => {
+        z.strictObject({ a: z.string() }).parse({ a: 1, secret: "s3cr3t" });
+        return Promise.resolve();
+      })
+    ) as KubevirtError;
+    assertEquals(bad.code, "invalid_response");
+    assert(bad.message.includes("a: invalid_type"));
+    assertEquals(bad.message.includes("s3cr3t"), false);
+    // Any other thrown error keeps its name only.
+    const other = await assertRejects(() =>
+      withCluster(d, KC, undefined, "kubevirt", () => {
+        throw new TypeError("contains token abc");
+      })
+    ) as KubevirtError;
+    assertEquals(other.message, "unexpected TypeError");
+    // A kubectl process failure is still the fixed message.
+    const failing = harness(() => ({ code: 1, stderr: "boom: token abc" }));
+    try {
+      const e = await assertRejects(() =>
+        withCluster(
+          currentDeps(),
+          KC,
+          undefined,
+          "kubevirt",
+          async (kubectl) => {
+            await kubectlText(kubectl, ["get", "nodes"]);
+          },
+        )
+      ) as KubevirtError;
+      assertEquals(e.code, "kubectl_failed");
+      assertEquals(e.message.includes("abc"), false);
+    } finally {
+      failing.restore();
+    }
+  } finally {
+    h.restore();
+  }
 });

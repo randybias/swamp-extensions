@@ -42,16 +42,20 @@ import {
   instanceKey,
   laterSnapshots,
   parseDatasets,
+  parseFindmnt,
   parsePoolList,
   parsePoolVdevs,
   parseSize,
   parseSnapshots,
+  parseSwaps,
   POOL_RE,
+  poolBootfsArgv,
   poolCreateArgv,
   poolDescendantsArgv,
   poolDestroyArgv,
   poolExportArgv,
   type PoolState,
+  poolVolumesArgv,
   PROPERTY_NAME_RE,
   propertyString,
   rollbackArgv,
@@ -320,6 +324,110 @@ async function listPoolDescendants(
   );
 }
 
+/** A refusal to touch a pool that carries the running system. */
+export class SystemPoolError extends Error {
+  /** Stable code for callers. */
+  readonly code = "system-pool";
+  /** Builds the error. */
+  constructor(message: string) {
+    super(message);
+    this.name = "SystemPoolError";
+  }
+}
+
+/** Mount targets whose source must never be a pool we are about to touch. */
+const SYSTEM_MOUNTS: ReadonlySet<string> = new Set([
+  "/",
+  "/boot",
+  "/boot/efi",
+  "/usr",
+  "/var",
+]);
+
+function mountFromPool(source: string, pool: string): boolean {
+  return source === pool || source.startsWith(`${pool}/`) ||
+    source.startsWith(`/dev/zvol/${pool}/`);
+}
+
+/**
+ * Refuses to touch a pool that backs the running system: `bootfs` set, a
+ * system mount (/, /boot, /boot/efi, /usr, /var) sourced from a dataset or zvol
+ * of the pool, or a zvol of the pool active as swap. Both probes must succeed;
+ * an unreadable host fails closed. `recursive` never overrides this.
+ */
+async function assertNotSystemPool(
+  deps: ZfsDeps,
+  target: SshTarget,
+  pool: string,
+): Promise<void> {
+  const reason = (r: { stdout: string; stderr?: string }) =>
+    commandReason({ stdout: r.stdout, stderr: r.stderr ?? "" });
+  const bootfs = await exec(deps.ssh, target, poolBootfsArgv(pool));
+  if (bootfs.exit_code !== 0) {
+    throw new SystemPoolError(
+      `refusing to touch pool ${pool}: could not read bootfs (exit ${bootfs.exit_code})${
+        reason(bootfs) ? `: ${reason(bootfs)}` : ""
+      }`,
+    );
+  }
+  const bootfsValue = bootfs.stdout.trim();
+  if (bootfsValue !== "" && bootfsValue !== "-") {
+    throw new SystemPoolError(
+      `refusing to touch pool ${pool}: bootfs is ${bootfsValue}; this pool boots the system`,
+    );
+  }
+  const findmnt = await exec(deps.ssh, target, ["sh", "-c", "findmnt -J"]);
+  if (findmnt.exit_code !== 0) {
+    throw new SystemPoolError(
+      `refusing to touch pool ${pool}: could not read mounts (exit ${findmnt.exit_code})`,
+    );
+  }
+  let mounts;
+  try {
+    mounts = parseFindmnt(findmnt.stdout);
+  } catch {
+    throw new SystemPoolError(
+      `refusing to touch pool ${pool}: the mount list was unreadable`,
+    );
+  }
+  for (const mount of mounts) {
+    if (!SYSTEM_MOUNTS.has(mount.target)) continue;
+    if (mountFromPool(mount.source, pool)) {
+      throw new SystemPoolError(
+        `refusing to touch pool ${pool}: ${mount.target} is mounted from ${mount.source}`,
+      );
+    }
+  }
+  const swaps = await exec(deps.ssh, target, ["cat", "--", "/proc/swaps"]);
+  if (swaps.exit_code !== 0) {
+    throw new SystemPoolError(
+      `refusing to touch pool ${pool}: could not read /proc/swaps (exit ${swaps.exit_code})`,
+    );
+  }
+  const swapDevices = parseSwaps(swaps.stdout);
+  if (swapDevices.length === 0) return;
+  const zvols = await exec(deps.ssh, target, poolVolumesArgv(pool));
+  if (zvols.exit_code !== 0) {
+    throw new SystemPoolError(
+      `refusing to touch pool ${pool}: could not list its volumes (exit ${zvols.exit_code})`,
+    );
+  }
+  for (const name of nonEmptyLines(zvols.stdout)) {
+    const dev = `/dev/zvol/${name}`;
+    const resolved = await exec(deps.ssh, target, ["readlink", "-f", dev]);
+    const resolvedPath = resolved.exit_code === 0 ? resolved.stdout.trim() : "";
+    if (
+      swapDevices.some((d) =>
+        d === dev || (resolvedPath !== "" && d === resolvedPath)
+      )
+    ) {
+      throw new SystemPoolError(
+        `refusing to touch pool ${pool}: zvol ${name} is active swap`,
+      );
+    }
+  }
+}
+
 async function listPools(deps: ZfsDeps, target: SshTarget): Promise<string[]> {
   const result = await exec(deps.ssh, target, [
     "zpool",
@@ -530,7 +638,7 @@ const DestroyPoolArgs = z.strictObject({
 const ExportPoolArgs = z.strictObject({
   ssh: SSH,
   pool: POOL,
-  force: z.boolean().default(true).describe("Force a busy pool out."),
+  force: z.boolean().default(false).describe("Force a busy pool out."),
 });
 const GetArgs = z.strictObject({
   ssh: SSH,
@@ -1065,6 +1173,7 @@ function buildZfsModel(deps: ZfsDeps) {
               pool: args.pool,
             });
           } else {
+            await assertNotSystemPool(deps, target, args.pool);
             const descendants = await listPoolDescendants(
               deps,
               target,
@@ -1105,7 +1214,7 @@ function buildZfsModel(deps: ZfsDeps) {
       export_pool: {
         kind: "action" as const,
         description:
-          "Export a pool so it can be imported on another host. Idempotent: exporting an absent pool is a clean no-op. Returns the pool and whether it was exported.",
+          "DESTRUCTIVE. Export a pool so it can be imported on another host, refusing a pool that carries the running system. Idempotent: exporting an absent pool is a clean no-op. Returns the pool and whether it was exported.",
         arguments: ExportPoolArgs,
         execute: async (
           args: z.infer<typeof ExportPoolArgs>,
@@ -1120,6 +1229,7 @@ function buildZfsModel(deps: ZfsDeps) {
               pool: args.pool,
             });
           } else {
+            await assertNotSystemPool(deps, target, args.pool);
             requireOk(
               await exec(
                 deps.ssh,

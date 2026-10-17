@@ -459,6 +459,75 @@ export function parsePoolVdevs(statusText: string): string[] {
   return [...out].sort();
 }
 
+/** One mount from `findmnt -J`. */
+export interface MountInfo {
+  /** Mount target. */
+  target: string;
+  /** Source device or dataset. */
+  source: string;
+  /** Filesystem type, or "". */
+  fstype: string;
+}
+
+/**
+ * Parses `findmnt -J`, flattening the mount tree (findmnt nests submounts).
+ * Throws when the output is not the shape findmnt documents, so a failed probe
+ * is never read as "nothing mounted".
+ */
+export function parseFindmnt(text: string): MountInfo[] {
+  let json: unknown;
+  try {
+    json = JSON.parse(text);
+  } catch {
+    throw new Error("findmnt output is not JSON");
+  }
+  const roots = (json as { filesystems?: unknown }).filesystems;
+  if (!Array.isArray(roots)) {
+    throw new Error("findmnt output has no filesystems");
+  }
+  const out: MountInfo[] = [];
+  const visit = (node: unknown): void => {
+    if (node === null || typeof node !== "object") return;
+    const e = node as Record<string, unknown>;
+    if (typeof e.target === "string" && typeof e.source === "string") {
+      out.push({
+        target: e.target,
+        source: e.source,
+        fstype: typeof e.fstype === "string" ? e.fstype : "",
+      });
+    }
+    if (Array.isArray(e.children)) {
+      for (const child of e.children) visit(child);
+    }
+  };
+  for (const root of roots) visit(root);
+  return out;
+}
+
+/** Parses `/proc/swaps`, returning the device of each active swap area. */
+export function parseSwaps(text: string): string[] {
+  const lines = text.split(/\r?\n/);
+  const out: string[] = [];
+  for (let i = 1; i < lines.length; i++) {
+    const line = lines[i].trim();
+    if (line === "") continue;
+    out.push(line.split(/\s+/)[0]);
+  }
+  return out;
+}
+
+/** Builds `zfs list` for every zvol in a pool. */
+export function poolVolumesArgv(pool: string): string[] {
+  assertPoolName(pool);
+  return ["zfs", "list", "-H", "-r", "-t", "volume", "-o", "name", pool];
+}
+
+/** Builds `zpool get -H -o value bootfs <pool>`. */
+export function poolBootfsArgv(pool: string): string[] {
+  assertPoolName(pool);
+  return ["zpool", "get", "-H", "-o", "value", "bootfs", pool];
+}
+
 /** True when two device sets name the same members. */
 export function vdevsMatch(existing: string[], desired: string[]): boolean {
   const a = new Set(existing);

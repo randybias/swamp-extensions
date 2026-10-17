@@ -197,3 +197,22 @@ and only the probe-running code kept. The guard was NOT rewritten here.
   word and every other metacharacter is still refused.
 - Host keys are strict-only with a required, non-empty `host_keys`; the model
   persists no learned keys, so trust-on-first-use is no longer offered.
+
+## Pool-review round 1 fixes
+
+- **System-pool refusal (HIGH).** `destroy_pool` and `export_pool` share
+  `assertNotSystemPool`: before touching a pool they read `zpool get … bootfs`,
+  `findmnt -J` and `/proc/swaps` and refuse with a typed `SystemPoolError` if
+  `bootfs` is set, a system mount (`/`, `/boot`, `/boot/efi`, `/usr`, `/var`) is
+  sourced from a dataset or zvol of the pool, or a zvol of the pool is active
+  swap. Both probes must succeed; an unreadable host fails closed, and
+  `recursive` never overrides this. So `destroy_pool{bpool, recursive:true}` and
+  `export_pool{rpool}` are refused.
+- **`export_pool` is not forced by default** (`force` defaults to false) and its
+  description leads with `DESTRUCTIVE.`.
+- **EFI boot entries (MEDIUM).** `safety.ts` now runs `efibootmgr -v` under
+  `sudo -n --`, matching cephadm's caller of the same guard, so an unprivileged
+  read cannot silently drop that protection.
+- **Synthetic fixtures (MEDIUM).** The by-id test IDs are now obviously
+  synthetic (`ata-ExampleDisk_SYNTHETIC0001-part3`,
+  `md-uuid-00000000:11111111:22222222:33333333`).

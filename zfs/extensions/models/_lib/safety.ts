@@ -149,7 +149,7 @@ export async function collectProbes(
     zpool: await runCommand(deps, target, ZPOOL_COMMAND, true),
     pvs: await runCommand(deps, target, PVS_COMMAND, true),
     efi: await runCommand(deps, target, EFI_COMMAND, false),
-    efibootmgr: await runCommand(deps, target, EFIBOOTMGR_COMMAND, false),
+    efibootmgr: await runCommand(deps, target, EFIBOOTMGR_COMMAND, true),
     mdExamine,
     mbr,
   };

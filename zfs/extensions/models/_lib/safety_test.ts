@@ -178,6 +178,7 @@ Deno.test("collectProbes reads every probe and runs device probes as root", asyn
       "lsblk -J -b -o",
       "zpool status -P",
       "pvs --noheadings",
+      "efibootmgr -v",
     ]
   ) {
     const remote = remotes.find((r) => has(r, fragment)) as string;

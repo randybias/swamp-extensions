@@ -54,14 +54,14 @@ Deno.test("name grammars accept valid ZFS names and reject injection", () => {
 Deno.test("device grammar accepts by-id names with colons but no injection", () => {
   // The md-uuid form Ubuntu writes in fstab, and a -partN suffix.
   assertDevicePath(
-    "/dev/disk/by-id/md-uuid-777c3ba6:ac3b1753:f9208445:a01c3c16",
+    "/dev/disk/by-id/md-uuid-00000000:11111111:22222222:33333333",
   );
   assertDevicePath(
-    "/dev/disk/by-id/ata-Samsung_SSD_860_EVO_250GB_S3YJNC0K915363M-part3",
+    "/dev/disk/by-id/ata-ExampleDisk_SYNTHETIC0001-part3",
   );
   assertEquals(
     DEVICE_RE.test(
-      "/dev/disk/by-id/md-uuid-777c3ba6:ac3b1753:f9208445:a01c3c16-part1",
+      "/dev/disk/by-id/md-uuid-00000000:11111111:22222222:33333333-part1",
     ),
     true,
   );

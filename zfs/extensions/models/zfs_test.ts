@@ -11,7 +11,7 @@ import {
 } from "./_lib/ssh.ts";
 import { DeviceGuardError } from "./_lib/safety.ts";
 import { instanceKey } from "./_lib/zfs.ts";
-import { createModel, type ZfsDeps } from "./zfs.ts";
+import { createModel, SystemPoolError, type ZfsDeps } from "./zfs.ts";
 
 const HOST = "192.0.2.10";
 const PORT = 22;
@@ -1210,7 +1210,7 @@ Deno.test("destroy_pool and export_pool are clean no-ops on an absent pool", asy
   assertEquals(exported.result.exported, false);
 });
 
-Deno.test("export_pool forces a busy pool out", async () => {
+Deno.test("export_pool is not forced by default and forces when asked", async () => {
   const commands: string[] = [];
   const m = model((remote) => {
     commands.push(remote);
@@ -1218,11 +1218,26 @@ Deno.test("export_pool forces a busy pool out", async () => {
     if (has(remote, P.poolExport)) return { code: 0 };
     return guardProbeRoute()(remote);
   });
-  const out = await m.methods.export_pool.execute(
+  const plain = await m.methods.export_pool.execute(
     m.methods.export_pool.arguments.parse({ ssh: SSH, pool: "tank" }),
     createModelTestContext().context,
   ) as { result: { exported: boolean } };
-  assertEquals(out.result.exported, true);
+  assertEquals(plain.result.exported, true);
+  assertEquals(commands.some((c) => has(c, "'zpool' 'export' 'tank'")), true);
+  assertEquals(
+    commands.some((c) => has(c, "'zpool' 'export' '-f' 'tank'")),
+    false,
+  );
+
+  const forced = await m.methods.export_pool.execute(
+    m.methods.export_pool.arguments.parse({
+      ssh: SSH,
+      pool: "tank",
+      force: true,
+    }),
+    createModelTestContext().context,
+  ) as { result: { exported: boolean } };
+  assertEquals(forced.result.exported, true);
   assertEquals(
     commands.some((c) => has(c, "'zpool' 'export' '-f' 'tank'")),
     true,
@@ -1254,4 +1269,109 @@ Deno.test("a zpool failure surfaces the sanitized stderr reason", async () => {
     "one or more devices is currently unavailable",
   );
   assertEquals(error.message.includes("failed (exit 1)"), true);
+});
+
+/** A route that makes `tank` look like a system pool via the given mount. */
+function systemPoolRoute(
+  mount: { target: string; source: string },
+  opts: { bootfs?: string; findmntCode?: number } = {},
+): Route {
+  const findmnt = JSON.stringify({ filesystems: [mount] });
+  return (remote) => {
+    if (has(remote, P.poolProbe)) return { code: 0, stdout: "tank\n" };
+    if (has(remote, "'zpool' 'get'")) {
+      return { code: 0, stdout: `${opts.bootfs ?? "-"}\n` };
+    }
+    if (has(remote, "findmnt -J")) {
+      return { code: opts.findmntCode ?? 0, stdout: findmnt };
+    }
+    if (has(remote, "/proc/swaps")) {
+      return { code: 0, stdout: "Filename Type Size Used Priority\n" };
+    }
+    if (has(remote, P.poolDescendants)) {
+      return { code: 0, stdout: "tank\ntank/data\n" };
+    }
+    if (has(remote, P.poolDestroy)) return { code: 0 };
+    if (has(remote, P.poolExport)) return { code: 0 };
+    return guardProbeRoute()(remote);
+  };
+}
+
+Deno.test("destroy_pool refuses a system pool regardless of recursive", async () => {
+  const cases: Route[] = [
+    systemPoolRoute({ target: "/", source: "tank/ROOT/ubuntu" }),
+    systemPoolRoute({ target: "/boot", source: "tank/BOOT/ubuntu" }),
+    systemPoolRoute({ target: "/boot/efi", source: "/dev/zvol/tank/esp" }),
+    systemPoolRoute({ target: "/var", source: "tank/var" }),
+    systemPoolRoute({ target: "/", source: "/dev/sda1" }, {
+      bootfs: "tank/ROOT/ubuntu",
+    }),
+  ];
+  for (const route of cases) {
+    const m = model(route);
+    await assertRejects(
+      () =>
+        m.methods.destroy_pool.execute(
+          m.methods.destroy_pool.arguments.parse({
+            ssh: SSH,
+            pool: "tank",
+            recursive: true,
+          }),
+          createModelTestContext().context,
+        ),
+      SystemPoolError,
+    );
+  }
+});
+
+Deno.test("a failing system-pool probe fails closed", async () => {
+  const m = model(
+    systemPoolRoute({ target: "/", source: "/dev/sda1" }, { findmntCode: 1 }),
+  );
+  await assertRejects(
+    () =>
+      m.methods.destroy_pool.execute(
+        m.methods.destroy_pool.arguments.parse({
+          ssh: SSH,
+          pool: "tank",
+          recursive: true,
+        }),
+        createModelTestContext().context,
+      ),
+    SystemPoolError,
+    "could not read mounts",
+  );
+});
+
+Deno.test("export_pool refuses a system pool too", async () => {
+  const m = model(
+    systemPoolRoute({ target: "/boot", source: "tank/BOOT/ubuntu" }),
+  );
+  await assertRejects(
+    () =>
+      m.methods.export_pool.execute(
+        m.methods.export_pool.arguments.parse({ ssh: SSH, pool: "tank" }),
+        createModelTestContext().context,
+      ),
+    SystemPoolError,
+  );
+});
+
+Deno.test("destroy_pool refuses without recursive when system checks pass", async () => {
+  const m = model(
+    systemPoolRoute({ target: "/", source: "/dev/sda1" }),
+  );
+  await assertRejects(
+    () =>
+      m.methods.destroy_pool.execute(
+        m.methods.destroy_pool.arguments.parse({
+          ssh: SSH,
+          pool: "tank",
+          recursive: false,
+        }),
+        createModelTestContext().context,
+      ),
+    Error,
+    "set recursive",
+  );
 });

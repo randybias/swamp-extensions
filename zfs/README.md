@@ -13,19 +13,19 @@ One definition serves any host. Every method takes the SSH target and the ZFS
 operands as arguments, and state is keyed by the target's `{host, port, user}`
 plus the pool or dataset name.
 
-| Method           | Description                                                                  |
-| ---------------- | ---------------------------------------------------------------------------- |
-| `create_pool`    | DESTRUCTIVE. Create a pool from named vdevs, refusing any boot/root device   |
-| `create_dataset` | Create a dataset, or set only the properties that differ                     |
-| `create_zvol`    | Create a sparse zvol of a given size                                         |
-| `snapshot`       | Create a `dataset@tag` snapshot                                              |
-| `clone`          | Clone a snapshot to a new dataset or zvol                                    |
-| `rollback`       | DESTRUCTIVE. Roll a dataset back to a snapshot                               |
-| `get`            | READ-ONLY. Report pool, dataset and snapshot state                           |
-| `sync`           | READ-ONLY. Compare recorded state with the host and report drift             |
-| `destroy`        | DESTRUCTIVE. Destroy a dataset, zvol or snapshot                             |
-| `destroy_pool`   | DESTRUCTIVE. Destroy a pool; refuses while children exist unless `recursive` |
-| `export_pool`    | Export a pool; absent is a no-op                                             |
+| Method           | Description                                                                        |
+| ---------------- | ---------------------------------------------------------------------------------- |
+| `create_pool`    | DESTRUCTIVE. Create a pool from named vdevs, refusing any boot/root device         |
+| `create_dataset` | Create a dataset, or set only the properties that differ                           |
+| `create_zvol`    | Create a sparse zvol of a given size                                               |
+| `snapshot`       | Create a `dataset@tag` snapshot                                                    |
+| `clone`          | Clone a snapshot to a new dataset or zvol                                          |
+| `rollback`       | DESTRUCTIVE. Roll a dataset back to a snapshot                                     |
+| `get`            | READ-ONLY. Report pool, dataset and snapshot state                                 |
+| `sync`           | READ-ONLY. Compare recorded state with the host and report drift                   |
+| `destroy`        | DESTRUCTIVE. Destroy a dataset, zvol or snapshot                                   |
+| `destroy_pool`   | DESTRUCTIVE. Destroy a pool; refuses a system pool and children unless `recursive` |
+| `export_pool`    | Export a pool; absent is a no-op                                                   |
 
 ## Dependencies
 

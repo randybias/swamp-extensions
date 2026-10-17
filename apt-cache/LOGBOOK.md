@@ -147,6 +147,49 @@ behavioural regressions that motivated the review were reproduced live first.
 - **Backend URL grammar (LOW).** `isBackendUrl` is a raw-string allowlist, so a
   trailing `#`, `;` or an explicit `:80` is refused.
 
+## Round 2 review fixes (2026-10-17)
+
+- **`https_backends` did not fetch over TLS (HIGH).** A path-only
+  `Remap-<k>:
+  /<k>` only matches path-style requests; the proxy-style requests
+  apt sends (`GET http://ports.ubuntu.com/ubuntu-ports/...`) missed it and went
+  upstream on port 80. Measured in the `acng-d5` image with `--network none` and
+  host override listeners:
+  - `Remap-ubuntu-ports: /ubuntu-ports` → proxy-style hit port 80.
+  - `... : /ubuntu-ports ports.ubuntu.com/ubuntu-ports` → hit port 443.
+  - `debian-security` with an own remap → still hit port 80 for both styles: the
+    built-in `Remap-secdeb` owns those prefixes with inline http backends, and
+    neither a second `Remap-` (it appends) nor the inline backend can be
+    overridden.
+  - Overwriting `/etc/apt-cacher-ng/backends_debian` with the https URL →
+    `Remap-debrep` (which reads that file) fetched over 443 for both styles.
+    Design: manage the built-in backend files for `debian` and `ubuntu`, render
+    an own remap (path + client host/path prefix) for `ubuntu-ports`, and refuse
+    `debian-security` (its configured mirror would be silently ignored). A
+    guarded docker test asserts 443 and never 80 for both styles and both
+    supported keys.
+- **`client_get` still persisted credentials (HIGH).** Redaction now handles any
+  `<scheme>://` (socks5h included), strips up to the LAST `@` before the first
+  `/`, and is tested with `socks5h://`, a double `@`, and an upper-case scheme.
+- **`cache_dir` could delete a system directory (HIGH).** `assertCacheDir` now
+  rejects `.`/`..` components, `//`, shallow paths and the system top-level
+  roots (`etc`, `usr`, `home`, ...), and `remove_server` requires the path to
+  match the live fragment's `CacheDir` or the recorded server `cache_dir`.
+- **`fallback_direct` tolerated a mismatch (MEDIUM).** A key mismatch and a
+  failed `apt-get update` are now always failures, with the prior state
+  restored.
+- **Rollback deleted a working snippet (MEDIUM).** `configure_client` snapshots
+  both managed files and restores them on failure, instead of always deleting.
+- **Unknown typed log rows defeated fail-closed (MEDIUM).** Only `I`, `O`, `E`
+  and the documented misc rows `M` and `X` count as recognised; `1|Z|100` now
+  trips the fail-closed check.
+- **`stats` under-counted after rotation (MEDIUM).** It reads the current log
+  and the rotated `.1` and `.N.gz` files (logrotate: `size 10M`, `rotate 7`,
+  `delaycompress`), gzip-decompressing as needed.
+- **A prior plain remove blocked a later purge (MEDIUM).** `remove_server`
+  treats `deinstall ok config-files` as present so a later call with
+  `purge_cache_ack` purges the package and deletes the cache.
+
 ## Fixtures
 
 - All addresses are RFC 5737 (`192.0.2.0/24`, `198.51.100.0/24`) or the IPv6

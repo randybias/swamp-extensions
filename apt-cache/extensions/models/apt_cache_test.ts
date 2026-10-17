@@ -5,6 +5,7 @@ import {
 } from "jsr:@std/assert@1.0.19";
 import { createModelTestContext } from "jsr:@swamp-club/swamp-testing@0.20261014.55";
 import { type CommandRunner, SshError } from "./_lib/ssh.ts";
+import { renderBackendFiles, renderServerFragment } from "./_lib/apt.ts";
 import {
   model,
   parseAptConfigDump,
@@ -253,6 +254,26 @@ Deno.test("in-method: wildcard listen and passthrough hosts are refused", async 
   );
 });
 
+Deno.test("in-method: the debian-security key is refused", async () => {
+  useFake(fakeApt(() => ({})));
+  await assertRejects(
+    () =>
+      model.methods.apply_server.execute(
+        model.methods.apply_server.arguments.parse({
+          ssh: SSH,
+          ...serverArgs({
+            backends: {
+              "debian-security": ["http://deb.debian.org/debian-security/"],
+            },
+          }),
+        }),
+        ctx().context,
+      ),
+    Error,
+    "debian-security",
+  );
+});
+
 Deno.test("in-method: backend scheme must match the HTTPS policy", async () => {
   useFake(fakeApt(() => ({})));
   await assertRejects(
@@ -320,9 +341,11 @@ Deno.test("render_server returns the fragment and backends with sha256", async (
     true,
   );
   assertEquals(out.result.fragment.text.includes("PassThroughPattern:"), true);
+  // `debian` is shadowed by the built-in Remap-debrep, so its backend file is
+  // the package's built-in file, not a zzzz- file.
   assertEquals(
     out.result.backends[0].path,
-    "/etc/apt-cacher-ng/zzzz-apt-cache-backend-debian",
+    "/etc/apt-cacher-ng/backends_debian",
   );
   assertEquals(out.result.fragment.sha256.length, 64);
   assertEquals(c.getWrittenResources().length, 1);
@@ -463,6 +486,9 @@ Deno.test("remove_server no-op when absent; purges when present", async () => {
     if (command.includes("-f=${Status}")) {
       return { code: 0, stdout: "install ok installed\n" };
     }
+    if (command.includes("cat") && command.includes("zzzz-apt-cache.conf")) {
+      return { code: 0, stdout: "CacheDir: /var/cache/apt-cacher-ng\n" };
+    }
     if (command.startsWith("'test' '-L'")) return { code: 1 }; // not a symlink
     if (command.startsWith("'test' '-d'")) return { code: 0 }; // present
     return undefined;
@@ -511,10 +537,71 @@ Deno.test("remove_server no-op when absent; purges when present", async () => {
   assertEquals(present.removed.includes("/var/cache/apt-cacher-ng"), true);
 });
 
+Deno.test("remove_server purges a package left in config-files", async () => {
+  const fake = fakeApt((command) => {
+    if (command.includes("-f=${Status}")) {
+      return { code: 0, stdout: "deinstall ok config-files\n" };
+    }
+    if (command.includes("cat") && command.includes("zzzz-apt-cache.conf")) {
+      return { code: 0, stdout: "CacheDir: /var/cache/apt-cacher-ng\n" };
+    }
+    if (command.startsWith("'test' '-L'")) return { code: 1 };
+    if (command.startsWith("'test' '-d'")) return { code: 0 };
+    return { code: 0 };
+  });
+  useFake(fake);
+  const out = await model.methods.remove_server.execute(
+    model.methods.remove_server.arguments.parse({
+      ssh: SSH,
+      confirm_host: "192.0.2.20",
+      purge_cache_ack: true,
+    }),
+    ctx().context,
+  );
+  assertEquals(out.result, {
+    host: "192.0.2.20",
+    removed: true,
+    cache_purged: true,
+  });
+  assertEquals(has(fake, "apt-get purge"), true);
+  assertEquals(hasTok(fake, "systemctl", "stop"), false);
+});
+
+Deno.test("remove_server refuses a cache_dir that is not the server's", async () => {
+  const fake = fakeApt((command) => {
+    if (command.includes("-f=${Status}")) {
+      return { code: 0, stdout: "install ok installed\n" };
+    }
+    if (command.includes("cat") && command.includes("zzzz-apt-cache.conf")) {
+      return { code: 0, stdout: "CacheDir: /var/cache/apt-cacher-ng\n" };
+    }
+    return { code: 0 };
+  });
+  useFake(fake);
+  await assertRejects(
+    () =>
+      model.methods.remove_server.execute(
+        model.methods.remove_server.arguments.parse({
+          ssh: SSH,
+          confirm_host: "192.0.2.20",
+          purge_cache_ack: true,
+          cache_dir: "/srv/other",
+        }),
+        ctx().context,
+      ),
+    Error,
+    "does not match",
+  );
+  assertEquals(fake.removed.includes("/srv/other"), false);
+});
+
 Deno.test("remove_server refuses a symlinked cache directory", async () => {
   const fake = fakeApt((command) => {
     if (command.includes("-f=${Status}")) {
       return { code: 0, stdout: "install ok installed\n" };
+    }
+    if (command.includes("cat") && command.includes("zzzz-apt-cache.conf")) {
+      return { code: 0, stdout: "CacheDir: /var/cache/apt-cacher-ng\n" };
     }
     if (command.startsWith("'test' '-L'")) return { code: 0 }; // it IS a symlink
     return { code: 0 };
@@ -711,6 +798,8 @@ Deno.test("configure_client refuses a policy that disagrees with the server", as
 
 Deno.test("configure_client rolls the snippet back on a failed verify", async () => {
   const fake = fakeApt((command) => {
+    if (command.startsWith("'test' '-e'")) return { code: 1 };
+    if (command.includes("cat")) return { code: 1 };
     if (command.includes("sha256sum")) return { code: 1 };
     if (command.includes("grep -lE")) return { code: 0, stdout: "" };
     if (command.includes("apt-config")) {
@@ -737,6 +826,73 @@ Deno.test("configure_client rolls the snippet back on a failed verify", async ()
     true,
   );
   assertEquals(c.getWrittenResources().length, 0);
+});
+
+Deno.test("configure_client fails a key mismatch even with fallback_direct", async () => {
+  const fake = fakeApt((command) => {
+    if (command.startsWith("'test' '-e'")) return { code: 1 };
+    if (command.includes("cat")) return { code: 1 };
+    if (command.includes("sha256sum")) return { code: 1 };
+    if (command.includes("grep -lE")) return { code: 0, stdout: "" };
+    if (command.includes("apt-config")) {
+      return {
+        code: 0,
+        stdout: `Acquire::http::Proxy "http://192.0.2.9:3142";\n`,
+      };
+    }
+    return { code: 0 };
+  });
+  useFake(fake);
+  await assertRejects(
+    () =>
+      model.methods.configure_client.execute(
+        model.methods.configure_client.arguments.parse({
+          ssh: SSH,
+          ...CLIENT,
+          fallback_direct: true,
+        }),
+        ctx().context,
+      ),
+    Error,
+    "not the proxy",
+  );
+});
+
+Deno.test("configure_client restores the prior snippet on a failed re-run", async () => {
+  const prior =
+    '// prior snippet\nAcquire::http::Proxy "http://old.example.test:3142";\n';
+  const fake = fakeApt((command) => {
+    if (command.includes("cat") && command.includes("90apt-cache-proxy")) {
+      return { code: 0, stdout: prior };
+    }
+    if (command.startsWith("'test' '-e'")) return { code: 1 };
+    if (command.includes("cat")) return { code: 1 };
+    if (command.includes("sha256sum")) return { code: 1 };
+    if (command.includes("grep -lE")) return { code: 0, stdout: "" };
+    if (command.includes("apt-config")) {
+      return {
+        code: 0,
+        stdout: `Acquire::http::Proxy "http://192.0.2.9:3142";\n`,
+      };
+    }
+    return { code: 0 };
+  });
+  useFake(fake);
+  await assertRejects(
+    () =>
+      model.methods.configure_client.execute(
+        model.methods.configure_client.arguments.parse({ ssh: SSH, ...CLIENT }),
+        ctx().context,
+      ),
+    Error,
+    "not the proxy",
+  );
+  assertEquals(
+    fake.uploads.some((u) =>
+      u.path.endsWith("90apt-cache-proxy") && u.content === prior
+    ),
+    true,
+  );
 });
 
 Deno.test("configure_client requires an ack when the policy cannot be checked", async () => {
@@ -916,4 +1072,132 @@ Deno.test("parseSsListen and parseAptConfigDump read real tool shapes", () => {
       "Acquire::http::Proxy": "http://192.0.2.20:3142",
     },
   );
+});
+
+// --- real-tool route check (docker) -----------------------------------------
+
+const LISTEN_PL = `use IO::Socket::INET;
+my ($port, $out) = @ARGV;
+my $s = IO::Socket::INET->new(LocalPort=>$port, Listen=>64, Reuse=>1) or die "$port: $!";
+open(my $fh, ">", $out) or die;
+$fh->autoflush(1);
+while (my $c = $s->accept) { print $fh "$port\\n"; close $c; }
+`;
+
+const ROUTE_RUN_SH = `#!/bin/sh
+set -eu
+CONF=/tmp/conf
+rm -rf "$CONF" /tmp/cache /tmp/log /tmp/hit80 /tmp/hit443
+mkdir -p "$CONF" /tmp/cache /tmp/log
+cp -a /etc/apt-cacher-ng/. "$CONF"/
+cp /w/fragment.conf "$CONF/zzzz-apt-cache.conf"
+cp -f /w/backends/* "$CONF/"
+printf '127.0.0.1 deb.debian.org ftp.debian.org security.debian.org cdn-fastly.deb.debian.org ports.ubuntu.com archive.ubuntu.com security.ubuntu.com\\n' >> /etc/hosts
+chown -R apt-cacher-ng:apt-cacher-ng /tmp/cache /tmp/log 2>/dev/null || true
+perl /w/listen.pl 80 /tmp/hit80 & L80=$!
+perl /w/listen.pl 443 /tmp/hit443 & L443=$!
+sleep 0.5
+apt-cacher-ng -c "$CONF" LogDir=/tmp/log CacheDir=/tmp/cache >/tmp/acng.out 2>&1 & ACNG=$!
+sleep 1.5
+probe() {
+  : > /tmp/hit80
+  : > /tmp/hit443
+  if [ "$1" = proxy ]; then
+    curl -sS --max-time 6 -x http://127.0.0.1:3142 -o /dev/null "$2" || true
+  else
+    curl -sS --max-time 6 -o /dev/null "http://127.0.0.1:3142$2" || true
+  fi
+  sleep 0.3
+  echo "$3 hit80=$(wc -l < /tmp/hit80) hit443=$(wc -l < /tmp/hit443)"
+}
+probe proxy "http://deb.debian.org/debian/dists/bookworm/Release" debian-proxy
+probe path "/debian/dists/bookworm/Release" debian-path
+probe proxy "http://ports.ubuntu.com/ubuntu-ports/dists/noble/Release" ports-proxy
+probe path "/ubuntu-ports/dists/noble/Release" ports-path
+kill $ACNG $L80 $L443 2>/dev/null || true
+`;
+
+async function dockerImage(name: string): Promise<boolean> {
+  try {
+    const out = await new Deno.Command("docker", {
+      args: ["image", "inspect", name],
+      stdout: "null",
+      stderr: "null",
+    }).output();
+    return out.code === 0;
+  } catch {
+    return false;
+  }
+}
+
+Deno.test("real acng routes https_backends over TLS for proxy- and path-style", async () => {
+  if (!(await dockerImage("acng-d5:latest"))) {
+    console.warn(
+      "acng-d5:latest not present; skipping the real-tool route check",
+    );
+    return;
+  }
+  const backends = {
+    debian: ["https://deb.debian.org/debian/"],
+    "ubuntu-ports": ["https://ports.ubuntu.com/ubuntu-ports/"],
+  };
+  const fragment = renderServerFragment({
+    listen: ["0.0.0.0"],
+    port: 3142,
+    https_policy: "https_backends",
+    passthrough_hosts: [],
+    backends,
+    expire_days: 4,
+    cache_dir: "/tmp/cache",
+  });
+  const dir = await Deno.makeTempDir({ prefix: "apt-cache-route-" });
+  try {
+    await Deno.writeTextFile(`${dir}/fragment.conf`, fragment);
+    await Deno.mkdir(`${dir}/backends`);
+    for (const file of renderBackendFiles(backends, "https")) {
+      const name = file.path.split("/").pop() as string;
+      await Deno.writeTextFile(`${dir}/backends/${name}`, file.text);
+    }
+    await Deno.writeTextFile(`${dir}/listen.pl`, LISTEN_PL);
+    await Deno.writeTextFile(`${dir}/run.sh`, ROUTE_RUN_SH);
+    const out = await new Deno.Command("docker", {
+      args: [
+        "run",
+        "--rm",
+        "--network",
+        "none",
+        "-v",
+        `${dir}:/w:ro`,
+        "acng-d5:latest",
+        "bash",
+        "/w/run.sh",
+      ],
+      stdout: "piped",
+      stderr: "piped",
+    }).output();
+    const text = new TextDecoder().decode(out.stdout) +
+      new TextDecoder().decode(out.stderr);
+    assertEquals(out.code, 0, text);
+    for (
+      const label of [
+        "debian-proxy",
+        "debian-path",
+        "ports-proxy",
+        "ports-path",
+      ]
+    ) {
+      const match = new RegExp(`${label} hit80=(\\d+) hit443=(\\d+)`).exec(
+        text,
+      );
+      if (!match) throw new Error(`no result for ${label}:\n${text}`);
+      assertEquals(Number(match[1]), 0, `${label} fetched over http (80)`);
+      assertEquals(
+        Number(match[2]) >= 1,
+        true,
+        `${label} did not use https (443)`,
+      );
+    }
+  } finally {
+    await Deno.remove(dir, { recursive: true });
+  }
 });

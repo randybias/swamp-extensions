@@ -71,9 +71,65 @@ export function managedBackendName(key: string): string {
   return `zzzz-apt-cache-backend-${key}`;
 }
 
-/** Absolute path of the managed backend file for a distribution key. */
+/** Absolute path of a managed backend file for a distribution key. */
 export function managedBackendPath(key: string): string {
   return `${ACNG_CONF_DIR}/${managedBackendName(key)}`;
+}
+
+/**
+ * The package's built-in backend file that a key's built-in remap reads, or
+ * null when the key needs its own `Remap-` line. `Remap-debrep` and
+ * `Remap-uburep` already claim the proxy-style and path-style prefixes for
+ * `debian` and `ubuntu`; overwriting the file they read is the only way to
+ * change those routes (`acng.conf` cannot be edited and a second `Remap-` for
+ * the same key only appends).
+ */
+export function backendFileFor(key: string): string | null {
+  switch (key) {
+    case "debian":
+      return `${ACNG_CONF_DIR}/backends_debian`;
+    case "ubuntu":
+      return `${ACNG_CONF_DIR}/backends_ubuntu`;
+    default:
+      return null;
+  }
+}
+
+/**
+ * The URL prefixes a key's own `Remap-` line matches. A path prefix serves
+ * transparent/path-style requests; a `host/path` prefix serves the
+ * proxy-style requests `configure_client` produces (apt sends
+ * `GET http://ports.ubuntu.com/ubuntu-ports/...` to the proxy).
+ */
+export function remapPrefixes(key: string): string[] {
+  switch (key) {
+    case "ubuntu-ports":
+      return ["/ubuntu-ports", "ports.ubuntu.com/ubuntu-ports"];
+    default:
+      return [`/${key}`];
+  }
+}
+
+/** One rendered backend file. */
+export interface RenderedBackend {
+  /** Distribution key. */
+  key: string;
+  /** Absolute remote path (built-in file for shadowed keys, else the managed file). */
+  path: string;
+  /** File body: one mirror base URL per line. */
+  text: string;
+}
+
+/** Renders every backend file, choosing the path a key's remap reads. */
+export function renderBackendFiles(
+  backends: Record<string, string[]>,
+  scheme: "http" | "https",
+): RenderedBackend[] {
+  return Object.keys(backends).sort().map((key) => ({
+    key,
+    path: backendFileFor(key) ?? managedBackendPath(key),
+    text: renderBackendFile(backends[key], scheme),
+  }));
 }
 
 /** DNS-1123 hostname, lower case, one or more labels. */
@@ -86,6 +142,28 @@ const IPV4_RE =
 
 /** Absolute cache directory path; at least two components. */
 const CACHE_DIR_RE = /^\/[A-Za-z0-9._/-]{1,255}$/;
+
+/**
+ * Top-level directories that must never be a cache directory, because
+ * `remove_server` may `rm -rf` it. `var`, `srv`, `opt`, `data`, `media`,
+ * `mnt` and `tmp` are allowed.
+ */
+const FORBIDDEN_CACHE_ROOTS = new Set([
+  "bin",
+  "boot",
+  "dev",
+  "etc",
+  "home",
+  "lib",
+  "lib32",
+  "lib64",
+  "proc",
+  "root",
+  "run",
+  "sbin",
+  "sys",
+  "usr",
+]);
 
 /** True for a dotted-quad IPv4 literal. */
 export function isIpv4(s: string): boolean {
@@ -140,10 +218,11 @@ export function assertPassthroughHost(host: string): void {
  * later `rm -rf` from ever naming a top-level directory.
  */
 export function assertCacheDir(path: string): void {
-  const components = path.split("/").filter((part) => part !== "");
+  const parts = path.split("/").filter((part) => part !== "");
   if (
-    !CACHE_DIR_RE.test(path) || path.endsWith("/") ||
-    path.split("/").includes("..") || components.length < 2
+    !CACHE_DIR_RE.test(path) || path.endsWith("/") || path.includes("//") ||
+    parts.includes(".") || parts.includes("..") || parts.length < 2 ||
+    FORBIDDEN_CACHE_ROOTS.has(parts[0])
   ) {
     throw new AptConfigError(`Not a valid cache directory: ${path}`);
   }
@@ -313,10 +392,19 @@ export function renderServerFragment(input: ServerRenderInput): string {
       throw new AptConfigError(`Backend ${key} names no mirror`);
     }
     for (const url of urls) assertBackendUrl(url, scheme);
+    // `debian` and `ubuntu` are served by the package's built-in Remap-debrep
+    // and Remap-uburep, whose backend files the model manages. A second
+    // Remap- line for the same key only appends to that repo (the built-in
+    // prefixes are added first and win ties), so it cannot change the route.
+    if (backendFileFor(key) !== null) continue;
     // The URL pattern comes first and the `file:` backend second, after the
     // `;` separator. Putting the backend in the pattern slot makes acng never
     // match the mirror (a `/ubuntu-ports` request then returns 503).
-    lines.push(`Remap-${key}: /${key} ; file:${managedBackendName(key)}`);
+    lines.push(
+      `Remap-${key}: ${remapPrefixes(key).join(" ")} ; file:${
+        managedBackendName(key)
+      }`,
+    );
   }
   return lines.join("\n") + "\n";
 }
@@ -489,11 +577,17 @@ export function parseAptCacherLog(
     const tokens = raw.split("|");
     if (tokens.length < 3 || !/^\d+$/.test(tokens[0])) continue;
     const type = tokens[1];
-    if (type !== "I" && type !== "O" && type !== "E") {
-      recognised++;
-      continue;
-    }
-    if (!/^\d+$/.test(tokens[2])) continue;
+    // Only the documented row types count as recognised: I (fetch upstream),
+    // O (serve), E (serve error), and the misc rows M and X. An unknown typed
+    // row (e.g. `1|Z|100`) must not defeat the fail-closed check.
+    if (
+      type !== "I" && type !== "O" && type !== "E" && type !== "M" &&
+      type !== "X"
+    ) continue;
+    if (
+      (type === "I" || type === "O" || type === "E") &&
+      !/^\d+$/.test(tokens[2])
+    ) continue;
     recognised++;
     const when = Number(tokens[0]);
     if (when < since || when > until) continue;
@@ -522,10 +616,18 @@ export function parseAptCacherLog(
   };
 }
 
-/** Removes any `user:password@` userinfo from a proxy URL value. */
-function stripUserinfo(value: string): string {
-  const match = /^(https?:\/\/)[^/@\s]*@(.*)$/i.exec(value);
-  return match ? `${match[1]}${match[2]}` : value;
+/**
+ * Drops the userinfo from any `<scheme>://` value, for every scheme (socks5h,
+ * http, ...) and up to the LAST `@` before the first `/`. `DIRECT`, `auto` and
+ * other non-URL values pass through unchanged.
+ */
+export function redactProxyValue(value: string): string {
+  const match = /^([A-Za-z][A-Za-z0-9+.-]*:\/\/)([^/]*)(.*)$/.exec(value);
+  if (!match) return value;
+  const [, scheme, authority, rest] = match;
+  const at = authority.lastIndexOf("@");
+  if (at === -1) return value;
+  return `${scheme}${authority.slice(at + 1)}${rest}`;
 }
 
 /**
@@ -540,10 +642,32 @@ export function proxyValuesOf(
   const out: Record<string, string> = {};
   for (const [key, value] of Object.entries(values)) {
     if (/^Acquire::(http|https)::Proxy(::[A-Za-z0-9._-]+)?$/.test(key)) {
-      out[key] = stripUserinfo(value);
+      out[key] = redactProxyValue(value);
     }
   }
   return out;
+}
+
+/**
+ * Renders the `sh -c` body that prints apt-cacher's current log plus its
+ * rotated logs, so a multi-day window is not silently truncated by logrotate
+ * (`size 10M`, `rotate 7`, `delaycompress`). Exits 3 when no log file exists.
+ */
+export function renderLogReadScript(logPath: string): string {
+  const l = shQuote(logPath);
+  return [
+    `L=${l}`,
+    "read_any=0",
+    `for f in "$L" "$L.1" "$L".*.gz; do`,
+    '  [ -f "$f" ] || continue',
+    "  read_any=1",
+    '  case "$f" in',
+    '    *.gz) gzip -dc "$f" 2>/dev/null || zcat "$f" 2>/dev/null ;;',
+    '    *) cat "$f" ;;',
+    "  esac",
+    "done",
+    '[ "$read_any" = 1 ] || { echo "no apt-cacher log found" >&2; exit 3; }',
+  ].join("\n");
 }
 
 /** Parses the byte count from `du -sb <dir>`. */

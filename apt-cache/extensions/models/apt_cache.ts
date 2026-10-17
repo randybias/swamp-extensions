@@ -47,15 +47,15 @@ import {
   isIpv6,
   isWildcardAddress,
   managedBackendName,
-  managedBackendPath,
   parseAptCacherLog,
   parseCacheBytes,
   parseFsFree,
   parseProxyUrl,
   proxyValuesOf,
-  renderBackendFile,
+  renderBackendFiles,
   renderClientSnippet,
   renderDetectScript,
+  renderLogReadScript,
   renderSecurityConf,
   renderServerFragment,
   SECURITY_CONF_PATH,
@@ -232,6 +232,7 @@ const ServerStateSchema = z.strictObject({
   listen: z.array(z.string()).optional(),
   port: z.number().int().optional(),
   https_policy: z.enum(HTTPS_POLICIES).optional(),
+  cache_dir: z.string().optional(),
   config_sha256: z.string().optional(),
   applied_at: z.string().optional(),
   observed_at: z.string(),
@@ -506,6 +507,16 @@ function assertServerArgs(args: {
     }
     for (const host of args.passthrough_hosts) assertPassthroughHost(host);
   }
+  // The package's built-in Remap-secdeb claims every debian-security prefix
+  // (both path-style and proxy-style) and uses inline http backends; acng.conf
+  // cannot be edited and a second Remap- only appends, so a managed
+  // debian-security mirror would be silently ignored. Refuse it instead.
+  if ("debian-security" in args.backends) {
+    throw new AptCacheError(
+      "config",
+      "the debian-security key cannot be managed: the package's built-in Remap-secdeb owns those routes and uses inline http backends that cannot be overridden; omit it and configure it in the package's acng.conf",
+    );
+  }
   const scheme = args.https_policy === "https_backends" ? "https" : "http";
   for (const [key, urls] of Object.entries(args.backends)) {
     if (urls.length === 0) {
@@ -747,10 +758,7 @@ export const model = {
         const scheme = args.https_policy === "https_backends"
           ? "https"
           : "http";
-        const backends = Object.keys(args.backends).sort().map((key) => {
-          const text = renderBackendFile(args.backends[key], scheme);
-          return { key, path: managedBackendPath(key), text };
-        });
+        const backends = renderBackendFiles(args.backends, scheme);
         const fragmentSha = await sha256Hex(
           new TextEncoder().encode(fragment),
         );
@@ -807,10 +815,7 @@ export const model = {
         const scheme = args.https_policy === "https_backends"
           ? "https"
           : "http";
-        const backendFiles = Object.keys(args.backends).sort().map((k) => ({
-          path: managedBackendPath(k),
-          text: renderBackendFile(args.backends[k], scheme),
-        }));
+        const backendFiles = renderBackendFiles(args.backends, scheme);
         let changed = false;
         if (await uploadIfChanged(deps, t, FRAGMENT_PATH, fragment, "0644")) {
           changed = true;
@@ -912,6 +917,7 @@ export const model = {
             listen: args.listen,
             port: args.port,
             https_policy: args.https_policy,
+            cache_dir: args.cache_dir,
             config_sha256: fragmentSha,
             applied_at: iso(now),
             observed_at: iso(now),
@@ -951,8 +957,13 @@ export const model = {
           "-f=${Status}",
           "apt-cacher-ng",
         ]);
-        const installed = /install ok installed/.test(status.stdout);
-        if (!installed) {
+        const statusText = status.stdout;
+        const installed = /install ok installed/.test(statusText);
+        // A prior plain remove leaves the package in `deinstall ok
+        // config-files`; only a purging apt-get can finish it, so treat those
+        // config files as present for the ack path.
+        const configFiles = /deinstall ok config-files/.test(statusText);
+        if (!installed && !configFiles) {
           context.logger.info(
             "apt-cacher-ng is not installed on {host}; remove is a no-op",
             { host: t.host },
@@ -972,25 +983,59 @@ export const model = {
             result: { host: t.host, removed: false, cache_purged: false },
           };
         }
-        requireOk(
-          await exec(deps, t, ["systemctl", "stop", "apt-cacher-ng"]),
-          "systemctl stop apt-cacher-ng",
-        );
-        requireOk(
-          await exec(deps, t, ["systemctl", "disable", "apt-cacher-ng"]),
-          "systemctl disable apt-cacher-ng",
-        );
-        // `purge` deletes the cache directory; `remove` does not. Without the
-        // ack the cache is data we must not touch, so use remove and leave it.
-        const subcommand = args.purge_cache_ack ? "purge" : "remove";
-        requireOk(
-          await exec(deps, t, [
-            "sh",
-            "-c",
-            `DEBIAN_FRONTEND=noninteractive apt-get ${subcommand} -y apt-cacher-ng`,
-          ]),
-          `apt-get ${subcommand} apt-cacher-ng`,
-        );
+        // Resolve the cache directory to delete before anything is removed:
+        // the live fragment's CacheDir first, then the recorded server state.
+        let knownCacheDir: string | undefined;
+        if (args.purge_cache_ack) {
+          const fragment = await readRemoteFile(deps, t, FRAGMENT_PATH);
+          knownCacheDir = fragment === null
+            ? undefined
+            : /^CacheDir:\s*(.*)$/m.exec(fragment)?.[1].trim();
+          if (knownCacheDir === undefined) {
+            const record = await context.readResource(serverName(t)) as
+              | ServerState
+              | null;
+            knownCacheDir = record?.cache_dir;
+          }
+          if (knownCacheDir === undefined) {
+            throw new AptCacheError(
+              "cache_dir_unknown",
+              "cannot determine the server's cache directory (no managed fragment and no recorded state); refusing to delete the cache",
+            );
+          }
+          if (knownCacheDir !== args.cache_dir) {
+            throw new AptCacheError(
+              "cache_dir_mismatch",
+              `cache_dir ${args.cache_dir} does not match the server's ${knownCacheDir}`,
+            );
+          }
+        }
+        if (installed) {
+          requireOk(
+            await exec(deps, t, ["systemctl", "stop", "apt-cacher-ng"]),
+            "systemctl stop apt-cacher-ng",
+          );
+          requireOk(
+            await exec(deps, t, ["systemctl", "disable", "apt-cacher-ng"]),
+            "systemctl disable apt-cacher-ng",
+          );
+        }
+        // `purge` deletes the cache directory and the package config files;
+        // `remove` keeps them. Without the ack the cache is data we must not
+        // touch, so use remove and leave it.
+        const subcommand = args.purge_cache_ack
+          ? "purge"
+          : (installed ? "remove" : undefined);
+        if (subcommand) {
+          requireOk(
+            await exec(deps, t, [
+              "sh",
+              "-c",
+              `DEBIAN_FRONTEND=noninteractive apt-get ${subcommand} -y apt-cacher-ng`,
+            ]),
+            `apt-get ${subcommand} apt-cacher-ng`,
+          );
+        }
         for (const name of listManagedConfNames()) {
           requireOk(
             await exec(deps, t, ["rm", "-f", "--", `${ACNG_CONF_DIR}/${name}`]),
@@ -1109,7 +1154,11 @@ export const model = {
         const now = deps.now();
         const until = Math.floor(now / 1000);
         const since = until - windowToSeconds(args.window);
-        const log = await exec(deps, t, ["cat", "--", APT_CACHER_LOG_PATH]);
+        const log = await exec(deps, t, [
+          "sh",
+          "-c",
+          renderLogReadScript(APT_CACHER_LOG_PATH),
+        ]);
         if (log.exit_code !== 0) {
           throw new AptCacheError(
             "log_missing",
@@ -1213,6 +1262,9 @@ export const model = {
           fallback_direct: args.fallback_direct,
         };
         const snippet = renderClientSnippet(renderInput);
+        // Snapshot the prior managed files so a failed re-run restores them
+        // instead of deleting a snippet that was working.
+        const snapshot = await snapshotClient(deps, t);
         let changed = false;
         let verified = false;
         try {
@@ -1256,26 +1308,28 @@ export const model = {
             t,
             expectedProxyKeys(renderInput),
           );
-          if (verified && args.verify_update) {
+          // A key mismatch is a configuration error, never tolerated (even
+          // with fallback_direct, which only makes apt resilient at run time).
+          if (!verified) {
+            throw new AptCacheError(
+              "verify_failed",
+              "the managed snippet is not the proxy apt-config reports",
+            );
+          }
+          if (args.verify_update) {
             const update = await exec(deps, t, ["apt-get", "update"]);
-            verified = update.exit_code === 0;
-            if (!verified && !args.fallback_direct) {
+            if (update.exit_code !== 0) {
               throw new AptCacheError(
                 "verify_failed",
                 `apt-get update failed after writing the snippet (exit ${update.exit_code})`,
               );
             }
           }
-          if (!verified && !args.fallback_direct) {
-            throw new AptCacheError(
-              "verify_failed",
-              "the managed snippet is not the proxy apt-config reports",
-            );
-          }
         } catch (error) {
-          // Any failure leaves no partial state: the snippet must never point
-          // at a missing auto-detect script or an unverified proxy.
-          await rollbackClient(deps, t);
+          // Any failure restores the prior state: the snippet must never point
+          // at a missing auto-detect script, an unverified proxy, or replace a
+          // working configuration with a broken one.
+          await restoreClient(deps, t, snapshot);
           throw error;
         }
         const now = deps.now();
@@ -1417,8 +1471,12 @@ export function createModel(overrides: Partial<AptCacheDeps> = {}) {
 }
 
 function listManagedConfNames(): string[] {
+  // The managed fragment and our own backend files, plus the package's built-in
+  // backend files the model manages for `debian` and `ubuntu`.
   return [
     FRAGMENT_PATH.split("/").pop() as string,
+    "backends_debian",
+    "backends_ubuntu",
     ...DISTRO_KEYS.map((k) => managedBackendName(k)),
   ];
 }
@@ -1495,9 +1553,41 @@ async function verifyClientProxy(
   );
 }
 
-async function rollbackClient(run: SshDeps, t: SshTarget): Promise<void> {
-  await exec(run, t, ["rm", "-f", "--", CLIENT_SNIPPET_PATH]);
-  await exec(run, t, ["rm", "-f", "--", DETECT_PATH]);
+/** The prior managed client files, or null when absent. */
+interface ClientSnapshot {
+  /** Prior snippet body, or null. */
+  snippet: string | null;
+  /** Prior auto-detect script body, or null. */
+  detect: string | null;
+}
+
+async function snapshotClient(
+  run: SshDeps,
+  t: SshTarget,
+): Promise<ClientSnapshot> {
+  return {
+    snippet: await readRemoteFile(run, t, CLIENT_SNIPPET_PATH),
+    detect: await readRemoteFile(run, t, DETECT_PATH),
+  };
+}
+
+/** Restores the prior managed files, or removes them when they were absent. */
+async function restoreClient(
+  run: SshDeps,
+  t: SshTarget,
+  snapshot: ClientSnapshot,
+): Promise<void> {
+  const files: [string, string | null, string][] = [
+    [CLIENT_SNIPPET_PATH, snapshot.snippet, "0644"],
+    [DETECT_PATH, snapshot.detect, "0755"],
+  ];
+  for (const [path, content, mode] of files) {
+    if (content === null) {
+      await exec(run, t, ["rm", "-f", "--", path]);
+    } else {
+      await uploadIfChanged(run, t, path, content, mode);
+    }
+  }
 }
 
 /**

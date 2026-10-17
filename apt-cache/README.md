@@ -51,9 +51,31 @@ every server and client method requires `https_policy`:
 
 `PassThroughPattern` is always rendered explicitly, even for `direct` and
 `https_backends`, so a broader value left in place by an earlier run or package
-default cannot remain in force. The managed fragment and backend files use a
-`zzzz-` prefix, so they sort after the packaged `acng.conf` and the Debian
-`zz_debconf.conf` and win.
+default cannot remain in force.
+
+### How the mirrors are routed
+
+Apt sends **proxy-style** requests when it uses the proxy
+(`GET
+http://ports.ubuntu.com/ubuntu-ports/...`), and path-style requests only
+when a client requests the cache by path. The routing follows the package's own
+remaps, because a second `Remap-` for a key only appends to that repo:
+
+- `debian` and `ubuntu` are served by the package's built-in `Remap-debrep` and
+  `Remap-uburep`. The model writes their backend files
+  (`/etc/apt-cacher-ng/backends_debian`, `backends_ubuntu`) so both proxy-style
+  and path-style requests use the configured mirrors (over TLS under
+  `https_backends`).
+- `ubuntu-ports` has no built-in remap, so the model renders
+  `Remap-ubuntu-ports: /ubuntu-ports ports.ubuntu.com/ubuntu-ports ; file:...`
+  with both the path and the client host+path prefix.
+- `debian-security` is **refused**: the package's built-in `Remap-secdeb`
+  already owns every `debian-security` prefix with inline `http` backends, and a
+  managed mirror would be silently ignored. Configure it in the package's own
+  `acng.conf` instead.
+
+`ss -ltn` verification requires the exact parsed `address:port` pair, and the
+managed fragment uses a `zzzz-` prefix so it loads after `acng.conf`.
 
 ## Dependencies
 
@@ -144,18 +166,23 @@ fragment.
 
 ## Behaviour notes
 
-- `stats` reads `/var/log/apt-cacher-ng/apt-cacher.log` directly and derives the
+- `stats` reads `/var/log/apt-cacher-ng/apt-cacher.log` plus its rotated `.1`
+  and `.N.gz` files (logrotate rotates at 10 MB, keeping 7), and derives the
   same hit/miss and byte totals the maintenance page shows, without invoking its
   `Count Data` action (which is off by default, so the page's log-analysis table
   is usually empty). It fails closed if too many rows are unrecognisable.
 - `remove_server` uses `apt-get remove` unless `purge_cache_ack` is set: the
-  package's `purge` deletes the cache directory, `remove` does not. The cache is
-  deleted only with the ack, only when it is a real directory (a symlink is
-  refused), and the recorded `cache_dir` is honoured.
-- The managed fragment and backend files use the
-  `Remap-<key>: /<key> ;
-  file:<backend>` form, with the URL pattern before the
-  `;` and the mirror file after it.
+  package's `purge` deletes the cache directory, `remove` does not. A package
+  left in `deinstall ok config-files` by an earlier remove is still purged. The
+  cache is deleted only with the ack, only when it is a real directory (a
+  symlink is refused), only when its path matches the server's recorded or live
+  `CacheDir`, and never for a system top-level directory.
+- A failed `configure_client` restores the prior managed files instead of
+  deleting them, and a key mismatch or a failed `apt-get update` is always a
+  failure, even with `fallback_direct`.
+- The managed fragment emits `Remap-` lines only for keys with no built-in
+  remap, in the `Remap-<key>: <prefix> ; file:<backend>` form (URL pattern
+  first, mirror file after the `;`).
 
 ## Live testing
 
@@ -163,11 +190,15 @@ Offline gates plus targeted real-tool checks so far; no full end-to-end run
 against a managed host yet. The rendered server fragment, client snippet and
 request-log parser were validated against real tools:
 
+- apt-cacher-ng 3.7.4: for `https_backends`, both proxy-style
+  (`GET http://ports.ubuntu.com/ubuntu-ports/...`) and path-style requests are
+  fetched over TLS (port 443), for `ubuntu-ports` (its own remap) and for
+  `debian` (the managed built-in backend file). The test that asserts this lives
+  in `apt_cache_test.ts` and runs when the `acng-d5:latest` image is present.
 - apt-cacher-ng 3.7.4: the fragment with
-  `Remap-ubuntu-ports: /ubuntu-ports ;
-  file:...` serves a real
-  `/ubuntu-ports/dists/.../Release` request (200); the pre-fix order
-  (`file:... /ubuntu-ports`) returns 503.
+  `Remap-ubuntu-ports: /ubuntu-ports ports.ubuntu.com/ubuntu-ports ; file:...`
+  serves a real `/ubuntu-ports/dists/.../Release` request (200); the pre-fix
+  order (`file:... /ubuntu-ports`) returns 503.
 - `apt-config` accepts the rendered snippet and reports every managed key.
 - The rendered auto-detect script runs under `sh -eu` and prints the proxy URL
   or `DIRECT` as intended.

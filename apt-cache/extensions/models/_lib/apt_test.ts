@@ -3,6 +3,7 @@ import {
   AptConfigError,
   assertCacheDir,
   assertPassthroughHost,
+  backendFileFor,
   escapeRegex,
   expectedProxyKeys,
   isBackendUrl,
@@ -12,9 +13,13 @@ import {
   parseFsFree,
   parseProxyUrl,
   proxyValuesOf,
+  redactProxyValue,
+  remapPrefixes,
   renderBackendFile,
+  renderBackendFiles,
   renderClientSnippet,
   renderDetectScript,
+  renderLogReadScript,
   renderPassthroughPattern,
   renderSecurityConf,
   renderServerFragment,
@@ -162,21 +167,12 @@ Deno.test("server fragment goldens per HTTPS policy", async () => {
     cache_dir: "/var/cache/apt-cacher-ng",
   });
   assertEquals(direct, await golden("server-direct.golden.txt"));
-  // The URL pattern comes first and the file backend after the `;`. Verified
-  // against real apt-cacher-ng 3.7.4: the buggy order returns 503 for
-  // /ubuntu-ports/dists/.../Release, this order returns 200.
-  assertEquals(
-    direct.includes(
-      "Remap-debian: /debian ; file:zzzz-apt-cache-backend-debian",
-    ),
-    true,
-  );
-  assertEquals(
-    direct.includes(
-      "Remap-ubuntu: /ubuntu ; file:zzzz-apt-cache-backend-ubuntu",
-    ),
-    true,
-  );
+  // `debian` and `ubuntu` are served by the package's built-in Remap-debrep and
+  // Remap-uburep; a second Remap- line for the same key only appends to that
+  // repo and cannot change the route, so the fragment emits none and the model
+  // manages the backend files instead.
+  assertEquals(direct.includes("Remap-debian"), false);
+  assertEquals(direct.includes("Remap-ubuntu:"), false);
   assertEquals(
     renderServerFragment({
       listen: ["192.0.2.10", "2001:db8::10"],
@@ -200,6 +196,57 @@ Deno.test("server fragment goldens per HTTPS policy", async () => {
       cache_dir: "/var/cache/apt-cacher-ng",
     }),
     await golden("server-https-backends.golden.txt"),
+  );
+  // A key with no built-in remap gets its own line, with both the path prefix
+  // (path-style requests) and the client host+path prefix (proxy-style requests
+  // that apt sends when Acquire::http::Proxy is set).
+  const ports = renderServerFragment({
+    listen: ["192.0.2.10"],
+    port: 3142,
+    https_policy: "https_backends",
+    passthrough_hosts: [],
+    backends: { "ubuntu-ports": ["https://ports.ubuntu.com/ubuntu-ports/"] },
+    expire_days: 4,
+    cache_dir: "/var/cache/apt-cacher-ng",
+  });
+  assertEquals(ports, await golden("server-ubuntu-ports.golden.txt"));
+  assertEquals(
+    ports.includes(
+      "Remap-ubuntu-ports: /ubuntu-ports ports.ubuntu.com/ubuntu-ports ; file:zzzz-apt-cache-backend-ubuntu-ports",
+    ),
+    true,
+  );
+});
+
+Deno.test("backend paths and remap prefixes route shadowed and own keys", () => {
+  assertEquals(backendFileFor("debian"), "/etc/apt-cacher-ng/backends_debian");
+  assertEquals(backendFileFor("ubuntu"), "/etc/apt-cacher-ng/backends_ubuntu");
+  assertEquals(backendFileFor("ubuntu-ports"), null);
+  assertEquals(backendFileFor("debian-security"), null);
+  assertEquals(remapPrefixes("ubuntu-ports"), [
+    "/ubuntu-ports",
+    "ports.ubuntu.com/ubuntu-ports",
+  ]);
+  assertEquals(
+    renderBackendFiles(
+      {
+        debian: ["https://deb.debian.org/debian/"],
+        "ubuntu-ports": ["https://ports.ubuntu.com/ubuntu-ports/"],
+      },
+      "https",
+    ),
+    [
+      {
+        key: "debian",
+        path: "/etc/apt-cacher-ng/backends_debian",
+        text: "https://deb.debian.org/debian/\n",
+      },
+      {
+        key: "ubuntu-ports",
+        path: "/etc/apt-cacher-ng/zzzz-apt-cache-backend-ubuntu-ports",
+        text: "https://ports.ubuntu.com/ubuntu-ports/\n",
+      },
+    ],
   );
 });
 
@@ -348,6 +395,21 @@ Deno.test("apt-cacher log parser matches the report's log analysis", async () =>
     AptConfigError,
     "unrecognised",
   );
+  // An unknown typed row must not count as recognised.
+  assertThrows(
+    () => parseAptCacherLog("1|Z|100\n2|Z|100\n3|I|5", 0, 10),
+    AptConfigError,
+    "unrecognised",
+  );
+  // Documented misc rows (M, X) are recognised, so a log with only those does
+  // not fail closed.
+  assertEquals(parseAptCacherLog("1|M|Download started\n2|X|hook", 0, 10), {
+    requests: 0,
+    hits: 0,
+    misses: 0,
+    bytes_from_cache: 0,
+    bytes_upstream: 0,
+  });
 });
 
 Deno.test("windowToSeconds accepts today and <n> days", () => {
@@ -364,14 +426,27 @@ Deno.test("cache size and free space parsers", () => {
   assertThrows(() => parseCacheBytes("nope"), AptConfigError);
 });
 
-Deno.test("cache directory grammar rejects traversal, shallow and relative paths", () => {
+Deno.test("cache directory grammar rejects traversal, shallow and system roots", () => {
   assertCacheDir("/var/cache/apt-cacher-ng");
   assertCacheDir("/srv/cache");
-  assertThrows(() => assertCacheDir("relative/dir"), AptConfigError);
-  assertThrows(() => assertCacheDir("/var/../etc"), AptConfigError);
-  assertThrows(() => assertCacheDir("/var/cache/"), AptConfigError);
-  assertThrows(() => assertCacheDir("/var"), AptConfigError);
-  assertThrows(() => assertCacheDir("/"), AptConfigError);
+  assertCacheDir("/data/acng");
+  for (
+    const bad of [
+      "relative/dir",
+      "/var/../etc",
+      "/./var",
+      "/var/.",
+      "/var/cache/",
+      "/var",
+      "/",
+      "/usr/bin",
+      "/etc/apt",
+      "/home/x",
+      "/var//cache",
+    ]
+  ) {
+    assertThrows(() => assertCacheDir(bad), AptConfigError, undefined, bad);
+  }
 });
 
 Deno.test("wildcard bind detection normalizes every IPv6 spelling", () => {
@@ -384,7 +459,7 @@ Deno.test("wildcard bind detection normalizes every IPv6 spelling", () => {
   }
 });
 
-Deno.test("proxyValuesOf keeps proxy keys and strips userinfo", () => {
+Deno.test("proxyValuesOf keeps proxy keys and redacts every scheme's userinfo", () => {
   assertEquals(
     proxyValuesOf({
       "Acquire::http::Proxy": "http://user:pw@192.0.2.10:3142",
@@ -401,4 +476,40 @@ Deno.test("proxyValuesOf keeps proxy keys and strips userinfo", () => {
       "Acquire::http::Proxy::archive.example.test": "DIRECT",
     },
   );
+});
+
+Deno.test("redactProxyValue drops userinfo for any scheme and double @", () => {
+  assertEquals(
+    redactProxyValue("socks5h://dave:SECRETD@192.0.2.10:1080"),
+    "socks5h://192.0.2.10:1080",
+  );
+  assertEquals(
+    redactProxyValue("HTTP://bob:SEC@RETB@192.0.2.10:3142"),
+    "HTTP://192.0.2.10:3142",
+  );
+  assertEquals(
+    redactProxyValue("http://user@host:3142/x"),
+    "http://host:3142/x",
+  );
+  assertEquals(redactProxyValue("DIRECT"), "DIRECT");
+  assertEquals(redactProxyValue("auto"), "auto");
+  assertEquals(redactProxyValue("http://host:3142"), "http://host:3142");
+});
+
+Deno.test("log read script covers rotations and is valid sh", async () => {
+  const script = renderLogReadScript("/var/log/apt-cacher-ng/apt-cacher.log");
+  assertEquals(script.includes(".1"), true);
+  assertEquals(script.includes(".gz"), true);
+  assertEquals(script.includes("gzip -dc"), true);
+  const check = await new Deno.Command("sh", {
+    args: ["-n"],
+    stdin: "piped",
+    stdout: "null",
+    stderr: "piped",
+  });
+  const child = check.spawn();
+  const writer = child.stdin.getWriter();
+  await writer.write(new TextEncoder().encode(script));
+  await writer.close();
+  assertEquals((await child.status).code, 0);
 });

@@ -4,4 +4,3 @@ Port: 3142
 CacheDir: /var/cache/apt-cacher-ng
 ExThreshold: 7
 PassThroughPattern: ^(archive\.example\.test|security\.example\.test)(:443)?$
-Remap-debian: /debian ; file:zzzz-apt-cache-backend-debian

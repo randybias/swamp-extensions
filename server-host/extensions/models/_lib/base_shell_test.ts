@@ -34,7 +34,21 @@ async function box() {
     await Deno.writeTextFile(`${bin}/${n}`, `#!/bin/sh\n${body}\n`);
     await Deno.chmod(`${bin}/${n}`, 0o755);
   };
-  await stub("getent", `echo "$2:x:1:1::${dir}/home/$2:/bin/bash"`);
+  // getent passwd USER: exit 2 when ${dir}/absent exists (no such account), 1
+  // when ${dir}/getent-fails exists (an NSS or LDAP error), else an entry.
+  await stub(
+    "getent",
+    `[ ! -e "${dir}/absent" ] || exit 2
+[ ! -e "${dir}/getent-fails" ] || exit 1
+echo "$2:x:1:1::${dir}/home/$2:/bin/bash"`,
+  );
+  // runuser -u USER -- CMD...: logs the call and runs CMD as the current user.
+  await stub(
+    "runuser",
+    `echo "$@" >> "${dir}/runuser.log"
+shift 3
+exec "$@"`,
+  );
   // gpasswd -d USER sudo: removes the group from the stub's group list unless
   // ${dir}/gpasswd-fails exists (a lock held, an NSS error).
   await stub(
@@ -52,7 +66,7 @@ sed -i 's/ sudo//' "${dir}/groups"`,
   // `id -u` succeeds; `id -nG` lists the groups in ${dir}/groups.
   await stub(
     "id",
-    `case "$1" in -u) exit 0;; -nG) [ -e "${dir}/groups" ] && cat "${dir}/groups";; esac`,
+    `case "$1" in -u) exit 0;; -nG) [ ! -e "${dir}/id-fails" ] || exit 1; [ -e "${dir}/groups" ] && cat "${dir}/groups";; esac`,
   );
   const run = async (s: { script: string; args: string[] }) => {
     const out = await new Deno.Command("sh", {
@@ -145,13 +159,55 @@ Deno.test("revoke: a failing gpasswd keeps the marker and fails the step so a re
   }
 });
 
-Deno.test("revoke: an account that no longer exists counts as revoked", async () => {
+Deno.test("revoke: only an account that is verifiably absent counts as revoked", async () => {
   const b = await box();
   try {
     await Deno.writeTextFile(`${b.state}/sudo-granted-oldops`, "");
-    // No groups file: `id -nG` fails, as it does for a deleted account.
+    await Deno.writeTextFile(`${b.dir}/absent`, "");
     assertEquals(await b.run(script("revoke grants of oldops")), 0);
     assertEquals(await b.exists(`${b.state}/sudo-granted-oldops`), false);
+  } finally {
+    await Deno.remove(b.dir, { recursive: true });
+  }
+});
+
+Deno.test("revoke: when gpasswd AND id both fail, the step fails and the marker is kept", async () => {
+  const b = await box();
+  try {
+    await Deno.writeTextFile(`${b.state}/sudo-granted-oldops`, "");
+    await Deno.writeTextFile(`${b.dir}/groups`, "oldops sudo\n");
+    await Deno.writeTextFile(`${b.dir}/gpasswd-fails`, "");
+    await Deno.writeTextFile(`${b.dir}/id-fails`, "");
+    const code = await b.run(script("revoke grants of oldops"));
+    assertEquals(code !== 0 && code !== 3, true);
+    assertEquals(await b.exists(`${b.state}/sudo-granted-oldops`), true);
+  } finally {
+    await Deno.remove(b.dir, { recursive: true });
+  }
+});
+
+Deno.test("revoke: a failing account lookup is an error, never 'gone'", async () => {
+  const b = await box();
+  try {
+    await Deno.writeTextFile(`${b.state}/sudo-granted-oldops`, "");
+    await Deno.writeTextFile(`${b.dir}/getent-fails`, "");
+    const code = await b.run(script("revoke grants of oldops"));
+    assertEquals(code !== 0 && code !== 3, true);
+    assertEquals(await b.exists(`${b.state}/sudo-granted-oldops`), true);
+    assertEquals(await b.read("home/oldops/.ssh/authorized_keys"), "k\n");
+  } finally {
+    await Deno.remove(b.dir, { recursive: true });
+  }
+});
+
+Deno.test("revoke: the keys file is removed as the account itself, not as root", async () => {
+  const b = await box();
+  try {
+    assertEquals(await b.run(script("revoke grants of oldops")), 0);
+    assertEquals(
+      await b.read("runuser.log"),
+      `-u oldops -- rm -f ${b.dir}/home/oldops/.ssh/authorized_keys\n`,
+    );
   } finally {
     await Deno.remove(b.dir, { recursive: true });
   }

@@ -787,8 +787,8 @@ export function createModel(overrides: Partial<HostDeps> = {}) {
             revoke: toRevoke,
           }, changed);
           const emitted = await executePlan(deps, t, steps);
-          // The revoke steps are not "checked" so that their exit code can say
-          // whether the keys file was left alone; any other failure is fatal.
+          // The revoke steps accept exit 3 (keys file left alone) as well as 0;
+          // any other exit already stopped the plan before this point.
           const stillPending = [...deferred];
           for (const u of toRevoke) {
             const done = emitted.find((e) =>

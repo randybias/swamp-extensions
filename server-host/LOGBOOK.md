@@ -309,3 +309,18 @@ Round 12 (delta review of f66c8d0, lead ruling 4g):
 - Ruling 4g: `insecure_tofu` is gone. `host_key_policy` accepts only `strict`
   and `host_keys` is required (at least one), in the schema and the transport;
   `pinHostKeys` and the first-contact scan are removed.
+
+Round 13 (delta review of 2aade6d):
+
+- HIGH the revoke verification failed open: if `id` itself failed, no output
+  meant "not in sudo" and the marker was deleted. Fixed: existence is decided
+  first from `getent passwd` (exit 2 is the only "absent"; any other failure
+  exits 1 with the marker kept), and for an existing account `id -nG` must
+  succeed and must not list sudo. Tested with a failing gpasswd AND failing id,
+  and with a failing lookup.
+- MEDIUM the keys removal could race a symlink swap. Fixed: it runs as the
+  account (`runuser -u USER -- rm -f`), so no root-owned path follows the
+  account's links; the earlier checks remain as a cheap guard.
+- MEDIUM README lockdown and commit examples lacked the now-required
+  `host_keys`. Added.
+- LOW comment about the revoke steps corrected.

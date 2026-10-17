@@ -140,8 +140,19 @@ export const REVOKE_SKIPPED = 3;
 const REVOKE_SCRIPT = `set -e
 user=$1
 rc=0
-home=$(getent passwd "$user" | cut -d: -f6 || true)
-if [ -n "$home" ]; then
+# Decide first whether the account exists: getent exits 2 only for "no such
+# entry"; any other failure (NSS, LDAP) must not be read as "gone".
+set +e
+entry=$(getent passwd "$user" 2>/dev/null)
+found=$?
+set -e
+case $found in
+  0) exists=1 ;;
+  2) exists=0 ;;
+  *) echo "cannot look up $user" >&2; exit 1 ;;
+esac
+if [ "$exists" = 1 ]; then
+  home=$(printf '%s\\n' "$entry" | cut -d: -f6)
   d="$home/.ssh"
   if [ -L "$d" ] || [ ! -d "$d" ] || [ "$(stat -c %U "$d")" != "$user" ]; then
     if [ -e "$d" ] || [ -L "$d" ]; then
@@ -149,15 +160,24 @@ if [ -n "$home" ]; then
       rc=${REVOKE_SKIPPED}
     fi
   else
-    rm -f "$d/authorized_keys"
+    # Removed as the account itself, so a swap of its own ~/.ssh for a symlink
+    # between the checks above and this line cannot make root delete a file
+    # that belongs to someone else.
+    runuser -u "$user" -- rm -f "$d/authorized_keys"
   fi
 fi
 m="${STATE_DIR}/sudo-granted-$user"
 if [ -e "$m" ]; then
-  gpasswd -d "$user" sudo >/dev/null 2>&1 || true
-  if id -nG "$user" 2>/dev/null | tr ' ' '\\n' | grep -qx sudo; then
-    echo "could not remove $user from sudo" >&2
-    exit 1
+  if [ "$exists" = 1 ]; then
+    gpasswd -d "$user" sudo >/dev/null 2>&1 || true
+    if ! groups=$(id -nG "$user"); then
+      echo "cannot read the groups of $user" >&2
+      exit 1
+    fi
+    if printf '%s\\n' "$groups" | tr ' ' '\\n' | grep -qx sudo; then
+      echo "could not remove $user from sudo" >&2
+      exit 1
+    fi
   fi
   rm -f "$m"
 fi

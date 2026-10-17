@@ -103,12 +103,14 @@ swamp behavior run @randybias/server-host apply_base hardened-host \
 swamp behavior run @randybias/server-host lockdown hardened-host \
   --input host=192.0.2.10 --input user=root \
   --input host_key_policy=strict \
+  --input 'host_keys=["192.0.2.10 ssh-ed25519 AAAA..."]' \
   --input 'ssh_key_ref={"vault":"prod","key":"server-host-key"}' \
   --input 'management_cidrs=["192.0.2.0/24"]' --input ssh_port=22
 
 swamp behavior run @randybias/server-host commit hardened-host \
   --input host=192.0.2.10 --input user=root \
   --input host_key_policy=strict \
+  --input 'host_keys=["192.0.2.10 ssh-ed25519 AAAA..."]' \
   --input 'ssh_key_ref={"vault":"prod","key":"server-host-key"}'
 ```
 

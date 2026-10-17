@@ -198,3 +198,88 @@ for this round.
   (other-host pin + record), and a matching pin proceeds strictly. Live was the
   only thing that caught this; unit tests now cover it. The `_lib/ssh.ts`
   vendored helper is unchanged by this fix.
+
+## Live end-to-end, 2026-10-17 (run sp-20261017)
+
+Folded from the swamp-e2e receipts. The target VPS address is redacted as
+`<vps1>`; 192.0.2.1 is the RFC 5737 unreachable probe. Receipt hashes were taken
+over the unredacted console output.
+
+Source: lane/d1 head 70b698f (ssh_host.ts sha256 5ff46ece…, _lib/ssh.ts sha256
+23074b45…), installed locally into swamp-e2e. Every cell below was run on
+70b698f. The earlier 5a0ede5 matrix (11/11 pass) is kept in ssh-host-5a0ede5.md.
+Target: shared VPS, user root, key from vault, strict pins from ssh-keyscan. Run
+through the model's real entry point (swamp model method run), never --json.
+Receipt hash = first 16 hex of sha256 of the run's console output with
+timestamps stripped.
+
+| Cell                                              | Result | Detail                                                                                                                                                                                                                                                       | Time (UTC)           | Receipt          |
+| ------------------------------------------------- | ------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | -------------------- | ---------------- |
+| 1 exec success                                    | PASS   | exit 0, stdout_sha256 == local sha256(hello-e2e)                                                                                                                                                                                                             | 2026-10-17T12:07:53Z | d2007a5a291a62dc |
+| 2 exec non-zero                                   | PASS   | exit_code 7 returned as data, run succeeded, no throw                                                                                                                                                                                                        | 2026-10-17T12:07:58Z | 9c849bc9b84bbb8a |
+| 3 upload                                          | PASS   | upload sha256 == local; changed=true                                                                                                                                                                                                                         | 2026-10-17T12:08:13Z | 00c4b014c96de4d2 |
+| 3b upload read-back                               | PASS   | remote sha256sum + mode 600 read back via exec == local                                                                                                                                                                                                      | 2026-10-17T12:08:19Z | 2d015d8c28352367 |
+| 10 idempotent re-run                              | PASS   | console: already current, no write; upload resource version unchanged (before=[v1] after=[v1])                                                                                                                                                               | 2026-10-17T12:08:27Z | d4c35e47d58b2bd7 |
+| 4 wait_connection                                 | PASS   | reachable=true                                                                                                                                                                                                                                               | 2026-10-17T12:08:33Z | 1f871f41bf635ad3 |
+| 5 strict host-key match                           | PASS   | connects under strict with pinned keys; id -un == root                                                                                                                                                                                                       | 2026-10-17T12:08:38Z | 31e2623c5d57bd8a |
+| 6 strict mismatch                                 | PASS   | wrong pin refused: Error: host key verification failed for <vps1>:22; refusing to connect                                                                                                                                                                    | 2026-10-17T12:08:40Z | 213c8fd95ca340e7 |
+| 7 unreachable host                                | PASS   | Error: host 192.0.2.1:22 did not answer SSH with acceptable host keys within 5s                                                                                                                                                                              | 2026-10-17T12:08:47Z | 0c472ca9f35a6dc5 |
+| 8 auth failure                                    | PASS   | Error: authentication failed for root@<vps1>:22                                                                                                                                                                                                              | 2026-10-17T12:08:50Z | f1e1910b99415e2b |
+| 9 injection literal                               | PASS   | ['echo','a;id'] -> stdout == 'a;id\n' (one argv word)                                                                                                                                                                                                        | 2026-10-17T12:08:55Z | 9dae74df1afeff43 |
+| 9b injection: $(), backtick, newline, quote-break | PASS   | none created /tmp/swamp-e2e-pwn (test -e exit 1)                                                                                                                                                                                                             | 2026-10-17T12:09:13Z | e2444ab28855a741 |
+| X1 over-cap output                                | PASS   | Error: ssh stdout exceeded the 100-byte capture limit                                                                                                                                                                                                        | 2026-10-17T12:09:16Z | 390b4d3f67f21df3 |
+| X2 upload onto symlink                            | PASS   | refused; symlink and target intact: Error: upload destination root@<vps1>:/tmp/swamp-e2e-link is a symlink; refusing to follow it                                                                                                                            | 2026-10-17T12:09:27Z | 268a3b5fe36ef418 |
+| X3 upload onto directory                          | PASS   | Error: upload destination root@<vps1>:/tmp is a directory                                                                                                                                                                                                    | 2026-10-17T12:09:30Z | 85f7b59ea0eb40ee |
+| X4 upload unwritable path                         | PASS   | typed error, no partial file: Error: upload to root@<vps1>:/nonexistent-dir/f failed (exit 1)                                                                                                                                                                | 2026-10-17T12:09:39Z | ff47b381413a31f7 |
+| X5 pin for a different host (strict)              | PASS   | refused: Error: host_keys were supplied but none apply to <vps1>:22                                                                                                                                                                                          | 2026-10-17T12:09:41Z | da1b064e4d8fe756 |
+| X5b pin for a different host (insecure_tofu)      | FAIL   | insecure_tofu with a supplied pin for another host connected and ran (exit 0); expected refusal. Cause (ssh_host.ts pinnedTarget): with a recorded key the caller host_keys are overwritten by the recorded set, so the supplied pin is ignored, not checked | 2026-10-17T12:09:44Z | 7d70f8d211604375 |
+| X6 remote exit 255                                | PASS   | typed transport error, never a remote exit code: Error: ssh transport failed for <vps1>:22 (exit 255)                                                                                                                                                        | 2026-10-17T12:09:47Z | 89a77fc2a2855662 |
+| X7a insecure_tofu first contact                   | PASS   | connects, records first key                                                                                                                                                                                                                                  | 2026-10-17T12:09:52Z | a15d6110a24f4987 |
+| X7b tofu second run, wrong pin                    | FAIL   | insecure_tofu second run with a deliberately wrong host_keys connected and ran (exit 0); expected refusal. Same cause: recorded keys replace the supplied pin silently                                                                                       | 2026-10-17T12:09:55Z | 15c0a6544d3a638a |
+| X7c tofu third run, recorded pin                  | PASS   | still connects with the recorded key                                                                                                                                                                                                                         | 2026-10-17T12:10:00Z | a15d6110a24f4987 |
+| X8 wait_connection wrong pin                      | PASS   | Error: host key mismatch for ssh-ed25519                                                                                                                                                                                                                     | 2026-10-17T12:10:03Z | ac911585eb51f320 |
+
+### Summary
+
+21 of 23 cells pass on 70b698f; 2 fail (X5b, X7b), both the same behaviour:
+under `insecure_tofu` with a recorded key, a caller-supplied `host_keys` is
+silently replaced by the recorded set and never compared, so a wrong or
+other-host pin is not refused. `strict` refuses both (6, X5, X8). Not testable
+live without rotating the shared VPS's host keys: a recorded key that then
+changes. Cleanup: /tmp/swamp-e2e-* test files removed from the VPS; no secret
+found in .swamp, receipts or models (grep for private-key armor).
+
+### Re-run on lane/d1 6773984 (ssh_host.ts sha256 599da438…, _lib/ssh.ts 23074b45… unchanged)
+
+| Cell                                     | Result | Detail                                                                           | Time (UTC)           | Receipt          |
+| ---------------------------------------- | ------ | -------------------------------------------------------------------------------- | -------------------- | ---------------- |
+| X7b tofu + recorded key, wrong pin       | PASS   | [6773984] Error: host key mismatch for ssh-rsa                                   | 2026-10-17T12:14:08Z | fbfb17fbd5dbcdd9 |
+| X5b tofu + recorded key, other-host pin  | PASS   | [6773984] Error: host_keys were supplied but none apply to <vps1>:22             | 2026-10-17T12:14:09Z | da1b064e4d8fe756 |
+| X9 tofu + recorded key, MATCHING pin     | PASS   | [6773984] connects, exit 0                                                       | 2026-10-17T12:14:17Z | 0b1162b302b33230 |
+| X7c tofu, recorded pin, no supplied keys | PASS   | [6773984] still connects                                                         | 2026-10-17T12:14:22Z | a15d6110a24f4987 |
+| 6 strict wrong pin (regression)          | PASS   | [6773984] Error: host key verification failed for <vps1>:22; refusing to connect | 2026-10-17T12:14:24Z | 213c8fd95ca340e7 |
+| 9 injection literal (regression)         | PASS   | [6773984]                                                                        | 2026-10-17T12:14:29Z | 78df4e4c72511d45 |
+
+Result on 6773984: X5b and X7b now refuse (X7b: "host key mismatch", X5b:
+"host_keys were supplied but none apply"); a matching pin with a recorded key
+still connects (X9, X7c). Regression cells 6 and 9 pass. With the 70b698f
+results for the other 21 cells (transport code in _lib/ssh.ts unchanged between
+the two heads, sha256 23074b45…): 23/23.
+
+## Review ledger: final verify (codex astra + terra on 6773984) and merge prep
+
+- No unrefuted Critical/High. terra's HIGH (two concurrent first-use
+  `insecure_tofu` calls race on the pin write) is downgraded to MEDIUM under the
+  run rulings: it needs distributed locking for a single-orchestrator op, and
+  first use is trust-on-first-use by definition.
+- Known residuals for the next version: MEDIUM argv has no allowlist grammar
+  beyond NUL (quoting is the defence for a generic exec); MEDIUM `ssh-keyscan`
+  output is not capped; MEDIUM a Linux target with no `sha256sum`/`shasum` fails
+  only after the rename; MEDIUM SHA-256 of low-entropy output or content can be
+  guessed; LOW `exec`/`upload` descriptions misstate `return_output` and the
+  mode-only path; LOW duplicated known_hosts setup and test fakes.
+- Merge prep `9e94c5a`: plain
+  `export const model = { ...createModel(), type,
+  version } satisfies SshHostModel`,
+  because the dry run flagged `uncatalogued-model`. Lanes vendoring this model
+  should resync it.

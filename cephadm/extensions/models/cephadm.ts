@@ -3210,7 +3210,7 @@ export function createCephadmModel(overrides: Partial<CephadmDeps> = {}) {
     cephRgwBucketEnsure: {
       kind: "action" as const,
       description:
-        "Ensure the bucket exists, is owned, private and fully Public-Access-Blocked, and prove anonymous listing is refused. Iff the probe runs, it also proves that public object ACLs cannot leak through the fixed probe prefix; a leaking or unprovable bucket throws and writes no record.",
+        "DESTRUCTIVE. Ensure the bucket exists, is owned, private and fully Public-Access-Blocked, and prove anonymous listing is refused; an existing ACL is reset to private, dropping any other grants. Iff the probe runs it also proves public object ACLs cannot leak through the fixed probe prefix, and a leaking or unprovable bucket throws and writes no record.",
       arguments: BucketEnsureArgs,
       execute: async (
         args: z.infer<typeof BucketEnsureArgs>,
@@ -3228,7 +3228,7 @@ export function createCephadmModel(overrides: Partial<CephadmDeps> = {}) {
     cephRgwBucketPolicyEnsure: {
       kind: "action" as const,
       description:
-        "Refuse a public or self-locking policy before any request, then write the caller's policy verbatim and prove it with a canonical read-back and an anonymous-list probe. Rolls back on failure, lifting and restoring BlockPublicPolicy when needed, and writes no record on any failure.",
+        "DESTRUCTIVE. Replace the bucket's policy with the caller's document, after refusing a public or self-locking policy before any request, and prove it with a canonical read-back and an anonymous-list probe. Rolls back on failure, lifting and restoring BlockPublicPolicy when needed, and writes no record on any failure.",
       arguments: BucketPolicyArgs,
       execute: async (
         args: z.infer<typeof BucketPolicyArgs>,

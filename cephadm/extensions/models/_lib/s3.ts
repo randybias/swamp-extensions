@@ -73,8 +73,12 @@ function stripUrls(text: string): string {
     .trim();
 }
 
+/** The most response body bytes the seam will buffer. */
+export const MAX_RESPONSE_BYTES = 1_048_576;
+
 /** Classifies a fetch rejection, producing a URL-free detail. */
 function classifyFetchError(e: unknown): HttpError {
+  if (e instanceof HttpError) return e;
   const message = e instanceof Error ? e.message : String(e);
   const clean = stripUrls(message).slice(0, 300);
   if (
@@ -88,6 +92,37 @@ function classifyFetchError(e: unknown): HttpError {
     return new HttpError("unreachable", clean || "the request timed out");
   }
   return new HttpError("unreachable", clean || "the connection failed");
+}
+
+/** Reads a response body up to `cap` bytes, refusing anything larger. */
+async function readBounded(
+  res: Response,
+  cap: number,
+): Promise<string> {
+  const reader = res.body?.getReader();
+  if (reader === undefined) return "";
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    total += value.byteLength;
+    if (total > cap) {
+      await reader.cancel().catch(() => undefined);
+      throw new HttpError(
+        "unreachable",
+        `the response body exceeded the ${cap}-byte cap`,
+      );
+    }
+    chunks.push(value);
+  }
+  const merged = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    merged.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return new TextDecoder().decode(merged);
 }
 
 /** Production fetch seam: one fresh connection per request, no keep-alive. */
@@ -106,7 +141,11 @@ export const denoFetch: FetchFn = async (request) => {
     res.headers.forEach((value, key) => {
       headers[key.toLowerCase()] = value;
     });
-    return { status: res.status, headers, body: await res.text() };
+    return {
+      status: res.status,
+      headers,
+      body: await readBounded(res, MAX_RESPONSE_BYTES),
+    };
   } catch (e) {
     throw classifyFetchError(e);
   } finally {
@@ -1356,6 +1395,26 @@ function statementTargetsOwner(
 }
 
 /**
+ * True when a Deny's Condition can never change the outcome: no Condition at
+ * all, or a Bool `aws:SecureTransport` that matches both true and false (so it
+ * applies on every request and equally locks the owner out).
+ */
+function conditionAlwaysApplies(condition: JsonValue | undefined): boolean {
+  if (condition === undefined) return true;
+  if (!isObject(condition)) return false;
+  const operators = Object.keys(condition);
+  if (operators.length !== 1 || operators[0] !== "Bool") return false;
+  const bool = condition.Bool;
+  if (!isObject(bool)) return false;
+  const keys = Object.keys(bool);
+  if (keys.length !== 1 || keys[0] !== "aws:SecureTransport") return false;
+  const values = conditionList(bool["aws:SecureTransport"]);
+  if (values === null) return false;
+  const lowered = new Set(values.map((v) => v.toLowerCase()));
+  return lowered.has("true") && lowered.has("false");
+}
+
+/**
  * Returns the management actions an unconditional Deny would take from the
  * owner. A non-empty result means the policy locks its own owner out.
  */
@@ -1371,7 +1430,7 @@ export function ownerLockout(
   const denied = new Set<string>();
   for (const { raw } of statements) {
     if (raw.Effect !== "Deny") continue;
-    if (isObject(raw.Condition)) continue;
+    if (!conditionAlwaysApplies(raw.Condition)) continue;
     if (!statementCoversBucket(raw, bucketArn)) continue;
     if (!statementTargetsOwner(raw, ownerId, tenant, uid)) continue;
     const actions = stringList(raw.Action);
@@ -1465,6 +1524,47 @@ async function putProbeObject(
   });
 }
 
+/** Sets `public-read` on an object with PutObjectAcl (`PUT ?acl`), no body. */
+async function putProbeAcl(
+  ctx: S3Context,
+  key: string,
+): Promise<Outcome> {
+  return await send(ctx, {
+    method: "PUT",
+    path: `/${ctx.bucket}/${key}`,
+    query: { acl: "" },
+    headers: { "x-amz-acl": "public-read" },
+    signed: true,
+  });
+}
+
+/** Lists every object version stored under `key`, or null when unreadable. */
+async function listObjectVersions(
+  ctx: S3Context,
+  key: string,
+): Promise<string[] | null> {
+  const res = await send(ctx, {
+    method: "GET",
+    path: `/${ctx.bucket}`,
+    query: { versions: "", prefix: key },
+    signed: true,
+  });
+  if (res.kind !== "answered" || res.status !== 200) return null;
+  try {
+    const root = parseS3Xml(res.body);
+    const entries = [
+      ...childrenOf(root, "Version"),
+      ...childrenOf(root, "DeleteMarker"),
+    ];
+    return entries
+      .filter((entry) => childText(entry, "Key") === key)
+      .map((entry) => childText(entry, "VersionId"))
+      .filter((version) => version !== "");
+  } catch {
+    return null;
+  }
+}
+
 async function deleteProbeObject(
   ctx: S3Context,
   key: string,
@@ -1479,6 +1579,28 @@ async function deleteProbeObject(
     signed: true,
   });
   return res.kind === "answered" && res.status >= 200 && res.status < 300;
+}
+
+/**
+ * Deletes every version of a probe object, so a retried or versioned PutObject
+ * cannot leave a public version behind. Falls back to the PutObject version id
+ * (or the key itself) when the version listing is unreadable.
+ */
+async function cleanupProbeObject(
+  ctx: S3Context,
+  key: string,
+  putVersionId: string,
+): Promise<boolean> {
+  const versions = await listObjectVersions(ctx, key);
+  if (versions !== null && versions.length > 0) {
+    let ok = true;
+    for (const version of versions) {
+      const id = version === "null" ? "" : version;
+      if (!await deleteProbeObject(ctx, key, id)) ok = false;
+    }
+    return ok;
+  }
+  return await deleteProbeObject(ctx, key, putVersionId);
 }
 
 async function anonymousGet(ctx: S3Context, key: string): Promise<number> {
@@ -1512,9 +1634,9 @@ async function objectLeakProbe(
     );
   }
   const cannedVersion = canned.headers["x-amz-version-id"] ?? "";
-  const acl = await putProbeObject(ctx, cannedKey, {
-    "x-amz-acl": "public-read",
-  });
+  // The public-read step is PutObjectAcl (?acl), never a second PutObject: a
+  // second PutObject on a versioned bucket would leave an undeleted version.
+  const acl = await putProbeAcl(ctx, cannedKey);
   const objectAclStatus = statusOf(acl);
   const anonymousObjectStatus = await anonymousGet(ctx, cannedKey);
   let storedGrant = false;
@@ -1534,10 +1656,10 @@ async function objectLeakProbe(
   }
   // Cleanup always runs, by version id when one was returned.
   const leftBehind: string[] = [];
-  if (!await deleteProbeObject(ctx, cannedKey, cannedVersion)) {
+  if (!await cleanupProbeObject(ctx, cannedKey, cannedVersion)) {
     leftBehind.push(cannedKey);
   }
-  if (storedGrant && !await deleteProbeObject(ctx, grantKey, grantVersion)) {
+  if (storedGrant && !await cleanupProbeObject(ctx, grantKey, grantVersion)) {
     leftBehind.push(grantKey);
   }
   if (leftBehind.length > 0) {
@@ -2050,8 +2172,26 @@ export async function bucketPolicyEnsure(
     const pab = await readPab(ctx);
     if (pab !== null && pab.blockPublicPolicy) {
       originalPab = pab;
-      await writePab(ctx, { ...pab, blockPublicPolicy: false }, "pab-lift");
-      pabLiftedForWrite = true;
+      try {
+        await writePab(ctx, { ...pab, blockPublicPolicy: false }, "pab-lift");
+        pabLiftedForWrite = true;
+      } catch {
+        // The lift PUT may have landed even though its read-back failed, so
+        // put the original block back and report whether that succeeded.
+        let restored = false;
+        try {
+          await writePab(ctx, originalPab, "pab-restore");
+          restored = true;
+        } catch {
+          restored = false;
+        }
+        fail(
+          "pab-lift",
+          restored
+            ? "the Public Access Block lift failed but the original block was restored"
+            : "the Public Access Block lift failed and the original block could NOT be restored",
+        );
+      }
     }
   }
   let wrote = false;
@@ -2068,15 +2208,25 @@ export async function bucketPolicyEnsure(
         body: encoder.encode(args.policyDocument),
         signed: true,
       });
-      if (
-        put.kind !== "answered" ||
-        (put.status !== 200 && put.status !== 204)
-      ) {
-        fail("policy-write", "the policy write was not accepted", {
-          status: statusOf(put),
-        });
+      if (put.kind === "answered") {
+        if (put.status !== 200 && put.status !== 204) {
+          fail("policy-write", "the policy write was not accepted", {
+            status: put.status,
+          });
+        }
+        wrote = true;
+      } else {
+        // Indeterminate: assume it landed until a re-read says otherwise, so
+        // the rollback runs if the re-read itself fails.
+        wrote = true;
+        const after = await readPolicyRaw(ctx);
+        if (canonicaliseStoredPolicy(after, ctx.bucket) === beforeCanonical) {
+          wrote = false;
+          fail("policy-write", "the policy write was not accepted", {
+            status: 0,
+          });
+        }
       }
-      wrote = true;
       const readBack = await readPolicyRaw(ctx);
       if (
         canonicaliseStoredPolicy(readBack, ctx.bucket) !== analysis.canonical
@@ -2096,8 +2246,18 @@ export async function bucketPolicyEnsure(
   }
   let policyOutcome = "";
   if (blockFailure !== null && wrote) {
-    const restored = await applyPolicyState(ctx, previous);
-    policyOutcome = restored
+    const applied = await applyPolicyState(ctx, previous);
+    let confirmed = false;
+    if (applied) {
+      try {
+        const back = await readPolicyRaw(ctx);
+        confirmed = canonicaliseStoredPolicy(back, ctx.bucket) ===
+          beforeCanonical;
+      } catch {
+        confirmed = false;
+      }
+    }
+    policyOutcome = confirmed
       ? (hadPolicyBefore
         ? "RESTORED; previous policy was put back"
         : "RESTORED")

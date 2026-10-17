@@ -275,3 +275,24 @@ a secret. Fixtures are synthetic only (RFC 5737 addresses, `.test` names).
   error; request transport detail is URL-stripped and truncated. 49 new unit
   tests (274 total) inject a scripted `fetch`, so no socket is opened; gates 0-6
   pass offline.
+- 2026-10-17: S3-plane review round 2 (delta vs 6807776). Fixes:
+  - HIGH: the object-leak public-read step was a second PutObject; it is now
+    `PUT ?acl` with `x-amz-acl: public-read` (empty body), so a versioned bucket
+    gains no extra version. Cleanup now lists object versions under each probe
+    key (`GET ?versions&prefix=`) and deletes every version by `versionId`,
+    falling back to the PutObject version id when the listing is unreadable, so
+    a retried or versioned probe cannot leave a public version.
+  - MEDIUM: a failed PAB lift now best-effort restores the original block and
+    says in the error whether it was restored.
+  - MEDIUM: a non-answered policy PUT is treated as indeterminate: the policy is
+    re-read, the rollback runs if it changed (or the re-read fails), and
+    RESTORED is reported only after a canonical read-back confirms it.
+  - MEDIUM: cephRgwBucketEnsure and cephRgwBucketPolicyEnsure now lead with
+    `DESTRUCTIVE.` and name what is replaced.
+  - MEDIUM: the fetch seam caps the response body at 1 MiB and throws a URL-free
+    transport error past the cap.
+  - LOW: added the AWS published examplebucket SigV4 known-answer tests (GET
+    Object and List Objects).
+  - LEAD RULING: self-lockout detection now also refuses a Deny on
+    `aws:SecureTransport` whose condition matches both true and false (it
+    applies on every request and would lock the owner out).

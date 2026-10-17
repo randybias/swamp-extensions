@@ -1467,3 +1467,170 @@ Deno.test("hygiene: no record, log or error carries the secret", async () => {
   assertEquals(blob.includes("secretKey"), false);
   assertEquals(blob.length > 0, true);
 });
+
+Deno.test("SigV4 known-answer: AWS examplebucket GET Object", async () => {
+  const signed = await signRequest({
+    method: "GET",
+    origin: "https://examplebucket.s3.amazonaws.com",
+    path: "/test.txt",
+    query: {},
+    headers: { range: "bytes=0-9" },
+    body: new Uint8Array(),
+    region: "us-east-1",
+    accessKey: "AKIDEXAMPLE",
+    secretKey: "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+    timestamp: Date.UTC(2013, 4, 24, 0, 0, 0),
+  });
+  assertEquals(
+    signed.headers["Authorization"].includes(
+      "Signature=f0e8bdb87c964420e857bd35b5d6ed310bd44f0170aba48dd91039c6036bdb41",
+    ),
+    true,
+    signed.headers["Authorization"],
+  );
+});
+
+Deno.test("SigV4 known-answer: AWS examplebucket List Objects", async () => {
+  const signed = await signRequest({
+    method: "GET",
+    origin: "https://examplebucket.s3.amazonaws.com",
+    path: "/",
+    query: { "max-keys": "2", prefix: "J" },
+    headers: {},
+    body: new Uint8Array(),
+    region: "us-east-1",
+    accessKey: "AKIDEXAMPLE",
+    secretKey: "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+    timestamp: Date.UTC(2013, 4, 24, 0, 0, 0),
+  });
+  assertEquals(
+    signed.headers["Authorization"].includes(
+      "Signature=34b48302e7b5fa45bde8084f4b7868a86f0a534bc59db6670ed5711ef69dc6f7",
+    ),
+    true,
+    signed.headers["Authorization"],
+  );
+});
+
+Deno.test("owner lockout: SecureTransport matching both true and false locks out", () => {
+  const doc = JSON.stringify({
+    Version: "2012-10-17",
+    Statement: {
+      Effect: "Deny",
+      Principal: "*",
+      Action: "s3:*",
+      Resource: "arn:aws:s3:::data-01",
+      Condition: { Bool: { "aws:SecureTransport": ["true", "false"] } },
+    },
+  });
+  assertEquals(
+    ownerLockout(analysePolicy(doc, "data-01").statements, "owner-1", "data-01")
+      .length,
+    3,
+  );
+});
+
+Deno.test("ensure: public-read is PutObjectAcl and every probe version is deleted", async () => {
+  const stem = `${PROBE_PREFIX}${NOW}`;
+  const cannedKey = `${stem}-canned`;
+  const grantKey = `${stem}-grant`;
+  const objectPuts: string[] = [];
+  const deletes: string[] = [];
+  const { fetch, calls } = fakeFetch((_req, p) => {
+    if (p.path === "/data-01" && p.query.publicAccessBlock !== undefined) {
+      if (_req.method === "PUT") return ok();
+      return ok(PAB_FULL);
+    }
+    if (p.path === "/data-01" && p.query.acl !== undefined) {
+      return ok(ACL_PRIVATE);
+    }
+    if (p.path === "/data-01" && p.query["list-type"] !== undefined) {
+      return p.signed ? { status: 200 } : { status: 403 };
+    }
+    if (p.path === "/data-01" && p.query.versions !== undefined) {
+      const key = p.query.prefix ?? "";
+      if (key === cannedKey) {
+        return ok(
+          `<ListVersionsResult><Version><Key>${cannedKey}</Key><VersionId>v1</VersionId></Version><Version><Key>${cannedKey}</Key><VersionId>v2</VersionId></Version></ListVersionsResult>`,
+        );
+      }
+      if (key === grantKey) {
+        return ok(
+          `<ListVersionsResult><Version><Key>${grantKey}</Key><VersionId>g1</VersionId></Version></ListVersionsResult>`,
+        );
+      }
+      return ok(`<ListVersionsResult/>`);
+    }
+    if (p.path === "/data-01" && _req.method === "HEAD") return { status: 200 };
+    if (p.path.startsWith("/data-01/")) {
+      const key = p.path.slice("/data-01/".length);
+      if (_req.method === "PUT") {
+        if (p.query.acl !== undefined) return ok();
+        objectPuts.push(key);
+        return {
+          status: 200,
+          headers: {
+            "x-amz-version-id": key.endsWith("-grant") ? "g1" : "v-new",
+          },
+        };
+      }
+      if (_req.method === "GET") return { status: 403 };
+      if (_req.method === "DELETE") {
+        deletes.push(`${key}@${p.query.versionId ?? ""}`);
+        return { status: 204 };
+      }
+    }
+    return { status: 500 };
+  });
+  const rec = await bucketEnsure({ fetch, now: () => NOW }, ensureBase());
+  assertEquals(rec.objectLeakProbe, "refused");
+  assertEquals(objectPuts.length, 2);
+  assertEquals(
+    calls.some((c) =>
+      c.method === "PUT" && new URL(c.url).searchParams.has("acl")
+    ),
+    true,
+  );
+  assertEquals(deletes.includes(`${cannedKey}@v1`), true);
+  assertEquals(deletes.includes(`${cannedKey}@v2`), true);
+  assertEquals(deletes.includes(`${grantKey}@g1`), true);
+});
+
+Deno.test("policy: a failed PAB lift restores the original block and says so", async () => {
+  let pabWrites = 0;
+  let full = true;
+  const { fetch } = fakeFetch((_req, p) => {
+    if (p.path === "/data-01" && p.query.publicAccessBlock !== undefined) {
+      if (_req.method === "PUT") {
+        pabWrites++;
+        if (pabWrites === 1) throw new HttpError("unreachable", "lost");
+        full = parsePab(_req.body).blockPublicPolicy;
+        return ok();
+      }
+      return ok(renderPabBody(parsePab(PAB_FULL)));
+    }
+    if (p.path === "/data-01" && p.query.acl !== undefined) {
+      return ok(ACL_PRIVATE);
+    }
+    if (p.path === "/data-01" && p.query.policy !== undefined) {
+      return {
+        status: 404,
+        body: `<Error><Code>NoSuchBucketPolicy</Code></Error>`,
+      };
+    }
+    if (p.path === "/data-01") return { status: 200 };
+    return { status: 500 };
+  });
+  let message = "";
+  try {
+    await bucketPolicyEnsure(
+      { fetch, now: () => NOW },
+      { ...ARGS, policyDocument: POLICY_OK },
+    );
+  } catch (e) {
+    message = (e as Error).message;
+  }
+  assertEquals(message.includes("cephadm[pab-lift]"), true);
+  assertEquals(message.includes("restored"), true);
+  assertEquals(full, true);
+});

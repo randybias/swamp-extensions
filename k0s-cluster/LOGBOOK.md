@@ -396,7 +396,7 @@ Verdict: NONE (adjacent only), so there is nothing to adopt or file upstream.
 ## 2026-10-17: live e2e (2026.10.17.3)
 
 Target: `<bm1>` (Cherry bare metal, Ubuntu 24.04, root, strict host-key pins,
-SSH key from vault), single node, pod 10.244.0.0/16, service 10.96.0.0/12. k0s
+SSH key from vault), single node, k0s's usual pod and service CIDRs. k0s
 v1.36.3+k0s.2 and v1.36.4+k0s.1 amd64, SHA-256 from the official
 `sha256sums.txt`. Heads: lane/d3-k0s-cluster-3 `8d63885` (first matrix, with the
 published 2026.10.17.2 as the baseline for cell 1 and the render comparison) and
@@ -480,6 +480,10 @@ Residuals:
   update has_helm_values, so the script's refusal is what kept R6 unknown.
 - LOW: `k0s.old` is removed after a successful upgrade; it is kept only when a
   rollback fails, so there is no manual roll-back copy afterwards.
+- MEDIUM (terra, `9a11d94`): if the upgrade succeeds on the host but the state
+  write or the `k0s.old` removal fails, the stale `k0s.old` makes a later
+  upgrade refuse until it is removed by hand. Make the cleanup resumable (a
+  pending-cleanup flag, as reset has).
 - MEDIUM (documented in the README): a 2026.10.17.2 record whose host came from
   the vault stays unreadable (swamp-club lab 3585): the host was stored masked
   and swamp cannot resolve the record. Recover by running `install` again to

@@ -1516,3 +1516,193 @@ Deno.test("22 a mounted non-root filesystem outside fstab also needs a known typ
   refused(plain({ ...mounted, lsblk: rows("xfs") }), ["/dev/sdb"], "protected");
   safe(plain({ ...mounted, lsblk: rows("xfs") }), ["/dev/sdc"]);
 });
+
+// --- round 3: siblings of a protected partition are not protected ----------------
+
+/** The Cherry two-disk layout: root RAID1 on sdX1, free space in sdX2. */
+function twinHost(opts: {
+  sibling?: Partial<Dev>;
+  extra?: Partial<ProbeInputs>;
+} = {}): ProbeInputs {
+  const u = ARRAY_UUID.replaceAll(":", "-");
+  const member = (n: string): Dev => ({
+    name: `${n}1`,
+    type: "part",
+    fstype: "linux_raid_member",
+    uuid: u,
+    children: [{ name: "md0", type: "raid1", fstype: "ext4", mounts: ["/"] }],
+  });
+  const free = (n: string): Dev => ({
+    name: `${n}2`,
+    type: "part",
+    ...(opts.sibling ?? {}),
+  });
+  return plain({
+    lsblk: lsblk(
+      { name: "sda", type: "disk", children: [member("sda"), free("sda")] },
+      { name: "sdb", type: "disk", children: [member("sdb"), free("sdb")] },
+    ),
+    findmnt: findmnt({ target: "/", source: "/dev/md0", fstype: "ext4" }),
+    fstab: file("/dev/md0 / ext4 defaults 0 1\n"),
+    mdstat: file("md0 : active raid1 sdb1[1] sda1[0]\n"),
+    links: ok(
+      "/dev/disk/by-id/ata-EXAMPLE_A-part2 /dev/sda2\n" +
+        "/dev/disk/by-id/ata-EXAMPLE_B-part2 /dev/sdb2\n",
+    ),
+    mdExamine: {
+      "/dev/sda1": ok(examineOut(ARRAY_UUID)),
+      "/dev/sdb1": ok(examineOut(ARRAY_UUID)),
+    },
+    ...opts.extra,
+  });
+}
+
+Deno.test("23a whole disks of the twin layout are refused", () => {
+  const input = twinHost();
+  refused(input, ["/dev/sda"], "protected");
+  refused(input, ["/dev/sdb"], "protected");
+});
+
+Deno.test("23b a free sibling partition is allowed, plain and by-id", () => {
+  const input = twinHost();
+  safe(input, ["/dev/sda2"]);
+  safe(input, ["/dev/sdb2"]);
+  safe(input, ["/dev/disk/by-id/ata-EXAMPLE_A-part2"]);
+  safe(input, ["/dev/sda2", "/dev/sdb2"]);
+  // The protected partitions themselves stay refused, however they are named.
+  refused(input, ["/dev/sda1"], "protected");
+  refused(input, ["/dev/sda2", "/dev/sdb1"], "protected");
+});
+
+Deno.test("23c a sibling that is swap, in fstab, a PV of root's VG or an array member is refused", () => {
+  // active swap
+  refused(
+    twinHost({
+      sibling: { fstype: "swap" },
+      extra: {
+        swaps: file(SWAP_HEADER + "/dev/sda2 partition 100 0 -2\n"),
+      },
+    }),
+    ["/dev/sda2"],
+    "protected",
+  );
+  // listed in fstab
+  refused(
+    twinHost({
+      sibling: { fstype: "ext4", uuid: "44444444-5555-6666-7777-888888888888" },
+      extra: {
+        fstab: file(
+          "/dev/md0 / ext4 defaults 0 1\nUUID=44444444-5555-6666-7777-888888888888 /srv ext4 nofail 0 2\n",
+        ),
+      },
+    }),
+    ["/dev/sda2"],
+    "protected",
+  );
+  // member of the root array that dropped out
+  refused(
+    twinHost({
+      sibling: {
+        fstype: "linux_raid_member",
+        uuid: ARRAY_UUID.replaceAll(":", "-"),
+      },
+      extra: {
+        mdExamine: {
+          "/dev/sda1": ok(examineOut(ARRAY_UUID)),
+          "/dev/sdb1": ok(examineOut(ARRAY_UUID)),
+          "/dev/sda2": ok(examineOut(ARRAY_UUID)),
+          "/dev/sdb2": ok(examineOut(ARRAY_UUID)),
+        },
+      },
+    }),
+    ["/dev/sda2"],
+    "protected",
+  );
+});
+
+Deno.test("23d a sibling that is a PV of the root volume group is refused", () => {
+  const input = plain({
+    lsblk: lsblk(
+      {
+        name: "sda",
+        type: "disk",
+        children: [
+          {
+            name: "sda1",
+            type: "part",
+            fstype: "LVM2_member",
+            children: [
+              { name: "vg0-root", type: "lvm", fstype: "ext4", mounts: ["/"] },
+            ],
+          },
+          { name: "sda2", type: "part", fstype: "LVM2_member" },
+          { name: "sda3", type: "part" },
+        ],
+      },
+    ),
+    findmnt: findmnt({
+      target: "/",
+      source: "/dev/mapper/vg0-root",
+      fstype: "ext4",
+    }),
+    fstab: file(""),
+    links: ok("/dev/mapper/vg0-root /dev/dm-0\n"),
+    pvs: ok("  /dev/sda1  vg0\n  /dev/sda2  vg0\n"),
+  });
+  refused(input, ["/dev/sda2"], "protected");
+  safe(input, ["/dev/sda3"]);
+});
+
+Deno.test("23e udev-less host with working blkid: an empty sibling is allowed", () => {
+  const input = plain({
+    lsblk: bare(
+      {
+        name: "sda",
+        type: "disk",
+        children: [
+          {
+            name: "sda1",
+            type: "part",
+            children: [{ name: "md0", type: "raid1", mounts: ["/"] }],
+          },
+          { name: "sda2", type: "part" },
+        ],
+      },
+      {
+        name: "sdb",
+        type: "disk",
+        children: [
+          {
+            name: "sdb1",
+            type: "part",
+            children: [{ name: "md0", type: "raid1", mounts: ["/"] }],
+          },
+          { name: "sdb2", type: "part" },
+        ],
+      },
+    ),
+    findmnt: findmnt({ target: "/", source: "/dev/md0", fstype: "ext4" }),
+    fstab: file("/dev/md0 / ext4 defaults 0 1\n"),
+    mdstat: file("md0 : active raid1 sdb1[1] sda1[0]\n"),
+    // blkid reports the raid members and md0, and nothing at all for sda2/sdb2.
+    blkid: ok(
+      `/dev/sda1: UUID="${
+        ARRAY_UUID.replaceAll(":", "-")
+      }" TYPE="linux_raid_member"\n` +
+        `/dev/sdb1: UUID="${
+          ARRAY_UUID.replaceAll(":", "-")
+        }" TYPE="linux_raid_member"\n` +
+        `/dev/md0: UUID="11111111-2222-3333-4444-555555555555" TYPE="ext4"\n`,
+    ),
+    mdExamine: {
+      "/dev/sda1": ok(examineOut(ARRAY_UUID)),
+      "/dev/sdb1": ok(examineOut(ARRAY_UUID)),
+    },
+  });
+  safe(input, ["/dev/sda2"]);
+  refused(input, ["/dev/sda"], "protected");
+  // blkid failing: nothing can be told apart, so the same host refuses.
+  for (const failing of [missing, NO_SB, { code: 2, stdout: "" }]) {
+    refused({ ...input, blkid: failing }, ["/dev/sda2"], "unverifiable");
+  }
+});

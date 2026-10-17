@@ -17,6 +17,14 @@
  * ZFS pool that backs one. Device-mapper and md devices that sit on several
  * disks protect all of them.
  *
+ * Protection follows the stack, never the neighbourhood: a protected device,
+ * everything stacked on it and everything those sit on are protected, but a
+ * free partition that merely shares a disk with a protected one is not. The
+ * whole disk is still refused (it contains a protected partition), and a
+ * sibling is refused as soon as a normal rule claims it (fstab, swap, an LVM
+ * physical volume of a protected group, a member of a protected array or
+ * pool).
+ *
  * Accepted limits, because the kernel refuses the destructive write anyway
  * when it opens a device that is mounted, in use as swap or claimed by an
  * assembled md array or device-mapper target (it opens block devices
@@ -384,22 +392,38 @@ function subtree(graph: Graph, path: string): string[] {
   return out;
 }
 
-/** The connected component of a path in the undirected device graph. */
-function component(graph: Graph, path: string): string[] {
-  const out: string[] = [];
+/** Every device `path` sits on or is held by, transitively, and itself. */
+function closure(
+  graph: Graph,
+  path: string,
+  next: (n: Node) => Iterable<string>,
+): Set<string> {
   const seen = new Set<string>();
   const stack = [path];
   while (stack.length > 0) {
     const current = stack.pop()!;
     if (seen.has(current)) continue;
     seen.add(current);
-    out.push(current);
     const node = graph.nodes.get(current);
-    for (const next of [...(node?.parents ?? []), ...(node?.children ?? [])]) {
-      stack.push(next);
-    }
+    if (node) { for (const p of next(node)) stack.push(p); }
   }
-  return out;
+  return seen;
+}
+
+/**
+ * The stack a protected device belongs to: itself, everything stacked on it
+ * (descendants), and everything any of those sit on (ancestors), so the other
+ * members of an array or the other disks of a volume that spans several are
+ * included. It does not spread sideways: a free partition next to a protected
+ * one shares only their disk, and that is not a reason to protect it.
+ */
+function stackOf(graph: Graph, path: string): string[] {
+  const held = closure(graph, path, (n) => n.children);
+  const out = new Set<string>();
+  for (const p of held) {
+    for (const q of closure(graph, p, (n) => n.parents)) out.add(q);
+  }
+  return [...out];
 }
 
 /** The md and swap and zfs lines of the probes, parsed. */
@@ -546,9 +570,9 @@ class Collector {
 
   constructor(private readonly graph: Graph) {}
 
-  /** Protects the whole connected stack around `path`. */
+  /** Protects `path` and the stack it belongs to, but not its siblings. */
   protect(path: string, reason: string): void {
-    for (const p of component(this.graph, path)) {
+    for (const p of stackOf(this.graph, path)) {
       const list = (this.devices[p] ??= []);
       const why = p === path
         ? reason

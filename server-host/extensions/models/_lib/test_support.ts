@@ -34,7 +34,9 @@ export function bodyOf(call: RecordedCall): string {
 
 /** The script inside a `timeout ... sh -c '<script>'; exit $?` stdin text. */
 export function unquoteBody(stdin: string): string {
-  const m = /^timeout -k \d+ \d+ sh -c ('[\s\S]*'); exit \$\?$/.exec(stdin);
+  const m = /^set -eu\ntimeout -k \d+ \d+ sh -c ('[\s\S]*'); exit \$\?$/.exec(
+    stdin,
+  );
   return m === null ? "" : splitQuotedWords(m[1])?.[0] ?? "";
 }
 
@@ -59,17 +61,22 @@ export interface FakeHost extends RecordingRunner {
  * Creates the fake. `respond` sees each remote script (the body, with the
  * deadline wrapper and the data literal included) and answers it; unanswered
  * scripts exit 0 with no output. Local `ssh-agent`, `ssh-add` and
- * `ssh-keyscan` calls get the harness's default replies.
+ * `ssh-keyscan` calls get the harness's default replies. Scripts reach
+ * `BOGWORKS_CAPTURE_SCRIPTS` only when `capture` is true, so the gates see one
+ * pass over every script shape and not a copy per test.
  */
 export function fakeHost(
   respond: (body: string, call: RecordedCall) => HostReply | undefined = () =>
     undefined,
+  capture = false,
 ): FakeHost {
   // The harness recognises a stdin script only behind a bare `sh -s`, not behind
   // `sudo -n`; this mirror feeds it the call without sudo so the scripts reach
   // the capture directory the gates read.
-  const mirror = createRecordingRunner();
+  const off = capture ? {} : { captureDir: "" };
+  const mirror = createRecordingRunner(off);
   const runner = createRecordingRunner({
+    ...off,
     respond: async (call) => {
       if (call.cmd !== "ssh") return undefined;
       await mirror.run("ssh", [

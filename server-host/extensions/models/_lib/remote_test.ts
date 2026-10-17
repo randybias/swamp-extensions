@@ -53,7 +53,7 @@ Deno.test("renderRemote: only `sh -s` is on the command line; the script and its
     deadlineS: 40,
   });
   assertEquals(r.argv, ["sudo", "-n", "sh", "-s"]);
-  assertEquals(r.stdin.startsWith("timeout -k 5 40 sh -c "), true);
+  assertEquals(r.stdin.startsWith("set -eu\ntimeout -k 5 40 sh -c "), true);
   assertEquals(r.stdin.endsWith("; exit $?"), true);
   assertEquals(r.timeoutMs, 65_000);
   assertEquals(JSON.stringify(r.argv).includes("echo"), false);

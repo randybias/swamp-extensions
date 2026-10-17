@@ -375,7 +375,7 @@ Deno.test("executePlan: every step is a stdin script under a remote timeout, not
   assertEquals(calls.length, steps.length);
   for (const c of calls) {
     assertEquals(c.argv[c.argv.length - 1], "'sudo' '-n' 'sh' '-s'");
-    assertEquals(c.stdin?.startsWith("timeout -k 5 "), true);
+    assertEquals(c.stdin?.startsWith("set -eu\ntimeout -k 5 "), true);
     assertEquals(typeof c.timeoutMs, "number");
   }
 });

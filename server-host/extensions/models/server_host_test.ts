@@ -10,6 +10,7 @@ import { bodyOf, fakeHost, unquoteBody } from "./_lib/test_support.ts";
 import {
   assertNoRemoteSecretWrite,
   assertNoSecretOnArgv,
+  createRecordingRunner,
   type Recording,
 } from "./_lib/bogworks/recording-runner.ts";
 import {
@@ -21,6 +22,7 @@ import {
   rulesetSha256,
 } from "./_lib/nftables.ts";
 import { renderSysctlConf } from "./_lib/plans.ts";
+import { renderRevertScript } from "./_lib/armed_revert.ts";
 
 const NOW = 1_700_000_000_000;
 const TOKEN = "0".repeat(16);
@@ -87,6 +89,7 @@ function fakeTransport(
   respond: (command: string) => { code: number; stdout?: string } = () => ({
     code: 0,
   }),
+  capture = false,
 ): Fake {
   const stdins: string[] = [];
   const secrets: [string, string][] = [];
@@ -105,7 +108,7 @@ function fakeTransport(
         ? expectedListing(FIREWALL)
         : "");
     return { code: r.code, stdout };
-  });
+  }, capture);
   const base = host.run;
   const run: CommandRunner = (cmd, args, options = {}) => {
     if (options.stdin) {
@@ -2340,4 +2343,87 @@ Deno.test("resources: data names are distinct within one method run, and carry n
     assertEquals(new Set(names).size, names.length, name);
     for (const n of names) assertEquals(/[\/\\\0]|\.\./.test(n), false, n);
   }
+});
+
+Deno.test("capture: one pass over every script shape, for the dash and bashism gates", async () => {
+  let cancelled = false;
+  let applied = false;
+  const f = fakeTransport((c) => {
+    if (isGuardedApply(c)) applied = true;
+    if (c.includes('systemctl stop "$unit.timer"')) cancelled = true;
+    if (isRouteProbe(c)) return { code: 0, stdout: ROUTES };
+    if (c.includes("nft -j list ruleset")) {
+      return {
+        code: 0,
+        stdout: applied
+          ? expectedListing({ ...FIREWALL, trustedInterfaces: ["cali*"] })
+          : '{"nftables":[]}',
+      };
+    }
+    if (c.includes("nft -j list table")) {
+      return {
+        code: 0,
+        stdout: expectedListing({ ...FIREWALL, trustedInterfaces: ["cali*"] }),
+      };
+    }
+    if (isTimerProbe(c)) {
+      return cancelled
+        ? { code: 3, stdout: "inactive\n" }
+        : { code: 0, stdout: "active\n" };
+    }
+    return { code: 0 };
+  }, true);
+  const m = modelWith(f);
+  const stored = await baseStored("oldops");
+  const ctx = createModelTestContext({
+    globalArgs: {},
+    storedResources: stored,
+  });
+  await m.methods.apply_base.execute(
+    m.methods.apply_base.arguments.parse({
+      ...BASE_ARGS,
+      packages: ["curl", "nftables"],
+      admin_user: "ops",
+      sysctl: { "net.ipv4.ip_forward": "1" },
+    }),
+    ctx.context,
+  );
+  await m.methods.apply_firewall.execute(
+    m.methods.apply_firewall.arguments.parse({
+      ...FIREWALL_ARGS,
+      trusted_interfaces: ["cali*"],
+    }),
+    ctx.context,
+  );
+  await m.methods.get.execute(m.methods.get.arguments.parse(SSH), ctx.context);
+  await m.methods.commit.execute(
+    m.methods.commit.arguments.parse(SSH),
+    ctx.context,
+  );
+  await m.methods.sync.execute(
+    m.methods.sync.arguments.parse(SSH),
+    ctx.context,
+  );
+  const commands = f.commands;
+  for (
+    const shape of [
+      "apt-get install",
+      "useradd",
+      "authorized_keys",
+      "sysctl --system",
+      "systemd-run",
+      "| nft -c -f -",
+      "| nft -f -",
+      "gpasswd",
+      'systemctl stop "$unit.timer"',
+      "ip -j route get",
+    ]
+  ) {
+    assertEquals(commands.some((c) => c.includes(shape)), true, shape);
+  }
+  // The restore script runs from a file on the host, under systemd; it is
+  // captured as the shell script it is.
+  const revert = createRecordingRunner();
+  await revert.run("sh", ["-c", renderRevertScript(TOKEN)]);
+  assertEquals(revert.recording.calls.length, 1);
 });

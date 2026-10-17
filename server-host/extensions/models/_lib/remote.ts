@@ -7,7 +7,7 @@
  * `bw_data` function.
  *
  * Every call carries a remote deadline: the body runs under `timeout` inside a
- * shell that survives it, so a hung command ends as exit 124 or 137 and not as
+ * shell (itself under `set -eu`) that survives it, so a hung command ends as exit 124 or 137 and not as
  * a killed ssh (exit 255, a transport error). The local ssh deadline is set
  * past the remote one, so the host-side bound always fires first.
  *
@@ -92,11 +92,13 @@ export function renderRemote(
 ): { argv: string[]; stdin: string; timeoutMs: number } {
   return {
     argv: withSudo(call.sudo, ["sh", "-s"]),
-    stdin: remoteTimeout({
-      sec: call.deadlineS,
-      killAfterSec: KILL_AFTER_S,
-      body: renderScript(call),
-    }),
+    stdin: `set -eu\n${
+      remoteTimeout({
+        sec: call.deadlineS,
+        killAfterSec: KILL_AFTER_S,
+        body: renderScript(call),
+      })
+    }`,
     timeoutMs: (call.deadlineS + KILL_AFTER_S + LOCAL_SLACK_S) * 1000,
   };
 }

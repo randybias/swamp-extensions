@@ -116,7 +116,7 @@ Deno.test("arm: under the host lock, snapshots, records the marker, then starts 
     true,
   );
   // The script travels on stdin, bounded by a remote deadline.
-  assertEquals(stdin.startsWith("timeout -k 5 60 sh -c "), true);
+  assertEquals(stdin.startsWith("set -eu\ntimeout -k 5 60 sh -c "), true);
   assertEquals(stdin.endsWith("; exit $?"), true);
   for (const bad of [59, 1801, 0, -1, 1.5]) {
     assertThrows(() => armCall(TOKEN, bad, false, SHA), HostConfigError);

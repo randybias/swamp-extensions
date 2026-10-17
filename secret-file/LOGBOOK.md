@@ -225,3 +225,65 @@ the scratch vault emptied afterwards; no provider resource changed.
   - Refuted: a relative destination path (the schema requires an absolute path);
     findings located only in the canonical `_lib/ssh.ts` (reviewed in ssh-host).
   - Pending Randy: rename to `ssh-secret-file` (see Naming and visibility).
+
+## Prior art
+
+Prior art terms: secret, scp, sftp, rsync
+
+Registry search on stable and beta (`swamp extension search`, whole-word
+matches in the package name or description). The package name's segment
+`file` is a plain English word that matches dozens of unrelated packages, so
+the terms name the job: deliver a secret from a vault onto a host as a file,
+the way `scp`, `sftp` or `rsync` would, without the value touching argv or a
+local file. This extends the "Registry evaluation (before building)" section
+above with the full hit list.
+
+- secret:
+  - Vault backends and secret stores: `@sntxrr/scaleway-secret-manager`
+    (stable), `@sntxrr/scaleway-secret-manager-vault` (stable),
+    `@webframp/griptape/secrets` (stable), `@swamp/gcp-sm` (stable),
+    `@swamp/azure-kv` (stable), `@swamp/aws-sm` (stable),
+    `@webframp/hashicorp-vault` (stable), `@swamp/1password` (stable),
+    `@dataverket/sops` (stable), `@zocc/sops-age` (stable),
+    `@svendowideit/systemd-creds` (stable and beta). Each reads and writes
+    secrets in a store; none writes a file onto a remote host. They are
+    sources this extension consumes, not alternatives. NONE.
+  - `@thomas/woodpecker` (stable), `@thomas/forgejo` (stable): CI and forge
+    administration that sets repository secrets through an API; no host
+    file. NONE.
+  - `@mgreten/notification-outbox` (stable): a secret-redacting notification
+    queue; word match only. NONE.
+  - `@sntxrr/scaleway-object-storage` (stable): S3 buckets signed with an
+    access key and secret; word match only. NONE.
+  - `@randybias/k8s-secret` (beta), `@randybias/server-stack` (beta): ours;
+    the Kubernetes counterpart and the stack that composes this extension.
+    Not prior art.
+  - `@kneel/super-productivity` (beta), `@kneel/jlcpcb` (beta),
+    `@svendowideit/test-factory` (beta): API integrations and a test harness
+    that take a secret as input; word matches only. NONE.
+- scp:
+  - `@adam/cfgmgmt` (stable): its `file` type converges content by sha256,
+    but the content is a plain model argument (not vault-oriented) and
+    travels through its SSH session as an argument. OVERLAP (minor),
+    justified: it is not built for vault values and offers no stdin-only
+    delivery.
+  - `@swamp/ssh` (stable): `copy` is scp or rsync from a local file; the
+    secret would have to exist on local disk first and the copy is not
+    hash-converged or atomic. OVERLAP (minor), justified.
+  - `@sntxrr/tailcat-probe` (stable): a Tailscale path probe whose transfer
+    test uses scp; not a file manager. NONE.
+  - `@jentz/aws-vpc-inventory` (stable), `@jentz/aws-vpc-inventory-report`
+    (stable), `@jentz/aws-default-sg-audit` (stable),
+    `@jentz/aws-default-sg-audit-report` (stable),
+    `@jentz/aws-rds-reservations` (stable): "SCP" as in AWS service control
+    policies; word matches only. NONE.
+- sftp: no hits.
+- rsync:
+  - `@wendy/rsync` (stable): local rsync src/dst pairs, run on the host where
+    swamp runs; no vault, no remote target over SSH, no owner or mode
+    convergence. NONE.
+
+Verdict: OVERLAP (minor), justified. No package delivers a vault value onto a
+remote host over stdin with nothing on disk or argv, atomically and
+idempotently by content hash. Worth filing upstream: an atomic,
+hash-verified, stdin-fed copy mode for `@swamp/ssh`.

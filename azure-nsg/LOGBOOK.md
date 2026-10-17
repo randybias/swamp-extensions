@@ -89,3 +89,41 @@ singular-plus-empty-plural read-back shape) cover every path.
   IPv6 prefix validation accepts some malformed forms (shared `_lib`); LOW a
   safe ordered priority swap is refused (conservative); LOW tightness
   (`values.includes("*")`, duplicated grammars and arg interfaces).
+
+## Prior art
+
+Registry search on stable and beta (`swamp extension search`, whole-word
+matches in the package name or description) for `azure-nsg`, `azure` and
+`nsg`.
+
+- azure-nsg, nsg: no hits.
+- azure:
+  - `@dougschaefer/azure` (stable): its `azure-nsg` type has list, get,
+    sync, create and delete, rule CRUD, and `applyRuleSet`, which converges an
+    NSG onto a declared rule set with a plan step, acts only when
+    `dryRun=false` and prunes undeclared rules only when `pruneUndeclared` is
+    set. That is functionally the same idea as this extension. It relies on
+    the ambient `az login` session with no vault-wired service principal.
+    OVERLAP, weakly justified: the justification rests only on the transport
+    and auth model (ARM REST with a vault service principal, no `az`). If
+    `az login` were acceptable, theirs would do the job.
+  - `@nedbellavance/azure-ssh-key` (stable): Azure sshPublicKeys resources
+    through the az CLI. NONE.
+  - `@rkcoleman/azure-containers` (stable), `@rkcoleman/azure-app-service`
+    (stable): Container Apps and App Service over the az CLI. NONE.
+  - `@swamp/azure-kv` (stable): the Key Vault secret backend. NONE.
+  - `@webframp/azure-blob-datastore` (stable),
+    `@webframp/azure-blob-datastore-bootstrap` (stable): a swamp datastore on
+    Blob Storage. NONE.
+  - `@webframp/azure/openai-usage` (stable), `@webframp/ai-usage` (stable),
+    `@webframp/ai-research-mapper` (stable), `@webframp/cost-projection`
+    (stable), `@twonines/cloud-cost-focus` (stable): usage and cost
+    reporting; read-only. NONE.
+  - `@dougschaefer/ms-graph` (stable), `@dougschaefer/purview` (stable):
+    Microsoft Graph and Purview; not Azure networking. NONE.
+  - `@randybias/azure-vm` (beta): ours; the sibling compute type. Not prior
+    art.
+
+Verdict: OVERLAP, weakly justified. Worth filing upstream: vault or
+service-principal auth for `@dougschaefer/azure`, which would remove most of
+the reason to keep this extension.

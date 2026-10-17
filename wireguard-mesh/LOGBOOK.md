@@ -527,3 +527,38 @@ Residuals (not failures, do not block beta):
   7023c53 fixed it with a remote `timeout -k 5` around every script and a
   retrying rollback lock, netns-tested. Live above is on 7023c53, and the
   published bytes are that code. `_lib/ssh.ts` is blob `8f132c43`.
+
+## Prior art
+
+Prior art terms: wireguard, vpn
+
+Registry search on stable and beta (`swamp extension search`, whole-word
+matches in the package name or description). The package name's segment
+`mesh` matches observability and Wi-Fi packages that have nothing to do with
+tunnels, so the terms are the protocol and its generic name.
+
+- wireguard:
+  - `@kitquiet/homelab-ingress` (stable): one point-to-point server/client
+    WireGuard tunnel inside a Traefik ingress bundle, applied over SSH; the
+    private key stays in a file on the host; no multi-peer rendering,
+    allowlist or relay exclusion. OVERLAP (minor), justified: it configures
+    one tunnel for its own ingress, not one node of an N-node mesh.
+  - `@dougschaefer/opnsense-firewall` (stable): reads WireGuard state on an
+    OPNsense appliance over its REST API; manages nothing on a Linux host.
+    NONE.
+  - `@kitquiet/gluetun` (stable): read-only VPN status and public IP for a
+    gluetun container. NONE.
+  - `@magistr/observability-agent` (stable): installs a metrics and logs
+    agent that can bind its exporter to a WireGuard address; it does not
+    configure the interface. NONE.
+  - `@randybias/server-stack` (beta): ours; composes this extension. Not
+    prior art.
+  - `@figy/homelab-otel` (beta): site-specific OpenTelemetry bootstrap; word
+    match only. NONE.
+- vpn: no hits. (Tailscale packages such as `@bitgnome/tailscale` and
+  `@josephholsten/tailscale` solve a different problem: a managed control
+  plane rather than a self-rendered static mesh.)
+
+Verdict: OVERLAP (minor), justified. No package renders one node of a
+multi-peer WireGuard mesh from mesh data and delivers the private key over
+stdin; nothing to file upstream.

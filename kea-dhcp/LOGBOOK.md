@@ -307,3 +307,22 @@ tests green.
   - LOW: `prior.json` is written but unused; `is-enabled` is reduced to a
     boolean (static/enabled-runtime); restore-asset prep is duplicated in
     apply/remove.
+
+## Prior art
+
+Registry search on stable and beta (`swamp extension search`, whole-word
+matches in the package name or description) for `kea-dhcp`, `kea` and `dhcp`.
+
+- kea-dhcp, kea: no hits.
+- dhcp:
+  - `@sntxrr/unifi-dhcp-reservation` (stable): fixed-IP reservations on a
+    UniFi controller through its API; it runs no DHCP server and renders no
+    Kea configuration. NONE (adjacent).
+  - `@dougschaefer/opnsense-firewall` (stable): reads DHCP leases from an
+    OPNsense appliance; read-only and appliance-bound. NONE (adjacent).
+  - `@bad-at-naming/libvirt` (stable): lists DHCP leases of a libvirt
+    network; a hypervisor view, not a DHCP server. NONE (adjacent).
+
+No package installs or configures ISC Kea or any other DHCP server on a Linux
+host, with subnets, pools, reservations and typed options validated by the
+server itself. Verdict: NONE; nothing to file upstream.

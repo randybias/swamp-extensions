@@ -325,3 +325,46 @@ Residuals on 2026.10.17.5 (beta), all from review, none blocking:
 - `answersInfo`'s 2 s bound covers the read, not the connect.
 - The `--auth` probe test passes a synthetic token on the docker argv (test
   only, never a real secret).
+
+## Prior art
+
+Prior art terms: k0s, wireguard, nats
+
+Registry search on stable and beta (`swamp extension search`, whole-word
+matches in the package name or description). The package name's own segments
+(`server`, `stack`) are plain English words that match dozens of unrelated
+packages, so the terms name the systems the stack composes. The stack is
+workflows only: it orchestrates our own server, SSH, mesh, hardening, cluster
+and secret model types, so a prior-art hit would have to be a comparable
+provisioning stack, not one of its parts.
+
+- k0s:
+  - `@randybias/k0s-multinode` (beta): ours; the multi-node k0s operator this
+    stack does not yet use (it provisions one node). Not prior art.
+  - `@randybias/k0s-cluster` (beta): ours; the single-node k0s type the stack
+    composes. Not prior art.
+- wireguard:
+  - `@kitquiet/homelab-ingress` (stable): one point-to-point WireGuard tunnel
+    inside a Traefik ingress bundle; no host provisioning, no k0s, no NATS,
+    no DNS publication. NONE.
+  - `@dougschaefer/opnsense-firewall` (stable): reads WireGuard state on an
+    OPNsense appliance over its REST API; manages nothing on a Linux host.
+    NONE.
+  - `@kitquiet/gluetun` (stable): read-only VPN status for a gluetun
+    container. NONE.
+  - `@magistr/observability-agent` (stable): installs a metrics and logs agent
+    that can bind to a WireGuard address; it is an exporter, not a
+    provisioning stack. NONE.
+  - `@randybias/wireguard-mesh` (beta): ours; the mesh node type the stack
+    composes. Not prior art.
+  - `@figy/homelab-otel` (beta): site-specific OpenTelemetry bootstrap whose
+    description mentions meshes; no provisioning. NONE.
+- nats:
+  - `@retr0h/nats` (stable): uses NATS as a swamp transport (exec, upload,
+    wait for an agent); it does not install or configure a NATS server on a
+    host. NONE.
+  - `@sntxrr/scaleway-messaging` (stable): manages Scaleway's hosted NATS
+    accounts through the MNQ API; nothing on a self-managed host. NONE.
+
+No package composes a hardened host, a WireGuard mesh, k0s, NATS and DNS
+publication. Verdict: NONE; nothing to file upstream.

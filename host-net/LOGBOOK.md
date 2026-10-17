@@ -346,3 +346,38 @@ Earlier heads (superseded; each finding was fixed by the next head):
   a dropped session is covered by the armed revert.
 - LOW: the `revert_now` unit name interpolates the token unquoted; the token is
   generated locally as 16 hex characters, so it cannot carry shell syntax.
+
+## Prior art
+
+Prior art terms: netplan, bridge, vlan, mtu, ovs
+
+Registry search on stable and beta (`swamp extension search`, whole-word
+matches in the package name or description). The package name's own segments
+(`host`, `net`) are plain English words that match dozens of unrelated
+packages, so the terms name what this extension writes: Netplan configuration
+for a Linux or OVS bridge, a VLAN plane and jumbo MTU under an armed revert.
+
+- netplan:
+  - `@mccormick/migrate` (stable): host-to-host VM disk migration; the word
+    appears in its description only. NONE.
+- bridge:
+  - `@keeb/mikrotik-routeros` (stable): bridge and interface objects on a
+    MikroTik router over its REST API; not a Linux host and no Netplan. NONE.
+  - `@jpisgeek/video-pipeline` (stable), `@atalanta/external-reviewer`
+    (stable), `@maphew/bd` (stable), `@kneel/super-productivity` (beta):
+    "bridge" in the software-integration sense; word matches only. NONE.
+- vlan:
+  - `@shrug/freeradius` (stable): a RADIUS server that can assign VLANs; it
+    configures no host interface. NONE.
+  - `@shrug/freeipa/group` (stable): FreeIPA group management; word match
+    only. NONE.
+  - `@dougschaefer/cisco-ios-switch` (stable): VLANs on a Cisco switch over
+    its CLI; a network appliance, not a Linux host. NONE.
+- mtu: no hits.
+- ovs: no hits.
+
+Also checked in the sweep: `@mccormick/helios` (dladm link configuration) is
+illumos-only. NONE.
+
+Verdict: NONE. No package configures a Linux bridge, OVS bridge, VLAN or MTU
+with an armed revert; nothing to file upstream.

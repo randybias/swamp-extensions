@@ -347,3 +347,38 @@ round-2/3 and escalation fixes above.
   disk of an existing domain as its root volume.
 - MEDIUM (astra): the stateful test fake does not drop attachments on
   `detach-disk`; the golden flow is covered live (cell golden flow 3).
+
+## Prior art
+
+Registry search on stable and beta (`swamp extension search`, whole-word
+matches in the package name or description) for `libvirt`.
+
+- `@bad-at-naming/libvirt` (stable): very broad libvirt/virsh management
+  (about forty VM methods including snapshots and the guest agent; network
+  define, undefine, start, autostart and DHCP leases; pools, volumes and
+  `volClone`; host facts) over SSH or a local URI, with adversarial,
+  idempotency and coverage suites. Host keys are hard-coded to
+  `StrictHostKeyChecking=accept-new`, so there is no strict or pinned mode;
+  no turnkey golden-volume or zvol clone per node and no serial-console
+  capture. OVERLAP, justified on narrow grounds: this extension's spec
+  modelled its command shapes on theirs and built only because of the
+  host-key policy plus zvol clone and console capture. If upstream accepted a
+  strict known_hosts option, most of this extension would be redundant; that
+  is the overlap most worth upstreaming.
+- `@evrardjp/libvirt-vm-pool` (stable): a desired-state reconciler for a
+  local VM pool that publishes connection facts; local only, no remote host
+  and no network or volume management. OVERLAP (minor), justified.
+- `@rjeschmi/vm` (stable): VM provisioning for libvirt/QEMU and OpenStack
+  through an ssh-virsh provider, bundled with k3s, Helm and cloud-init
+  utilities; weaker host-key handling and no clone-from-golden flow. OVERLAP
+  (minor), justified.
+- `@rjeschmi/kolla-openstack` (stable): provisions one Ubuntu VM on libvirt
+  as a step of a Kolla-Ansible OpenStack deployment; libvirt is incidental.
+  NONE (adjacent).
+- `@mccormick/truenas` (stable): read-only VM inventory on TrueNAS SCALE
+  through its JSON-RPC API; not libvirt management. NONE.
+
+Verdict: OVERLAP, justified on narrow grounds (strict pinned host keys, zvol
+clone, serial console). Worth filing upstream: an opt-in strict pinned
+known_hosts mode, a zvol-backed clone and serial-console capture for
+`@bad-at-naming/libvirt`.

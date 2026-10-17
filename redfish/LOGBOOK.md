@@ -153,3 +153,19 @@ exercised, so the release stays on beta until a real BMC run.
   - LOW (fixed at merge-prep, comment only): the `TlsPolicy` comment in
     `_lib/http.ts` called `caPem` "pinned"; it is an additional trusted CA
     alongside the system store, not an exclusive pin.
+
+## Prior art
+
+Prior art terms: redfish, bmc, ipmi
+
+Registry search on stable and beta (`swamp extension search`, whole-word
+matches in the package name or description) for the protocol, the device
+class and the older protocol it replaces.
+
+- redfish, bmc, ipmi: no hits on either channel.
+
+Out-of-band packages that exist drive IP-KVM devices, not BMCs
+(`@sntxrr/glinet-kvm`, `@svendowideit/nanokvm`, `@sntxrr/jetkvm`), so they
+are not prior art for power and boot control over Redfish.
+
+Verdict: NONE; nothing to file upstream.

@@ -433,3 +433,59 @@ vendored `exec()`:
   (as documented); bound it with the remote `timeout` inside a surviving shell.
 - `_lib/ssh.ts` stays one file of 1250 lines. Vendors copy it byte for byte and
   check it by blob hash, so it is not split.
+
+## Prior art
+
+Prior art terms: ssh, openssh
+
+Registry search on stable and beta (`swamp extension search`, whole-word
+matches in the package name or description). The package name's segment
+`host` is a plain English word that matches dozens of unrelated packages, so
+the terms are the protocol and its implementation. This extends the
+"Adopt-versus-build evaluation" section above with the full hit list.
+
+- ssh, general-purpose SSH transports:
+  - `@swamp/ssh` (stable): first-party fleet model (hosts declared on the
+    model, exec, script, copy, forward, check and collect-host-public-key
+    against a selector, ControlMaster or Tailscale SSH). The host-key policy
+    (`strictHostKeyChecking`, `knownHostsFile`) is optional and falls back to
+    the user's OpenSSH defaults; no wait-for-host-keys, no TOFU pin record,
+    copy is scp or rsync rather than an atomic hash-converged push. OVERLAP,
+    justified: this extension requires an explicit strict-or-TOFU policy
+    with pinning, pushes bytes atomically with mode convergence, types the
+    exit-255 error and stores output as hashes by default.
+  - `@keeb/ssh` (stable): ships skills only, no model, so there is nothing
+    to adopt. OVERLAP in name only, justified.
+  - `@evrardjp/ssh-ca` (stable): OpenSSH certificate authority lifecycle
+    (CA keys, host and user certificates, KRLs); it issues credentials and is
+    not a transport. NONE (adjacent).
+  - `@nedbellavance/azure-ssh-key` (stable): Azure sshPublicKeys resources
+    through the az CLI. NONE.
+- ssh, packages that use SSH as their transport to manage something else
+  (none of them is a reusable per-call SSH exec with a required host-key
+  policy): `@josephholsten/tailscale/device` (stable),
+  `@bitgnome/tailscale` (stable), `@shelson/k3s` (stable),
+  `@shrug/machinectl` (stable), `@bad-at-naming/libvirt` (stable),
+  `@mccormick/helios` (stable), `@mccormick/migrate` (stable),
+  `@webframp/exe-dev/vm` (stable), `@dougschaefer/cisco-ios-switch` (stable),
+  `@dougschaefer/netgear-m4250` (stable), `@easel/ruckus` (stable),
+  `@adam/cfgmgmt` (stable), `@josephholsten/freebsd` (stable),
+  `@josephholsten/zfs` (stable), `@dieter/prometheus` (stable),
+  `@psftw/pets` (beta), `@shrug/borgmatic` (beta). NONE for each.
+- ssh, ours (vendors of this extension's `_lib/ssh.ts`, not prior art):
+  `@randybias/k0s-cluster`, `@randybias/k0s-multinode`, `@randybias/zfs`,
+  `@randybias/server-host`, `@randybias/server-stack`, `@randybias/libvirt`,
+  `@randybias/wireguard-mesh`, `@randybias/apt-cache`, `@randybias/cephadm`,
+  `@randybias/secret-file`, `@randybias/artifact-server`,
+  `@randybias/knot-dns`, `@randybias/syncthing-peer`, `@randybias/host-net`,
+  `@randybias/cherry-servers`, `@randybias/ubuntu-autoinstall`,
+  `@randybias/kea-dhcp` (all beta).
+- openssh:
+  - `@figy/swamp-worker` (stable): site-specific worker deployment over
+    `@swamp/ssh`. NONE.
+  - `@svendowideit/fleet-inventory` (beta): a network inventory that notes
+    which machines answer on OpenSSH. NONE.
+
+Verdict: OVERLAP, justified. Worth filing upstream for `@swamp/ssh`: let a
+caller require an explicit host-key policy (fail when it is unset), a TOFU
+pin record, and an atomic hash-verified copy.

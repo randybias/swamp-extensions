@@ -514,3 +514,57 @@ Residuals on 2026.10.17.3 (beta):
 - Widening guard: a deliberate `ssh_port` change can bypass the management-only
   to open check.
 - `_lib/ssh.ts` is not the canonical transport (see 7860bb0); convergence debt.
+
+## Prior art
+
+Prior art terms: hardening, firewall, nftables, sshd
+
+Registry search on stable and beta (`swamp extension search`, whole-word
+matches in the package name or description). The package name's own segments
+(`server`, `host`) are plain English words that match dozens of unrelated
+packages, so the terms name what this extension does: harden a Linux host
+(packages and users, an nftables firewall, an SSH lockdown under an armed
+revert).
+
+- hardening:
+  - `@dougschaefer/cisco-ios-switch` (stable): baselines a Cisco IOS switch
+    over SSH; a network appliance, not a Linux host. NONE.
+  - `@svendowideit/sudo` (stable): runs one privileged operation on a host
+    (install a package, restart a unit, set a sysctl); a primitive, not a
+    hardening profile, and no firewall or SSH policy. NONE.
+  - `@randybias/server-stack` (beta): ours; composes this extension. Not
+    prior art.
+  - `@kneel/super-productivity` (beta): a task-app integration; word match
+    only. NONE.
+- firewall:
+  - `@dougschaefer/opnsense-firewall` (stable): drives an OPNsense appliance
+    over its REST API; no Linux host ruleset. NONE.
+  - `@swamp/cloudflare/firewall` (stable), `@webframp/cloudflare` (stable),
+    `@webframp/cloudflare-audit` (stable): Cloudflare edge firewall and WAF
+    rules; nothing on a host. NONE.
+  - `@mgreten/unifi` (stable), `@dmc/unifi-networks` (stable),
+    `@shrug/unifi-networks` (stable): UniFi controller firewall policies over
+    the UniFi API; nothing on a host. NONE.
+  - `@kitquiet/homelab-ingress` (stable): reconciles nftables and Docker
+    chains on an ingress host, but only for its own Traefik and WireGuard
+    stack; no user or package phase, no SSH lockdown, no armed revert.
+    OVERLAP, justified (recorded in the spec as well).
+  - `@adam/cfgmgmt` (stable): user, authorized_key and apt types plus a
+    `firewall` type for ufw, firewalld and iptables (no nftables); host keys
+    default to accept-new; no armed revert and no SSH lockdown phase.
+    OVERLAP (minor), justified: none of its types renders an nftables ruleset
+    checked with `nft -c` or locks SSH down under a revert.
+  - `@dougschaefer/apple-business-manager` (stable): Apple device
+    management; word match only. NONE.
+  - `@svendowideit/otel-backend` (beta): an observability backend profile;
+    word match only. NONE.
+- nftables: no hits.
+- sshd: no hits.
+
+Also judged in the sweep although not a whole-word hit for these terms:
+`@psftw/pets` (beta, apt, systemd and template primitives over `@swamp/ssh`,
+marked by its author as not for use) has no firewall or SSH lockdown. NONE.
+
+Verdict: OVERLAP (minor), justified. No package combines an nftables ruleset,
+users and packages, and an SSH lockdown under an armed revert. Worth filing
+upstream: an nftables backend for `@adam/cfgmgmt`'s `firewall` type.

@@ -36,6 +36,7 @@ import {
   mbrTargets,
   mdExamineCommand,
   parseExamineUuid,
+  parseMbrSector,
   type ProbeInputs,
   type ProtectedSet,
   PVS_COMMAND,
@@ -496,7 +497,32 @@ async function readLsblk(session: SshSession): Promise<LsblkNode[]> {
   return parseLsblk(r.stdout);
 }
 
-/** True when one device is already raw: no signature, no children, no array, no PV. */
+/**
+ * Whether a whole disk's first sector and signatures say "raw": sector 0 is
+ * readable with every byte of the boot code area (0-439) zero and no 55 AA
+ * signature (a dos or protective-MBR table), and wipefs finds no signature. An
+ * unreadable sector or a failing wipefs is "not raw", never "raw".
+ */
+async function sectorAndSignaturesAreRaw(
+  session: SshSession,
+  device: string,
+): Promise<boolean> {
+  if (!isDevicePath(device)) return false;
+  const sector = parseMbrSector(
+    await root(session, mbrReadCommand(device), { allowNonZero: true }),
+  );
+  if (sector === null) return false;
+  if (sector.slice(0, 440).some((b) => b !== 0)) return false;
+  if (sector[510] === 0x55 && sector[511] === 0xaa) return false;
+  const sigs = await root(
+    session,
+    `wipefs --noheadings --output TYPE -- ${quote(device)}`,
+    { allowNonZero: true },
+  );
+  return sigs.code === 0 && sigs.stdout.trim() === "";
+}
+
+/** True when one device is already raw: no signature, no children, no array, no PV, an empty sector 0. */
 async function deviceIsRaw(
   session: SshSession,
   tree: LsblkNode[],
@@ -509,7 +535,9 @@ async function deviceIsRaw(
   if (subtreeMounts(node).length > 0) return false;
   if ((await pvsVg(session, device)) !== "") return false;
   if ((await examineArray(session, device)) !== null) return false;
-  return true;
+  // The partitionless disk that still carries boot code or a dos signature in
+  // sector 0 is not raw, whatever lsblk says about its (absent) children.
+  return await sectorAndSignaturesAreRaw(session, device);
 }
 
 /** SHA-256 hex of a string. */
@@ -940,6 +968,22 @@ export async function wipeDiskToRaw(
     await root(session, `sgdisk --zap-all -- ${quote(device.device)}`, {
       allowNonZero: true,
     });
+    // wipefs removes only the two signature bytes of a dos table, and the
+    // zap leaves a dos disk's boot code: zero sector 0 itself.
+    const zeroed = await root(
+      session,
+      `dd if=/dev/zero of=${
+        quote(device.device)
+      } bs=512 count=1 conv=fsync status=none`,
+      { allowNonZero: true },
+    );
+    if (zeroed.code !== 0) {
+      fail("wipe.sector-zero", "could not zero the first sector", {
+        host,
+        device: device.device,
+        stderr: zeroed.stderr.slice(0, 300),
+      });
+    }
     const probed = await root(session, `partprobe -- ${quote(device.device)}`, {
       allowNonZero: true,
     });
@@ -1056,6 +1100,16 @@ export async function wipeDiskToRaw(
       fail(
         "wipe.raw-unobservable",
         "the wiped device is absent from the final lsblk",
+        {
+          host,
+          device: device.device,
+        },
+      );
+    }
+    if (!(await sectorAndSignaturesAreRaw(session, device.device))) {
+      fail(
+        "wipe.raw-signatures",
+        "the wiped device still has boot code, a table signature or a filesystem signature",
         {
           host,
           device: device.device,

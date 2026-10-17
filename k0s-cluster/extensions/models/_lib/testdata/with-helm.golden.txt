@@ -1,0 +1,31 @@
+apiVersion: k0s.k0sproject.io/v1beta1
+kind: ClusterConfig
+metadata:
+  name: k0s-lab
+spec:
+  api:
+    port: 6443
+    sans:
+      - "192.0.2.10"
+      - k0s.example.com
+  network:
+    podCIDR: "192.0.2.0/24"
+    serviceCIDR: "198.51.100.0/24"
+  storage:
+    type: etcd
+  telemetry:
+    enabled: false
+  extensions:
+    helm:
+      repositories:
+        - name: charts-example-com
+          url: "https://charts.example.com"
+      charts:
+        - name: nginx
+          chartname: charts-example-com/nginx
+          version: "1.2.3"
+          namespace: default
+          values: |
+            {
+              "replicaCount": 1
+            }

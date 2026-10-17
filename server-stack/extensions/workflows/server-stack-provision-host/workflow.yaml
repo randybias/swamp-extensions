@@ -384,7 +384,7 @@ inputs:
       type: string
       description: >-
         Vault key (in server-stack) holding a NATS auth token of 16-256
-        characters from A-Z a-z 0-9 . _ ~ + = -. When set, the token is written
+        characters from A-Z a-z 0-9 . _ ~ + = -, starting with a letter. When set, the token is written
         to the Secret named by nats_auth_secret (key `token`, in a namespace
         listed in cluster_namespaces) before the chart is installed, the chart values must read it from
         there (see the README), and the probe must see authentication enforced.
@@ -1091,8 +1091,8 @@ jobs:
             # that gets the token through its environment. Output is the verdict only.
             run: |
               bash -c '
-                [[ "$NATS_TOKEN" =~ ^[A-Za-z0-9._~+=-]{16,256}$ ]] ||
-                  { echo "token must be 16-256 characters from A-Z a-z 0-9 . _ ~ + = -"; exit 1; }
+                [[ "$NATS_TOKEN" =~ ^[A-Za-z][A-Za-z0-9._~+=-]{15,255}$ ]] ||
+                  { echo "token must be 16-256 characters, start with a letter, and use only A-Z a-z 0-9 . _ ~ + = -"; exit 1; }
                 echo "token shape ok"
               '
             env:

@@ -183,6 +183,14 @@ install: `config.merge: {host: <mesh address>, http: "0.0.0.0:8222"}` with
   first run; the token never appeared in 700k local and 60k remote argv samples,
   run logs or any file of the repo; adopt re-run was a no-op (manifests and Helm
   `changed false`, firewall and lockdown already live).
+- The probe test's flake was real, not a test race: `<< $NATS_TOKEN >>` makes
+  NATS parse the env value as a config value, so a random token that looks like
+  a number, an exponent or a date (a UUID or hex string starting with digits)
+  fails the server start
+  (`variable reference for 'NATS_TOKEN' ... could not be parsed`).
+  `check-nats-token` now requires a leading letter (all such letter-first shapes
+  were verified to start). Also fixed in the tests: docker-assigned ports,
+  polling for the port mapping and the INFO line instead of a fixed sleep.
 - Not done: TLS (server cert handling needs its own design), token rotation
   (re-running with a new vault value rewrites the Secret; the pods need a roll).
 

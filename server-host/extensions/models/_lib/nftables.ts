@@ -4,7 +4,7 @@
  * The ruleset is pure data: given the same inputs it renders byte for byte the
  * same text, with CIDRs and ports sorted, so a SHA-256 of the output is a
  * stable idempotency key. The ruleset owns one table (`inet server_host`) and
- * begins with `destroy table` so `nft -f` replaces it atomically and succeeds
+ * begins with `add table` and `delete table` so `nft -f` replaces it atomically and succeeds
  * whether or not the table already exists.
  *
  * @module
@@ -65,7 +65,10 @@ export function splitCidrs(cidrs: string[]): { v4: string[]; v6: string[] } {
 export function renderRuleset(rules: FirewallRules): string {
   const lines: string[] = [
     HEADER,
-    `destroy table inet ${TABLE}`,
+    // `add` then `delete` in one batch is the idiom that works on every kernel:
+    // `destroy` needs 6.3 or later.
+    `add table inet ${TABLE}`,
+    `delete table inet ${TABLE}`,
     `table inet ${TABLE} {`,
   ];
   lines.push(`\tchain input {`);
@@ -135,6 +138,10 @@ export interface NormChain {
 export interface NormTable {
   /** Chains sorted by name. */
   chains: NormChain[];
+  /** Table flags such as `dormant`; none are expected. */
+  flags: string[];
+  /** Any set, map or other object of the table besides chains and rules. */
+  extras: string[];
 }
 
 const bitsOf = (family: 4 | 6) => (family === 4 ? 32 : 128);
@@ -202,17 +209,65 @@ function leftKey(left: unknown): { key: string; family?: 4 | 6 } {
 
 function elem(v: unknown, family?: 4 | 6): string {
   if (typeof v === "number") return `n:${v}`;
+  if (typeof v === "string") return `s:${v}`;
+  return `raw:${stable(v)}`;
+}
+
+interface Span {
+  lo: bigint;
+  hi: bigint;
+}
+
+/** The addresses an element covers: a bare address, a prefix or a range. */
+function span(family: 4 | 6, v: unknown): Span | null {
+  const bits = bitsOf(family);
+  const addr = (t: unknown): bigint | null =>
+    typeof t === "string" ? parseCidr(`${t}/${bits}`)?.network ?? null : null;
   if (typeof v === "string") {
-    return family && /^[0-9a-fA-F:.]+$/.test(v) && /[.:]/.test(v)
-      ? normAddr(family, v)
-      : `s:${v}`;
+    const a = addr(v);
+    return a === null ? null : { lo: a, hi: a };
   }
   const o = v as Json;
-  if (o?.prefix && family) {
+  if (o?.prefix) {
     const p = o.prefix as Json;
-    return normAddr(family, String(p.addr), Number(p.len));
+    const a = addr(p.addr);
+    const len = Number(p.len);
+    if (a === null || !(len >= 0 && len <= bits)) return null;
+    const lo = (a >> BigInt(bits - len)) << BigInt(bits - len);
+    return { lo, hi: lo + (1n << BigInt(bits - len)) - 1n };
   }
-  return `raw:${stable(v)}`;
+  if (Array.isArray(o?.range) && o.range.length === 2) {
+    const lo = addr(o.range[0]);
+    const hi = addr(o.range[1]);
+    return lo === null || hi === null || lo > hi ? null : { lo, hi };
+  }
+  return null;
+}
+
+/**
+ * Merges address elements into the sorted list of intervals they cover. nft
+ * merges overlapping and adjacent entries of a set itself and prints a union
+ * that is not aligned to a prefix as a range, so only the covered addresses
+ * are comparable. Null when an element is not an address.
+ */
+function mergedSpans(family: 4 | 6, set: unknown[]): string[] | null {
+  const spans: Span[] = [];
+  for (const e of set) {
+    const sp = span(family, e);
+    if (!sp) return null;
+    spans.push(sp);
+  }
+  spans.sort((a, b) => (a.lo < b.lo ? -1 : a.lo > b.lo ? 1 : 0));
+  const merged: Span[] = [];
+  for (const sp of spans) {
+    const last = merged.at(-1);
+    if (last && sp.lo <= last.hi + 1n) {
+      if (sp.hi > last.hi) last.hi = sp.hi;
+    } else merged.push({ ...sp });
+  }
+  return merged.map((m) =>
+    `a${family}:${m.lo.toString(16)}-${m.hi.toString(16)}`
+  );
 }
 
 /** One rule's expressions as a normalized string. */
@@ -228,8 +283,11 @@ function normRule(expr: Json[]): string {
         ? (r as Json).set as unknown[]
         : [r];
       const op = m.op === "==" || m.op === "in" ? "in" : String(m.op);
+      const spans = family !== undefined && /\.[sd]addr$/.test(key)
+        ? mergedSpans(family, set)
+        : null;
       return `${key} ${op} ${
-        sortElems(set.map((x) => elem(x, family))).join(",")
+        (spans ?? sortElems(set.map((x) => elem(x, family)))).join(",")
       }`;
     }
     if ("accept" in e) return "accept";
@@ -253,6 +311,22 @@ export function normalizeListing(jsonText: string): NormTable | null {
     return t && t.family === "inet" && t.name === TABLE;
   });
   if (!hasTable) return null;
+  const meta = objs.map((o) => o.table as Json | undefined).find((t) =>
+    t && t.family === "inet" && t.name === TABLE
+  )!;
+  const flags = [meta.flags ?? []].flat().map(String).sort();
+  const extras: string[] = [];
+  for (const o of objs) {
+    for (const [kind, body] of Object.entries(o)) {
+      if (["table", "chain", "rule", "metainfo"].includes(kind)) continue;
+      const b = body as Json;
+      if (b && mine(b)) {
+        const { handle: _h, ...rest } = b;
+        extras.push(`${kind}:${stable(rest)}`);
+      }
+    }
+  }
+  extras.sort();
   const chains = new Map<string, NormChain>();
   for (const o of objs) {
     const c = o.chain as Json | undefined;
@@ -272,6 +346,8 @@ export function normalizeListing(jsonText: string): NormTable | null {
   }
   return {
     chains: [...chains.values()].sort((a, b) => a.name < b.name ? -1 : 1),
+    flags,
+    extras,
   };
 }
 
@@ -388,6 +464,14 @@ export function assertListingMatches(
   const live = normalizeListing(liveJson);
   const want = normalizeListing(expectedListing(rules))!;
   if (!live) throw new HostConfigError(`table inet ${TABLE} is not present`);
+  if (stable(live.flags) !== stable(want.flags)) {
+    throw new HostConfigError(`table inet ${TABLE} has unexpected flags`);
+  }
+  if (stable(live.extras) !== stable(want.extras)) {
+    throw new HostConfigError(
+      `table inet ${TABLE} holds sets or other objects that were not rendered`,
+    );
+  }
   const names = new Set([
     ...live.chains.map((c) => c.name),
     ...want.chains.map((c) => c.name),

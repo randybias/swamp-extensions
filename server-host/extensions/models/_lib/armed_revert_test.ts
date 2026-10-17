@@ -52,7 +52,9 @@ Deno.test("withSudo: prefixes only when asked", () => {
 
 Deno.test("revert script: locked, atomic, and abort-safe", () => {
   const script = renderRevertScript(TOKEN);
-  assertEquals(script.includes("echo 'destroy table inet server_host'"), true);
+  assertEquals(script.includes("echo 'add table inet server_host'"), true);
+  assertEquals(script.includes("echo 'delete table inet server_host'"), true);
+  assertEquals(script.includes("destroy"), false);
   // Only the managed table is ever restored: never the whole ruleset.
   assertEquals(script.includes("flush ruleset"), false);
   assertEquals(script.includes("| nft -f -"), true);

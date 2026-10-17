@@ -1,5 +1,6 @@
 # Managed by @randybias/server-host. Edit the model inputs, not this file.
-destroy table inet server_host
+add table inet server_host
+delete table inet server_host
 table inet server_host {
 	chain input {
 		type filter hook input priority filter; policy drop;

@@ -60,8 +60,8 @@ swamp extension pull @randybias/server-host
 
 - A POSIX control host with the OpenSSH client (`ssh`, `ssh-agent`, `ssh-add`),
   which the transport uses.
-- A target with `nft`, `systemd`, `sudo`, `flock` (util-linux) and a
-  Debian-family package manager.
+- A target with `nft` (tested on nftables 1.0.9), `systemd`, `sudo`, `flock`
+  (util-linux) and a Debian-family package manager.
 - An SSH private key, named by a vault reference (`ssh_key_ref`); the key is
   read inside the method and never appears in arguments or logs. The host-key
   policy is required on every call; `strict` also requires pinned host keys.

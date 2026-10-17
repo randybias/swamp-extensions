@@ -709,6 +709,7 @@ Deno.test("commit: refuses nothing armed, expired, not active, and mismatched ru
         createModelTestContext({ globalArgs: {} }).context,
       ),
     Error,
+    "No armed revert is recorded",
   );
   const expired = createModelTestContext({
     globalArgs: {},
@@ -723,11 +724,12 @@ Deno.test("commit: refuses nothing armed, expired, not active, and mismatched ru
         expired.context,
       ),
     Error,
+    "expired",
   );
   // Timer not active.
   const inactive = fakeTransport((c) => {
     if (c.includes("'nft' '-j' 'list' 'ruleset'")) {
-      return { code: 0, stdout: renderRuleset(FIREWALL) };
+      return { code: 0, stdout: expectedListing(FIREWALL) };
     }
     if (c.includes("'systemctl' 'is-active'")) {
       return { code: 3, stdout: "inactive\n" };
@@ -745,11 +747,12 @@ Deno.test("commit: refuses nothing armed, expired, not active, and mismatched ru
         inactiveCtx.context,
       ),
     Error,
+    "is not active",
   );
   // Live rules no longer match the armed revert.
   const mismatch = fakeTransport((c) => {
     if (c.includes("'nft' '-j' 'list' 'ruleset'")) {
-      return { code: 0, stdout: renderRuleset(FIREWALL) };
+      return { code: 0, stdout: expectedListing(FIREWALL) };
     }
     if (c.includes("'systemctl' 'is-active'")) {
       return { code: 0, stdout: "active\n" };
@@ -767,6 +770,7 @@ Deno.test("commit: refuses nothing armed, expired, not active, and mismatched ru
         mismatchCtx.context,
       ),
     Error,
+    "no longer matches",
   );
 });
 

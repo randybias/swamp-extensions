@@ -251,3 +251,26 @@ Fixed by comparing structures read back from nft, not text:
 - The revert path is unchanged (it never hashes). Not covered: IPv6 sets, ranges
   and rule shapes nft might print differently on other versions; an unfamiliar
   shape fails the verify rather than passing.
+
+Round 10 (delta review of 749819d):
+
+- HIGH nft merges overlapping and adjacent entries of a source-address set and
+  prints a union that is not prefix-aligned as a range, so the rendered elements
+  and the listing differed after `nft -f`. Fixed: address sets (`saddr` and
+  `daddr`) are compared as the sorted, merged intervals they cover, from bare
+  addresses, prefixes and `{"range": [a, b]}` alike, on both sides. Real
+  nftables 1.0.9 listings for contained, adjacent, non-aligned and same-network
+  (host bits) IPv4 and a contained IPv6 case, taken in a network namespace on a
+  throwaway VPS, are fixtures (RFC 5737 addresses), and a hole in a union still
+  changes the hash.
+- MEDIUM table flags and extra sets or maps were dropped from the normalized
+  table, so a dormant or altered table hashed as clean. Fixed: flags and any
+  other object of the table are part of the structure; unexpected ones fail the
+  verify and change the hash.
+- MEDIUM the commit tests for "timer not active" and "rules no longer match"
+  answered with rendered text, so they failed on a JSON parse error. They now
+  return real-shaped JSON and assert the specific messages.
+- MEDIUM `destroy table` needs kernel 6.3. Fixed: the script and the revert use
+  `add table` then `delete table` in the same batch, which works on older
+  kernels too (applied for real on nftables 1.0.9 here; not run on a 6.1
+  kernel).

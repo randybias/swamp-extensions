@@ -304,9 +304,97 @@ Deno.test("the rendered script owns exactly one table and never flushes anything
     allowSshFromAnywhere: false,
   });
   assertEquals(/flush/i.test(text), false);
-  assertEquals(text.includes("destroy table inet server_host"), true);
-  // Every `table` statement and every `destroy` names the managed table.
-  const tables = text.split("\n").filter((l) => /^(destroy )?table /.test(l));
-  assertEquals(tables.length, 2);
+  // `destroy` needs kernel 6.3; add + delete works on older kernels too.
+  assertEquals(text.includes("destroy"), false);
+  assertEquals(
+    text.includes(
+      "add table inet server_host\ndelete table inet server_host\n",
+    ),
+    true,
+  );
+  // Every table statement names the managed table.
+  const tables = text.split("\n").filter((l) =>
+    /^(add |delete )?table /.test(l)
+  );
+  assertEquals(tables.length, 3);
   for (const l of tables) assertEquals(l.includes("inet server_host"), true, l);
+});
+
+Deno.test("real nft merges overlapping and adjacent set entries; the structure compares the covered addresses", async () => {
+  // Each of these was listed by nftables 1.0.9 as fewer elements than rendered,
+  // or as a range, yet is exactly the rendered rule once merged.
+  for (
+    const name of [
+      "contained",
+      "adjacent",
+      "unaligned_range",
+      "same_network_host_bits",
+      "v6_contained",
+    ]
+  ) {
+    const x = REAL[name];
+    const rules = rulesOf(x);
+    assertListingMatches(rules, JSON.stringify(x.json));
+    assertEquals(
+      await managedSha256(normalizeListing(JSON.stringify(x.json))),
+      await expectedManagedSha256(rules),
+      name,
+    );
+  }
+  assertEquals(
+    REAL.unaligned_range.text.includes("198.51.100.64-198.51.100.191"),
+    true,
+  );
+  // Merging does not paper over a real difference: a hole is still a hole.
+  const gap = {
+    ...rulesOf(REAL.adjacent),
+    managementCidrs: ["198.51.100.0/26", "198.51.100.128/25"],
+  };
+  assertEquals(
+    await expectedManagedSha256(gap) ===
+      await expectedManagedSha256(rulesOf(REAL.adjacent)),
+    false,
+  );
+});
+
+Deno.test("table flags and extra sets are part of the structure", async () => {
+  const x = REAL.single_cidr;
+  const rules = rulesOf(x);
+  const withTable = (edit: (t: Record<string, unknown>) => void) => {
+    const d = JSON.parse(JSON.stringify(x.json)) as {
+      nftables: Record<string, Record<string, unknown>>[];
+    };
+    edit(d.nftables.find((o) => o.table)!.table);
+    return JSON.stringify(d);
+  };
+  const dormant = withTable((t) => t.flags = ["dormant"]);
+  assertThrows(
+    () => assertListingMatches(rules, dormant),
+    HostConfigError,
+    "flags",
+  );
+  assertEquals(
+    await managedSha256(normalizeListing(dormant)) ===
+      await expectedManagedSha256(rules),
+    false,
+  );
+  const withSet = JSON.stringify({
+    nftables: [
+      ...(x.json as { nftables: unknown[] }).nftables,
+      {
+        set: {
+          family: "inet",
+          table: "server_host",
+          name: "extra",
+          type: "ipv4_addr",
+          handle: 9,
+        },
+      },
+    ],
+  });
+  assertThrows(
+    () => assertListingMatches(rules, withSet),
+    HostConfigError,
+    "sets or other",
+  );
 });

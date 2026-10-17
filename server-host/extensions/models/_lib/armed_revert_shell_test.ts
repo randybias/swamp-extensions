@@ -39,7 +39,7 @@ async function box(): Promise<Box> {
     await Deno.chmod(`${bin}/${name}`, 0o755);
   };
   // nft: the live ruleset is a file with one line per table, `table inet NAME
-  // BODY`. `-f -` applies `destroy table inet NAME` and `table inet NAME BODY`
+  // BODY`. `-f -` applies `add table`, `delete table inet NAME` and `table inet NAME BODY`
   // lines; `flush ruleset` empties everything (which the code must never send).
   await stub(
     "nft",
@@ -56,7 +56,8 @@ case "$1" in
     if grep -q '^flush ruleset' "$live.in"; then : > "$live"; fi
     while IFS= read -r line; do
       case "$line" in
-        "destroy table "*) n="$(echo "$line" | awk '{print $3, $4}')"; grep -v "^table $n\\( \\|$\\)" "$live" > "$live.t" || true; mv "$live.t" "$live" ;;
+        "add table "*) ;;
+        "delete table "*) n="$(echo "$line" | awk '{print $3, $4}')"; grep -v "^table $n\\( \\|$\\)" "$live" > "$live.t" || true; mv "$live.t" "$live" ;;
         "table "*) echo "$line" >> "$live" ;;
       esac
     done < "$live.in" ;;
@@ -132,7 +133,7 @@ Deno.test("shell: arm snapshots, records the marker, starts the timer; apply the
     );
     const code = await b.run(
       scriptOf(renderGuardedApplyArgv(A, false)),
-      "destroy table inet server_host\ntable inet server_host new\n",
+      "add table inet server_host\ndelete table inet server_host\ntable inet server_host new\n",
       1100,
     );
     assertEquals(code, 0);
@@ -187,7 +188,7 @@ Deno.test("shell: once the restore has run, an apply under the old token is refu
     assertEquals(await b.file("live"), "table inet server_host original\n");
     const code = await b.run(
       scriptOf(renderGuardedApplyArgv(A, false)),
-      "destroy table inet server_host\ntable inet server_host late\n",
+      "add table inet server_host\ndelete table inet server_host\ntable inet server_host late\n",
       1100,
     );
     assertEquals(code, APPLY_REFUSED.superseded);
@@ -204,7 +205,7 @@ Deno.test("shell: an apply after the revert expired is refused", async () => {
     assertEquals(await arm(b, A), 0); // expires at 1300
     const code = await b.run(
       scriptOf(renderGuardedApplyArgv(A, false)),
-      "destroy table inet server_host\ntable inet server_host late\n",
+      "add table inet server_host\ndelete table inet server_host\ntable inet server_host late\n",
       1300,
     );
     assertEquals(code, APPLY_REFUSED.expired);
@@ -225,7 +226,7 @@ Deno.test("shell: a superseded restore never overwrites the newer rules", async 
     assertEquals(
       await b.run(
         scriptOf(renderGuardedApplyArgv(B, false)),
-        "destroy table inet server_host\ntable inet server_host b\n",
+        "add table inet server_host\ndelete table inet server_host\ntable inet server_host b\n",
         1150,
       ),
       0,
@@ -280,7 +281,7 @@ Deno.test("shell: the snapshot and the restore touch only the managed table; oth
     assertEquals(
       await b.run(
         scriptOf(renderGuardedApplyArgv(A, false)),
-        "destroy table inet server_host\ntable inet server_host new\n",
+        "add table inet server_host\ndelete table inet server_host\ntable inet server_host new\n",
         1100,
       ),
       0,
@@ -311,7 +312,7 @@ Deno.test("shell: when no managed table existed, the restore removes it and stil
     assertEquals(
       await b.run(
         scriptOf(renderGuardedApplyArgv(A, false)),
-        "destroy table inet server_host\ntable inet server_host new\n",
+        "add table inet server_host\ndelete table inet server_host\ntable inet server_host new\n",
         1100,
       ),
       0,

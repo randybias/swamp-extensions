@@ -70,7 +70,7 @@ const BUSY_FN = `busy() {
  * only while it is still the CURRENT revert and its snapshot exists: a
  * superseded or already-cancelled revert does nothing, so a late restore can
  * never overwrite newer rules. The restore is ONE `nft -f -` transaction
- * (`destroy table` of the managed table plus its snapshot; no other table is read, flushed or restored).
+ * (`add table` and `delete table` of the managed table plus its snapshot; no other table is read, flushed or restored).
  */
 export function renderRevertScript(token: string): string {
   const snap = snapshotPath(token);
@@ -88,7 +88,8 @@ if [ "$ctok" != '${token}' ] || [ ! -f "$snap" ]; then
   exit 0
 fi
 {
-  echo 'destroy table inet ${TABLE}'
+  echo 'add table inet ${TABLE}'
+  echo 'delete table inet ${TABLE}'
   if [ -s "$snap" ]; then cat "$snap"; fi
 } | nft -f -
 rm -f "$snap" "${self}" "${CURRENT_PATH}"

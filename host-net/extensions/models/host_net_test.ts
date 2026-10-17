@@ -33,7 +33,9 @@ interface Fake {
   calls: string[];
 }
 
-function fakeRun(opts: { links?: unknown[]; armCode?: number } = {}): Fake {
+function fakeRun(
+  opts: { links?: unknown[]; armCode?: number; markerJson?: string } = {},
+): Fake {
   const calls: string[] = [];
   const run: CommandRunner = (cmd, args, _options = {}) => {
     if (cmd === "ssh-agent") {
@@ -55,6 +57,16 @@ function fakeRun(opts: { links?: unknown[]; armCode?: number } = {}): Fake {
     }
     const command = args[args.length - 1];
     calls.push(command);
+    if (
+      command.includes("marker.json") && command.includes("cat") &&
+      !command.includes("systemd-run")
+    ) {
+      return Promise.resolve({
+        code: 0,
+        stdout: opts.markerJson ?? "",
+        stderr: "",
+      });
+    }
     if (command.includes("systemd-run")) {
       return Promise.resolve({
         code: opts.armCode ?? 0,
@@ -211,7 +223,13 @@ Deno.test("apply arms before it writes or applies", async () => {
 });
 
 Deno.test("apply refuses when a revert is already armed", async () => {
-  const fake = fakeRun();
+  const fake = fakeRun({
+    markerJson: JSON.stringify({
+      token: "0000000000000000",
+      result: "pass",
+      fired_at: 1760400001,
+    }),
+  });
   const m = modelWith(fake);
   const ctx = createModelTestContext({
     globalArgs: {},
@@ -245,7 +263,12 @@ Deno.test("remove arms before deleting and deletes only created devices", async 
     }],
   });
   const m = modelWith(fake);
-  const ctx = createModelTestContext({ globalArgs: {} });
+  const ctx = createModelTestContext({
+    globalArgs: {},
+    storedResources: {
+      "config-root@192.0.2.20:22": { devices: ["enp1s0.100"] },
+    },
+  });
   await m.methods.remove.execute(
     m.methods.remove.arguments.parse({ ...NET, bridge_type: "linux" }),
     ctx.context as never,
@@ -260,7 +283,13 @@ Deno.test("remove arms before deleting and deletes only created devices", async 
 });
 
 Deno.test("revert_now runs the restore script for the token", async () => {
-  const fake = fakeRun();
+  const fake = fakeRun({
+    markerJson: JSON.stringify({
+      token: "0000000000000000",
+      result: "pass",
+      fired_at: 1760400001,
+    }),
+  });
   const m = modelWith(fake);
   const ctx = createModelTestContext({
     globalArgs: {},
@@ -354,4 +383,114 @@ Deno.test("the vaultService object resolves the SSH key", async () => {
     ctx.context as never,
   );
   assertEquals(calls, [["prod", "host-net-key"]]);
+});
+
+Deno.test("apply after a committed apply does not treat an owned device as foreign", async () => {
+  const fake = fakeRun({
+    links: [{
+      ifname: "enp1s0.100",
+      mtu: 9000,
+      operstate: "UP",
+      linkinfo: { info_kind: "vlan", info_data: { id: 100 } },
+    }],
+  });
+  const m = modelWith(fake);
+  const ctx = createModelTestContext({
+    globalArgs: {},
+    storedResources: {
+      "config-root@192.0.2.20:22": {
+        devices: ["enp1s0.100"],
+        configSha256: "different",
+      },
+    },
+  });
+  await m.methods.apply.execute(
+    m.methods.apply.arguments.parse({ ...NET }),
+    ctx.context as never,
+  );
+  // It reached the arm instead of throwing "already exists and is not managed".
+  assertEquals(fake.calls.some((c) => c.includes("systemd-run")), true);
+});
+
+Deno.test("remove of an unowned live device is a no-op", async () => {
+  const fake = fakeRun({
+    links: [{
+      ifname: "enp1s0.100",
+      mtu: 9000,
+      operstate: "UP",
+      linkinfo: { info_kind: "vlan", info_data: { id: 100 } },
+    }],
+  });
+  const m = modelWith(fake);
+  const ctx = createModelTestContext({ globalArgs: {} });
+  const out = await m.methods.remove.execute(
+    m.methods.remove.arguments.parse({ ...NET, bridge_type: "linux" }),
+    ctx.context as never,
+  ) as { result: { removed: string[] } };
+  assertEquals(out.result.removed, []);
+  assertEquals(
+    fake.calls.some((c) => c.includes("'ip' 'link' 'delete'")),
+    false,
+  );
+});
+
+Deno.test("an arm failure with exit 1 throws and writes nothing", async () => {
+  const fake = fakeRun({ armCode: 1 });
+  const m = modelWith(fake);
+  const ctx = createModelTestContext({ globalArgs: {} });
+  await assertRejects(
+    () =>
+      m.methods.apply.execute(
+        m.methods.apply.arguments.parse({ ...NET }),
+        ctx.context as never,
+      ),
+    Error,
+    "the revert arm failed",
+  );
+  assertEquals(ctx.getWrittenResources().length, 0);
+});
+
+Deno.test("commit refuses an expired, a fired, and a missing revert", async () => {
+  const m = modelWith(fakeRun());
+  const expired = createModelTestContext({
+    globalArgs: {},
+    storedResources: {
+      "revert-root@192.0.2.20:22": {
+        token: "0000000000000000",
+        operation: "apply",
+        armedAt: new Date(1_700_000_000_000).toISOString(),
+        expiresAt: new Date(1_700_000_001_000).toISOString(),
+      },
+    },
+  });
+  await assertRejects(
+    () =>
+      m.methods.commit.execute(
+        m.methods.commit.arguments.parse({ ...NET }),
+        expired.context as never,
+      ),
+    Error,
+    "expired",
+  );
+  const fired = createModelTestContext({
+    globalArgs: {},
+    storedResources: {
+      "revert-root@192.0.2.20:22": {
+        token: "0000000000000000",
+        operation: "apply",
+        armedAt: new Date(1_760_400_000_000).toISOString(),
+        expiresAt: new Date(1_760_400_300_000).toISOString(),
+        firedAt: new Date(1_760_400_100_000).toISOString(),
+      },
+    },
+  });
+  await assertRejects(
+    () =>
+      m.methods.commit.execute(
+        m.methods.commit.arguments.parse({ ...NET }),
+        fired.context as never,
+      ),
+    Error,
+    "already fired",
+  );
 });

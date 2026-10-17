@@ -51,7 +51,7 @@ function yamlScalar(value: string): string {
 }
 
 function renderEthernet(eth: EthernetSpec): string[] {
-  const lines: string[] = [`    ${eth.name}:`];
+  const lines: string[] = [`    ${yamlScalar(eth.name)}:`];
   if (eth.matchMac !== undefined) {
     lines.push(
       "      match:",
@@ -65,13 +65,15 @@ function renderEthernet(eth: EthernetSpec): string[] {
 function renderVlan(vlan: VlanSpec): string[] {
   const name = vlanName(vlan);
   const lines: string[] = [
-    `    ${name}:`,
+    `    ${yamlScalar(name)}:`,
     `      id: ${vlan.id}`,
-    `      link: ${vlan.link}`,
+    `      link: ${yamlScalar(vlan.link)}`,
   ];
   if (vlan.mtu !== undefined) lines.push(`      mtu: ${vlan.mtu}`);
   lines.push("      addresses:");
-  for (const cidr of vlan.addresses) lines.push(`        - ${cidr}`);
+  for (const cidr of vlan.addresses) {
+    lines.push(`        - ${yamlScalar(cidr)}`);
+  }
   lines.push("      accept-ra: false");
   if (vlan.optional) lines.push("      optional: true");
   return lines;
@@ -79,14 +81,18 @@ function renderVlan(vlan: VlanSpec): string[] {
 
 function renderBridge(cfg: NetConfig, bridge: BridgeSpec): string[] {
   const lines: string[] = [
-    `    ${bridge.name}:`,
+    `    ${yamlScalar(bridge.name)}:`,
     "      interfaces:",
   ];
-  for (const member of bridge.interfaces) lines.push(`        - ${member}`);
+  for (const member of bridge.interfaces) {
+    lines.push(`        - ${yamlScalar(member)}`);
+  }
   if (bridge.mtu !== undefined) lines.push(`      mtu: ${bridge.mtu}`);
   if (bridge.addresses.length > 0) {
     lines.push("      addresses:");
-    for (const cidr of bridge.addresses) lines.push(`        - ${cidr}`);
+    for (const cidr of bridge.addresses) {
+      lines.push(`        - ${yamlScalar(cidr)}`);
+    }
   }
   if (cfg.bridgeType === "ovs") {
     lines.push("      openvswitch: {}");
@@ -155,49 +161,51 @@ export function renderNetworkdFiles(cfg: NetConfig): RenderedFile[] {
     });
   }
   const bridgeMembers = new Set(cfg.bridge?.interfaces ?? []);
+  const unit = (
+    name: string,
+    mtu: number | undefined,
+    network: string[],
+  ): string[] => {
+    const body: string[] = [...networkdMatch(name)];
+    if (mtu !== undefined) body.push("[Link]", `MTUBytes=${mtu}`, "");
+    body.push("[Network]", ...network, "");
+    return body;
+  };
   // Ethernet .network units.
   for (const eth of cfg.ethernets) {
-    const body: string[] = [...networkdMatch(eth.name), "[Network]"];
-    if (eth.mtu !== undefined) body.push(`MTUBytes=${eth.mtu}`);
+    const network: string[] = [];
     for (const vlan of cfg.vlans) {
-      if (vlan.link === eth.name) body.push(`VLAN=${vlanName(vlan)}`);
+      if (vlan.link === eth.name) network.push(`VLAN=${vlanName(vlan)}`);
     }
     if (bridgeMembers.has(eth.name)) {
-      body.push(`Bridge=${cfg.bridge!.name}`);
+      network.push(`Bridge=${cfg.bridge!.name}`);
     }
-    body.push("");
     files.push({
       path: `${NETWORKD_DIR}/${NETWORKD_PREFIX}${eth.name}.network`,
       mode: "0644",
-      content: body.join("\n"),
+      content: unit(eth.name, eth.mtu, network).join("\n"),
     });
   }
   // VLAN .network units.
   for (const vlan of cfg.vlans) {
     const name = vlanName(vlan);
-    const body: string[] = [...networkdMatch(name), "[Network]"];
-    if (vlan.mtu !== undefined) body.push(`MTUBytes=${vlan.mtu}`);
-    for (const cidr of vlan.addresses) body.push(`Address=${cidr}`);
-    if (bridgeMembers.has(name)) body.push(`Bridge=${cfg.bridge!.name}`);
-    if (vlan.optional) body.push("RequiredForOnline=no");
-    body.push("");
+    const network: string[] = vlan.addresses.map((cidr) => `Address=${cidr}`);
+    if (bridgeMembers.has(name)) network.push(`Bridge=${cfg.bridge!.name}`);
+    if (vlan.optional) network.push("RequiredForOnline=no");
     files.push({
       path: `${NETWORKD_DIR}/${NETWORKD_PREFIX}${name}.network`,
       mode: "0644",
-      content: body.join("\n"),
+      content: unit(name, vlan.mtu, network).join("\n"),
     });
   }
   if (cfg.bridge !== undefined) {
     const bridge = cfg.bridge;
-    const body: string[] = [...networkdMatch(bridge.name), "[Network]"];
-    if (bridge.mtu !== undefined) body.push(`MTUBytes=${bridge.mtu}`);
-    for (const cidr of bridge.addresses) body.push(`Address=${cidr}`);
-    if (bridge.stp) body.push("STP=yes");
-    body.push("");
+    const network: string[] = bridge.addresses.map((cidr) => `Address=${cidr}`);
+    if (bridge.stp) network.push("STP=yes");
     files.push({
       path: `${NETWORKD_DIR}/${NETWORKD_PREFIX}${bridge.name}.network`,
       mode: "0644",
-      content: body.join("\n"),
+      content: unit(bridge.name, bridge.mtu, network).join("\n"),
     });
   }
   return files.sort((a, b) => a.path < b.path ? -1 : 1);

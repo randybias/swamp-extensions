@@ -48,10 +48,12 @@ import {
   LOCK_PATH,
   renderArmScript,
   renderDisarmScript,
+  renderMarkerJsonReadScript,
   renderMarkerReadScript,
   restorePath,
   type RevertContext,
   revertDir,
+  stagedDir,
   unitName,
 } from "./_lib/revert.ts";
 
@@ -179,6 +181,7 @@ const RevertSchema = z.strictObject({
   expiresAt: z.string(),
   armedSha256: z.string(),
   contentSha256: z.string().optional(),
+  operation: z.string().optional(),
   devices: z.array(z.string()).optional(),
   committedAt: z.string().optional(),
   cancelledAt: z.string().optional(),
@@ -337,6 +340,7 @@ async function armRevert(
   revertAfterS: number,
   created: string[],
   parentMtus: { name: string; mtu: number }[],
+  operation: "apply" | "remove",
 ): Promise<
   { handle: { name: string }; expiresAt: string; contentSha256: string }
 > {
@@ -354,6 +358,7 @@ async function armRevert(
         revertAfterS,
         armedSha256: render.sha256,
         contentSha256,
+        operation,
       }),
     ],
     "the revert arm",
@@ -371,6 +376,8 @@ async function armRevert(
     expiresAt,
     armedSha256: render.sha256,
     contentSha256,
+    operation,
+    devices: created,
     result: "pending",
   });
   return { handle, expiresAt, contentSha256 };
@@ -428,7 +435,8 @@ function capturedOf(
     backend: cfg.backend,
     bridgeType: cfg.bridgeType,
     created,
-    createdBridges: cfg.bridgeType === "ovs" && cfg.bridge !== undefined
+    createdBridges: cfg.bridgeType === "ovs" && cfg.bridge !== undefined &&
+        created.includes(cfg.bridge.name)
       ? [cfg.bridge.name]
       : [],
     ownedFiles: render.files.map((f) => f.path),
@@ -437,26 +445,42 @@ function capturedOf(
 }
 
 /** The guarded apply script: it applies only while this token still guards. */
-function guardedApplyScript(ctx: RevertContext): string {
+function shq(value: string): string {
+  return `'${value.replace(/'/g, `'\\''`)}'`;
+}
+
+/** The guarded apply script: it applies only while this token still guards. */
+function guardedApplyScript(
+  ctx: RevertContext,
+  files: RenderResult["files"],
+): string {
   const apply = ctx.backend === "netplan"
     ? "netplan apply"
     : "networkctl reload && networkctl reconfigure";
+  const moves = files.map((f) => {
+    const base = f.path.split("/").pop() ?? f.path;
+    return `mv -f ${shq(`${stagedDir(ctx.token)}/${base}`)} ${shq(f.path)}`;
+  }).join("\n");
   return [
     "set -eu",
     `exec 9>${LOCK_PATH}`,
-    "flock 9",
-    `[ -f ${CURRENT_PATH} ] || { echo 'superseded' >&2; exit 70; }`,
+    "flock -w 30 9 || { echo 'lock busy' >&2; exit 75; }",
+    `DIR=${shq(revertDir(ctx.token))}`,
+    `cleanup() { rm -rf "$DIR/staged"; }`,
+    `[ -f ${CURRENT_PATH} ] || { cleanup; echo 'superseded' >&2; exit 70; }`,
     `ctok=; cexp=0; read ctok cexp _ < ${CURRENT_PATH} || true`,
-    `[ "$ctok" = '${ctx.token}' ] || { echo 'superseded' >&2; exit 70; }`,
-    `[ -d '${
-      revertDir(ctx.token)
-    }/snapshot' ] || { echo 'restored' >&2; exit 71; }`,
-    `[ "$(date +%s)" -lt "$cexp" ] || { echo 'expired' >&2; exit 72; }`,
-    `[ "$(systemctl is-active '${
-      unitName(ctx.token)
-    }.timer' || true)" = active ] || { echo 'timer gone' >&2; exit 73; }`,
+    `[ "$ctok" = ${
+      shq(ctx.token)
+    } ] || { cleanup; echo 'superseded' >&2; exit 70; }`,
+    `[ -d "$DIR/snapshot" ] || { cleanup; echo 'restored' >&2; exit 71; }`,
+    `[ "$(date +%s)" -lt "$cexp" ] || { cleanup; echo 'expired' >&2; exit 72; }`,
+    `[ "$(systemctl is-active ${
+      shq(unitName(ctx.token))
+    }.timer || true)" = active ] || { cleanup; echo 'timer gone' >&2; exit 73; }`,
+    moves,
+    "cleanup",
     apply,
-  ].join("\n");
+  ].filter((l) => l !== "").join("\n");
 }
 
 /** True while a recorded revert is pending and has not expired. */
@@ -601,6 +625,23 @@ export function createModel(overrides: Partial<HostNetDeps> = {}) {
         if (cfg.bridgeType === "ovs" && !live.hasOvs) {
           throw new HostNetConfigError("ovs-vsctl is not present on the host");
         }
+        // A match_mac that resolves to the management NIC touches management.
+        for (const e of cfg.ethernets) {
+          const touchesMgmt = (e.name !== "" &&
+            e.name === cfg.managementInterface) ||
+            (e.matchMac !== undefined &&
+              live.links.some((l) =>
+                l.mac === e.matchMac && l.name === cfg.managementInterface
+              ));
+          if (
+            touchesMgmt && e.mtu !== undefined &&
+            !(cfg.mode === "takeover" && cfg.managementChangeAck)
+          ) {
+            throw new HostNetConfigError(
+              "the change touches the management interface; use mode takeover with management_change_ack",
+            );
+          }
+        }
         // Pre-check the rendered netplan against a staged root before arming.
         if (cfg.backend === "netplan") {
           if (!live.hasNetplan) {
@@ -642,27 +683,55 @@ export function createModel(overrides: Partial<HostNetDeps> = {}) {
           ...(cfg.bridge?.addresses ?? []),
         ];
         assertNoManagementOverlap(storage, live.managementAddrs);
-        const recorded = await context.readResource(
+        const revertRecord = await context.readResource(
           `revert-${targetKey(args)}`,
         );
-        if (isPending(recorded, deps.now())) {
+        if (isPending(revertRecord, deps.now())) {
           throw new HostNetConfigError(
             `a revert is already armed for this host (token ${
-              String(recorded!.token)
+              String(revertRecord!.token)
             })`,
           );
         }
-        const liveNames = new Set(live.links.map((l) => l.name));
+        // Ownership comes only from the config record, never from the inputs.
+        const config = await context.readResource(
+          `config-${targetKey(args)}`,
+        );
         const owned = new Set(
-          recorded !== null && Array.isArray(recorded.devices)
-            ? recorded.devices as string[]
+          config !== null && Array.isArray(config.devices)
+            ? config.devices as string[]
             : [],
         );
+        const liveNames = new Set(live.links.map((l) => l.name));
         for (const name of render.created) {
           if (liveNames.has(name) && !owned.has(name)) {
             throw new HostNetConfigError(
               `device ${name} already exists and is not managed by this model`,
             );
+          }
+        }
+        // An identical live config arms nothing and writes nothing.
+        if (
+          config !== null && typeof config.contentSha256 === "string" &&
+          [...owned].every((name) => liveNames.has(name))
+        ) {
+          const liveSha = await liveContentSha(deps, target, render);
+          if (liveSha === config.contentSha256) {
+            return {
+              result: {
+                host: args.host,
+                revert_token: "",
+                config_sha256: render.sha256,
+                verify: {
+                  management: "pass",
+                  fresh_connection: "pass",
+                  default_route: "pass",
+                  links: "pass",
+                  jumbo: "skipped",
+                },
+                note: "identical live config; nothing armed",
+              },
+            };
           }
         }
         const created = render.created.filter((name) => !liveNames.has(name));
@@ -694,6 +763,7 @@ export function createModel(overrides: Partial<HostNetDeps> = {}) {
           args.revert_after_s,
           created,
           parentMtus,
+          "apply",
         );
         for (const step of plan) {
           if (step.kind === "mtu" && step.argv !== undefined) {
@@ -701,8 +771,9 @@ export function createModel(overrides: Partial<HostNetDeps> = {}) {
           }
         }
         for (const file of render.files) {
+          const base = file.path.split("/").pop() ?? file.path;
           await sshUpload(deps, target, {
-            path: file.path,
+            path: `${stagedDir(token)}/${base}`,
             content: file.content,
             mode: file.mode,
           });
@@ -710,7 +781,7 @@ export function createModel(overrides: Partial<HostNetDeps> = {}) {
         await run(
           deps,
           target,
-          ["sh", "-c", guardedApplyScript(ctx)],
+          ["sh", "-c", guardedApplyScript(ctx, render.files)],
           "the guarded apply",
         );
         const after = await probeLive(deps, target);
@@ -724,7 +795,7 @@ export function createModel(overrides: Partial<HostNetDeps> = {}) {
             bridgeType: cfg.bridgeType,
             mode: cfg.mode,
             managementInterface: cfg.managementInterface,
-            devices: render.managed,
+            devices: created,
             configSha256: render.sha256,
             contentSha256,
           },
@@ -789,7 +860,32 @@ export function createModel(overrides: Partial<HostNetDeps> = {}) {
             "the host marker is no longer this revert; refusing to commit",
           );
         }
-        if (typeof recorded.contentSha256 === "string") {
+        const isRemove = recorded.operation === "remove";
+        if (isRemove) {
+          // A remove commits only when the owned files and devices are gone.
+          for (const file of render.files) {
+            const exists = await sshExec(deps, target, [
+              "sh",
+              "-c",
+              'test -e "$1"',
+              "sh",
+              file.path,
+            ]);
+            if (exists.exit_code === 0) {
+              throw new HostNetConfigError(
+                `the owned file ${file.path} is still present; refusing to commit`,
+              );
+            }
+          }
+          const liveNames = new Set(live.links.map((l) => l.name));
+          for (const name of (recorded.devices as string[] | undefined) ?? []) {
+            if (liveNames.has(name)) {
+              throw new HostNetConfigError(
+                `device ${name} is still present; refusing to commit`,
+              );
+            }
+          }
+        } else if (typeof recorded.contentSha256 === "string") {
           const liveSha = await liveContentSha(deps, target, render);
           if (liveSha !== recorded.contentSha256) {
             throw new HostNetConfigError(
@@ -811,9 +907,29 @@ export function createModel(overrides: Partial<HostNetDeps> = {}) {
             committedAt: new Date(deps.now()).toISOString(),
           },
         );
+        if (isRemove) {
+          await context.writeResource("config", `config-${targetKey(args)}`, {
+            target: targetKey(args),
+            backend: cfg.backend,
+            bridgeType: cfg.bridgeType,
+            mode: cfg.mode,
+            managementInterface: cfg.managementInterface,
+            devices: [],
+            configSha256: "",
+            contentSha256: "",
+          });
+        }
         return {
           dataHandles: [handle],
-          result: { host: args.host, committed: true, verify: true },
+          result: {
+            host: args.host,
+            committed: true,
+            // No L2 peer on the storage VLAN in this run, so the jumbo path is
+            // not proven; say so rather than implying it passed.
+            jumbo: args.mtu_peer !== undefined && args.require_mtu_verify
+              ? "not-verified"
+              : "skipped",
+          },
         };
       },
     },
@@ -925,20 +1041,22 @@ export function createModel(overrides: Partial<HostNetDeps> = {}) {
           );
         }
         const liveNames = new Set(live.links.map((l) => l.name));
-        const managed = new Set(
-          recorded !== null && Array.isArray(recorded.devices)
-            ? recorded.devices as string[]
-            : render.created,
+        // Ownership comes only from the config record; remove never infers it.
+        const config = await context.readResource(
+          `config-${targetKey(args)}`,
         );
-        const created = render.created.filter((name) =>
-          liveNames.has(name) && managed.has(name)
+        const owned = new Set(
+          config !== null && Array.isArray(config.devices)
+            ? config.devices as string[]
+            : [],
         );
+        const created = [...owned].filter((name) => liveNames.has(name));
         if (created.length === 0) {
           return {
             result: {
               host: args.host,
               removed: [],
-              note: "nothing managed is live",
+              note: "nothing owned by this model is live",
             },
           };
         }
@@ -950,10 +1068,7 @@ export function createModel(overrides: Partial<HostNetDeps> = {}) {
           }))
           .filter((p) => p.mtu > 0);
         const ctx = capturedOf(cfg, render, token, created, parentMtus);
-        const plan = planRemove(cfg, {
-          token,
-          revertAfterS: args.revert_after_s,
-        });
+        const plan = planRemove(cfg);
         assertArmBeforeApply(plan);
         const { handle: revertHandle } = await armRevert(
           deps,
@@ -965,6 +1080,7 @@ export function createModel(overrides: Partial<HostNetDeps> = {}) {
           args.revert_after_s,
           created,
           parentMtus,
+          "remove",
         );
         const bridgeName = cfg.bridge?.name;
         const ordered = [
@@ -994,7 +1110,7 @@ export function createModel(overrides: Partial<HostNetDeps> = {}) {
         await run(
           deps,
           target,
-          ["sh", "-c", guardedApplyScript(ctx)],
+          ["sh", "-c", guardedApplyScript(ctx, [])],
           "the guarded remove apply",
         );
         return {
@@ -1028,19 +1144,47 @@ export function createModel(overrides: Partial<HostNetDeps> = {}) {
         if (typeof recorded.committedAt === "string") {
           throw new HostNetConfigError("this revert is already committed");
         }
+        if (typeof recorded.firedAt === "string") {
+          throw new HostNetConfigError("this revert already fired");
+        }
         await run(
           deps,
           target,
           [restorePath(args.token), args.token],
           "the revert_now restore",
         );
+        // The restore's superseded path exits 0 without running; only a marker
+        // with a fired_at proves it actually restored.
+        const markerOut = await run(
+          deps,
+          target,
+          ["sh", "-c", renderMarkerJsonReadScript(args.token)],
+          "the marker read",
+        );
+        let marker: { result?: string; fired_at?: number | null } = {};
+        try {
+          marker = JSON.parse(markerOut.stdout || "{}");
+        } catch {
+          marker = {};
+        }
+        if (marker.fired_at === undefined || marker.fired_at === null) {
+          throw new HostNetConfigError(
+            "the restore was superseded; nothing fired",
+          );
+        }
+        const result = marker.result === "fail" ? "fail" : "pass";
         await context.writeResource("revert", `revert-${targetKey(args)}`, {
           ...recorded,
           firedAt: new Date(deps.now()).toISOString(),
-          result: "pass",
+          result,
         });
+        if (result === "fail") {
+          throw new HostNetConfigError(
+            "the restore reported fail; the host marker holds the evidence",
+          );
+        }
         return {
-          result: { host: args.host, token: args.token, fired: true },
+          result: { host: args.host, token: args.token, fired: true, result },
         };
       },
     },

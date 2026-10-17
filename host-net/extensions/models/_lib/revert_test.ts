@@ -33,7 +33,9 @@ Deno.test("restore deletes only created devices (bridge first) and never flushes
   assertEquals(script.includes("ip link delete dev 'enp1s0'"), false);
   // Restores the parent MTU and only the owned file.
   assertEquals(script.includes("ip link set dev 'enp1s0' mtu 1500"), true);
-  assertEquals(script.includes("/etc/netplan/90-host-net.yaml"), true);
+  assertEquals(script.includes('while IFS="$(printf'), true);
+  assertEquals(script.includes("$DIR/owned.txt"), true);
+  assertEquals(script.includes("$DIR/owned.txt"), true);
 });
 
 Deno.test("restore is token-guarded, fail-closed and never reboots", () => {
@@ -45,7 +47,8 @@ Deno.test("restore is token-guarded, fail-closed and never reboots", () => {
   assertEquals(script.includes("systemctl reboot"), false);
   assertEquals(script.includes("shutdown -r"), false);
   // The default-route check must require a non-empty route.
-  assertEquals(script.includes('[ -n "$(ip -j route show default'), true);
+  assertEquals(script.includes('route="$(ip -j route show default'), true);
+  assertEquals(script.includes('case "$route" in ""|"[]")'), true);
 });
 
 Deno.test("restore exits non-zero when invoked with the wrong token", () => {
@@ -59,14 +62,17 @@ Deno.test("arm script creates state, snapshots owned files, writes the per-token
     revertAfterS: 300,
     armedSha256: "a".repeat(64),
     contentSha256: "b".repeat(64),
+    operation: "apply",
   });
   assertEquals(script.includes('mkdir -p "/var/lib/host-net"'), true);
-  assertEquals(script.includes("flock 9"), true);
+  assertEquals(script.includes("flock -w 30 9"), true);
   assertEquals(script.includes("systemd-run"), true);
   assertEquals(script.includes(restorePath(CTX.token)), true);
   assertEquals(script.includes("HOST_NET_RESTORE"), true);
   assertEquals(script.includes("exit 76"), true);
   assertEquals(script.includes("/etc/netplan"), true);
+  // Regression: the shellQuote'd restore path must be bare, not double-wrapped.
+  assertEquals(script.includes("\"'/var/lib/host-net"), false);
 });
 
 Deno.test("arm refuses an invalid sha and honours the token check", () => {
@@ -76,6 +82,7 @@ Deno.test("arm refuses an invalid sha and honours the token check", () => {
         revertAfterS: 300,
         armedSha256: "short",
         contentSha256: "b".repeat(64),
+        operation: "apply",
       }),
     Error,
   );
@@ -101,6 +108,7 @@ Deno.test("marker round-trips; the read script only cats the current marker", ()
     expires_at: 2,
     armed_sha256: "a".repeat(64),
     content_sha256: "b".repeat(64),
+    operation: "apply",
     created: CTX.created,
     result: "pending" as const,
     fired_at: null,

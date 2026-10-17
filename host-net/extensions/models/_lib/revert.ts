@@ -1,11 +1,11 @@
 /**
  * The host-side armed-revert artifacts, adapted from the server-host hardened
- * pattern: one host script decides under a `flock` whether an earlier revert is
- * still live, snapshots only what this change owns, writes a per-token restore
- * script and a current-revert marker, and only then activates the transient
- * timer. The restore is token-guarded, removes only created devices, restores
- * only owned files and records its outcome; a failure leaves the marker for an
- * operator and never reboots.
+ * pattern: one host script decides under a `flock -w` whether an earlier revert
+ * is still live, snapshots exactly the owned files this change may replace,
+ * writes a per-token restore script and a current-revert marker, and only then
+ * activates the transient timer. The restore is token-guarded, removes only
+ * created devices, restores exactly the owned files and records its outcome;
+ * a failure keeps the marker for an operator and never reboots.
  *
  * @module
  */
@@ -30,6 +30,11 @@ export function restorePath(token: string): string {
   return `${revertDir(token)}/restore.sh`;
 }
 
+/** The per-token staging directory for config files. */
+export function stagedDir(token: string): string {
+  return `${revertDir(token)}/staged`;
+}
+
 /** The systemd unit name for a token. */
 export function unitName(token: string): string {
   return `host-net-revert-${token}`;
@@ -43,11 +48,11 @@ export interface RevertContext {
   backend: "netplan" | "networkd";
   /** Bridge implementation. */
   bridgeType: "linux" | "ovs";
-  /** Virtual devices this change creates (bridge first is applied in restore). */
+  /** Virtual devices this change creates. */
   created: string[];
-  /** Subset of `created` that are OVS bridges. */
+  /** Subset of `created` that are OVS bridges, deleted with `ovs-vsctl`. */
   createdBridges: string[];
-  /** The managed files this change owns (the restore restores only these). */
+  /** The managed files this change owns and may replace. */
   ownedFiles: string[];
   /** Parent interfaces whose MTU this change raises, with the pre-change value. */
   parentMtus: { name: string; mtu: number }[];
@@ -63,6 +68,8 @@ export interface RevertMarker {
   armed_sha256: string;
   /** SHA-256 over the managed file contents only. */
   content_sha256: string;
+  /** `apply` or `remove`. */
+  operation: string;
   /** Devices this change created. */
   created: string[];
   /** `pending`, `pass` or `fail`. */
@@ -71,7 +78,7 @@ export interface RevertMarker {
   fired_at: number | null;
 }
 
-function shellQuote(value: string): string {
+function shq(value: string): string {
   return `'${value.replace(/'/g, `'\\''`)}'`;
 }
 
@@ -81,28 +88,17 @@ export function renderMarker(marker: RevertMarker): string {
   return JSON.stringify(marker) + "\n";
 }
 
-function ownedFileRestore(ctx: RevertContext): string {
-  if (ctx.backend === "netplan") {
-    const files = ctx.ownedFiles.map(shellQuote).join(" ");
-    return [
-      `for f in ${files}; do`,
-      `  b="$(basename "$f")"`,
-      `  if [ -f "$SNAP/$b" ]; then cp -a "$SNAP/$b" "$f.host-net-new" && mv -f "$f.host-net-new" "$f"; else rm -f "$f"; fi`,
-      `done`,
-    ].join("\n");
-  }
-  return [
-    `for f in /etc/systemd/network/90-host-net-*; do [ -e "$f" ] || continue; b="$(basename "$f")"; if [ ! -f "$SNAP/$b" ]; then rm -f "$f"; fi; done`,
-    `cp -a "$SNAP/." /etc/systemd/network/ 2>/dev/null || true`,
-  ].join("\n");
+/** The shell list of owned files, for a `for` loop. */
+function ownedList(ctx: RevertContext): string {
+  return ctx.ownedFiles.map(shq).join(" ");
 }
 
 /**
  * Renders the per-token restore script. It exits non-zero unless invoked with
  * its own token, is a no-op when superseded, deletes only created devices
- * (bridges first), restores parent MTUs and only owned files, and records its
- * outcome in the marker under a trap so a mid-restore failure still writes
- * `fail`.
+ * (bridges first), restores the parent MTUs and exactly the owned files from
+ * the manifest, and records its outcome under a trap so a mid-restore failure
+ * still writes `fail`. The current marker is cleared only on success.
  */
 export function renderRestoreScript(ctx: RevertContext): string {
   if (!TOKEN_RE.test(ctx.token)) throw new Error("invalid revert token");
@@ -110,20 +106,23 @@ export function renderRestoreScript(ctx: RevertContext): string {
     assertIface(name, "created device");
   }
   const dir = revertDir(ctx.token);
-  const bridges = ctx.createdBridges.map(shellQuote).join(" ");
+  const bridges = ctx.createdBridges.map(shq).join(" ");
   const others = ctx.created.filter((n) => !ctx.createdBridges.includes(n))
-    .map(shellQuote).join(" ");
+    .map(shq).join(" ");
   const parentLines = ctx.parentMtus
-    .map((p) => `ip link set dev ${shellQuote(p.name)} mtu ${p.mtu}`)
+    .map((p) => `ip link set dev ${shq(p.name)} mtu ${p.mtu}`)
     .join("\n");
   const applyCmd = ctx.backend === "netplan"
     ? "netplan apply"
     : "networkctl reload && networkctl reconfigure";
+  const ovsDelete = ctx.bridgeType === "ovs" && ctx.createdBridges.length > 0
+    ? `for br in ${bridges}; do ovs-vsctl --if-exists del-br "$br" >/dev/null 2>&1 || true; done`
+    : "";
   return `#!/bin/sh
 # host-net restore, token ${ctx.token}. Generated; do not edit.
 set -eu
-TOKEN=${shellQuote(ctx.token)}
-DIR=${shellQuote(dir)}
+TOKEN=${shq(ctx.token)}
+DIR=${shq(dir)}
 SNAP="$DIR/snapshot"
 MARKER="$DIR/marker.json"
 RESULT=fail
@@ -135,7 +134,7 @@ write_result() {
 trap 'RESULT=fail; write_result' EXIT
 [ "\${1-}" = "$TOKEN" ] || { echo 'host-net: wrong token' >&2; exit 64; }
 exec 9>"${LOCK_PATH}"
-flock 9
+flock -w 30 9 || { echo 'host-net: lock busy' >&2; exit 75; }
 cur=
 if [ -f "${CURRENT_PATH}" ]; then read cur _ < "${CURRENT_PATH}" || true; fi
 if [ "$cur" != "$TOKEN" ]; then
@@ -145,21 +144,28 @@ if [ "$cur" != "$TOKEN" ]; then
 fi
 # 1. delete only the devices this change created (bridge before its ports).
 for dev in ${bridges} ${others}; do ip link delete dev "$dev" 2>/dev/null || true; done
-${
-    ctx.bridgeType === "ovs" && ctx.createdBridges.length > 0
-      ? `for br in ${bridges}; do ovs-vsctl --if-exists del-br "$br" >/dev/null 2>&1 || true; done`
-      : ""
-  }
+${ovsDelete}
 # 2. restore the parent MTUs this change raised.
 ${parentLines}
-# 3. restore only the owned files from the snapshot.
-${ownedFileRestore(ctx)}
+# 3. restore exactly the owned files recorded in the manifest.
+if [ -f "$DIR/owned.txt" ]; then
+  while IFS="$(printf '\\t')" read -r p state; do
+    [ -n "$p" ] || continue
+    b="$(basename "$p")"
+    if [ "$state" = present ] && [ -f "$SNAP/$b" ]; then
+      cp -a "$SNAP/$b" "$p.host-net-new" && mv -f "$p.host-net-new" "$p"
+    else
+      rm -f "$p"
+    fi
+  done < "$DIR/owned.txt"
+fi
 # 4. apply the restored configuration.
 ${applyCmd}
-# 5. record the outcome; a non-empty default route means the path is back.
-if [ -n "$(ip -j route show default 2>/dev/null || true)" ]; then RESULT=pass; fi
+# 5. record the outcome; only a non-empty default route is a pass.
+route="$(ip -j route show default 2>/dev/null || true)"
+case "$route" in ""|"[]") ;; *) RESULT=pass ;; esac
 write_result
-rm -f "${CURRENT_PATH}"
+if [ "$RESULT" = pass ]; then rm -f "${CURRENT_PATH}"; fi
 trap - EXIT
 exit 0
 `;
@@ -173,19 +179,19 @@ export interface ArmOptions {
   armedSha256: string;
   /** SHA-256 over the managed file contents only. */
   contentSha256: string;
+  /** `apply` or `remove`. */
+  operation: "apply" | "remove";
 }
 
 /**
- * Renders the arm script: under the lock it refuses while any earlier revert
- * timer or service is active (or within the firing grace), removes a dead
- * revert's leftovers, snapshots only the owned files, writes the per-token
- * restore script and the current marker, and activates the timer. If the timer
- * fails to start it rolls its own marker and snapshot back and exits non-zero.
+ * Renders the arm script. Under `flock -w 30` it refuses (exit 76) while an
+ * earlier revert timer or service is active, within the firing grace, or left a
+ * `fail` marker for an operator; otherwise it removes a dead revert's
+ * leftovers, snapshots exactly the owned files (with a present/absent
+ * manifest), writes the per-token restore script and the marker, and activates
+ * the timer. A failed `systemd-run` rolls its own files back and exits 1.
  */
-export function renderArmScript(
-  ctx: RevertContext,
-  opts: ArmOptions,
-): string {
+export function renderArmScript(ctx: RevertContext, opts: ArmOptions): string {
   if (!TOKEN_RE.test(ctx.token)) throw new Error("invalid revert token");
   if (!/^[0-9a-f]{64}$/.test(opts.armedSha256)) {
     throw new Error("armed sha must be 64 hex");
@@ -195,28 +201,29 @@ export function renderArmScript(
   }
   const dir = revertDir(ctx.token);
   const unit = unitName(ctx.token);
+  const self = restorePath(ctx.token);
   const marker = renderMarker({
     token: ctx.token,
     expires_at: 0,
     armed_sha256: opts.armedSha256,
     content_sha256: opts.contentSha256,
+    operation: opts.operation,
     created: ctx.created,
     result: "pending",
     fired_at: null,
-  }).trim();
-  const restore = renderRestoreScript(ctx);
+  }).trim().replace(/'/g, `'\\''`);
   return `set -eu
 umask 077
 mkdir -p "${STATE_DIR}"
 exec 9>"${LOCK_PATH}"
-flock 9
+flock -w 30 9 || { echo 'host-net: lock busy' >&2; exit 75; }
 cur="${CURRENT_PATH}"
 if [ -f "$cur" ]; then
   otok=; oexp=0
   read otok oexp _ < "$cur" || true
   case "$otok" in ""|*[!0-9a-f]*) otok= ;; esac
   case "$oexp" in ""|*[!0-9]*) oexp=0 ;; esac
-  if [ -n "$otok" ] && [ "$otok" != ${shellQuote(ctx.token)} ]; then
+  if [ -n "$otok" ] && [ "$otok" != ${shq(ctx.token)} ]; then
     ou="${unitName(ctx.token).replace(ctx.token, "$otok")}"
     state=$(systemctl is-active "$ou.timer" || true)
     sstate=$(systemctl is-active "$ou.service" || true)
@@ -228,30 +235,35 @@ if [ -f "$cur" ]; then
       echo "an earlier revert has not finished firing" >&2
       exit 76
     fi
+    if [ -f "${STATE_DIR}/revert/$otok/marker.json" ] && grep -q '"result":"fail"' "${STATE_DIR}/revert/$otok/marker.json"; then
+      echo "an earlier revert failed and needs clearing" >&2
+      exit 76
+    fi
     rm -rf "${STATE_DIR}/revert/$otok"
   fi
 fi
-DIR=${shellQuote(dir)}
+DIR=${shq(dir)}
 SNAP="$DIR/snapshot"
-mkdir -p "$SNAP"
-if [ -d /etc/netplan ]; then cp -a /etc/netplan/. "$SNAP/" 2>/dev/null || true; fi
-if [ -d /etc/systemd/network ]; then for f in /etc/systemd/network/90-host-net-*; do [ -e "$f" ] || continue; cp -a "$f" "$SNAP/"; done; fi
-ip -d -j link > "$DIR/live-link.json"
-printf '%s\\n' '${marker.replace(/'/g, `'\\''`)}' > "$DIR/marker.json"
-cat > "${shellQuote(restorePath(ctx.token))}" <<'HOST_NET_RESTORE'
-${restore}HOST_NET_RESTORE
-chmod 700 "${shellQuote(restorePath(ctx.token))}"
+rm -rf "$DIR"
+mkdir -p "$SNAP" "$DIR/staged"
+: > "$DIR/owned.txt"
+for p in ${ownedList(ctx)}; do
+  b="$(basename "$p")"
+  if [ -f "$p" ]; then cp -a "$p" "$SNAP/$b"; printf '%s\\tpresent\\n' "$p" >> "$DIR/owned.txt"; else printf '%s\\tabsent\\n' "$p" >> "$DIR/owned.txt"; fi
+done
+printf '%s\\n' '${marker}' > "$DIR/marker.json"
+cat > ${shq(self)} <<'HOST_NET_RESTORE'
+${renderRestoreScript(ctx)}HOST_NET_RESTORE
+chmod 700 ${shq(self)}
 now=$(date +%s)
-printf '%s %s %s\\n' ${
-    shellQuote(ctx.token)
-  } "$((now + ${opts.revertAfterS}))" ${
-    shellQuote(opts.armedSha256)
+printf '%s %s %s\\n' ${shq(ctx.token)} "$((now + ${opts.revertAfterS}))" ${
+    shq(opts.armedSha256)
   } > "$cur.tmp"
 mv -f "$cur.tmp" "$cur"
-if ! systemd-run --unit=${unit} --on-active=${opts.revertAfterS} --timer-property=AccuracySec=1s "${
-    shellQuote(restorePath(ctx.token))
-  }" ${shellQuote(ctx.token)}; then
-  rm -f "$cur" "$DIR/marker.json" "${shellQuote(restorePath(ctx.token))}"
+if ! systemd-run --unit=${unit} --on-active=${opts.revertAfterS} --timer-property=AccuracySec=1s ${
+    shq(self)
+  } ${shq(ctx.token)}; then
+  rm -f "$cur" "$DIR/marker.json" ${shq(self)}
   exit 1
 fi
 `;
@@ -279,16 +291,22 @@ systemctl stop "${unit}.timer"
 `;
   return `set -eu
 exec 9>"${LOCK_PATH}"
-flock 9
+flock -w 30 9 || { echo 'host-net: lock busy' >&2; exit 75; }
 ${active}systemctl stop "${unit}.service" 2>/dev/null || true
 cur=
 if [ -f "${CURRENT_PATH}" ]; then read cur _ < "${CURRENT_PATH}" || true; fi
-if [ "$cur" = ${shellQuote(token)} ]; then rm -f "${CURRENT_PATH}"; fi
-rm -rf ${shellQuote(revertDir(token))}
+if [ "$cur" = ${shq(token)} ]; then rm -f "${CURRENT_PATH}"; fi
+rm -rf ${shq(revertDir(token))}
 `;
 }
 
 /** The READ-ONLY script that prints the current marker line, if any. */
 export function renderMarkerReadScript(): string {
   return `if [ -e "${CURRENT_PATH}" ]; then cat "${CURRENT_PATH}"; fi`;
+}
+
+/** The READ-ONLY script that prints the current revert's marker JSON, if any. */
+export function renderMarkerJsonReadScript(token: string): string {
+  const marker = `${revertDir(token)}/marker.json`;
+  return `if [ -e ${shq(marker)} ]; then cat ${shq(marker)}; fi`;
 }

@@ -109,3 +109,33 @@ The `context.vaultService` path is now driven as a plain `{get(vault,key)}`
 object in a test, with `resolveSecret` left undefined.
 
 80 unit tests; gates 0-6 pass offline. Live jumbo cells remain `blocked`.
+
+## Round-2 review
+
+- **HIGH** — the arm script wrapped `shellQuote(restorePath)` in double quotes,
+  so every live arm would `cat` a path with literal apostrophes and abort under
+  `set -e`. The quoted paths are now bare at `cat`, `chmod`, `systemd-run` and
+  the rollback `rm`; a regression test asserts no double-wrapped restore path.
+- **HIGH** — ownership is persisted: the revert record stores `created`, the
+  config record stores the owned `devices`, and `apply`/`remove` read ownership
+  only from the config record. An identical live config (recorded content sha
+  matches and every owned device is present) arms nothing; a declared name that
+  exists but is unowned is refused. Tests cover apply-after-commit and
+  remove-of-unowned.
+- **HIGH** — the revert record stores the `operation`; commit of a `remove`
+  verifies the owned files are absent and the recorded devices are gone, then
+  clears the config record, instead of trying to `cat` deleted files.
+- **HIGH** — the snapshot records exactly `ctx.ownedFiles` with a present/absent
+  manifest and the restore replays only those, so a takeover drop-in is
+  snapshotted and networkd no longer copies netplan YAML.
+- **MEDIUM** — the restore treats `[]` as no default route and keeps the marker
+  on failure; the arm refuses (76) while an old marker says `fail`; config files
+  are uploaded to the revert dir and moved into place inside the guarded apply
+  (removed on a guard refusal); `revert_now` requires a pending unfired record
+  and reads the host marker result; the management guard resolves `match_mac`
+  against the live probe; every interpolated YAML scalar is quoted; networkd
+  `MTUBytes` moved to `[Link]`; commit reports `jumbo: not-verified` when a peer
+  is configured.
+- **LOW** — `flock -w 30` everywhere so a held lock exits non-zero instead of
+  blocking; the dead `armArgv`/`revertNowArgv`/`disarmArgv` builders are gone.
+- 83 unit tests; gates 0-6 pass offline. Live jumbo cells remain `blocked`.

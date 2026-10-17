@@ -30,20 +30,20 @@ Deno.test("golden netplan: linux bridge on a VLAN at MTU 9000", () => {
   version: 2
   renderer: networkd
   ethernets:
-    enp1s0:
+    "enp1s0":
   vlans:
-    enp1s0.100:
+    "enp1s0.100":
       id: 100
-      link: enp1s0
+      link: "enp1s0"
       mtu: 9000
       addresses:
-        - 198.51.100.10/24
+        - "198.51.100.10/24"
       accept-ra: false
       optional: true
   bridges:
-    br0:
+    "br0":
       interfaces:
-        - enp1s0.100
+        - "enp1s0.100"
       mtu: 9000
 `,
   );

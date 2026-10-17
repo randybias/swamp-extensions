@@ -1,12 +1,10 @@
 import { assertEquals, assertThrows } from "jsr:@std/assert@1.0.19";
 import {
-  armArgv,
   assertArmBeforeApply,
   mtuLowerOrder,
   mtuRaiseOrder,
   planApply,
   planRemove,
-  revertNowArgv,
   type Step,
 } from "./plan.ts";
 import type { NetConfig } from "./validate.ts";
@@ -47,10 +45,7 @@ Deno.test("arm precedes every mtu/write/apply step", () => {
     const at = steps.findIndex((s) => s.kind === kind);
     assertEquals(at > armAt, true, `${kind} after arm`);
   }
-  const remove = planRemove(CFG, {
-    token: "0000000000000000",
-    revertAfterS: 300,
-  });
+  const remove = planRemove(CFG);
   assertArmBeforeApply(remove);
 });
 
@@ -65,19 +60,4 @@ Deno.test("a plan with the arm moved after the apply fails the invariant", () =>
     { kind: "mtu", id: "mtu", description: "raise" },
   ];
   assertThrows(() => assertArmBeforeApply(stageAsArm), Error);
-});
-
-Deno.test("arm arg is a systemd-run timer; revert_now runs the restore script", () => {
-  assertEquals(armArgv("0000000000000000", 300), [
-    "systemd-run",
-    "--unit=host-net-revert-0000000000000000",
-    "--on-active=300",
-    "--timer-property=AccuracySec=1s",
-    "/var/lib/host-net/restore.sh",
-    "0000000000000000",
-  ]);
-  assertEquals(revertNowArgv("0000000000000000"), [
-    "/var/lib/host-net/restore.sh",
-    "0000000000000000",
-  ]);
 });

@@ -22,6 +22,8 @@ export interface LiveLink {
   vlanId: number;
   /** Master device, when enslaved. */
   master: string;
+  /** MAC address, lowercased. */
+  mac: string;
 }
 
 /** One address as reported by `ip -j addr`. */
@@ -101,6 +103,7 @@ export function parseLinks(text: string): LiveLink[] {
       state: String(entry.operstate ?? ""),
       vlanId: kind === "vlan" && typeof info?.id === "number" ? info.id : 0,
       master: typeof entry.master === "string" ? entry.master : "",
+      mac: typeof entry.address === "string" ? entry.address.toLowerCase() : "",
     };
   });
 }

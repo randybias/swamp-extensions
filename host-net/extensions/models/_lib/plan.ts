@@ -49,33 +49,6 @@ export function mtuLowerOrder(cfg: NetConfig): DeviceNode[] {
   return mtuRaiseOrder(cfg).reverse();
 }
 
-/** The argv that activates the host-side revert timer. */
-export function armArgv(token: string, revertAfterS: number): string[] {
-  return [
-    "systemd-run",
-    `--unit=host-net-revert-${token}`,
-    `--on-active=${revertAfterS}`,
-    "--timer-property=AccuracySec=1s",
-    "/var/lib/host-net/restore.sh",
-    token,
-  ];
-}
-
-/** The argv that fires the armed revert immediately. */
-export function revertNowArgv(token: string): string[] {
-  return ["/var/lib/host-net/restore.sh", token];
-}
-
-/** The argv that stops and clears the revert timer for a token. */
-export function disarmArgv(token: string): string[] {
-  return [
-    "systemctl",
-    "stop",
-    `host-net-revert-${token}.timer`,
-    `host-net-revert-${token}.service`,
-  ];
-}
-
 function mtuStep(node: DeviceNode, direction: "raise" | "lower"): Step {
   return {
     kind: "mtu",
@@ -111,7 +84,6 @@ export function planApply(
       kind: "arm",
       id: "arm",
       description: "activate the host-side revert timer",
-      argv: armArgv(opts.token, opts.revertAfterS),
     },
   ];
   for (const node of mtuRaiseOrder(cfg)) steps.push(mtuStep(node, "raise"));
@@ -134,10 +106,7 @@ export function planApply(
 }
 
 /** Builds the ordered steps for a remove. */
-export function planRemove(
-  cfg: NetConfig,
-  opts: { token: string; revertAfterS: number },
-): Step[] {
+export function planRemove(cfg: NetConfig): Step[] {
   const steps: Step[] = [
     { kind: "probe", id: "probe", description: "probe live link/addr/route" },
     {
@@ -154,7 +123,6 @@ export function planRemove(
       kind: "arm",
       id: "arm",
       description: "activate the host-side revert timer",
-      argv: armArgv(opts.token, opts.revertAfterS),
     },
     {
       kind: "delete",

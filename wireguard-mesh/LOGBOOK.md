@@ -374,3 +374,51 @@ guards) are unchanged; only delivery changed:
   cleanup; tested under the system sh (dash).
 - MEDIUM: legacy `{type,key}` host keys must be exactly those two string keys.
 - LOW: the "never at rest" wording corrected.
+
+## 2026-10-17 live e2e (2026.10.17.5): 12 pass, 0 fail, 0 blocked
+
+Head under test: lane/b2-wg f70424d (`@randybias/wireguard-mesh` 2026.10.17.5),
+from a temporary detached worktree, in a separate scratch repo. Upgrade
+baseline: the published 2026.10.17.4 (beta) pulled from the registry, then
+replaced by the f70424d build; swamp bumped the definition's typeVersion to
+2026.10.17.5 by itself, with no definition or input edits. Targets: two
+throwaway VPS, `<vps3>` (node vps3, the hub) and `<vps4>` (node vps4). Mesh
+addresses <wg-a>/32 and <wg-b>/32 (RFC 1918, redacted), UDP 51830. WireGuard
+keys and the SSH key went straight into the vault; every run used
+`swamp model method run` without `--json`. Argv scan: a sampler on both nodes
+recorded `ps -eww -o args` for the whole run, and the samples were grepped
+locally for each private key and its sha256 (patterns from a 0600 file, never on
+argv); a 50 ms canary was caught as a positive control.
+
+| Cell                             | Result | Detail                                                                                                                                                                                                                                          |
+| -------------------------------- | ------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| A1 17.4 apply, accept-new        | pass   | both nodes applied; ping both ways 0% loss; per-node `vps3-hostkeys` / `vps4-hostkeys` records hold 17.4's `{type,key}` objects                                                                                                                 |
+| A2 switch to 17.5, re-apply      | pass   | no edits, no error; "No change" on both (accept-new maps to insecure_tofu, the 17.4 pins are used as strict); keyed records `<node>-hostkeys-<host>-22` written with ssh-keyscan lines matching the real keys                                   |
+| A3 re-apply after migration      | pass   | "No change"; keyed records not rewritten (no re-learn)                                                                                                                                                                                          |
+| A4 `host_key_policy: insecure`   | pass   | refused at validation; nothing contacted                                                                                                                                                                                                        |
+| B1 fresh 17.5 definition, strict | pass   | applied on both; files 0600; no hostkeys record written under strict                                                                                                                                                                            |
+| B2 handshake                     | pass   | ping both ways, handshake recent; `get` returns the live peer                                                                                                                                                                                   |
+| B3 re-apply                      | pass   | "No change"; epoch and ifindex unchanged                                                                                                                                                                                                        |
+| C armed revert (manual)          | pass   | the real 17.5 apply script through the real transport without confirmation: Address <wg-b> -> <wg-b2>, rollback armed, mesh broken; after the 120 s window the address and interface came back, ping OK, a swamp apply then reports "No change" |
+| D wrong pin                      | pass   | strict pins of the other host with a pending change: `host key verification failed for <vps4>:22; refusing to connect`; config, epoch and ifindex unchanged, no upload, no temp dir                                                             |
+| E pins per port                  | pass   | second sshd on :2222: insecure_tofu learns a separate `vps4-hostkeys-<vps4>-2222` record; :22 and :2222 re-runs add no record versions; a new host key on :2222 is refused, :22 unaffected                                                      |
+| F argv and temp dir              | pass   | 0 hits for either private key or its sha256 in about 2,900 unique argv lines; `/tmp/wgmesh.*` count 0 on both nodes after every run                                                                                                             |
+| G delete, then again             | pass   | "Deleted" on both: wg0, `wg0.conf`, `wg0.key` gone, UDP 51830 closed; repeat "No change"; rollback dirs and processes gone after the window                                                                                                     |
+
+Cleanup: wg0 and its files are gone on both nodes, the side sshd and its host
+key were removed, the scratch vault was emptied and the worktree removed. The
+VPS are left for deletion by the live lane.
+
+Residuals (follow-ups, not failures):
+
+- delete leaves `.wg0.epoch` and `.wg0.lock` in `/etc/wireguard`.
+- The 2026.10.17.4 per-node `<node>-hostkeys` records stay in the data after
+  migration; the keyed record wins, but deleting a keyed record to re-learn
+  after a real key rotation reads the old record again (terra, Medium).
+- Runs are about 3x slower than 2026.10.17.4: an apply or no-op takes 15-20 s
+  against about 6 s; delete is unchanged.
+- Host case-sensitivity fails closed: the keyed record name lowercases the host
+  but the stored host is compared as given, so a pin reused with different DNS
+  capitalization is reported unreadable instead of reused (astra, Medium).
+- Different spellings of one IPv6 address, and a name with a trailing dot, get
+  separate pins (Low).

@@ -4,6 +4,42 @@ Not packaged. Notes for whoever maintains this extension.
 
 ---
 
+## HANDOFF: group 08 workflow catalog (remaining)
+
+**What remains.** The full catalog in `docs/specs/cephadm/08-workflows.md` §2
+(`cephadm-prep-host` through `cephadm-verify-osds`), plus the §1.8 catalog
+tests. This is the LAST group; all methods it needs exist except the four
+S3-plane RGW methods (the S3 handoff above), so build every workflow whose
+methods exist and list the S3-dependent ones as pending in the manifest.
+
+**Where.** `cephadm/extensions/workflows/<name>/workflow.yaml`, one directory
+per workflow, and each path added to `cephadm/manifest.yaml` `workflows:`. D60:
+a test must fail when the manifest list and `extensions/workflows/` disagree.
+
+**Normative shape (08 §1), non-negotiable:**
+
+- Name `cephadm-<verb>-<object>`, single hyphens; description one line 40-90
+  chars, verb first, no markdown/template.
+- Every step addresses instance `cephadm`, or `cephadm-<purpose>-<item>` for a
+  fan-out (D57). An assert reads the record from the SAME instance that wrote it
+  (D59).
+- SSH block inputs: `port` required with no default (not even 22); `sshUser`
+  required; `keyPath` optional; `strictHostKeyChecking` enum exactly `yes`/`no`;
+  pass optionals as `has(x) ? x : null` (D57).
+- Every M/M!/D workflow: pre-gate (verify with `throwOnFail: false`) where the
+  entry names one, `manual_approval` 3600s, the mutation, a SEPARATE prove job
+  (independent read-back with `throwOnFail: false` + null-safe assert of
+  expected vs observed), and a report-failure job that triggers on failed OR
+  skipped. No approval prompt may contain `data.latest`.
+
+**Reuse.** The method argument schemas in `extensions/models/cephadm.ts` are the
+source of truth for input names; the record keys are in the owning group spec
+(e.g. `cephHostMaintenanceEnter-<host>-<hostName>`). `cephadm_test.ts` shows the
+model-method shape. Validate with
+`SWAMP_API_KEY=$(secrets get
+swamp/randybias/cli-token) swamp workflow validate <name>`
+after adding each.
+
 ## HANDOFF: RGW S3 plane (clean room)
 
 **What remains.** The four S3-plane methods only:

@@ -1,0 +1,89 @@
+{
+  "extension": "@randybias/cephadm",
+  "version": "2026.10.17.1",
+  "reviewedAt": "2026-10-17T13:16:35Z",
+  "dimensions": [
+    {
+      "id": "credentials-secrets",
+      "verdict": "pass",
+      "note": "The SSH private key is sensitive-marked on the string and its nullish wrapper and reaches ssh through a key file, never argv; the S3 accessKey/secretKey are sensitive and used only to sign SigV4 (no URL, header or signature reaches a record, log or error); RGW user keys and CSI client keys are generated or read into sensitive, vaulted resource fields (the user record's accessKey is sensitive-marked beside key). Known external issue swamp-club lab 3555: README examples pass secrets as vault references only and never show --json."
+    },
+    {
+      "id": "logging-quality",
+      "verdict": "pass",
+      "note": "Methods log structured, value-free summaries (host, method, verdict); remote stderr and S3 transport detail are URL-stripped and truncated before they reach logs or errors."
+    },
+    {
+      "id": "error-handling",
+      "verdict": "pass",
+      "note": "Failures are typed (validate, transport, unverifiable, protected, object-leak-*, policy rollback) with bounded detail; SSH exit 255 is a typed transport error; indeterminate S3 writes are re-read and rolled back, and RESTORED is reported only after a canonical read-back."
+    },
+    {
+      "id": "testing-completeness",
+      "verdict": "pass",
+      "note": "486 unit/contract tests with scripted SSH sessions and an injected fetch (no socket), including the wipe guard's refusal matrix, SigV4 known-answer tests, workflow catalog tests (manifest vs directory, gate polarity, succeeded-only safety dependencies) and plain-object method contexts. Live end-to-end is BLOCKED: a real cluster needs at least three hosts with free whole disks and the one bare-metal test box has root RAID1 members on both disks; every live cell (77) is recorded as blocked in LOGBOOK, which is why the channel is beta."
+    },
+    {
+      "id": "idempotency-resilience",
+      "verdict": "pass",
+      "note": "Every ensure/apply method reads first and converges or does nothing (bootstrap no-ops on an existing cluster, placement converges to an explicit list keeping quorum, pools/fs/users adopt); delete paths are double-confirmed and re-runs are clean no-ops; maintenance enter/exit prove their effect. Residual LOW: probe-cleanup fallback after an unreadable version listing reports success after a plain DELETE."
+    },
+    {
+      "id": "api-contracts",
+      "verdict": "pass",
+      "note": "Public cephadm/ceph CLI over SSH (pinned cephadm binary from a caller-supplied URL), Ceph RGW admin via radosgw-admin, and the RGW S3 API with SigV4; PutObjectAcl (not a second PutObject) for the leak probe; versioning is the three-state model."
+    },
+    {
+      "id": "resource-management",
+      "verdict": "pass",
+      "note": "SSH sessions are closed per call (optional multiplexing is opt-in); remote temp files are removed in finally paths; S3 responses are capped at 1 MiB; every wait is bounded."
+    },
+    {
+      "id": "published-surface-hygiene",
+      "verdict": "pass",
+      "note": "Manifest @randybias/cephadm, two-sentence description, Apache-2.0, additionalFiles README.md and LICENSE.txt (LOGBOOK not packaged). Destructive methods lead with DESTRUCTIVE., read-only with READ-ONLY.; README method table regenerated from source (50 methods, 22 workflows). Fixtures are synthetic (RFC 5737, example.com/.test); leak scan, gitleaks and fixture guard pass. Clean-room provenance is logged in docs/CLEANROOM.md."
+    },
+    {
+      "id": "schema-strictness",
+      "verdict": "pass",
+      "note": "Global arguments are an empty strictObject; every method argument object is strict with grammars and bounds for hosts, devices, pool/fs/user/bucket names and URLs; strictHostKeyChecking is a required yes/no enum; bucket policy documents are parsed, validated and re-serialized from the validated structure."
+    },
+    {
+      "id": "lifetime-gc",
+      "verdict": "pass",
+      "note": "34 result resources lifetime infinite with garbageCollection 10; the CSI key resource keeps 2 versions."
+    },
+    {
+      "id": "crud-completeness",
+      "verdict": "pass",
+      "note": "Host prep, bootstrap, enrol, mon/mgr/mds/osd placement, pools, CephFS, CSI users and keys, maintenance, teardown, RGW users and buckets, plus verify methods for each; every mutator is kind action (25 methods), so no verb tombstones the definition; 22 workflows gate every mutation behind a pre-check and manual approval."
+    },
+    {
+      "id": "preflight-checks",
+      "verdict": "pass",
+      "note": "wipeDiskToRaw refuses any device that backs the running or bootable system (protected-device closure over lsblk, blkid, mdstat, mdadm --examine, pvs and ZFS), and refuses when lsblk and blkid disagree; destructive teardown requires the named fsid; placement changes are judged against live quorum first."
+    },
+    {
+      "id": "instance-names",
+      "verdict": "pass",
+      "note": "Workflows address the instance cephadm or cephadm-<purpose>-<item> for a fan-out, and each assert reads the record from the instance that wrote it."
+    },
+    {
+      "id": "data-access",
+      "verdict": "pass",
+      "note": "Every host, credential and target arrives as method arguments, so one generic definition serves any cluster; the model reads no other model's data."
+    },
+    {
+      "id": "version-upgrades",
+      "verdict": "pass",
+      "note": "First release (2026.10.17.1): no earlier version or stored data to upgrade."
+    }
+  ],
+  "panel": {
+    "codex-astra": "codex gpt-6-astra conformance seat: integrated tree CLEAN at 7f931c2; delta 7f931c2..95517dc: 1 Medium (curl URL denylist; mitigated, assertHttpUrl runs first in ensureCephadm), 1 Low (stackOf duplicates closure); residuals in LOGBOOK.",
+    "codex-terra": "codex gpt-5.6-terra adversarial seat, delta 7f931c2..95517dc: HIGH versioned probe cleanup refuted (cleanupProbeObject deletes every Version and DeleteMarker by id); MEDIUM blkid exit 2 on blank disks refuted (bare blkid lists the root filesystem; exit 2 refuses fail-closed by design). Shared wipe guard (protected_devices.ts blob 2a2592a4) signed off at round 5.",
+    "merge-prep": "Post-review change e788314: plain model export (dry-run uncatalogued-model) and same-line .meta({ sensitive: true }) on the S3 credential fields plus the RGW user record's accessKey (credentials-sensitive-field); no other behaviour change, 486 tests and gates 0 to 6 pass.",
+    "live": "blocked: a real cephadm cluster needs at least three hosts with free whole disks; the one bare-metal test box has root RAID1 members on both disks. Every live cell (77) recorded as blocked in LOGBOOK.",
+    "ocr-llm": "OCR sonnet5 and glm seats were not run"
+  }
+}

@@ -1,6 +1,21 @@
 # Spec: P2 — `@randybias/kea-dhcp`
 
-Status: DRAFT — awaiting Randy's approval (P2, written from public docs only; no prior implementation consulted)
+visibility: public
+audience: general
+
+Naming answers (naming and visibility convention, questions 1 to 5):
+
+Q1: Public.
+
+Q2: General usage: anyone running ISC Kea as a DHCP server on a Linux host.
+
+Q3: Yes. `kea-dhcp` names the product (Kea) and the protocol (DHCP); short and unambiguous. Naming audit verdict: keep.
+
+Q4: Not applicable (public and general).
+
+Q5: Yes. A stranger reads `kea-dhcp` as a Kea DHCP server manager, which is what it does, and guesses wrong about nothing.
+
+Status: approved (see `docs/CLEANROOM.md`); written from public docs only, no prior implementation consulted. The next-version scope is at the end.
 RFC 2119 keywords.
 Sources: ISC Kea Administrator Reference Manual (kea.readthedocs.io, 2.4/2.6
 lines), Debian/Ubuntu `kea` package documentation, this repo's CONVENTIONS and
@@ -272,3 +287,20 @@ secret: lease backends with credentials (MySQL/PostgreSQL) are refused, and
    the hook?
 3. Distro Kea (Ubuntu 2.4.x / Debian 2.6.x) only, or also ISC's 3.0 packages?
 4. DHCPv6 and DDNS to a Knot zone: later version, or a separate model?
+
+## Next version scope: next
+
+Next `kea-dhcp` version (public, beta).
+
+- Re-vendor the canonical transport (`8f132c4329c9e64bed686731cd5a0e02980194ea`).
+- Residual Mediums, all in the armed revert: the commit script stops the timer
+  before the drift check; commit enables the unit before taking the lock; the
+  service-active and hash re-check run outside the lock; post-claim writes sit
+  outside the cleanup try, and `abortClaim` marks cancelled even when remote
+  cleanup failed; `disarmAndRestore` reports "timer left armed" after a restore
+  that already cleared the state file; the restore copies over the live config
+  non-atomically.
+- Fix the class once (one lock, one ordering, atomic restore) rather than six
+  patches.
+- Live in the veth lab: apply, commit, uncommitted apply reverting, a late
+  commit racing the timer, remove.

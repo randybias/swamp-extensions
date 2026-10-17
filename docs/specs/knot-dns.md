@@ -1,6 +1,21 @@
 # Spec: P2 — `@randybias/knot-dns`
 
-Status: DRAFT — awaiting Randy's approval (P2, written from public docs only; no prior implementation consulted)
+visibility: public
+audience: general
+
+Naming answers (naming and visibility convention, questions 1 to 5):
+
+Q1: Public.
+
+Q2: General usage: anyone running Knot DNS or Knot Resolver on a Linux host.
+
+Q3: Yes. `knot-dns` names the product (Knot) and the protocol (DNS); Knot Resolver is still DNS; short and unambiguous. Naming audit verdict: keep.
+
+Q4: Not applicable (public and general).
+
+Q5: Yes. A stranger reads `knot-dns` as a Knot DNS server manager, which is what it does, and guesses wrong about nothing.
+
+Status: approved (see `docs/CLEANROOM.md`); written from public docs only, no prior implementation consulted. The next-version scope is at the end.
 RFC 2119 keywords.
 Sources: Knot DNS documentation (knot-dns.cz: configuration, reference,
 operation, `knotc`/`kzonecheck`/`keymgr` man pages), Knot Resolver 6
@@ -256,3 +271,16 @@ only public DS/DNSKEY data.
 3. Knot Resolver 6 from the vendor repo only, or also render 5.x Lua for distro
    packages?
 4. Secondaries/zone transfer (TSIG, NOTIFY) in v1, or primary-only first?
+
+## Next version scope: next
+
+Next `knot-dns` version (public, beta).
+
+- Re-vendor the canonical transport (`8f132c4329c9e64bed686731cd5a0e02980194ea`).
+- The previous merge head's reset-failed fix and strict schemas were never
+  live-tested: this version's live run covers them.
+- Lows worth taking: `remove_zone` purges the zone's KASP keys (or documents
+  `keymgr`); `parent_ds_check` is rendered or dropped from the schema; the
+  resolver self-test picks a listen address that `allow_query_from` permits.
+- Secondaries remain configuration only; the README says so.
+- Live, loopback-only on a small server: 13 cells plus the reset-failed path.

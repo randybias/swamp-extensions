@@ -1,6 +1,21 @@
 # Spec: P2 — `@randybias/kubevirt`
 
-Status: DRAFT — awaiting Randy's approval (P2, written from public docs only; no prior implementation consulted)
+visibility: public
+audience: general
+
+Naming answers (naming and visibility convention, questions 1 to 5):
+
+Q1: Public.
+
+Q2: General usage: anyone installing KubeVirt and CDI on a Kubernetes cluster and running VMs on it.
+
+Q3: Yes. `kubevirt` is the product name. Naming audit verdict: keep; the model types `kubevirt` and `kubevirt-vm` do not follow `<ext>/<resource>` and could become `kubevirt/installs` and `kubevirt/virtual-machines` at the next major change.
+
+Q4: Not applicable (public and general).
+
+Q5: Yes. A stranger reads `kubevirt` as the KubeVirt project, which is what it installs and drives.
+
+Status: approved (see `docs/CLEANROOM.md`); written from public docs only, no prior implementation consulted. The next-version scope is at the end.
 RFC 2119 keywords.
 Sources: kubevirt.io user guide + release assets, CDI (containerized-data-importer)
 public docs, kubernetes.io (kubectl, server-side apply), docs.k0sproject.io. This
@@ -241,3 +256,15 @@ Private registry pull secrets: Secret name only, same rule.
    via the SHA-pinned manifest?
 3. One extension with two types (as drafted) or `@randybias/kubevirt-vm`
    published separately?
+
+## Next version scope: next
+
+Next `kubevirt` version (public, beta).
+
+- The previous merge head's quality pass was never live-tested: this version's
+  live run covers it.
+- Medium: when the CDI CRD is gone but its namespace remains, `uninstall` fails
+  before the manifest delete.
+- Live on a single-node k0s cluster with a local-path StorageClass, so the
+  DataVolume cells run. Upgrade across releases and `use_emulation` stay
+  untested with the reason if the lab cannot provide them.

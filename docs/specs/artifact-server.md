@@ -1,6 +1,21 @@
 # Spec: P2 — `@randybias/artifact-server`
 
-Status: DRAFT — awaiting Randy's approval (P2, written from public docs only; no prior implementation consulted)
+visibility: public
+audience: general
+
+Naming answers (naming and visibility convention, questions 1 to 5):
+
+Q1: Public.
+
+Q2: General usage: anyone serving content-addressed files (seeds, binaries, bundles) to hosts.
+
+Q3: Yes, borderline. "server" is a banned noun but is qualified by "artifact"; it is nginx serving a content-addressed directory. Naming audit verdict: keep (alternative `nginx-artifact-store`, low priority).
+
+Q4: Not applicable (public and general).
+
+Q5: Mostly. A stranger guesses a file server for build artifacts, which is right, but may expect Artifactory or Nexus; the README says what it is.
+
+Status: approved (see `docs/CLEANROOM.md`); written from public docs only, no prior implementation consulted. The next-version scope is at the end.
 RFC 2119 keywords.
 Sources: nginx docs (nginx.org/en/docs: `ngx_http_core_module`,
 `ngx_http_auth_basic_module`, `ngx_http_ssl_module`, `nginx -t`), Caddy docs
@@ -205,3 +220,16 @@ request).
 2. nginx over Caddy (§2) — confirm.
 3. Should refs be served (e.g. `/refs/<name>` as a stable redirect), or stay
    private as drafted?
+
+## Next version scope: next
+
+Next `artifact-server` version (public, beta).
+
+- Re-vendor the canonical transport (`8f132c4329c9e64bed686731cd5a0e02980194ea`): stdin
+  delivery, remote deadlines.
+- Lows worth taking: refuse a symlinked `bundles/` directory instead of
+  producing an empty prune plan; `purge` removes the enable link that `install`
+  created; the `config` record drops the removed-default-site flag after
+  `uninstall`.
+- Live on a small server: install with listener sampling, upload, fetch,
+  `publish_bundle`, prune, uninstall, reboot.

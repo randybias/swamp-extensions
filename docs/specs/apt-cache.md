@@ -1,6 +1,21 @@
 # Spec: P2 — `@randybias/apt-cache`
 
-Status: DRAFT — awaiting Randy's approval (P2, written from public docs only; no prior implementation consulted)
+visibility: public
+audience: general
+
+Naming answers (naming and visibility convention, questions 1 to 5):
+
+Q1: Public.
+
+Q2: General usage: anyone running an APT package cache for a fleet of Debian or Ubuntu hosts.
+
+Q3: No. the name collides with Debian's `apt-cache` query command, so a Debian user guesses wrong; it installs and runs Apt-Cacher NG and points clients at it. Naming audit verdict: rename to `apt-cacher-ng`, pending Randy's confirmation; until confirmed the published name stays `apt-cache`.
+
+Q4: Not applicable (public and general).
+
+Q5: No. A Debian user reads `apt-cache` as the package-index query tool, not a caching proxy. The proposed name fixes that.
+
+Status: approved (see `docs/CLEANROOM.md`); written from public docs only, no prior implementation consulted. The next-version scope is at the end.
 RFC 2119 keywords.
 Sources: Apt-Cacher NG user manual (server quick start, client setup,
 "SSL/TLS" and "BindAddress" how-tos), squid-deb-proxy package documentation,
@@ -239,3 +254,32 @@ Receipts into `apt-cache/LOGBOOK.md`; no `stable` with any `untested`/`skip`.
    per call (spec) driven by a workflow?
 4. Fold the port-3142 firewall rule into this model, or leave it to
    `server-host`?
+
+## Next version scope: next
+
+Next `apt-cache` version (public, beta).
+
+- Re-vendor the canonical transport (`8f132c4329c9e64bed686731cd5a0e02980194ea`).
+- The previous merge head's `verify` changes (HTTP 200 after the credential is
+  dropped, `--noproxy`) were covered by unit tests only: this version's live run
+  covers them.
+- Medium: fixtures hold a hardcoded synthetic admin credential; generate one
+  per test instead.
+- Low: `install` upgrading a shared library is recorded in the README as a side
+  effect.
+- Live: the full matrix with the wildcard-listener sampling.
+- Lands under `apt-cacher-ng` instead if the rename is confirmed before this
+  version starts.
+
+## Next version scope: apt-cacher-ng (new package, pending rename)
+
+New package `apt-cacher-ng` (public, general), pending rename.
+
+- Blocked on Randy confirming the rename `apt-cache` -> `apt-cacher-ng` (the
+  current name collides with Debian's `apt-cache` query command).
+- New package from the `apt-cache` head above (the version above lands here
+  instead if the rename is confirmed first): manifest, model type, README,
+  LOGBOOK with the five naming answers and the literal declarations,
+  `release.yaml` stanza.
+- Full live matrix under the new name, with the wildcard-listener sampling.
+- Deprecate the public `apt-cache` versions afterwards (never delete).

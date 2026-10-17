@@ -62,6 +62,7 @@ sees the old code, builds from that spec and public documentation.
 | 2026-10-17 | Implementer lane d4 | RGW S3 plane (bucket inventory, inspect, ensure, policy, versioning); clean-room preamble |
 | 2026-10-17 | Implementer lane b2 | Disk-wipe guard, the shared protected-device module (`_lib/protected_devices.ts`) and integration of all lanes (`lane/cephadm-int`); clean-room preamble |
 | 2026-10-17 | Merged to main | `@randybias/cephadm` 2026.10.17.1 (beta), from `lane/cephadm-int` at `95517dc` |
+| 2026-10-17 | Editorial amendment of approved specs | `docs/specs/cephadm/00-overview.md` and the seven P2 specs gained the `visibility:`/`audience:` header, the five naming answers and a next-version scope section; no behaviour changed. `SHA256SUMS` and the hash table below record the amended text; `docs/specs/cephadm/CLEANROOM` records the approval commit for the factory's spec probe |
 | 2026-10-17 | P2 specs approved by Randy | Seven P2 specs (see "Approved specs" below), approval relayed via the swamp-publisher session; written from public docs only, so no old-source clone exists to delete |
 
 ## Approved specs
@@ -69,8 +70,11 @@ sees the old code, builds from that spec and public documentation.
 The approved text of each spec is pinned by its sha256. An "editorial scrub"
 hash, where present, is a later commit that removed internal run jargon with
 purely editorial changes: no method, input, output, invariant or failure mode
-changed. Implementers build from the current file; if it no longer matches
-either hash, the spec needs re-approval before implementation continues.
+changed. The "naming header and scope" hash is a further editorial commit that
+added the `visibility:`/`audience:` header, the five naming answers and a
+next-version scope section. Implementers build from the current file; if it no
+longer matches any listed hash, the spec needs re-approval before implementation
+continues.
 
 ### P2 specs, approved 2026-10-17
 
@@ -78,15 +82,15 @@ Approved by Randy on 2026-10-17, relayed via the swamp-publisher session. The
 specs were written from public documentation only; no prior implementation
 was consulted.
 
-| Spec | Approved sha256 | Editorial scrub sha256 (behaviour unchanged) |
-|---|---|---|
-| `docs/specs/kubevirt.md` | `07c1cdb1743178123fc3776b3d72d99b9e5052f5a6f65843dbb08a6c75663982` | `3fec77a4d9c9bc1ac96f38a269202d68137a6879ed0967ccb086ce6ec44f1bff` |
-| `docs/specs/k0s-multinode.md` | `6534cd73d873394725e06f72ca6d2efa65b8d7ce17f853d6aed24aba446d340d` | `8010a3fdaaa8a0cb0c523d5905a69a515912a39e61c0b5d706618acedfe627f3` |
-| `docs/specs/kea-dhcp.md` | `1bd3383b8fb51d619cf563da767fb5b15706a052fc570a2f0fb55aca497eb84d` | `a4b6adca531d04e6e5ebb86416f90678cef282003606317c4c6f189f1e434a69` |
-| `docs/specs/knot-dns.md` | `4063e65244c7279dd2dc17a579e1b62f35b74ea438786192e211c53a7fdbb1e6` | `0df62cab1620625b04768dc413900a400878462610832749946156c54b3c3cf6` |
-| `docs/specs/apt-cache.md` | `7c72f48649fc3b22b1abe69373a9ed5b65009a6f01a5e642599d49df27cd03e2` | `78f9ee84896cfbb4285ca626ebea985592a9a8cd732eec4091ecb021116ae2c3` |
-| `docs/specs/artifact-server.md` | `fe7243f97cfd95a0a7a878e5777abfc01b53a318cad2f38953a10216ef735e4c` | `e6c0808dc849f1b57fcd3427bc4a86dbee8d2057b6d7adad71a541dd1fb541d0` |
-| `docs/specs/ubuntu-autoinstall.md` | `aa444f483129ad43688cdc8e7f28948fd152aaa74c50edd82e2a18e088469a36` | `66faea8c972cc44a4d83168caf0fac42d315952cfaba8654ad828591b6dbb347` |
+| Spec | Approved sha256 | Editorial scrub sha256 (behaviour unchanged) | Naming header and scope sha256 (behaviour unchanged) |
+|---|---|---|---|
+| `docs/specs/kubevirt.md` | `07c1cdb1743178123fc3776b3d72d99b9e5052f5a6f65843dbb08a6c75663982` | `3fec77a4d9c9bc1ac96f38a269202d68137a6879ed0967ccb086ce6ec44f1bff` | `0a420d0f0a23e1b7ea42717efe3b45a331fcf1189b9ab7ebb785e1b2d7ee6d17` |
+| `docs/specs/k0s-multinode.md` | `6534cd73d873394725e06f72ca6d2efa65b8d7ce17f853d6aed24aba446d340d` | `8010a3fdaaa8a0cb0c523d5905a69a515912a39e61c0b5d706618acedfe627f3` | `19c3947633f2d2d9bf69330aebb82f3bebbe9e82fcbd8360f8dd8261225f3b0b` |
+| `docs/specs/kea-dhcp.md` | `1bd3383b8fb51d619cf563da767fb5b15706a052fc570a2f0fb55aca497eb84d` | `a4b6adca531d04e6e5ebb86416f90678cef282003606317c4c6f189f1e434a69` | `11e27cac4379f20754260b4c0f125663edad102e818dacfb91d7d823ee7125ca` |
+| `docs/specs/knot-dns.md` | `4063e65244c7279dd2dc17a579e1b62f35b74ea438786192e211c53a7fdbb1e6` | `0df62cab1620625b04768dc413900a400878462610832749946156c54b3c3cf6` | `25827645b5c12fe1eee2112bb8976be6d04ed6faa506cb8306cbfdafa22c573c` |
+| `docs/specs/apt-cache.md` | `7c72f48649fc3b22b1abe69373a9ed5b65009a6f01a5e642599d49df27cd03e2` | `78f9ee84896cfbb4285ca626ebea985592a9a8cd732eec4091ecb021116ae2c3` | `7b3237eec1c1f8548fb9f2a8ffa7cafd3fabd10e5bc8e677409c6c65af8154a7` |
+| `docs/specs/artifact-server.md` | `fe7243f97cfd95a0a7a878e5777abfc01b53a318cad2f38953a10216ef735e4c` | `e6c0808dc849f1b57fcd3427bc4a86dbee8d2057b6d7adad71a541dd1fb541d0` | `c1148f243d8d920749fb4be0d73a73557d466ed38ceb5d3804078f209aff849e` |
+| `docs/specs/ubuntu-autoinstall.md` | `aa444f483129ad43688cdc8e7f28948fd152aaa74c50edd82e2a18e088469a36` | `66faea8c972cc44a4d83168caf0fac42d315952cfaba8654ad828591b6dbb347` | `5dfcafb2650eb7ce5766099dbc868c9598ceaa28becf73f52a7ab685af2f0c5a` |
 
 Implementation-side rules for these specs:
 

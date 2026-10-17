@@ -1,6 +1,21 @@
 # Spec: P2 — `@randybias/k0s-multinode`
 
-Status: DRAFT — awaiting Randy's approval (P2, written from public docs only; no prior implementation consulted)
+visibility: public
+audience: general
+
+Naming answers (naming and visibility convention, questions 1 to 5):
+
+Q1: Public.
+
+Q2: General usage: anyone running a multi-node k0s cluster with an HA control plane.
+
+Q3: Yes. `k0s-multinode` names the system (k0s) and the kind (multi-node); the workflows `k0s-multinode-create-cluster` and `k0s-multinode-join-node` use listed verbs at four segments; short and unambiguous. Naming audit verdict: keep.
+
+Q4: Not applicable (public and general).
+
+Q5: Yes. A stranger reads `k0s-multinode` as a multi-node k0s cluster manager, which is what it does, and guesses wrong about nothing.
+
+Status: approved (see `docs/CLEANROOM.md`); written from public docs only, no prior implementation consulted. The next-version scope is at the end.
 RFC 2119 keywords.
 Sources: docs.k0sproject.io (multi-node, HA control plane, control plane load
 balancing, node-local load balancing, join tokens, upgrade, remove controller,
@@ -225,3 +240,20 @@ any admin kubeconfig follow `k0s-cluster`'s existing rules.
    balancer? Drives `externalAddress`, tokens, and the Topology B cells.
 2. Approve the three `k0s-cluster` changes in §2 landing first as a MICRO bump.
 3. Keep the k0sctl wrapper as a documented fallback only (as drafted), or drop it.
+
+## Next version scope: next
+
+Next `k0s-multinode` version (public, beta).
+
+- Re-vendor the canonical transport (`8f132c4329c9e64bed686731cd5a0e02980194ea`).
+- Build the deferred pieces of this spec: the add-node, remove-node,
+  upgrade-cluster and reset-cluster workflows (per-item child workflows,
+  succeeded-only gate edges, re-gate after approval), the `upgrade` method,
+  `render_config`, `sync` drift beyond membership (config sha per node, cordoned
+  and NotReady as drift), and etcd health in `get`.
+- Medium: the detach self-host refusal compares only the SSH host string, and
+  `peer_address` has no address grammar.
+- Tests: a regression test that greps state, logs and results for token- or
+  kubeconfig-shaped text; a model-level `plan_remove` test.
+- Live: HA with three controllers on 2 GB nodes, including controller loss and
+  etcd member removal. The VRRP VIP cell stays untested on VPS, with the reason.

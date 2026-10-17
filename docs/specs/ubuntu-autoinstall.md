@@ -1,6 +1,21 @@
 # Spec: P2 — `@randybias/ubuntu-autoinstall`
 
-Status: DRAFT — awaiting Randy's approval (P2, written from public docs only; no prior implementation consulted)
+visibility: public
+audience: general
+
+Naming answers (naming and visibility convention, questions 1 to 5):
+
+Q1: Public.
+
+Q2: General usage: anyone provisioning Ubuntu hosts unattended.
+
+Q3: Yes. `ubuntu-autoinstall` names the product (Ubuntu) and Ubuntu's own feature name (autoinstall); short and unambiguous. Naming audit verdict: keep.
+
+Q4: Not applicable (public and general).
+
+Q5: Yes. A stranger reads `ubuntu-autoinstall` as an Ubuntu autoinstall seed builder and publisher, which is what it does, and guesses wrong about nothing.
+
+Status: approved (see `docs/CLEANROOM.md`); written from public docs only, no prior implementation consulted. The next-version scope is at the end.
 RFC 2119 keywords.
 Sources: Ubuntu installer (subiquity) docs at
 canonical-subiquity.readthedocs-hosted.com (autoinstall reference, autoinstall
@@ -248,3 +263,16 @@ sensitive, and its use requires `tls.mode:"provided"` on the server or the
    to `artifact-server.publish_bundle` — acceptable coupling?
 3. Is a LUKS passphrase in served user-data acceptable at all, or is LUKS
    limited to the `CIDATA` path?
+
+## Next version scope: next
+
+Next `ubuntu-autoinstall` version (public, beta).
+
+- Re-vendor the canonical transport (`8f132c4329c9e64bed686731cd5a0e02980194ea`).
+- Medium: `unpublish` without a ref treats a bundle with no `meta-data` as
+  absent and leaves stray files.
+- Live: the CIDATA path end to end (hand the files to the NoCloud CIDATA
+  builder, boot a KVM guest from the ISO plus CIDATA, SSH-verify), plus the
+  `publish_http` path as regression. The guest may be created with the
+  `libvirt` extension if its define path supports it, else `virt-install` with
+  the reason noted.

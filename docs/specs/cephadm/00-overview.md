@@ -1,7 +1,23 @@
 # `@randybias/cephadm`: behaviour specification
 
-Status: draft for review · Date: 2026-10-14 · Clean-room spec (see
-`docs/CLEANROOM.md`)
+visibility: public
+audience: general
+clean-room: true
+
+Naming answers (naming and visibility convention, questions 1 to 5):
+
+Q1: Public.
+
+Q2: General usage: anyone deploying Ceph with cephadm on Linux hosts.
+
+Q3: Yes. `cephadm` is the product name, unambiguous. Naming audit verdict: keep. Workflows: `cephadm-prep-host`, `cephadm-verify-host-prep` and `cephadm-get-conn-bundle` carry abbreviations and are proposed as `cephadm-prepare-host`, `cephadm-verify-prepared-host` and `cephadm-get-connection-bundle`; the verbs add, remove, get, fetch, prepare, wipe, distribute and inventory are proposed as documented exceptions. Both pending Randy's confirmation.
+
+Q4: Not applicable (public and general).
+
+Q5: Yes. A stranger reads `cephadm` as Ceph's cephadm orchestrator, which is what it drives.
+
+Status: approved 2026-10-17 · Date: 2026-10-14 · Clean-room spec (see
+`docs/CLEANROOM.md`). The next-version scope is at the end.
 
 This specification is the **only** description of the behaviour that
 implementers may use. It says what the extension must do and why. How to do it
@@ -486,3 +502,22 @@ environment before stable release.
    - Every **[twin]** decision is confirmed.
    - Every workflow in 08-workflows runs end to end on the twin, one at a time
      in its listed order, followed by the teardown chain.
+
+## Next version scope: next
+
+Next `cephadm` version (public, beta).
+
+- Residual Mediums: the stored host-key record is read with a cast and not
+  re-validated; on an EFI host with `efibootmgr` missing or failing, an
+  unmounted EFI boot partition without the ESP type is unprotected (treat
+  "cannot decide" as refuse); the catalog test does not check that gate edges
+  are succeeded-only or tie each re-gate to its pre-gate.
+- Add the `lsblk`/`mdstat`/`fstab`/`blkid` fixture corpus captured from
+  containers and VMs with LVM, MD and crypt layouts, with provenance.
+- Workflow renames, only if Randy confirms them in time: `prep` -> `prepare`,
+  `conn` -> `connection`; the verb-set extension (add, remove, get, fetch,
+  prepare, wipe, distribute, inventory) documented as exceptions. Otherwise
+  ship without.
+- Live: the wipe guard on RAM-backed disks. Cluster cells (three or more hosts
+  with free whole disks) stay untested with the reason unless three small
+  servers free up, in which case bootstrap, one OSD apply and verify-health run.

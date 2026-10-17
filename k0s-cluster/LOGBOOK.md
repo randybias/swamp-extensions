@@ -178,3 +178,55 @@ Low findings fixed as noted.
   controller; any mismatch with the requested role needs `confirm_role_change`.
   The pinned-version behaviour of `--no-taints` is from the k0s docs, not tried
   here: swamp-live's re-run is the check.
+
+## 2026-10-17: live e2e
+
+Target: `<vps2>` (4 GB, Ubuntu 24.04 x86_64, root, strict host-key pins, SSH key
+from vault). k0s v1.36.4+k0s.1 amd64, binary SHA-256 matching the release's
+`sha256sums.txt` and an independent download. Heads: lane/b2 `6554ea0` (base
+cells), `3cc23a3` (role migration, no taint, api_address), `27a214e` (reset;
+transport resync only). Receipt = first 16 hex of sha256 of the console output
+with timestamps stripped. Addresses, node names and vault names are redacted.
+
+| Cell                                            | Result    | Detail                                                                                               | Head      | Receipt          |
+| ----------------------------------------------- | --------- | ---------------------------------------------------------------------------------------------------- | --------- | ---------------- |
+| render_config                                   | PASS      | rendered                                                                                             | `6554ea0` | 6c91fe1d6a2d9bc3 |
+| install bad SHA (negative)                      | PASS      | refused before anything ran; no binary, no unit left                                                 | `6554ea0` | 96b9e8e1cf933a0b |
+| install (SHA ok)                                | PASS      | k0scontroller active; config_sha256 equals render_config's                                           | `6554ea0` | 822719b134592bf8 |
+| wait_ready                                      | PASS      | ready after 59 s, 5 system pods                                                                      | `6554ea0` | 0e06b84496798ba8 |
+| kubeconfig (store_in_vault)                     | PASS      | key present in the vault; kubeconfig-shaped console text 0                                           | `6554ea0` | 8c93f98b2bba232d |
+| kubeconfig usable                               | PASS      | vault copy reaches the API; server equals the recorded URL; node Ready                               | `6554ea0` | -                |
+| apply_manifests                                 | PASS      | namespace and configmap appear in-cluster                                                            | `6554ea0` | 820f7080f13f8c51 |
+| apply_manifests idempotent                      | PASS      | configmap uid.resourceVersion unchanged; changed false                                               | `6554ea0` | ddc4f3fcb587b1d2 |
+| apply_helm bad version (negative)               | PASS      | typed "Helm release ... failed"                                                                      | `6554ea0` | 924f1053c76a0deb |
+| apply_helm before the taint fix                 | FAIL      | pod Pending on the control-plane NoSchedule taint (role single lacked --no-taints); fixed in 3cc23a3 | `6554ea0` | -                |
+| apply_helm (taint removed by hand, diagnostic)  | PASS      | hello-world 0.1.0: 1 pod Running                                                                     | `6554ea0` | 70f74cc38e79580c |
+| get                                             | PASS      | installed, version, 1 node, 5 system pods, stacks, helm_releases                                     | `6554ea0` | 6dd23b33f196a48d |
+| sync                                            | PASS      | no drift                                                                                             | `6554ea0` | 3607c8ddfe773880 |
+| install re-run without the helm block           | EXPLAINED | k0s.yaml rewritten without the applied Helm extension and the controller restarted; now in README    | `6554ea0` | 281c25eb91fc54e2 |
+| install idempotent (same inputs)                | PASS      | MainPID and config SHA unchanged                                                                     | `6554ea0` | 7a69bda18b4d0860 |
+| M1 role migration without confirm (negative)    | PASS      | refused; MainPID, ExecStart and config identical                                                     | `3cc23a3` | 021424dd2c8d17d5 |
+| M2 role migration with confirm_role_change      | PASS      | stop/reset/reinstall; ExecStart has --enable-worker=true --no-taints=true                            | `3cc23a3` | ea9ec155934c7470 |
+| M3 wait_ready after migration                   | PASS      | ready after 66 s                                                                                     | `3cc23a3` | acd67cfd686d707d |
+| M4 kubeconfig store_in_vault after migration    | PASS      | overwrote the earlier copy; kubeconfig-shaped console text 0                                         | `3cc23a3` | c7b481df49b49e4c |
+| M5 no control-plane taint                       | PASS      | node Ready, spec.taints empty                                                                        | `3cc23a3` | bf7d847e4a33fbf3 |
+| M6 apply_helm on the migrated single node       | PASS      | 1 pod Running, no manual untaint                                                                     | `3cc23a3` | 13371e3dbc61dad8 |
+| A1 render_config with api_address               | PASS      | spec.api.address set and in the SANs                                                                 | `3cc23a3` | 22c775e98dceefe9 |
+| A2 install with api_address                     | PASS      | adopted the running node; k0s.yaml carries the address; controller restarted                         | `3cc23a3` | 3c3bf7f4802e281c |
+| A3 wait_ready after the api_address change      | PASS      | ready after 3 s                                                                                      | `3cc23a3` | 6e54d62180aca30a |
+| A4 kubeconfig with api_address (store_in_vault) | PASS      | recorded and stored server URL use api_address; cluster answers through it                           | `3cc23a3` | 17781ac947d66b71 |
+| A5 apply_helm after the api_address change      | PASS      | 1 pod Running                                                                                        | `3cc23a3` | 83f6f5aa264d4e14 |
+| R0 get (carry check)                            | PASS      | cluster answers before reset                                                                         | `27a214e` | 129e461b7cdd1995 |
+| R1 reset with wrong confirm_host (negative)     | PASS      | refused; k0scontroller still active                                                                  | `27a214e` | 3369fbe8a614175a |
+| R2 reset                                        | PASS      | no unit, no /var/lib/k0s, no process, k0s.yaml removed; residue below                                | `27a214e` | dbfb93f92a5db433 |
+| R3 reset again                                  | PASS      | clean no-op                                                                                          | `27a214e` | 112a85f6e4784db1 |
+
+An earlier apply_helm attempt on `6554ea0` (run right after the bad-version
+negative, which left the chart controller wedged) is superseded by the cells
+above. Every cell passes on the merged heads. Released on the beta channel.
+
+Follow-up (reset leftovers): `reset` leaves the k0s binary
+(`/usr/local/bin/k0s`) and k0s's own `/etc/k0s/containerd.toml` placeholder plus
+an empty `/etc/k0s/containerd.d` on the host (cell R2; removed by hand after the
+run). The README now says so. Decide whether `reset` removes them (an option to
+remove the binary, and `/etc/k0s` when it holds only k0s's placeholders).

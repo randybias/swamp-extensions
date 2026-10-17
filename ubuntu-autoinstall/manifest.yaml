@@ -1,0 +1,19 @@
+manifestVersion: 1
+name: "@randybias/ubuntu-autoinstall"
+version: "2026.10.17.1"
+description: "Render, validate and publish an Ubuntu Server autoinstall NoCloud seed from typed inputs, over SSH to an artifact-server root or for a CIDATA image. The password is a crypt hash from vault and no output carries a plaintext."
+license: Apache-2.0
+repository: https://github.com/randybias/swamp-extensions
+platforms: [darwin-aarch64, darwin-x86_64, linux-x86_64, linux-aarch64]
+labels: [
+  ubuntu,
+  autoinstall,
+  subiquity,
+  cloud-init,
+  nocloud,
+  provisioning,
+  seed,
+]
+additionalFiles: [README.md, LICENSE.txt]
+models:
+  - ubuntu_autoinstall.ts

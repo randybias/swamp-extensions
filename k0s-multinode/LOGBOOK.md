@@ -195,3 +195,28 @@ distribution.
 - Live evidence from the mock run also confirmed the nested-default gap: swamp
   does not apply the child's nested `ssh_port`/`api_address` defaults, so the
   caller must supply them (or the fields must be made required). Still to fix.
+
+## Failed-node gating and open residuals
+
+- The create workflow now splits `join-controllers` and `join-workers`; the
+  workers job depends on the controllers job **succeeded**, so after a
+  controller failure no further controller or worker join. Mock run (c1
+  controller fails): calls are the bootstrap install, `mint:tok-c1`,
+  `install:<c1>`, `invalidate:tok-c1`; no worker call. **swamp forEach has no
+  early stop**, so a later node in the _same_ job still runs after one fails;
+  the split only gates one job on the whole previous job. This is the strongest
+  gating the engine offers without a child workflow per node category.
+
+### Open residuals (from review round 2, still to fix)
+
+- `peer_address` self-host refusal compares only the ssh.host string
+  (hostname-vs-IP bypass); resolve the leaving node's InternalIP.
+- swamp does not apply nested input defaults (`ssh_port`, `api_address`, ...);
+  either make them required or guard with `has()` at each use site.
+- The model export is still `createModel()` (not a plain literal), so swamp's
+  static type read warns (gate 7 risk).
+- `transport.ts` keeps unused upload/learn-key adapters; `fakeJoinToken` is
+  duplicated in two test files; the workflow test asserts expression text rather
+  than behaviour.
+- `render_config`, the add/remove/upgrade/reset workflows, `sync` config-sha
+  drift and `get` etcd health are still to add.

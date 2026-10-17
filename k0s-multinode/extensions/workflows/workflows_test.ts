@@ -23,8 +23,12 @@ Deno.test("create workflow installs the first controller, then calls the join ch
   assertEquals(s.includes("type: model\n"), false);
   assertStringIncludes(s, "vaults:\n  - k0s-multinode\n  - default");
   // The first controller is installed and waited for before the join job.
-  assert(s.indexOf("install-first-controller") < s.indexOf("name: join"));
-  assert(s.indexOf("wait-first-controller") < s.indexOf("name: join"));
+  assert(
+    s.indexOf("install-first-controller") < s.indexOf("name: join-controllers"),
+  );
+  assert(
+    s.indexOf("wait-first-controller") < s.indexOf("name: join-controllers"),
+  );
   // The join job calls the per-node child workflow once per node, ordered
   // controllers-first, with no mint/install steps of its own.
   assertStringIncludes(s, "type: workflow");
@@ -32,7 +36,8 @@ Deno.test("create workflow installs the first controller, then calls the join ch
     s,
     'workflowIdOrName: "@randybias/k0s-multinode-join-node"',
   );
-  assertStringIncludes(s, "name: join-${{ self.node.name }}");
+  assertStringIncludes(s, "name: join-controller-${{ self.node.name }}");
+  assertStringIncludes(s, "name: join-worker-${{ self.node.name }}");
   assertStringIncludes(s, 'n.role != "worker"');
   assertEquals(s.includes("methodName: mint_join_token"), false);
   assertEquals(/BEGIN [A-Z ]*PRIVATE KEY/.test(s), false);

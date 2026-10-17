@@ -247,20 +247,45 @@ jobs:
             node: ${{ inputs.controller.name }}
             role: controller
             timeout_s: ${{ inputs.joined_timeout_s }}
-  - name: join
-    description: Join each extra node through the per-node child workflow, one at a time
+  - name: join-controllers
+    description: >-
+      Join the extra controllers and controller_workers one at a time. swamp
+      forEach has no early stop, so a later controller in the same job still
+      runs after one fails; the workers job is gated on this whole job.
     dependsOn:
       - job: bootstrap
         condition:
           type: succeeded
     concurrency: 1
     steps:
-      - name: join-${{ self.node.name }}
-        description: Mint, install, wait and invalidate for this node
+      - name: join-controller-${{ self.node.name }}
+        description: Mint, install, wait and invalidate for this controller
         forEach:
           item: node
-          in: >-
-            ${{ inputs.nodes.filter(n, n.role != "worker") + inputs.nodes.filter(n, n.role == "worker") }}
+          in: ${{ inputs.nodes.filter(n, n.role != "worker") }}
+        concurrency: 1
+        task:
+          type: workflow
+          workflowIdOrName: "@randybias/k0s-multinode-join-node"
+          inputs:
+            cluster: ${{ inputs.cluster }}
+            controller: ${{ inputs.controller }}
+            node: ${{ self.node }}
+            token_expiry: ${{ inputs.token_expiry }}
+            joined_timeout_s: ${{ inputs.joined_timeout_s }}
+  - name: join-workers
+    description: Join the workers one at a time, only after every controller join succeeded
+    dependsOn:
+      - job: join-controllers
+        condition:
+          type: succeeded
+    concurrency: 1
+    steps:
+      - name: join-worker-${{ self.node.name }}
+        description: Mint, install, wait and invalidate for this worker
+        forEach:
+          item: node
+          in: ${{ inputs.nodes.filter(n, n.role == "worker") }}
         concurrency: 1
         task:
           type: workflow
@@ -274,9 +299,16 @@ jobs:
   - name: verify
     description: Read back the membership
     dependsOn:
-      - job: join
+      - job: join-controllers
         condition:
           type: completed
+      - job: join-workers
+        condition:
+          type: or
+          conditions:
+            - type: succeeded
+            - type: failed
+            - type: skipped
     steps:
       - name: get
         description: Record nodes, etcd members and outstanding tokens

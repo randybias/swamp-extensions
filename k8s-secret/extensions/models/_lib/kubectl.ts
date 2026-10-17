@@ -11,6 +11,8 @@
  * @module
  */
 
+import { checkCanonical } from "./kubeconfig.ts";
+
 /** Result of running kubectl. */
 export interface KubectlResult {
   /** Process exit code. */
@@ -182,7 +184,7 @@ export const isContext = (s: string): boolean => CONTEXT_RE.test(s);
 export const isSecretType = (s: string): boolean => TYPE_RE.test(s);
 /** True for a valid Secret data key. */
 export const isDataKey = (s: string): boolean =>
-  KEY_RE.test(s) && s !== "." && s !== "..";
+  KEY_RE.test(s) && s !== "." && s !== ".." && s !== "__proto__";
 
 /** Decodes standard base64 to raw bytes. */
 export function b64ToBytes(s: string): Uint8Array<ArrayBuffer> {
@@ -212,7 +214,7 @@ export async function sha256Hex(s: string): Promise<string> {
 export async function hashData(
   data: Record<string, string>,
 ): Promise<Record<string, string>> {
-  const keys: Record<string, string> = {};
+  const keys: Record<string, string> = Object.create(null);
   for (const k of Object.keys(data).sort()) keys[k] = await sha256Hex(data[k]);
   return keys;
 }
@@ -225,7 +227,7 @@ export async function hashData(
 export async function hashObserved(
   dataB64: Record<string, string>,
 ): Promise<Record<string, string>> {
-  const keys: Record<string, string> = {};
+  const keys: Record<string, string> = Object.create(null);
   for (const k of Object.keys(dataB64).sort()) {
     keys[k] = await sha256HexBytes(b64ToBytes(dataB64[k]));
   }
@@ -262,7 +264,7 @@ export function buildManifest(
   type: string,
   data: Record<string, string>,
 ): string {
-  const enc: Record<string, string> = {};
+  const enc: Record<string, string> = Object.create(null);
   for (const k of Object.keys(data).sort()) enc[k] = b64(data[k]);
   return JSON.stringify({
     apiVersion: "v1",
@@ -343,8 +345,13 @@ export function classify(stderr: string, t: Target): K8sSecretError {
 
 /**
  * Runs `fn` with a kubectl runner bound to a temporary kubeconfig, removing
- * the file in a `finally`, even when `fn` throws. A failure to launch kubectl
- * is reported without its exception text.
+ * every file in a `finally`, even when `fn` throws. The caller's text is first
+ * written to a private file only so `kubectl config view --raw -o json` can
+ * resolve it exactly as kubectl will (merge keys and all; this does not
+ * authenticate or run any plugin and does not read credential files). That
+ * canonical document is validated, and only it is written to the file kubectl
+ * uses afterwards. A failure to launch kubectl is reported without its
+ * exception text.
  */
 export async function withKubectl<T>(
   deps: Deps,
@@ -353,13 +360,33 @@ export async function withKubectl<T>(
     kubectl: (args: string[], stdin?: string) => Promise<KubectlResult>,
   ) => Promise<T>,
 ): Promise<T> {
-  const path = await deps.files.write(t.kubeconfig);
+  const base = {
+    PATH: Deno.env.get("PATH") ?? "/usr/local/bin:/usr/bin:/bin",
+    HOME: Deno.env.get("HOME") ?? "/tmp",
+  };
+  const written: string[] = [];
   try {
-    const env: Record<string, string> = {
-      KUBECONFIG: path,
-      PATH: Deno.env.get("PATH") ?? "/usr/local/bin:/usr/bin:/bin",
-      HOME: Deno.env.get("HOME") ?? "/tmp",
-    };
+    const rawPath = await deps.files.write(t.kubeconfig);
+    written.push(rawPath);
+    let view: KubectlResult;
+    try {
+      view = await deps.run(["config", "view", "--raw", "-o", "json"], {
+        env: { ...base, KUBECONFIG: rawPath },
+      });
+    } catch {
+      throw new K8sSecretError("kubectl_failed", "Could not run kubectl");
+    }
+    if (view.code !== 0) {
+      throw new K8sSecretError(
+        "invalid_input",
+        "kubectl could not load the kubeconfig",
+      );
+    }
+    const check = checkCanonical(view.stdout);
+    if (!check.ok) throw new K8sSecretError("invalid_input", check.reason);
+    const path = await deps.files.write(view.stdout);
+    written.push(path);
+    const env: Record<string, string> = { ...base, KUBECONFIG: path };
     return await fn(async (args, stdin) => {
       try {
         return await deps.run([...args, ...baseArgs(t)], { stdin, env });
@@ -371,6 +398,6 @@ export async function withKubectl<T>(
       }
     });
   } finally {
-    await deps.files.remove(path);
+    for (const path of written) await deps.files.remove(path);
   }
 }

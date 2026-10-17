@@ -126,12 +126,22 @@ Deno.test("classify returns fixed messages that never echo stderr", () => {
   );
 });
 
+const CANONICAL = JSON.stringify({
+  apiVersion: "v1",
+  kind: "Config",
+  clusters: null,
+  users: null,
+  contexts: null,
+  preferences: {},
+  "current-context": "",
+});
+
 Deno.test("withKubectl removes the file when fn throws", async () => {
   const removed: string[] = [];
   await assertRejects(() =>
     withKubectl(
       {
-        run: () => Promise.resolve({ code: 0, stdout: "", stderr: "" }),
+        run: () => Promise.resolve({ code: 0, stdout: CANONICAL, stderr: "" }),
         files: {
           write: () => Promise.resolve("/p"),
           remove: (p) => {
@@ -145,12 +155,15 @@ Deno.test("withKubectl removes the file when fn throws", async () => {
       () => Promise.reject(new Error("x")),
     )
   );
-  assertEquals(removed, ["/p"]);
+  assertEquals(removed, ["/p", "/p"]);
 });
 
 Deno.test("withKubectl never surfaces a runner exception", async () => {
   const deps = {
-    run: () => Promise.reject(new Error("boom secret-value-x")),
+    run: (args: string[]) =>
+      args[0] === "config"
+        ? Promise.resolve({ code: 0, stdout: CANONICAL, stderr: "" })
+        : Promise.reject(new Error("boom secret-value-x")),
     files: {
       write: () => Promise.resolve("/p"),
       remove: () => Promise.resolve(),

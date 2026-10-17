@@ -98,3 +98,15 @@ Not packaged. Notes for whoever maintains this extension.
   - delete again: blocked
   - unreachable API: blocked
   - bad credential, temp kubeconfig deleted: blocked
+- 2026-10-17 (round 5, CRITICAL): the `yaml` package (YAML 1.2) reads `<<` as a
+  plain key but kubectl's loader applies the merge, so a merge could hide an
+  `exec` plugin or `tokenFile` from the validator and kubectl would run it.
+  Reproduced with kubectl 1.35.3. Fix: merge keys and tags are refused up front;
+  then `kubectl config view --raw -o json` (applies merges exactly as kubectl
+  will; does not authenticate, run plugins or read credential files, unlike
+  `--flatten`) produces the canonical document, which is validated with
+  default-deny at the top level, per entry and for user, cluster and context
+  fields, and is the only thing written to the kubeconfig file used for every
+  later call. Also `__proto__` is no longer an accepted data key and the key
+  maps are null-prototype objects. `insecure-skip-tls-verify` stays the caller's
+  choice. Tests include a run against the real kubectl when it is available.

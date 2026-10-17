@@ -1,5 +1,6 @@
 import { assert, assertEquals } from "jsr:@std/assert@1.0.19";
 import {
+  checkCanonical,
   checkKubeconfig,
   clusterFingerprint,
   resolveServer,
@@ -152,4 +153,191 @@ Deno.test("clusterFingerprint follows the selected cluster, not the first server
   assertEquals(await clusterFingerprint(rotated, "staged"), staged);
   // The omitted context uses current-context.
   assertEquals(await clusterFingerprint(KC), staged);
+});
+
+const HEAD = `apiVersion: v1
+kind: Config
+current-context: c
+clusters:
+- name: k
+  cluster: {server: "https://192.0.2.1:6443"}
+contexts:
+- name: c
+  context: {cluster: k, user: u}
+`;
+const EXEC_USER =
+  `{user: {exec: {apiVersion: client.authentication.k8s.io/v1, command: /bin/true, args: []}}}`;
+
+Deno.test("a merge key cannot smuggle an exec plugin into a user entry", () => {
+  const smuggled = `${HEAD}users:\n- name: u\n  <<: ${EXEC_USER}\n`;
+  const r = checkKubeconfig(smuggled);
+  assert(!r.ok);
+  assert(!r.ok && r.reason.includes("merge"));
+  // The same keys written quoted, in flow style, or with an explicit tag.
+  for (
+    const text of [
+      `${HEAD}users:\n- name: u\n  "<<": ${EXEC_USER}\n`,
+      `${HEAD}users: [{name: u, <<: ${EXEC_USER}}]\n`,
+      `${HEAD}users:\n- name: u\n  !!merge <<: ${EXEC_USER}\n`,
+      `${HEAD}users:\n- name: u\n  ? !<tag:yaml.org,2002:merge> <<\n  : ${EXEC_USER}\n`,
+    ]
+  ) {
+    assert(!checkKubeconfig(text).ok, text);
+  }
+});
+
+Deno.test("a top-level merge cannot smuggle a tokenFile", () => {
+  const text =
+    `${HEAD}<<: {users: [{name: u, user: {tokenFile: /etc/hostname}}]}\n`;
+  assert(!checkKubeconfig(text).ok);
+});
+
+Deno.test("anchors and aliases are resolved, then judged like any other value", () => {
+  const ok =
+    `${HEAD}users:\n- name: u\n  user: &u {token: placeholder}\n- name: v\n  user: *u\n`;
+  assert(checkKubeconfig(ok).ok);
+  const bad =
+    `${HEAD}users:\n- name: a\n  user: &x {token: t}\n- name: u\n  user:\n    token: t\n    exec: &e {command: /bin/true}\n- name: w\n  user: {exec: *e}\n`;
+  assert(!checkKubeconfig(bad).ok);
+  const laughs = ["a: &a [x,x,x,x,x,x,x,x,x]"];
+  let prev = "a";
+  for (const n of "bcdefghijk") {
+    laughs.push(`${n}: &${n} [${Array(9).fill(`*${prev}`).join(",")}]`);
+    prev = n;
+  }
+  assert(!checkKubeconfig(laughs.join("\n")).ok);
+});
+
+Deno.test("the canonical document is default-deny at every level", () => {
+  const base = {
+    apiVersion: "v1",
+    kind: "Config",
+    "current-context": "c",
+    clusters: [{ name: "k", cluster: { server: "https://192.0.2.1:6443" } }],
+    contexts: [{ name: "c", context: { cluster: "k", user: "u" } }],
+    users: [{ name: "u", user: { token: "placeholder" } }],
+    preferences: {},
+  };
+  assert(checkCanonical(JSON.stringify(base)).ok);
+  const mutations: [string, (c: Record<string, unknown>) => void][] = [
+    ["exec", (c) => {
+      c.users = [{ name: "u", user: { exec: { command: "/bin/true" } } }];
+    }],
+    ["auth-provider", (c) => {
+      c.users = [{ name: "u", user: { "auth-provider": { name: "gcp" } } }];
+    }],
+    ["tokenFile", (c) => {
+      c.users = [{ name: "u", user: { tokenFile: "/etc/hostname" } }];
+    }],
+    ["top-level key", (c) => {
+      c.somethingElse = true;
+    }],
+    ["top-level extensions", (c) => {
+      c.extensions = [{ name: "x", extension: { a: 1 } }];
+    }],
+    ["wrong kind", (c) => {
+      c.kind = "Other";
+    }],
+    ["entry key", (c) => {
+      c.users = [{ name: "u", user: { token: "t" }, extra: {} }];
+    }],
+    ["entry without name", (c) => {
+      c.users = [{ user: { token: "t" } }];
+    }],
+    ["context key", (c) => {
+      c.contexts = [{
+        name: "c",
+        context: { cluster: "k", user: "u", extensions: [{ name: "x" }] },
+      }];
+    }],
+    ["context extra field", (c) => {
+      c.contexts = [{
+        name: "c",
+        context: { cluster: "k", user: "u", x: "y" },
+      }];
+    }],
+    ["cluster ca file", (c) => {
+      c.clusters = [{
+        name: "k",
+        cluster: {
+          server: "https://192.0.2.1:6443",
+          "certificate-authority": "/etc/ca",
+        },
+      }];
+    }],
+    ["cluster nested value", (c) => {
+      c.clusters = [{ name: "k", cluster: { server: { a: "b" } } }];
+    }],
+    ["preferences key", (c) => {
+      c.preferences = { extensions: [{ name: "x" }] };
+    }],
+    ["merge key in output", (c) => {
+      (c.users as Record<string, unknown>[])[0]["<<"] = {};
+    }],
+  ];
+  for (const [name, mutate] of mutations) {
+    const doc = structuredClone(base) as Record<string, unknown>;
+    mutate(doc);
+    const r = checkCanonical(JSON.stringify(doc));
+    assert(!r.ok, name);
+  }
+  assert(!checkCanonical("not json").ok);
+  assert(!checkCanonical("[]").ok);
+});
+
+Deno.test("a null-prototype or __proto__ key in the document is not trusted", () => {
+  const json = `{"apiVersion":"v1","kind":"Config","__proto__":{"x":1}}`;
+  assert(!checkCanonical(json).ok);
+});
+
+Deno.test("real kubectl: merge-smuggled configs are rejected at both stages", async () => {
+  const perm = await Deno.permissions.query({
+    name: "run",
+    command: "kubectl",
+  });
+  if (perm.state !== "granted") return;
+  try {
+    await new Deno.Command("kubectl", {
+      args: ["version", "--client"],
+      stdout: "null",
+      stderr: "null",
+    }).output();
+  } catch {
+    return; // kubectl is not installed here
+  }
+  const dir = await Deno.makeTempDir({ prefix: "kc-merge-" });
+  try {
+    const cases: [string, string][] = [
+      ["user", `${HEAD}users:\n- name: u\n  <<: ${EXEC_USER}\n`],
+      [
+        "top",
+        `${HEAD}<<: {users: [{name: u, user: {tokenFile: /etc/hostname}}]}\n`,
+      ],
+    ];
+    for (const [name, text] of cases) {
+      assert(!checkKubeconfig(text).ok, `${name} early`);
+      const path = `${dir}/${name}.yaml`;
+      await Deno.writeTextFile(path, text, { mode: 0o600 });
+      const out = await new Deno.Command("kubectl", {
+        args: ["config", "view", "--raw", "-o", "json"],
+        env: { KUBECONFIG: path, PATH: Deno.env.get("PATH") ?? "", HOME: dir },
+        clearEnv: true,
+      }).output();
+      assertEquals(out.code, 0, name);
+      // kubectl applied the merge, so the canonical document carries it, and
+      // the canonical check refuses it.
+      assert(!checkCanonical(new TextDecoder().decode(out.stdout)).ok, name);
+    }
+    const good = `${HEAD}users:\n- name: u\n  user: {token: placeholder}\n`;
+    const path = `${dir}/good.yaml`;
+    await Deno.writeTextFile(path, good, { mode: 0o600 });
+    const out = await new Deno.Command("kubectl", {
+      args: ["config", "view", "--raw", "-o", "json"],
+      env: { KUBECONFIG: path, PATH: Deno.env.get("PATH") ?? "", HOME: dir },
+      clearEnv: true,
+    }).output();
+    assert(checkCanonical(new TextDecoder().decode(out.stdout)).ok);
+  } finally {
+    await Deno.remove(dir, { recursive: true });
+  }
 });

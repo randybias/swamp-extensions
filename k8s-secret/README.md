@@ -80,9 +80,13 @@ and total UTF-8 size. A kubeconfig is inspected before kubectl runs and rejected
 if it uses `exec` or `auth-provider` credentials (which execute a local command)
 or any credential that names a local file (`tokenFile`, `client-certificate`,
 `client-key`, `certificate-authority`); only embedded `*-data` credentials and
-`token`/`username`/`password` are accepted. The server-side apply field manager
-is derived from the definition name, so two definitions that target the same
-Secret do not prune each other's keys.
+`token`/`username`/`password` are accepted. YAML merge keys are refused, because
+kubectl applies them while other parsers do not; kubectl's own
+`config view --raw -o json` output is validated with default-deny at every level
+and is the only kubeconfig kubectl then uses. Cluster TLS settings are the
+caller's choice: `insecure-skip-tls-verify` is accepted if the kubeconfig sets
+it. The server-side apply field manager is derived from the definition name, so
+two definitions that target the same Secret do not prune each other's keys.
 
 ## License
 

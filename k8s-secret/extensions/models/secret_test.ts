@@ -35,15 +35,31 @@ interface Call {
   kubeconfigPath?: string;
 }
 
-function harness(route: (c: Call) => Partial<KubectlResult>) {
+/** What `kubectl config view --raw -o json` prints for the test kubeconfig. */
+const CANONICAL = JSON.stringify({
+  apiVersion: "v1",
+  kind: "Config",
+  clusters: null,
+  users: null,
+  contexts: null,
+  preferences: {},
+  "current-context": "",
+});
+
+function harness(
+  route: (c: Call) => Partial<KubectlResult>,
+  canonical: string | (() => KubectlResult) = CANONICAL,
+) {
   const calls: Call[] = [];
+  const views: Call[] = [];
   const written: string[] = [];
   const removed: string[] = [];
+  const contents: string[] = [];
   const prev = setDeps({
     now: () => new Date("2026-10-17T00:00:00Z"),
     files: {
       write: (content) => {
-        assertEquals(content, KC);
+        contents.push(content);
         const p = `/tmp/kc-${written.length}`;
         written.push(p);
         return Promise.resolve(p);
@@ -55,12 +71,26 @@ function harness(route: (c: Call) => Partial<KubectlResult>) {
     },
     run: (args, o) => {
       const c = { args, stdin: o.stdin, kubeconfigPath: o.env.KUBECONFIG };
+      if (args[0] === "config") {
+        views.push(c);
+        if (typeof canonical === "function") {
+          return Promise.resolve(canonical());
+        }
+        return Promise.resolve({ code: 0, stdout: canonical, stderr: "" });
+      }
       calls.push(c);
       const r = route(c);
       return Promise.resolve({ code: 0, stdout: "", stderr: "", ...r });
     },
   });
-  return { calls, written, removed, restore: () => setDeps(prev) };
+  return {
+    calls,
+    views,
+    written,
+    removed,
+    contents,
+    restore: () => setDeps(prev),
+  };
 }
 
 /**
@@ -536,4 +566,93 @@ Deno.test("no fixture, source or doc carries real-looking secret material", asyn
       assertEquals(re.test(text), false, `${name} found in ${file.pathname}`);
     }
   }
+});
+
+Deno.test("the canonical kubeconfig, not the caller's text, is what kubectl uses", async () => {
+  const h = harness((c) => (c.args[0] === "get" ? { stdout: "" } : {}));
+  try {
+    const { context } = testCtx();
+    await model.methods.apply.execute(APPLY, context).catch(() => undefined);
+    // First write is the caller's text, for `config view` only; the second is
+    // kubectl's canonical JSON, and every later call points at that file.
+    assertEquals(h.contents[0], KC);
+    assertEquals(h.contents[1], CANONICAL);
+    assertEquals(h.views.length, 1);
+    assertEquals(h.views[0].kubeconfigPath, h.written[0]);
+    assert(h.calls.length > 0);
+    assert(h.calls.every((c) => c.kubeconfigPath === h.written[1]));
+    assertEquals(h.removed.sort(), h.written.sort());
+  } finally {
+    h.restore();
+  }
+});
+
+Deno.test("a canonical document that carries an exec plugin is refused before any call", async () => {
+  const smuggled = JSON.stringify({
+    apiVersion: "v1",
+    kind: "Config",
+    users: [{ name: "u", user: { exec: { command: "/bin/touch" } } }],
+  });
+  const h = harness(() => ({}), smuggled);
+  try {
+    const { context } = testCtx();
+    const e = await assertRejects(() =>
+      model.methods.apply.execute(APPLY, context)
+    );
+    assert(e instanceof K8sSecretError);
+    assertEquals((e as K8sSecretError).code, "invalid_input");
+    assert(!(e as Error).message.includes("touch"));
+    assertEquals(h.calls.length, 0, "nothing ran against the cluster");
+    assertEquals(h.written.length, 1, "only the raw file was written");
+    assertEquals(h.removed, h.written);
+  } finally {
+    h.restore();
+  }
+});
+
+Deno.test("a kubectl that cannot load the kubeconfig fails with a fixed message", async () => {
+  const h = harness(
+    () => ({}),
+    () => ({ code: 1, stdout: "", stderr: `error: ${VAL} line 3` }),
+  );
+  try {
+    const { context } = testCtx();
+    const e = await assertRejects(() =>
+      model.methods.get.execute(BASE, context)
+    );
+    assertEquals((e as K8sSecretError).code, "invalid_input");
+    assert(!(e as Error).message.includes(VAL));
+    assertEquals(h.removed, h.written);
+  } finally {
+    h.restore();
+  }
+});
+
+Deno.test("merge keys in the caller's kubeconfig are refused by the schema", () => {
+  const merged =
+    `${KC}users:\n- name: u\n  <<: {user: {exec: {command: /bin/true}}}\n`;
+  for (const m of [model.methods.get, model.methods.apply]) {
+    const parsed = m.arguments.safeParse({ ...APPLY, kubeconfig: merged });
+    assert(!parsed.success);
+    assert(!JSON.stringify(parsed.error?.issues).includes("/bin/true"));
+  }
+});
+
+Deno.test("a __proto__ data key is rejected and the maps are null-prototype", async () => {
+  const parsed = model.methods.apply.arguments.safeParse({
+    ...BASE,
+    data: JSON.parse('{"__proto__": "x"}'),
+  });
+  assert(!parsed.success);
+  const { hashData, buildManifest } = await import("./_lib/kubectl.ts");
+  const h = await hashData(JSON.parse('{"__proto__": "x", "a": "y"}'));
+  assertEquals(Object.keys(h).sort(), ["__proto__", "a"]);
+  const manifest = JSON.parse(
+    buildManifest(
+      { kubeconfig: KC, namespace: "app", name: "n" },
+      "Opaque",
+      JSON.parse('{"__proto__": "x"}'),
+    ),
+  );
+  assertEquals(Object.keys(manifest.data), ["__proto__"]);
 });

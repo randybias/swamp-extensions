@@ -1,0 +1,11 @@
+manifestVersion: 1
+name: "@randybias/zfs"
+version: "2026.10.17.1"
+description: "Manage a ZFS pool, datasets, sparse zvols, snapshots, clones and rollback on a Linux host over SSH. One model type serves any host; state is keyed by the SSH identity plus the pool or dataset name, and create_pool refuses any device that carries the running system."
+license: Apache-2.0
+repository: https://github.com/randybias/swamp-extensions
+platforms: [darwin-aarch64, darwin-x86_64, linux-x86_64, linux-aarch64]
+labels: [zfs, storage, pool, dataset, zvol, snapshot, ssh, linux]
+additionalFiles: [README.md, LICENSE.txt]
+models:
+  - zfs.ts

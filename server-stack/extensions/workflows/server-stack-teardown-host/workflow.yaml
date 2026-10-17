@@ -208,6 +208,9 @@ jobs:
           - step: check-ownership
             condition:
               type: succeeded
+          - step: sync-server
+            condition:
+              type: succeeded
           - step: dns-safety-ok
             condition:
               type: succeeded
@@ -239,6 +242,9 @@ jobs:
         description: Delete the server after hostname and project checks
         dependsOn:
           - step: check-ownership
+            condition:
+              type: succeeded
+          - step: sync-server
             condition:
               type: succeeded
           - step: dns-safety-ok

@@ -21,6 +21,11 @@ azure-nsg:
   notes:
     2026.10.17.1: 'First release, beta. Generic Azure network security group rules over Azure Resource Manager REST: get/sync, ensure_rule (idempotent converge of one rule), remove_rule, apply_rule_set (plans first; applies only with an explicit flag; refuses the whole set with zero writes on any collision or invalid rule; never deletes undeclared rules) and delete (an action). Rule comparison uses the real read-back shape (singular field beside an empty plural list). Auth as in azure-vm. Live testing was not possible in this release; every live cell is recorded as blocked, so it stays on beta.'
 
+secret-file:
+  channel: beta
+  ci: false
+  published: {}
+
 ssh-host:
   channel: beta
   ci: true

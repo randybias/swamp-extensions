@@ -153,5 +153,8 @@ server-stack:
 
 apt-cache:
   channel: beta
-  ci: false
-  published: {}
+  ci: true
+  published:
+    2026.10.17.1: d54ce88bc97c7153a57268d98a4e3a0701765ca57170ada8ffeddbbd903c983e
+  notes:
+    2026.10.17.1: 'First release, beta. Install Apt-Cacher NG on one Linux host over SSH and point apt clients at it: one managed config fragment plus per-distribution backend files, a required HTTPS policy (direct, passthrough or https_backends), an optional AdminAuth credential from the vault, client proxy configuration with an optional direct fallback, hit/miss and byte statistics from the request log, and removal that restores the package''s own files and keeps the cache unless purge_cache_ack is set. install_server refreshes the package lists and keeps the first start on loopback, so the default wildcard listener is never exposed; apply verifies the exact listen addresses, a local fetch and the admin probe (401 with a credential, 200 after it is dropped). Live end to end on a throwaway Ubuntu 24.04 VPS: 9 of 10 at the first head (install on a stock image fixed since), then 7 of 7 and 5 of 5, with no wildcard listener in 554 samples during install and 0 credential hits on argv. Residuals are in the LOGBOOK: proxy-style security.ubuntu.com goes upstream over :80 uncached, debian-security is refused by design, bytes_from_cache follows apt-cacher-ng''s own formula, and the install can upgrade a shared library.'

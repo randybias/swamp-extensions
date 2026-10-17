@@ -515,4 +515,8 @@ export function createModel(deps: Partial<Deps> = {}) {
 }
 
 /** Model definition for `@randybias/wireguard-mesh`. */
-export const model = createModel();
+export const model = {
+  ...createModel(),
+  type: "@randybias/wireguard-mesh",
+  version: "2026.10.17.4",
+} satisfies ReturnType<typeof createModel>;

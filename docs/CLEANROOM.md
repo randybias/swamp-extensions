@@ -35,7 +35,7 @@ sees the old code, builds from that spec and public documentation.
 ### What the implementation side may not do
 
 3. Implementers must never read, clone, fetch or search the old repositories.
-   That covers `randybias/swamp-ceph-cluster` and any other repo or backup of
+   That covers the previous private repository and any other repo or backup of
    ex-employer code.
 4. Implementers must not be given any summary of the old code other than the
    approved spec.
@@ -51,7 +51,7 @@ sees the old code, builds from that spec and public documentation.
 
 | Date (UTC) | Event | Detail |
 |---|---|---|
-| 2026-10-14 | Old source cloned for spec extraction | `randybias/swamp-ceph-cluster` at `4f6c72b`, into a session scratchpad (not in this repo) |
+| 2026-10-14 | Old source cloned for spec extraction | the previous private repository at `4f6c72b`, into a session scratchpad (not in this repo) |
 | 2026-10-14 | Spec extraction | 8 spec-side subagents wrote behaviour notes (scratchpad only, not committed) under shared extraction rules |
 | 2026-10-14 | Spec written | `docs/specs/cephadm/00-overview.md` … `08-workflows.md` (9 files) |
 | 2026-10-17 | Spec approved by Randy | sha256 of each file in `docs/specs/cephadm/SHA256SUMS` |

@@ -1,0 +1,16 @@
+<!DOCTYPE html>
+<html><body>
+<h2>Transfer statistics</h2>
+<table border=0>
+<tr><td class="coltitle">Data fetched:</td><td class="colcont">1048576</td><td class="colcont">4096</td></tr>
+<tr><td class="coltitle">Data served:</td><td class="colcont">3145728</td><td class="colcont">12288</td></tr>
+</table>
+<h3>Log analysis</h3>
+<table border=0>
+<tr><td class="coltitle" rowspan=3>Period</td><td class="coltitle" colspan=8>Cache efficiency</td></tr>
+<tr><td class="coltitle">&nbsp;</td><td class="coltitle" colspan=3>Requests</td><td class="coltitle">&nbsp;</td><td class="coltitle" colspan=3>Data</td></tr>
+<tr><td class="coltitle">Hits</td><td class="coltitle">Misses</td><td class="coltitle">Total</td><td class="coltitle">&nbsp;</td><td class="coltitle">Hits</td><td class="coltitle">Misses</td><td class="coltitle">Total</td></tr>
+<tr><td class="coltitle">Today</td><td class="colcont">12</td><td class="colcont">3</td><td class="colcont">15</td><td class="colcont">&nbsp;</td><td class="colcont">1048576</td><td class="colcont">2097152</td><td class="colcont">3145728</td></tr>
+<tr><td class="coltitle">Last 7 days</td><td class="colcont">40</td><td class="colcont">10</td><td class="colcont">50</td><td class="colcont">&nbsp;</td><td class="colcont">4096</td><td class="colcont">8192</td><td class="colcont">12288</td></tr>
+</table>
+</body></html>

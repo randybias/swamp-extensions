@@ -1,0 +1,3 @@
+// Managed by @randybias/apt-cache. Do not edit; re-applied by the model.
+Acquire::http::Proxy "http://192.0.2.10:3142";
+Acquire::https::Proxy "DIRECT";

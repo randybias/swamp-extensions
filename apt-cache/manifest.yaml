@@ -1,0 +1,20 @@
+manifestVersion: 1
+name: "@randybias/apt-cache"
+version: "2026.10.17.1"
+description: "Install and operate Apt-Cacher NG on a Linux host over SSH and point apt clients at it: one managed server fragment plus per-distribution mirror backends, client proxy configuration with conflict detection and rollback, hit/miss and byte statistics, and removal. One model type serves any host: the SSH target and inputs arrive per call, and state is keyed by the target."
+license: Apache-2.0
+repository: https://github.com/randybias/swamp-extensions
+platforms: [darwin-aarch64, darwin-x86_64, linux-x86_64, linux-aarch64]
+labels: [
+  apt,
+  apt-cacher-ng,
+  proxy,
+  caching,
+  ssh,
+  debian,
+  ubuntu,
+  infrastructure,
+]
+additionalFiles: [README.md, LICENSE.txt]
+models:
+  - apt_cache.ts

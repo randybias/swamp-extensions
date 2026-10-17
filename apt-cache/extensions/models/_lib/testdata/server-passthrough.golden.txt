@@ -1,0 +1,7 @@
+# Managed by @randybias/apt-cache. Do not edit; re-applied by the model.
+BindAddress: 192.0.2.10 2001:db8::10
+Port: 3142
+CacheDir: /var/cache/apt-cacher-ng
+ExThreshold: 7
+PassThroughPattern: ^(archive\.example\.test|security\.example\.test)(:443)?$
+Remap-debian: file:zzzz-apt-cache-backend-debian /debian

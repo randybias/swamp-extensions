@@ -9,6 +9,7 @@ import {
   assess,
   type CommandProbe,
   DEVICE_PATH_RE,
+  efiBootPartuuids,
   examineTargets,
   LSBLK_COMMAND,
   mdExamineCommand,
@@ -156,6 +157,9 @@ function realHost(free = true): ProbeInputs {
     blkid: ok(blkid),
     zpool: { code: 0, stdout: "no pools available\n" },
     pvs: { code: 0, stdout: "" },
+    // The captured host boots by BIOS: no EFI.
+    efi: { code: 1, stdout: "" },
+    efibootmgr: { code: 127, stdout: "" },
     mdExamine: {
       "/dev/sda": NO_SB("/dev/sda"),
       "/dev/sdb": NO_SB("/dev/sdb"),
@@ -180,8 +184,11 @@ function code(input: ProbeInputs, candidates: string[]): string {
   return r.ok ? "allowed" : r.refusal.code;
 }
 
-Deno.test("the probe asks lsblk for the partition type and name", () => {
-  assert(LSBLK_COMMAND.includes("PARTTYPE,PARTTYPENAME"));
+Deno.test("the probe asks lsblk for the partition type, and not for the name", () => {
+  assert(LSBLK_COMMAND.endsWith(",PARTTYPE"));
+  // PARTTYPENAME needs util-linux 2.35: on 2.34 (Ubuntu 20.04) lsblk errors and
+  // every wipe would be refused. The module never read it.
+  assertEquals(LSBLK_COMMAND.includes("PARTTYPENAME"), false);
 });
 
 Deno.test("mdadm is given the device bare: never after `--`, and only a plain /dev path", () => {
@@ -210,24 +217,32 @@ Deno.test("mdadm is given the device bare: never after `--`, and only a plain /d
 });
 
 Deno.test("a path mdadm could not safely be given is never made an examine target", () => {
-  const input = realHost();
-  const weird = JSON.parse(input.lsblk.stdout);
-  weird.blockdevices.push({
-    name: "sdz",
-    path: "/dev/sdz; id",
-    pkname: null,
-    type: "disk",
-    fstype: null,
-    uuid: null,
-    partuuid: null,
-    label: null,
-    mountpoints: [null],
-    parttype: null,
-    parttypename: null,
-  });
-  const lsblk = ok(JSON.stringify(weird));
-  const targets = examineTargets({ ...input, lsblk }, ["/dev/sda3"]);
-  assertEquals(targets.some((t) => t.includes(";")), false);
+  const withMember = (path: string) => {
+    const input = realHost();
+    const weird = JSON.parse(input.lsblk.stdout);
+    // An md member (so examineTargets would normally list it) at `path`.
+    weird.blockdevices.push({
+      name: "sdz",
+      path,
+      pkname: null,
+      type: "disk",
+      fstype: "linux_raid_member",
+      uuid: null,
+      partuuid: null,
+      label: null,
+      mountpoints: [null],
+      parttype: null,
+    });
+    return examineTargets({ ...input, lsblk: ok(JSON.stringify(weird)) }, [
+      "/dev/sda3",
+    ]);
+  };
+  // Control: the same member at a plain path is a target ...
+  assert(withMember("/dev/sdz").includes("/dev/sdz"));
+  // ... and at an unsafe one it is left out.
+  for (const bad of ["/dev/sdz; id", "/dev/sdz'x", "/dev/../sdz"]) {
+    assertEquals(withMember(bad).includes(bad), false, bad);
+  }
 });
 
 Deno.test("the real failing mdadm answer ('No devices to examine') still refuses, as unverifiable", () => {
@@ -321,7 +336,8 @@ Deno.test("an unreadable partition type on a disk holding a protected device ref
   assertEquals(code(input, ["/dev/sdb3"]), "unverifiable");
 });
 
-Deno.test("a boot partition on a disk that holds nothing protected is not swept in", () => {
+/** A third disk, away from the root topology, carrying one boot-type partition. */
+function withBootDisk(parttype: string, mounted = false): ProbeInputs {
   const input = realHost();
   const lsblk = JSON.parse(input.lsblk.stdout);
   lsblk.blockdevices.push(
@@ -332,15 +348,190 @@ Deno.test("a boot partition on a disk that holds nothing protected is not swept 
       children: [{
         name: "sdc1",
         type: "part",
-        parttype: BIOS_BOOT,
-        parttypename: "BIOS boot",
+        parttype,
+        fstype: parttype === ESP ? "vfat" : null,
+        mounts: mounted ? ["/boot/efi"] : [null],
+        partuuid: "00000003-0000-4000-8000-000000000001",
+      }, {
+        name: "sdc2",
+        type: "part",
+        parttype: LINUX_FS,
+        partuuid: "00000003-0000-4000-8000-000000000002",
       }],
     }, null),
   );
   input.lsblk = ok(JSON.stringify(lsblk));
-  input.mdExamine["/dev/sdc"] = NO_SB("/dev/sdc");
-  input.mdExamine["/dev/sdc1"] = NO_SB("/dev/sdc1");
-  assertEquals(code(input, ["/dev/sdc"]), "allowed");
+  for (const d of ["/dev/sdc", "/dev/sdc1", "/dev/sdc2"]) {
+    input.mdExamine[d] = NO_SB(d);
+  }
+  input.blkid = ok(
+    input.blkid.stdout +
+      '/dev/sdc1: PARTUUID="00000003-0000-4000-8000-000000000001"\n',
+  );
+  return input;
+}
+
+Deno.test("a boot partition on a disk holding nothing protected is refused by default", () => {
+  // A legacy-BIOS host can keep GRUB's core image on a SATA disk while / and
+  // /boot sit on NVMe; an unmounted fallback ESP is the UEFI equivalent. The
+  // firmware's boot device is not discoverable from the root topology.
+  for (const type of [BIOS_BOOT, ESP]) {
+    const input = withBootDisk(type);
+    for (const dev of ["/dev/sdc", "/dev/sdc1"]) {
+      const r = assess(input, [dev]);
+      assert(!r.ok, `${type} ${dev}`);
+      assertEquals(r.refusal.code, "boot-partition", `${type} ${dev}`);
+    }
+    // The free sibling partition on that disk is not a boot partition.
+    assertEquals(code(input, ["/dev/sdc2"]), "allowed");
+  }
+});
+
+Deno.test("the acknowledgement lifts only the boot-partition refusal, only for the named disk", () => {
+  const input = withBootDisk(BIOS_BOOT);
+  const ok1 = assess(input, ["/dev/sdc"], undefined, {
+    bootAcknowledged: ["/dev/sdc"],
+  });
+  assert(ok1.ok, "the named disk is allowed");
+  // Naming a partition's disk is what counts; a partition candidate needs it too.
+  assert(
+    assess(input, ["/dev/sdc1"], undefined, { bootAcknowledged: ["/dev/sdc"] })
+      .ok,
+  );
+  // A different disk's acknowledgement does not help this one.
+  const other = assess(input, ["/dev/sdc"], undefined, {
+    bootAcknowledged: ["/dev/sda"],
+  });
+  assert(!other.ok && other.refusal.code === "boot-partition");
+  // And it never lifts a protection: the root disks stay refused as protected.
+  for (const dev of ["/dev/sda", "/dev/sda1", "/dev/sdb1", "/dev/md0"]) {
+    const r = assess(input, [dev], undefined, {
+      bootAcknowledged: ["/dev/sda", "/dev/sdb", "/dev/sdc"],
+    });
+    assert(!r.ok, dev);
+    assertEquals(r.refusal.code, "protected", dev);
+  }
+});
+
+Deno.test("an EFI System partition that is mounted is seeded by its mount, not only by its type", () => {
+  const input = withBootDisk(ESP, true);
+  input.findmnt = ok(JSON.stringify({
+    filesystems: [
+      { target: "/", source: "/dev/md0", fstype: "ext4" },
+      { target: "/boot/efi", source: "/dev/sdc1", fstype: "vfat" },
+    ],
+  }));
+  const r = assess(input, ["/dev/sdc"], undefined, {
+    bootAcknowledged: ["/dev/sdc"],
+  });
+  assert(!r.ok);
+  assertEquals(r.refusal.code, "protected", "a mounted ESP stays protected");
+});
+
+Deno.test("an unmounted ESP on a multipath root device is refused", () => {
+  const mp = (extra: Partial<P>): P => ({
+    name: "mpatha",
+    type: "mpath",
+    parttype: null,
+    ...extra,
+  });
+  const part = (n: number, p: Partial<P>): P => ({
+    name: `mpatha${n}`,
+    type: "part",
+    parttype: LINUX_FS,
+    ...p,
+  });
+  const children = [
+    part(1, { parttype: ESP, fstype: "vfat" }),
+    part(2, { fstype: "ext4", mounts: ["/"] }),
+  ];
+  const device = (name: string): P => ({
+    name,
+    type: "disk",
+    parttype: null,
+    children: [mp({ children })],
+  });
+  const input = realHost(false);
+  input.lsblk = ok(JSON.stringify({
+    blockdevices: [device("sdc"), device("sdd")].map((d) => row(d, null)),
+  }));
+  input.findmnt = ok(JSON.stringify({
+    filesystems: [{ target: "/", source: "/dev/mpatha2", fstype: "ext4" }],
+  }));
+  input.fstab = { state: "ok", text: "/dev/mpatha2 / ext4 defaults 0 1\n" };
+  input.mdstat = { state: "absent" };
+  input.links = ok("");
+  input.blkid = ok(
+    '/dev/mpatha1: UUID="AAAA-AAAA" TYPE="vfat"\n/dev/mpatha2: UUID="22222222-bbbb-4ccc-8ddd-333333333333" TYPE="ext4"\n',
+  );
+  input.mdExamine = {};
+  for (const d of ["/dev/sdc", "/dev/sdd", "/dev/mpatha1", "/dev/mpatha2"]) {
+    input.mdExamine[d] = NO_SB(d);
+  }
+  const r = assess(input, ["/dev/mpatha1"]);
+  assert(!r.ok);
+  assertEquals(r.refusal.code, "protected");
+  // Even with the disks acknowledged: it sits in the root's own stack.
+  const lifted = assess(input, ["/dev/mpatha1"], undefined, {
+    bootAcknowledged: ["/dev/sdc", "/dev/sdd"],
+  });
+  assert(!lifted.ok && lifted.refusal.code === "protected");
+});
+
+Deno.test("GUID case does not matter: an upper-case boot type is still a boot type", () => {
+  const input = realHost();
+  const lsblk = JSON.parse(input.lsblk.stdout);
+  lsblk.blockdevices[0].children[0].parttype = BIOS_BOOT.toUpperCase();
+  lsblk.blockdevices[1].children[0].parttype = ESP.toUpperCase();
+  input.lsblk = ok(JSON.stringify(lsblk));
+  assertEquals(code(input, ["/dev/sda1"]), "protected");
+  assertEquals(code(input, ["/dev/sdb1"]), "protected");
+  // And on a disk away from the root, the upper-case type is refused as well.
+  const away = withBootDisk(ESP.toUpperCase());
+  assertEquals(code(away, ["/dev/sdc"]), "boot-partition");
+});
+
+const EFIBOOTMGR = `BootCurrent: 0001
+Timeout: 1 seconds
+BootOrder: 0001,0000
+Boot0000* UEFI: PXE IPv4	PciRoot(0x0)/Pci(0x1c,0x0)/MAC(020000000001,1)/IPv4(0.0.0.0)
+Boot0001* ubuntu	HD(1,GPT,00000003-0000-4000-8000-000000000002,0x800,0x100000)/File(\\EFI\\ubuntu\\shimx64.efi)
+Boot0002* old	HD(1,GPT,00000009-0000-4000-8000-000000000009,0x800,0x100000)/File(\\EFI\\old.efi)
+`;
+
+Deno.test("EFI boot entries are extra, hard evidence: the partition they name is protected even when acknowledged", () => {
+  assertEquals(efiBootPartuuids(EFIBOOTMGR), [
+    "00000003-0000-4000-8000-000000000002",
+  ]);
+  const input = withBootDisk(BIOS_BOOT);
+  input.efi = { code: 0, stdout: "" };
+  input.efibootmgr = ok(EFIBOOTMGR);
+  // sdc2 is typed as plain Linux data but is what the firmware boots.
+  const r = assess(input, ["/dev/sdc2"], undefined, {
+    bootAcknowledged: ["/dev/sdc"],
+  });
+  assert(!r.ok);
+  assertEquals(r.refusal.code, "protected");
+  const whole = assess(input, ["/dev/sdc"], undefined, {
+    bootAcknowledged: ["/dev/sdc"],
+  });
+  assert(!whole.ok && whole.refusal.code === "protected");
+});
+
+Deno.test("efibootmgr is never the only evidence, and a missing one does not block an EFI host", () => {
+  const input = withBootDisk(BIOS_BOOT);
+  input.efi = { code: 0, stdout: "" };
+  for (
+    const efibootmgr of [{ code: 127, stdout: "" }, { code: 1, stdout: "" }]
+  ) {
+    const r = assess({ ...input, efibootmgr }, ["/dev/sdc2"]);
+    assert(r.ok, "the type-based rules still decide");
+    const boot = assess({ ...input, efibootmgr }, ["/dev/sdc"]);
+    assert(!boot.ok && boot.refusal.code === "boot-partition");
+  }
+  // The firmware type must be readable: neither an EFI nor a BIOS answer refuses.
+  const odd = assess({ ...input, efi: { code: 2, stdout: "" } }, ["/dev/sdc2"]);
+  assert(!odd.ok && odd.refusal.code === "unverifiable");
 });
 
 Deno.test("the live probes do not break with blkid or mdadm failing on the real layout", () => {

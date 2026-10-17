@@ -24,6 +24,8 @@ import {
   assess,
   BLKID_COMMAND,
   type CommandProbe,
+  EFI_COMMAND,
+  EFIBOOTMGR_COMMAND,
   examineTargets,
   type FileProbe,
   FINDMNT_COMMAND,
@@ -46,6 +48,14 @@ export interface DataDevice {
   sizeBytes?: number;
   /** Informational kernel-name hint; never used for selection. */
   devHint?: string;
+  /**
+   * DESTRUCTIVE. Acknowledge that this disk's boot partitions (BIOS boot, EFI
+   * System, and similar) may be wiped, which can leave the host unbootable. By
+   * default a disk holding one is refused: the firmware's boot device cannot be
+   * found from the root topology. It never lifts a protection that comes from
+   * the root, /boot, fstab, swap or an md/LVM/ZFS stack.
+   */
+  acknowledgeBootPartitions?: boolean;
 }
 
 /** One disk that must never be touched. */
@@ -295,6 +305,8 @@ async function collectProbes(
     blkid,
     zpool: await command(ZPOOL_COMMAND, true),
     pvs: await command(PVS_COMMAND, true),
+    efi: await command(EFI_COMMAND, false),
+    efibootmgr: await command(EFIBOOTMGR_COMMAND, true),
     mdExamine,
   };
 }
@@ -309,11 +321,13 @@ async function guardBootAndRoot(
   devices: string[],
   serials: Map<string, string>,
   previous?: ProtectedSet,
+  bootAcknowledged: string[] = [],
 ): Promise<ProtectedSet> {
   const result = assess(
     await collectProbes(session, devices),
     devices,
     previous,
+    { bootAcknowledged },
   );
   if (result.ok) return result.set;
   const { refusal } = result;
@@ -328,6 +342,8 @@ async function guardBootAndRoot(
   fail(
     refusal.code === "protected"
       ? "wipe.boot-protected"
+      : refusal.code === "boot-partition"
+      ? "wipe.boot-partition"
       : "wipe.boot-unverifiable",
     refusal.message,
     detail,
@@ -588,10 +604,17 @@ export async function wipeDiskToRaw(
   const candidatePaths = args.dataDevices.map((d) =>
     resolved.get(d.serial)!.device
   );
+  // Disks whose boot partitions the caller named by serial; resolved paths,
+  // never anything the caller typed as a path.
+  const bootAcknowledged = args.dataDevices
+    .filter((d) => d.acknowledgeBootPartitions === true)
+    .map((d) => resolved.get(d.serial)!.device);
   let protectedSet = await guardBootAndRoot(
     session,
     candidatePaths,
     serialOf,
+    undefined,
+    bootAcknowledged,
   );
 
   // Gate 4: a data device aliasing an excluded disk.
@@ -669,6 +692,7 @@ export async function wipeDiskToRaw(
     candidatePaths,
     serialOf,
     protectedSet,
+    bootAcknowledged,
   );
 
   // Step 0: recovery capture and one stable, idempotent backup.

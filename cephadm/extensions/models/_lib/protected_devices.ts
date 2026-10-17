@@ -77,6 +77,10 @@ export interface ProbeInputs {
   zpool: CommandProbe;
   /** {@link PVS_COMMAND}; code 127 when LVM is not installed. */
   pvs: CommandProbe;
+  /** {@link EFI_COMMAND}: exit 0 on an EFI host, 1 on a BIOS host. */
+  efi: CommandProbe;
+  /** {@link EFIBOOTMGR_COMMAND}: extra evidence on an EFI host, never required. */
+  efibootmgr: CommandProbe;
   /** `mdadm --examine <path>` for every path in {@link examineTargets}. */
   mdExamine: Record<string, CommandProbe>;
 }
@@ -97,16 +101,32 @@ export interface ProtectedSet {
 }
 
 /** Why the module refused. */
-export type RefusalCode = "unverifiable" | "protected";
+export type RefusalCode = "unverifiable" | "protected" | "boot-partition";
 
 /** A typed refusal: the caller must not proceed. */
 export interface Refusal {
-  /** `unverifiable`: the host could not be read safely. `protected`: a candidate is protected. */
+  /**
+   * `unverifiable`: the host could not be read safely. `protected`: a
+   * candidate backs the running system. `boot-partition`: a candidate holds a
+   * boot-type partition (BIOS boot, EFI System, ...) and its disk was not
+   * acknowledged.
+   */
   code: RefusalCode;
   /** One-line explanation, free of any secret. */
   message: string;
   /** Structured detail for the caller's error. */
   detail: Record<string, unknown>;
+}
+
+/** Per-call options of {@link assess}. */
+export interface AssessOptions {
+  /**
+   * Canonical paths of disks whose boot-type partitions the caller has
+   * explicitly acknowledged it intends to wipe (identified by serial or WWN
+   * upstream, never by a path the caller typed). It lifts only the
+   * `boot-partition` refusal, never a protection.
+   */
+  bootAcknowledged?: string[];
 }
 
 /** The module's verdict. */
@@ -116,7 +136,7 @@ export type Assessment =
 
 /** Probe that lists block devices with the columns the module needs. */
 export const LSBLK_COMMAND =
-  "lsblk -J -b -o NAME,PATH,PKNAME,TYPE,FSTYPE,UUID,PARTUUID,LABEL,MOUNTPOINTS,PARTTYPE,PARTTYPENAME";
+  "lsblk -J -b -o NAME,PATH,PKNAME,TYPE,FSTYPE,UUID,PARTUUID,LABEL,MOUNTPOINTS,PARTTYPE";
 /** Probe for live mounts. */
 export const FINDMNT_COMMAND = "findmnt -J";
 /** Probe that resolves every device symlink: one `<link> <target>` per line. */
@@ -126,6 +146,10 @@ export const LINKS_COMMAND =
 export const BLKID_COMMAND = "blkid";
 /** Probe for ZFS pool membership with full device paths. */
 export const ZPOOL_COMMAND = "zpool status -P";
+/** Probe that tells an EFI host (exit 0) from a BIOS host (exit 1). */
+export const EFI_COMMAND = "test -d /sys/firmware/efi";
+/** Probe for the firmware's boot entries; extra evidence on an EFI host. */
+export const EFIBOOTMGR_COMMAND = "efibootmgr -v";
 /** Probe for LVM physical volumes and their volume groups. */
 export const PVS_COMMAND = "pvs --noheadings -o pv_name,vg_name";
 /**
@@ -558,6 +582,27 @@ function parseFindmnt(probe: CommandProbe): Mount[] {
   return mounts;
 }
 
+/**
+ * The PARTUUIDs of the partitions the current and ordered EFI boot entries
+ * point at, from `efibootmgr -v` (`HD(n,GPT,<partuuid>,...)`), lowercased.
+ */
+export function efiBootPartuuids(text: string): string[] {
+  const wanted = new Set<string>();
+  const current = /^BootCurrent:\s*([0-9A-Fa-f]{4})/m.exec(text)?.[1];
+  if (current) wanted.add(current.toUpperCase());
+  const order = /^BootOrder:\s*(\S+)/m.exec(text)?.[1] ?? "";
+  for (const id of order.split(",")) {
+    if (/^[0-9A-Fa-f]{4}$/.test(id)) wanted.add(id.toUpperCase());
+  }
+  const out = new Set<string>();
+  for (const line of text.split("\n")) {
+    const m = /^Boot([0-9A-Fa-f]{4})\*?\s.*HD\(\d+,GPT,([0-9A-Fa-f-]{36})[,)]/
+      .exec(line);
+    if (m && wanted.has(m[1].toUpperCase())) out.add(m[2].toLowerCase());
+  }
+  return [...out];
+}
+
 /** Parses `blkid` lines into path to identifiers. */
 function parseBlkid(probe: CommandProbe): Map<string, Record<string, string>> {
   const out = new Map<string, Record<string, string>>();
@@ -905,14 +950,14 @@ function compute(input: ProbeInputs): ProtectedSet {
   for (let pass = 0, before = ""; before !== size(); pass++) {
     if (pass > 32) unverifiable("the protected topology did not settle");
     before = size();
-    // 3a. Boot partitions (BIOS boot, EFI system, ...) of every disk that holds
-    // a protected device. They carry no filesystem and no mount, so nothing
+    // 3a. Boot partitions (BIOS boot, EFI system, ...) under every protected
+    // device: a disk, but also a multipath device whose partitions sit on it. They carry no filesystem and no mount, so nothing
     // else claims them, and wiping one leaves the host unbootable. A partition
     // whose type cannot be read cannot be ruled out, so it refuses.
     for (const path of protectedNow()) {
-      const disk = graph.nodes.get(path);
-      if (disk?.type !== "disk") continue;
-      for (const childPath of disk.children) {
+      const holder = graph.nodes.get(path);
+      if (!holder) continue;
+      for (const childPath of holder.children) {
         const child = graph.nodes.get(childPath)!;
         if (child.type !== "part") continue;
         if (child.parttype === "") {
@@ -1122,6 +1167,24 @@ function compute(input: ProbeInputs): ProtectedSet {
     }
   }
 
+  // Extra evidence on an EFI host: the partitions the firmware's boot entries
+  // point at. A hard protection (the acknowledgement cannot lift it), but only
+  // ever in addition to the type-based rule, never instead of it.
+  if (input.efi.code !== 0 && input.efi.code !== 1) {
+    unverifiable("the firmware type could not be determined", {
+      exit: input.efi.code,
+    });
+  }
+  if (input.efi.code === 0 && input.efibootmgr.code === 0) {
+    for (const partuuid of efiBootPartuuids(input.efibootmgr.stdout)) {
+      for (const node of graph.nodes.values()) {
+        if (node.partuuid !== "" && node.partuuid.toLowerCase() === partuuid) {
+          collector.protect(node.path, "named by an EFI boot entry");
+        }
+      }
+    }
+  }
+
   // Missing evidence is never "not related". A mounted or configured
   // filesystem always has a type; and when blkid gave nothing either, a
   // protected device that carries data with no type at all cannot be told
@@ -1228,6 +1291,7 @@ function conflict(
   set: ProtectedSet,
   input: ProbeInputs,
   candidates: string[],
+  options: AssessOptions,
 ): Refusal | null {
   const graph = parseLsblkGraph(input.lsblk, input.blkid);
   const resolver = new Resolver(graph, input.links);
@@ -1275,6 +1339,27 @@ function conflict(
       }
       const node = graph.nodes.get(p)!;
       const probe = input.mdExamine[p];
+      // A boot-type partition anywhere is refused unless its disk was named:
+      // the firmware's boot device cannot be found from the root topology
+      // (GRUB on a SATA disk with / on NVMe, an unmounted fallback ESP).
+      if (node.type === "part" && BOOT_PART_TYPES.has(node.parttype)) {
+        const roots = [...closure(graph, p, (n) => n.parents)].filter((q) =>
+          (graph.nodes.get(q)?.parents.size ?? 0) === 0
+        );
+        const acknowledged = new Set(options.bootAcknowledged ?? []);
+        if (!roots.every((q) => acknowledged.has(q))) {
+          return {
+            code: "boot-partition",
+            message:
+              "the device holds a boot partition (BIOS boot, EFI System or similar); acknowledge its serial to wipe it",
+            detail: {
+              device: path,
+              partition: p,
+              partitionType: node.parttype,
+            },
+          };
+        }
+      }
       // Without a working blkid an empty type proves nothing: a stale row, or
       // the second device of a multi-device root that spans a whole disk, looks
       // exactly like a raw disk. Only a candidate that mdadm identified, or that
@@ -1349,6 +1434,7 @@ export function assess(
   input: ProbeInputs,
   candidates: string[],
   previous?: ProtectedSet,
+  options: AssessOptions = {},
 ): Assessment {
   try {
     if (candidates.length === 0) {
@@ -1356,7 +1442,7 @@ export function assess(
     }
     let set = compute(input);
     if (previous) set = unionProtected(previous, set);
-    const hit = conflict(set, input, candidates);
+    const hit = conflict(set, input, candidates, options);
     if (hit) return { ok: false, refusal: hit };
     return { ok: true, set };
   } catch (e) {

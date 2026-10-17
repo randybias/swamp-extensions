@@ -143,3 +143,16 @@ Not packaged. Notes for whoever maintains this extension.
   boot-type partition of a disk that holds a protected device is protected, and
   an unreadable partition type on such a disk refuses. Tests use the real
   captured shapes (`protected_devices_real_test.ts`).
+- 2026-10-17 guard r7: boot-type partitions (BIOS boot, EFI System, extended
+  boot, PReP, MBR 0xef/0x41) are now refused on ANY disk, not only disks that
+  hold a protected device: legacy-BIOS GRUB can live on a SATA disk with / on
+  NVMe, and a fallback ESP is never in fstab. A new `boot-partition` refusal
+  (`wipe.boot-partition`) is lifted only by `acknowledgeBootPartitions` on that
+  data device's serial, and never lifts a protection. On an EFI host
+  `efibootmgr -v` adds hard evidence (partitions named by BootCurrent/BootOrder
+  are protected even when acknowledged) but a missing efibootmgr does not block
+  the host. Rule 3a now covers the partitions of any protected node (a multipath
+  device), `PARTTYPENAME` is dropped (util-linux 2.34 lacks it), and the GUID
+  lowercasing is pinned by a test. Not modelled: GRUB in the MBR gap of an msdos
+  disk. Left as is: a foreign array named `/dev/md/<host>:0` fails the
+  array-path grammar in `validate.ts` and aborts the wipe (fail-closed).

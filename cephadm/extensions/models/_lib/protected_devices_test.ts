@@ -126,6 +126,9 @@ function plain(overrides: Partial<ProbeInputs> = {}): ProbeInputs {
     ),
     zpool: missing,
     pvs: missing,
+    // A BIOS host (no /sys/firmware/efi) with no efibootmgr.
+    efi: { code: 1, stdout: "" },
+    efibootmgr: missing,
     mdExamine: {},
     ...overrides,
   };

@@ -268,6 +268,9 @@ const WipeArgsSchema = z.strictObject({
       devHint: z.string().max(64).optional().describe(
         "Informational kernel name; never used.",
       ),
+      acknowledgeBootPartitions: z.boolean().optional().describe(
+        "DESTRUCTIVE. Allow wiping this disk's boot partitions (BIOS boot, EFI System): the host may not boot afterwards. Without it a disk holding one is refused. Never lifts a root, /boot, fstab, swap, md, LVM or ZFS protection.",
+      ),
     }),
   ).min(1).max(128).describe("Disks to wipe, selected by serial."),
   excludeDevices: z.array(
@@ -608,7 +611,12 @@ const VerifyHostPrepArgs = z.strictObject({
 
 const VerifyDisksRawArgs = z.strictObject({
   ...VerifyCommon,
-  dataDevices: z.array(z.strictObject({ serial: SERIAL_SCHEMA })).min(1).max(
+  // The wipe workflow hands this method the same device list it gives the wipe,
+  // so the wipe-only acknowledgement is accepted here and ignored.
+  dataDevices: z.array(z.strictObject({
+    serial: SERIAL_SCHEMA,
+    acknowledgeBootPartitions: z.boolean().optional(),
+  })).min(1).max(
     128,
   )
     .describe("Devices that must be raw, selected by serial."),

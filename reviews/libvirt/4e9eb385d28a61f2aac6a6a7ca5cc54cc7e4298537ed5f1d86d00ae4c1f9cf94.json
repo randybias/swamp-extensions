@@ -1,0 +1,88 @@
+{
+  "extension": "@randybias/libvirt",
+  "version": "2026.10.17.1",
+  "reviewedAt": "2026-10-17T15:36:29Z",
+  "dimensions": [
+    {
+      "id": "credentials-secrets",
+      "verdict": "pass",
+      "note": "private_key is a sensitive-marked argument, passed as a vault reference, and reaches the vendored canonical transport (_lib/ssh.ts blob fe0139f08c42e3fdae0061b9688fb5c534174957), which loads it into a short-lived ssh-agent over stdin, never argv. The console capture text is stored only in the sensitive console_capture resource; the method returns its byte count and SHA-256, never the text. No content-derived hash appears on any argv or remote script text. Known external issue swamp-club lab 3555: the CLI prints literal sensitive arguments, so examples use vault references only."
+    },
+    {
+      "id": "logging-quality",
+      "verdict": "pass",
+      "note": "Methods log once with structured placeholders (target, name, state, changed); warnings for a differing existing network or an unrecorded root are structured; no key, XML secret or console text in log fields."
+    },
+    {
+      "id": "error-handling",
+      "verdict": "pass",
+      "note": "Every OpenSSH exit 255 is a typed SshError from the canonical transport; virsh non-zero exits are typed LibvirtError with the virsh cause, and documented benign outcomes (already active, not running, already paused) are no-ops. The console runs inside a remote shell that maps the expected timeout kill to a normal exit with its partial output (TRIAGE 4f), live-verified on a running domain; a console on a non-running domain is a typed error with nothing stored (live). define_network keeps the start error and refuses bridge names over 15 characters. Residual MEDIUM (terra): undefine_domain remove_volumes=true destroys a running guest before its detach-disk --config calls; a detach failure leaves the guest off and partly detached (nothing is deleted)."
+    },
+    {
+      "id": "testing-completeness",
+      "verdict": "pass",
+      "note": "118 tests with an injected runner and a stateful fake virsh, including the full golden-image flow in one context (define with data disk and seed, power shutdown, undefine remove_volumes deleting only the root), remove_attached_media cases, refusal ordering before destroy, uuid mismatch refusal and destroy of in-shutdown/dying domains. xml_test runs virt-xml-validate on network and domain renders when it is on PATH and reports ignored otherwise. Live end to end on bare metal (Ubuntu 24.04, libvirt 10.0): 15/15 on 08e8052, including the four cells that failed on 0733670 and the golden-image flow; the earlier 0733670 run passed 37 of 41 cells (networks, volumes, domains, power, get/sync, injection and transport refusals, cloud-init seed boot). Residual MEDIUM (astra): the fake does not drop attachments on detach-disk; covered live. Residual: virsh define --validate is not used (it needs a driver that accepts type='kvm')."
+    },
+    {
+      "id": "idempotency-resilience",
+      "verdict": "pass",
+      "note": "define_network and define_domain re-runs are no-ops (same uuid, XML mtime unchanged) and a differing existing object warns unless replace=true; clone_volume re-run is a no-op; power to the current state is a no-op with no virsh call; undefine_network and undefine_domain again are clean no-ops (all live)."
+    },
+    {
+      "id": "api-contracts",
+      "verdict": "pass",
+      "note": "Built on virsh over SSH against a caller-supplied libvirt URI (grammar-checked). Disks are rendered as type='file' with the path from vol-path so stock Ubuntu AppArmor (virt-aa-helper) allows them, and domains carry ACPI so shutdown works (both live-verified). domblklist reads --inactive, the persistent config that undefine --remove-all-storage acts on."
+    },
+    {
+      "id": "resource-management",
+      "verdict": "pass",
+      "note": "The console is bounded by timeout_s (5 s floor) and returns within the bound plus ssh overhead (live: 5 s -> 9 s, 20 s -> 24 s). undefine_domain on a running domain leaves no qemu process (live). Output is capped by the transport."
+    },
+    {
+      "id": "published-surface-hygiene",
+      "verdict": "pass",
+      "note": "Manifest: @randybias/libvirt 2026.10.17.1 (model version literals match, plain model export), two-sentence description, Apache-2.0, additionalFiles README.md and LICENSE.txt. Every mutating method is kind action with a DESTRUCTIVE description; console, get and sync start READ-ONLY. Fixtures use RFC 5737 addresses and synthetic keys; the LOGBOOK redacts the live target. Leak scan, gitleaks and fixture guard pass. README documents which disks undefine deletes or keeps per remove_attached_media."
+    },
+    {
+      "id": "schema-strictness",
+      "verdict": "pass",
+      "note": "All arguments and resources are strictObject. Domain, network, pool and volume names match ^[A-Za-z0-9][A-Za-z0-9._-]{0,62}$, the URI has its own grammar (command= injection refused live), and target_volume path traversal is refused (live). Structured networks are rendered from validated fields; raw network XML (bounded to 256 KiB) is passed to virsh as the operator's own definition, after its first <name> (XML comments stripped) must equal the requested name. host_key_policy accepts only strict with a non-empty host_keys list (insecure_tofu not offered, as no key is persisted)."
+    },
+    {
+      "id": "lifetime-gc",
+      "verdict": "pass",
+      "note": "network_state, volume_state and domain_state: lifetime infinite, garbageCollection 10. console_capture and host_state: lifetime 1d, garbageCollection 5."
+    },
+    {
+      "id": "crud-completeness",
+      "verdict": "pass",
+      "note": "define_network/undefine_network (including the default network), clone_volume, define_domain/undefine_domain (with remove_volumes and remove_attached_media), power (start, shutdown, destroy, reboot, suspend, resume), console, get and sync."
+    },
+    {
+      "id": "preflight-checks",
+      "verdict": "pass",
+      "note": "Names, URI and paths are validated before any spawn; define_domain refuses a missing volume and clone_volume a missing golden (live). undefine_domain remove_volumes refuses, before any destroy, detach or undefine, without a recorded root, when the root is not attached, or when the recorded uuid is missing or differs from dominfo (08e8052, tested). Residual MEDIUM (astra, raised as High and downgraded at merge prep): define_domain on an existing domain records volume as the root whenever it is attached, even as a data disk; it requires the operator to name another disk of an existing domain as its root volume."
+    },
+    {
+      "id": "instance-names",
+      "verdict": "pass",
+      "note": "<kind>-<user@host:port with unsafe characters replaced>-<object name>; one record per target and object."
+    },
+    {
+      "id": "data-access",
+      "verdict": "pass",
+      "note": "Methods read only this model's own records for the target (the domain record for its recorded root and uuid); every hypervisor, URI and operand arrives as method arguments, so one definition manages any hypervisor."
+    },
+    {
+      "id": "version-upgrades",
+      "verdict": "pass",
+      "note": "First release; no earlier data to upgrade."
+    }
+  ],
+  "panel": {
+    "codex-astra": "codex gpt-6-astra conformance seat over the escalation-fix delta 889af57..28ccf18: 2 High, 1 Medium. High (recorded uuid not checked before volume removal) fixed in 08e8052. High (an attached data disk can be recorded as the root) downgraded to MEDIUM: it requires the operator to name a non-boot disk of an existing domain as its volume; carried in the LOGBOOK. Medium (fake does not drop attachments on detach) carried; covered live. Rounds r1-r3 on lane/d5-libvirt are dispositioned in the LOGBOOK.",
+    "codex-terra": "codex gpt-5.6-terra adversarial seat over the same delta: 0 Critical/High; 1 Medium (destroy before detach leaves a partly detached, powered-off guest if a detach fails), carried in the LOGBOOK. No credential exposure or injection found.",
+    "merge-prep": "Merged as 8e43553 from lane/fx-libvirt 08e8052 (lane/d5-libvirt history plus the escalation fixer's commits); release.yaml conflict resolved by keeping main and adding the libvirt beta stanza. Triage verdict on 28ccf18 CLEAN; the 08e8052 delta (undefine destroys any non-off state; remove_volumes refuses on a missing or mismatched recorded uuid before any destroy, detach or undefine; README disk table) was self-reviewed against triage 4b-4h: no new remote-bound input, destroy failures other than not-running stay fatal, tests cover both refusals and the in-shutdown/dying states; no Critical/High. No code change at merge prep; gate 7 passed without changes.",
+    "ocr-llm": "OCR sonnet5 and glm seats were not run"
+  }
+}

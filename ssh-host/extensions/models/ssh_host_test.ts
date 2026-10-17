@@ -94,19 +94,28 @@ interface Written {
   data: Record<string, unknown>;
 }
 
-/** Reads `sensitive` through the optional/nullable/default wrappers. */
+/**
+ * Reads `sensitive` through the optional/nullable/default wrappers. Fails
+ * loudly rather than returning a false negative if zod's shape changes.
+ */
 function isSensitive(schema: z.ZodType): boolean {
   let current: z.ZodType | undefined = schema;
-  while (current) {
+  for (let depth = 0; current; depth++) {
+    if (typeof current.meta !== "function") {
+      throw new Error("isSensitive: zod schema has no meta(); API changed");
+    }
     if (current.meta()?.sensitive) return true;
     current = (current as unknown as { def?: { innerType?: z.ZodType } }).def
       ?.innerType;
+    if (depth > 5) throw new Error("isSensitive: unexpected wrapper nesting");
   }
   return false;
 }
 
-/** Minimal method context that records resource writes. */
-function testContext(): { context: MethodContext; written: Written[] } {
+/** Minimal method context that records writes and serves stored reads. */
+function testContext(
+  stored: Record<string, Record<string, unknown>> = {},
+): { context: MethodContext; written: Written[] } {
   const written: Written[] = [];
   const context: MethodContext = {
     logger: { info: () => {}, warn: () => {}, error: () => {} },
@@ -121,6 +130,7 @@ function testContext(): { context: MethodContext; written: Written[] } {
         size: 0,
       });
     },
+    readResource: (name) => Promise.resolve(stored[name] ?? null),
   };
   return { context, written };
 }
@@ -155,11 +165,20 @@ Deno.test("model contract: type, empty globals, action methods, read-only label"
     model.methods.wait_connection.description,
     "READ-ONLY.",
   );
+  assertStringIncludes(model.methods.upload.description, "DESTRUCTIVE.");
+  assert(model.description.length > 20);
   assertEquals(Object.keys(model.resources).sort(), [
     "connection",
     "execution",
     "upload",
   ]);
+});
+
+Deno.test("persisted exec output is sensitive-marked", () => {
+  const shape = (model.resources.execution.schema as z.ZodObject)
+    .shape as Record<string, z.ZodType>;
+  assertEquals(isSensitive(shape.stdout), true);
+  assertEquals(isSensitive(shape.stderr), true);
 });
 
 Deno.test("argument schemas are strict and mark every secret sensitive", () => {
@@ -225,15 +244,17 @@ Deno.test("schemas reject injection in host, user, path and mode", () => {
       .success,
     false,
   );
-  assertEquals(
-    uploadArgsSchema.safeParse({
-      ...STRICT,
-      path: "/a/../b",
-      content: "x",
-      mode: "0600",
-    }).success,
-    false,
-  );
+  for (const path of ["/a/../b", "/etc/", "/a/./b"]) {
+    assertEquals(
+      uploadArgsSchema.safeParse({
+        ...STRICT,
+        path,
+        content: "x",
+        mode: "0600",
+      }).success,
+      false,
+    );
+  }
   assertEquals(
     uploadArgsSchema.safeParse({
       ...STRICT,
@@ -255,7 +276,7 @@ Deno.test("exec runs the argv, writes a host-keyed resource, returns data", asyn
   assertEquals(result.result, { stdout: "hi\n", stderr: "", exit_code: 0 });
   assertEquals(written.length, 1);
   assertEquals(written[0].specName, "execution");
-  assertEquals(written[0].name, `exec-${HOST}`);
+  assertEquals(written[0].name, `exec-${HOST}-22-root`);
   assertEquals(written[0].data.exit_code, 0);
   assertEquals(written[0].data.stdout, "hi\n");
   assertEquals(
@@ -364,12 +385,31 @@ Deno.test("upload writes a host-keyed resource and is idempotent", async () => {
   assertEquals(first.result, second.result);
   assertEquals(new TextDecoder().decode(seen), "placeholder\n");
   assertEquals(written[0].specName, "upload");
-  assertEquals(written[0].name, `upload-${HOST}`);
+  assertEquals(written[0].name, `upload-${HOST}-22-root`);
   assertEquals(written[0].data.bytes, 12);
   assertEquals(written[0].data.sha256, await sha256Hex("placeholder\n"));
   for (const call of calls) {
     assertEquals(call.args.join(" ").includes("placeholder"), false);
   }
+});
+
+Deno.test("upload writes no resource when the remote bytes are unchanged", async () => {
+  const calls: Call[] = [];
+  const content = "already current\n";
+  const sha = await sha256Hex(content);
+  const deps = fakeDeps(fakeRun(calls, {
+    ssh: () => ({ code: 0, stdout: `${sha}  /etc/x\n`, stderr: "" }),
+  }));
+  const m = createModel(deps);
+  const { context, written } = testContext();
+  const result = await m.methods.upload.execute({
+    ...STRICT,
+    path: "/etc/x",
+    content,
+    mode: "0600",
+  }, context);
+  assertEquals((result.result as { changed: boolean }).changed, false);
+  assertEquals(written.length, 0);
 });
 
 Deno.test("upload decodes base64 and refuses ambiguous or missing content", async () => {
@@ -447,7 +487,7 @@ Deno.test("wait_connection records reachability and accepted keys", async () => 
   assertEquals(value.reachable, true);
   assertEquals(value.host_keys[0].sha256.startsWith("SHA256:"), true);
   assertEquals(written[0].specName, "connection");
-  assertEquals(written[0].name, `connection-${HOST}`);
+  assertEquals(written[0].name, `connection-${HOST}-22-root`);
   assertEquals(written[0].data.reachable, true);
 });
 
@@ -491,6 +531,72 @@ Deno.test("wait_connection times out with a typed error naming the host", async 
     SshError,
   );
   assertStringIncludes(err.message, HOST);
+});
+
+Deno.test("insecure_tofu records the first keys and pins them on later runs", async () => {
+  const args = {
+    ...STRICT,
+    host_key_policy: "insecure_tofu" as const,
+    host_keys: undefined,
+    argv: ["true"],
+  };
+  const calls: Call[] = [];
+  const deps = fakeDeps(fakeRun(calls));
+  const m = createModel(deps);
+  const { context, written } = testContext();
+  const first = await m.methods.exec.execute(args, context);
+  assertEquals(first.result, { stdout: "hi\n", stderr: "", exit_code: 0 });
+  // First use scanned and recorded the keys, then pinned them for the run.
+  assertEquals(calls.some((c) => c.cmd === "ssh-keyscan"), true);
+  const connection = written.find((w) => w.specName === "connection");
+  assertEquals(connection?.name, `connection-${HOST}-22-root`);
+  const firstSsh = calls.filter((c) => c.cmd === "ssh").at(-1);
+  assertEquals(firstSsh?.args.includes("StrictHostKeyChecking=yes"), true);
+  assert(connection);
+
+  // Second run reads the record: no scan, no new connection write, still pinned.
+  const calls2: Call[] = [];
+  const deps2 = fakeDeps(fakeRun(calls2));
+  const m2 = createModel(deps2);
+  const stored = { [`connection-${HOST}-22-root`]: connection.data };
+  const { context: context2, written: written2 } = testContext(stored);
+  await m2.methods.exec.execute(args, context2);
+  assertEquals(calls2.some((c) => c.cmd === "ssh-keyscan"), false);
+  assertEquals(
+    calls2.find((c) => c.cmd === "ssh")?.args.includes(
+      "StrictHostKeyChecking=yes",
+    ),
+    true,
+  );
+  assertEquals(written2.some((w) => w.specName === "connection"), false);
+});
+
+Deno.test("insecure_tofu refuses a changed key on a later run", async () => {
+  const calls: Call[] = [];
+  const deps = fakeDeps(fakeRun(calls, {
+    ssh: () => ({
+      code: 255,
+      stdout: "",
+      stderr: "Host key verification failed.\n",
+    }),
+  }));
+  const m = createModel(deps);
+  const { context } = testContext({
+    [`connection-${HOST}-22-root`]: {
+      host_keys: [{ type: "ssh-ed25519", key: "QkJCQkJC" }],
+    },
+  });
+  await assertRejects(
+    () =>
+      m.methods.exec.execute({
+        ...STRICT,
+        host_key_policy: "insecure_tofu",
+        host_keys: undefined,
+        argv: ["true"],
+      }, context),
+    SshError,
+    "host key",
+  );
 });
 
 Deno.test("the factory returns an independent model with the production wiring", () => {

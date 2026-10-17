@@ -46,3 +46,39 @@ extension) so it can be copied byte-identical into the consuming lanes' `_lib/`.
   keys and a placeholder password as secrets. The fixtures now use low-entropy
   valid base64 blobs (`QUFBQUFB`, `QkJCQkJC`, `Q0NDQ0ND`) whose fingerprints are
   recomputed in the tests; no suppression comments were needed.
+
+## Review ledger: conformance + adversarial (round 1)
+
+Verified at `4117d67` by the lead; fixes below are in the offline-green commit
+for this round.
+
+- HIGH-1 (injection surface): `runRemote(remoteCommand: string)` was exported,
+  so a consumer could hand it an unquoted shell string. `runRemote` is now
+  internal. The public surface is `exec(argv)`, `quoteArgv(argv)` and
+  `buildRemoteCommand(stages, operators)`; operators come from a fixed allowlist
+  and every word is `posixQuote`d. A test asserts `runRemote` is not exported.
+- HIGH-2 (insecure_tofu was not TOFU): accept-new with a deleted per-invocation
+  known_hosts trusted a fresh key every run. Now `insecure_tofu` records the
+  first keys seen into the `connection-<host>-<port>-<user>` resource and pins
+  exactly those on later runs; a changed key is refused. `checkHostKeys`
+  verifies whenever pins are supplied, under either policy, and the helper's
+  bare accept-new path is only reachable on a genuine first use.
+- MEDIUM-3 (upload directory paths): `assertRemotePath` (and the `upload`
+  schema) now reject a trailing `/`, a `.` or `..` component, and require a
+  concrete final filename.
+- MEDIUM-4 (upload not idempotent): `upload` reads the destination's SHA-256
+  first and, on a match, skips the write and writes no new resource version;
+  `UploadResult.changed` reports which happened.
+- MEDIUM-5 (resource key ignored port): instance names are now
+  `<verb>-<host>-<port>-<user>`, so two ports or users cannot overwrite each
+  other.
+- MEDIUM-6 (exec output): persisted `stdout` and `stderr` are marked sensitive;
+  the method description and README say argv must never carry a secret.
+- MEDIUM-7 (README `--json`): dropped `--json` from the run examples.
+- LOW: `upload` is prefixed `DESTRUCTIVE.` and `exec` names its destructive
+  potential; the model has a `description`; `parseHostKeys` discriminates bare
+  lines by field count (accepting `sk-`/FIDO algorithms); `USER_RE` accepts
+  uppercase and dotted names; `keysForHost` accepts `[host]:22` on port 22; the
+  `isSensitive` test throws if zod's wrapper shape changes.
+- Not fixed by design: the LOWs from the two OCR seats that timed out were not
+  available at the time of this round; fold any that arrive into the next one.

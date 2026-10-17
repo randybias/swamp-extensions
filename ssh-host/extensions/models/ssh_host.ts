@@ -70,6 +70,10 @@ export interface MethodContext {
     instanceName: string,
     data: Record<string, unknown>,
   ) => Promise<DataHandle>;
+  /** Reads the latest version of one stored resource, or null. */
+  readResource: (
+    instanceName: string,
+  ) => Promise<Record<string, unknown> | null>;
 }
 
 /** A resource specification exposed by the model. */
@@ -102,6 +106,8 @@ export interface SshHostModel {
   type: string;
   /** CalVer version, matching the manifest. */
   version: string;
+  /** One-line summary of the model for `swamp model type describe`. */
+  description: string;
   /** Empty: every method takes its own target. */
   globalArguments: z.ZodType;
   /** Resource specifications. */
@@ -117,10 +123,10 @@ const TargetShape = {
   port: z.number().int().min(1).max(65535).default(22).describe("SSH port."),
   user: z.string().regex(USER_RE).describe("Remote user name."),
   host_key_policy: z.enum(["strict", "insecure_tofu"]).describe(
-    "Required. strict verifies against host_keys; insecure_tofu trusts the first key seen.",
+    "Required. strict verifies against host_keys; insecure_tofu records the first keys seen and pins them on every later run, refusing a change.",
   ),
   host_keys: z.array(z.string().max(8192)).max(64).nullish().describe(
-    "ssh-keyscan-format lines. Required and authoritative when host_key_policy is strict.",
+    "ssh-keyscan-format lines. Required for strict; a recorded set may be supplied for insecure_tofu to pin it immediately.",
   ),
   private_key: z.string().max(65536).meta({ sensitive: true }).nullish()
     .describe(
@@ -144,9 +150,12 @@ const ExecArgsSchema = z.strictObject({
 const UploadArgsSchema = z.strictObject({
   ...TargetShape,
   path: z.string().regex(REMOTE_PATH_RE).refine(
-    (p) => !p.split("/").includes(".."),
-    "path must not contain ..",
-  ).describe("Absolute destination path."),
+    (p) => !p.endsWith("/"),
+    "path must name a file, not a directory",
+  ).refine(
+    (p) => !p.split("/").some((part) => part === "." || part === ".."),
+    "path must not contain . or .. components",
+  ).describe("Absolute destination path naming one file."),
   content: z.string().max(4194304).meta({ sensitive: true }).nullish()
     .describe("UTF-8 content. Wire a vault reference."),
   content_base64: z.string().max(5592408).meta({ sensitive: true }).nullish()
@@ -180,8 +189,8 @@ const ExecutionSchema = z.strictObject({
   port: z.number().int(),
   user: z.string(),
   argv_sha256: z.string(),
-  stdout: z.string(),
-  stderr: z.string(),
+  stdout: z.string().meta({ sensitive: true }),
+  stderr: z.string().meta({ sensitive: true }),
   exit_code: z.number().int(),
   ran_at: z.string(),
 });
@@ -194,6 +203,7 @@ const UploadSchema = z.strictObject({
   mode: z.string(),
   bytes: z.number().int(),
   sha256: z.string(),
+  changed: z.boolean(),
   uploaded_at: z.string(),
 });
 
@@ -276,6 +286,84 @@ function resolveContent(
 }
 
 /**
+ * The per-target suffix for stored data: host, port and user together, so two
+ * ports or two users on one host never overwrite each other's evidence.
+ */
+function instanceSuffix(args: TargetArgs): string {
+  return `${args.host}-${args.port}-${args.user}`;
+}
+
+/** The keys recorded by an earlier `insecure_tofu` connection, if any. */
+interface RecordedKeys {
+  /** Recorded host keys. */
+  host_keys?: { type: string; key: string }[];
+}
+
+/**
+ * Applies host-key state. `strict` is used as given. `insecure_tofu` becomes
+ * `strict` pinned to the keys recorded for this target on first use; with no
+ * record it stays `insecure_tofu` for a genuine first connection.
+ */
+async function pinnedTarget(
+  context: MethodContext,
+  args: TargetArgs,
+): Promise<SshTarget> {
+  const target = toTarget(args);
+  if (args.host_key_policy !== "insecure_tofu") return target;
+  const stored = await context.readResource(
+    `connection-${instanceSuffix(args)}`,
+  ) as RecordedKeys | null;
+  const keys = stored?.host_keys ?? [];
+  if (keys.length === 0) return target;
+  return {
+    ...target,
+    host_key_policy: "strict",
+    host_keys: keys.map((k) => `${k.type} ${k.key}`),
+  };
+}
+
+/**
+ * Resolves the target for a mutating transport call. On the first
+ * `insecure_tofu` use it learns the host keys read-only, records them keyed by
+ * host/port/user, and pins them for the call; later calls verify against the
+ * record and refuse a changed key.
+ */
+async function resolveTarget(
+  deps: SshDeps,
+  context: MethodContext,
+  args: TargetArgs,
+): Promise<SshTarget> {
+  const target = await pinnedTarget(context, args);
+  if (
+    args.host_key_policy !== "insecure_tofu" ||
+    target.host_key_policy === "strict"
+  ) {
+    return target;
+  }
+  const learned = await waitConnection(deps, target, {
+    timeout_s: args.connect_timeout_s,
+    poll_interval_s: 1,
+  });
+  await context.writeResource(
+    "connection",
+    `connection-${instanceSuffix(args)}`,
+    ConnectionSchema.parse({
+      host: args.host,
+      port: args.port,
+      reachable: true,
+      host_keys: learned.host_keys,
+      checked_at: new Date(deps.now()).toISOString(),
+      waited_seconds: 0,
+    }),
+  );
+  return {
+    ...target,
+    host_key_policy: "strict",
+    host_keys: learned.host_keys.map((k) => `${k.type} ${k.key}`),
+  };
+}
+
+/**
  * Builds the model with injectable dependencies. The production export is
  * `createModel()`; tests pass a fake runner, clock and sleep so no process is
  * spawned and no socket is opened.
@@ -284,6 +372,8 @@ export function createModel(deps: SshDeps = denoDeps): SshHostModel {
   return {
     type: "@randybias/ssh-host",
     version: "2026.10.17.1",
+    description:
+      "Run one argv vector, push bytes atomically, and wait for SSH host keys on any host. One generic definition with no host or credential in it; every method takes its target as arguments and stores evidence keyed by host, port and user.",
     globalArguments: z.strictObject({}),
     resources: {
       execution: {
@@ -310,18 +400,18 @@ export function createModel(deps: SshDeps = denoDeps): SshHostModel {
       exec: {
         kind: "action",
         description:
-          "Run one argv vector on the host over SSH and return its stdout, stderr and exit code. Each element is passed as one literal argv word, never interpolated into a remote shell string; a non-zero remote exit is data, while an unreachable host, rejected credential or host-key mismatch is an error.",
+          "Run one argv vector on the host over SSH and return its stdout, stderr and exit code. Each element is passed as one literal argv word, never interpolated into a remote shell string, but argv can still run a destructive command on the host; a non-zero remote exit is data, while an unreachable host, rejected credential or host-key mismatch is an error. Never put a secret in argv. Stored stdout and stderr are sensitive.",
         arguments: ExecArgsSchema,
         execute: async (
           rawArgs: unknown,
           context: MethodContext,
         ): Promise<MethodResult> => {
           const args = rawArgs as ExecArgs;
-          const target = toTarget(args);
+          const target = await resolveTarget(deps, context, args);
           const result = await sshExec(deps, target, args.argv);
           const handle = await context.writeResource(
             "execution",
-            `exec-${args.host}`,
+            `exec-${instanceSuffix(args)}`,
             ExecutionSchema.parse({
               host: args.host,
               port: args.port,
@@ -348,22 +438,29 @@ export function createModel(deps: SshDeps = denoDeps): SshHostModel {
       upload: {
         kind: "action",
         description:
-          "Push bytes to an absolute path on the host over stdin, atomically: a temporary file in the destination directory is written, chmod'ed and renamed over the destination. Returns the path, byte count and SHA-256; an unwritable path is an error and leaves no partial file.",
+          "DESTRUCTIVE. Push bytes to an absolute path on the host over stdin, atomically: a temporary file in the destination directory is written, chmod'ed and renamed over the destination, overwriting it. Idempotent by bytes: an unchanged file is not rewritten and no new resource version is written. Returns the path, byte count, SHA-256 and whether it changed; an unwritable path is an error and leaves no partial file.",
         arguments: UploadArgsSchema,
         execute: async (
           rawArgs: unknown,
           context: MethodContext,
         ): Promise<MethodResult> => {
           const args = rawArgs as UploadArgs;
-          const target = toTarget(args);
+          const target = await resolveTarget(deps, context, args);
           const result = await sshUpload(deps, target, {
             path: args.path,
             content: resolveContent(args),
             mode: args.mode,
           });
+          if (!result.changed) {
+            context.logger.info(
+              "Upload to {host}:{path} already current; no write",
+              { host: args.host, path: result.path },
+            );
+            return { result };
+          }
           const handle = await context.writeResource(
             "upload",
-            `upload-${args.host}`,
+            `upload-${instanceSuffix(args)}`,
             UploadSchema.parse({
               host: args.host,
               port: args.port,
@@ -372,6 +469,7 @@ export function createModel(deps: SshDeps = denoDeps): SshHostModel {
               mode: args.mode,
               bytes: result.bytes,
               sha256: result.sha256,
+              changed: result.changed,
               uploaded_at: new Date(deps.now()).toISOString(),
             }),
           );
@@ -390,14 +488,16 @@ export function createModel(deps: SshDeps = denoDeps): SshHostModel {
       wait_connection: {
         kind: "action",
         description:
-          "READ-ONLY. Poll until the host answers SSH with acceptable host keys or the timeout expires; returns reachable and the accepted host keys with fingerprints. A strict key mismatch is refused immediately; insecure_tofu trusts the first keys seen.",
+          "READ-ONLY. Poll until the host answers SSH with acceptable host keys or the timeout expires; returns reachable and the accepted host keys with fingerprints. A strict or already-recorded key mismatch is refused immediately; insecure_tofu records the first keys seen for later runs.",
         arguments: WaitArgsSchema,
         execute: async (
           rawArgs: unknown,
           context: MethodContext,
         ): Promise<MethodResult> => {
           const args = rawArgs as WaitArgs;
-          const target = toTarget(args);
+          // A recorded insecure_tofu pin is enforced here too; only a genuine
+          // first use learns and records keys.
+          const target = await pinnedTarget(context, args);
           const started = deps.now();
           const result = await waitConnection(deps, target, {
             timeout_s: args.timeout_s,
@@ -405,7 +505,7 @@ export function createModel(deps: SshDeps = denoDeps): SshHostModel {
           });
           const handle = await context.writeResource(
             "connection",
-            `connection-${args.host}`,
+            `connection-${instanceSuffix(args)}`,
             ConnectionSchema.parse({
               host: args.host,
               port: args.port,

@@ -91,6 +91,8 @@ export interface UploadResult {
   bytes: number;
   /** SHA-256 of the bytes, lowercase hex. */
   sha256: string;
+  /** False when the destination already held these exact bytes; no write happened. */
+  changed: boolean;
 }
 
 /** A host key with its SHA-256 fingerprint. */
@@ -160,9 +162,9 @@ export class SshError extends Error {
 /** Grammar for a plain hostname or IP literal. */
 export const HOST_RE =
   /^(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)*$|^[0-9a-fA-F:.]{2,45}$/;
-/** Grammar for conventional POSIX user names. */
-export const USER_RE = /^[a-z_][a-z0-9_-]{0,31}$/;
-/** Grammar for absolute remote paths: safe characters, no `..` segment. */
+/** Grammar for POSIX user names, including uppercase and dotted names. */
+export const USER_RE = /^[A-Za-z_][A-Za-z0-9._-]{0,31}$/;
+/** Grammar for absolute remote paths: safe characters only. */
 export const REMOTE_PATH_RE = /^\/[A-Za-z0-9._\/-]{1,4095}$/;
 /** Grammar for octal file modes. */
 export const MODE_RE = /^[0-7]{3,4}$/;
@@ -188,13 +190,22 @@ export function assertPort(port: number): void {
   }
 }
 
-/** Throws unless `path` is an absolute path without a `..` segment. */
+/**
+ * Throws unless `path` is an absolute path naming one concrete file: no
+ * trailing `/`, no `.` or `..` component, and a non-empty final segment.
+ */
 export function assertRemotePath(path: string): void {
-  if (
-    typeof path !== "string" || !REMOTE_PATH_RE.test(path) ||
-    path.split("/").includes("..")
-  ) {
+  if (typeof path !== "string" || !REMOTE_PATH_RE.test(path)) {
     throw new SshConfigError(`Invalid remote path: ${String(path)}`);
+  }
+  if (path.endsWith("/")) {
+    throw new SshConfigError(
+      `Remote path must name a file, not a directory: ${path}`,
+    );
+  }
+  const parts = path.split("/");
+  if (parts.includes(".") || parts.includes("..")) {
+    throw new SshConfigError(`Remote path must not contain . or ..: ${path}`);
   }
 }
 
@@ -215,6 +226,54 @@ export function posixQuote(value: string): string {
   return `'${value.replace(/'/g, "'\\''")}'`;
 }
 
+/** A shell operator allowed between remote command stages. */
+export type RemoteOperator = "|" | "&&" | "||" | ";";
+
+/**
+ * Joins one argv vector into a single remote command, quoting every element as
+ * a literal word. This is the only public way to build a command string: the
+ * result is always a sequence of quoted words with no unquoted caller text.
+ */
+export function quoteArgv(argv: string[]): string {
+  if (!Array.isArray(argv) || argv.length === 0) {
+    throw new SshConfigError("argv must have at least one element");
+  }
+  for (const word of argv) {
+    if (typeof word !== "string") {
+      throw new SshConfigError("every argv element must be a string");
+    }
+  }
+  return argv.map(posixQuote).join(" ");
+}
+
+/**
+ * Builds a remote command from one or more argv vectors joined by operators
+ * chosen from a fixed allowlist. No caller value is ever an unquoted word, so
+ * a pipeline can be expressed without handing the helper a raw shell string.
+ */
+export function buildRemoteCommand(
+  stages: string[][],
+  operators: RemoteOperator[] = [],
+): string {
+  if (!Array.isArray(stages) || stages.length === 0) {
+    throw new SshConfigError("at least one command stage is required");
+  }
+  if (operators.length !== stages.length - 1) {
+    throw new SshConfigError(
+      "one operator is required between each pair of stages",
+    );
+  }
+  const allowed = new Set<RemoteOperator>(["|", "&&", "||", ";"]);
+  const parts = [quoteArgv(stages[0])];
+  for (let i = 0; i < operators.length; i++) {
+    if (!allowed.has(operators[i])) {
+      throw new SshConfigError(`unsupported operator: ${String(operators[i])}`);
+    }
+    parts.push(operators[i], quoteArgv(stages[i + 1]));
+  }
+  return parts.join(" ");
+}
+
 /** Parses `ssh-keyscan` or `known_hosts` lines into host keys. */
 export function parseHostKeys(text: string): HostKey[] {
   const keys: HostKey[] = [];
@@ -222,8 +281,11 @@ export function parseHostKeys(text: string): HostKey[] {
     const line = raw.trim();
     if (line === "" || line.startsWith("#")) continue;
     const parts = line.split(/\s+/);
-    const bare = parts[0].startsWith("ssh-") || parts[0].startsWith("ecdsa-");
-    const [host, type, key] = bare
+    // A bare `type key` line has exactly two fields; anything else is
+    // `host type key`. Discriminating on field count also accepts key
+    // algorithms whose name does not start with `ssh-` or `ecdsa-`, such
+    // as the FIDO `sk-` variants.
+    const [host, type, key] = parts.length === 2
       ? [undefined, parts[0], parts[1]]
       : [parts[0], parts[1], parts[2]];
     if (type && key) keys.push(host ? { host, type, key } : { type, key });
@@ -233,35 +295,37 @@ export function parseHostKeys(text: string): HostKey[] {
 
 /**
  * Keeps the keys that apply to `host` on `port`: lines without a host field,
- * or whose comma-separated host list names `host` (port 22) or `[host]:port`.
- * Hashed `known_hosts` entries are not supported.
+ * or whose comma-separated host list names `host`, `[host]:22` (both accepted
+ * on port 22) or `[host]:port`. Hashed `known_hosts` entries are unsupported.
  */
 export function keysForHost(
   keys: HostKey[],
   host: string,
   port: number,
 ): HostKey[] {
-  const want = port === 22 ? host : `[${host}]:${port}`;
+  const wants = port === 22 ? [host, `[${host}]:22`] : [`[${host}]:${port}`];
   return keys.filter((k) =>
-    k.host === undefined || k.host.split(",").includes(want)
+    k.host === undefined || k.host.split(",").some((h) => wants.includes(h))
   );
 }
 
 /**
- * Applies the host-key policy and returns the keys to trust. `strict` follows
- * OpenSSH: every observed key of a type that `expected` pins must match a
- * pinned key, types it does not pin are ignored, and at least one observed key
- * must match; only matching keys are returned. `insecure_tofu` returns what
- * was observed, without enforcement.
+ * Verifies observed keys against `expected` when any are pinned, whatever the
+ * policy: every observed key of a pinned type must match, types with no pin
+ * are ignored, and at least one observed key must match. With `insecure_tofu`
+ * and no pinned keys (genuine first use) it returns what was observed; with
+ * `strict` and no pin it refuses.
  */
 export function checkHostKeys(
   observed: HostKey[],
   policy: HostKeyPolicy,
   expected: HostKey[] = [],
 ): HostKey[] {
-  if (policy !== "strict") return observed;
   if (expected.length === 0) {
-    throw new SshConfigError("host_key_policy strict requires host keys");
+    if (policy === "strict") {
+      throw new SshConfigError("host_key_policy strict requires host keys");
+    }
+    return observed;
   }
   if (observed.length === 0) {
     throw new SshError("no host keys observed to verify");
@@ -296,10 +360,15 @@ export function buildKnownHosts(
     (keys.length > 0 ? "\n" : "");
 }
 
+/** The pinned keys that apply to `target`; empty when none are pinned. */
+function applicableKeys(target: NormalizedTarget): HostKey[] {
+  const parsed = parseHostKeys((target.host_keys ?? []).join("\n"));
+  return keysForHost(parsed, target.host, target.port);
+}
+
 /** Resolves the pinned keys for `target`, refusing an empty or inapplicable set. */
 function expectedKeys(target: NormalizedTarget): HostKey[] {
-  const parsed = parseHostKeys((target.host_keys ?? []).join("\n"));
-  const applicable = keysForHost(parsed, target.host, target.port);
+  const applicable = applicableKeys(target);
   if (applicable.length === 0) {
     throw new SshConfigError(
       `host_key_policy strict requires pinned host keys for ${target.host}:${target.port}`,
@@ -556,12 +625,16 @@ function transportFailure(
 }
 
 /**
- * Runs `remoteCommand` on the target over SSH. The command string is built by
- * the caller from {@link posixQuote}-quoted words, so no caller value is ever
- * interpreted by the remote shell. Returns the remote exit code as data; a
- * transport failure throws {@link SshError}.
+ * Runs `remoteCommand` on the target over SSH. Internal: a remote command is
+ * built only by {@link exec}, {@link buildRemoteCommand} or this module's own
+ * fixed scripts, so no public API accepts an unquoted command string. Returns
+ * the remote exit code as data; a transport failure throws {@link SshError}.
+ *
+ * When keys are pinned — always for `strict`, and for `insecure_tofu` once the
+ * caller supplies the keys it recorded on first use — the host is verified
+ * against exactly those keys and a change is refused.
  */
-export async function runRemote(
+async function runRemote(
   deps: SshDeps,
   target: SshTarget,
   remoteCommand: string,
@@ -577,14 +650,23 @@ export async function runRemote(
   const env: Record<string, string> = {};
   const args: string[] = ["-F", "/dev/null", "-o", "IdentityFile=none"];
   try {
+    const pinned = applicableKeys(t);
     if (t.host_key_policy === "strict") {
-      const keys = expectedKeys(t);
       await Deno.writeTextFile(
         knownHosts,
-        buildKnownHosts(t.host, t.port, keys),
+        buildKnownHosts(t.host, t.port, expectedKeys(t)),
+      );
+      args.push("-o", "StrictHostKeyChecking=yes");
+    } else if (pinned.length > 0) {
+      // Recorded keys exist: this is trust-on-first-use enforced, not a
+      // fresh accept-new. Pin exactly what was recorded.
+      await Deno.writeTextFile(
+        knownHosts,
+        buildKnownHosts(t.host, t.port, pinned),
       );
       args.push("-o", "StrictHostKeyChecking=yes");
     } else {
+      // Genuine first use under insecure_tofu: accept and learn the key.
       await Deno.writeTextFile(knownHosts, "");
       args.push("-o", "StrictHostKeyChecking=accept-new");
     }
@@ -633,23 +715,16 @@ export async function exec(
   target: SshTarget,
   argv: string[],
 ): Promise<ExecResult> {
-  if (!Array.isArray(argv) || argv.length === 0) {
-    throw new SshConfigError("argv must have at least one element");
-  }
-  for (const word of argv) {
-    if (typeof word !== "string") {
-      throw new SshConfigError("every argv element must be a string");
-    }
-  }
-  const remoteCommand = argv.map(posixQuote).join(" ");
-  return await runRemote(deps, target, remoteCommand);
+  return await runRemote(deps, target, quoteArgv(argv));
 }
 
 /**
  * Pushes `content` to `path` on the target: a temporary file in the
  * destination directory is written from stdin, chmod'ed, and renamed over the
- * destination, so the destination is never partially written. Returns the
- * destination, byte count and SHA-256.
+ * destination, so the destination is never partially written. Idempotent by
+ * bytes: when the destination already holds the same SHA-256 the write is
+ * skipped and `changed` is false. Returns the destination, byte count and
+ * SHA-256.
  */
 export async function upload(
   deps: SshDeps,
@@ -663,6 +738,28 @@ export async function upload(
     ? new TextEncoder().encode(options.content)
     : options.content;
   const sha256 = await sha256Hex(bytes);
+  const file = posixQuote(options.path);
+  // Idempotence: read the destination's SHA-256 first. Identical bytes mean no
+  // write, no rename and no new resource version. Portability: sha256sum on
+  // GNU, shasum -a 256 on macOS; if neither exists the check fails and the
+  // write proceeds.
+  const check = await runRemote(
+    deps,
+    target,
+    `f=${file}\n` +
+      `if [ -f "$f" ]; then { sha256sum "$f" 2>/dev/null || shasum -a 256 "$f" 2>/dev/null; }; else echo MISSING; fi`,
+  );
+  if (check.exit_code === 0) {
+    const existing = check.stdout.trim().split(/\s+/)[0] ?? "";
+    if (existing === sha256) {
+      return {
+        path: options.path,
+        bytes: bytes.length,
+        sha256,
+        changed: false,
+      };
+    }
+  }
   const dir = options.path.slice(0, options.path.lastIndexOf("/")) || "/";
   const script = [
     `d=${posixQuote(dir)}`,
@@ -670,7 +767,7 @@ export async function upload(
     `trap 'rm -f "$t"' EXIT HUP INT TERM`,
     `cat > "$t" || exit 1`,
     `chmod ${mode} "$t" || exit 1`,
-    `mv -f "$t" ${posixQuote(options.path)} || exit 1`,
+    `mv -f "$t" ${file} || exit 1`,
   ].join("\n");
   const res = await runRemote(deps, target, script, bytes);
   if (res.exit_code !== 0) {
@@ -678,7 +775,7 @@ export async function upload(
       `upload to ${target.user}@${target.host}:${options.path} failed (exit ${res.exit_code})`,
     );
   }
-  return { path: options.path, bytes: bytes.length, sha256 };
+  return { path: options.path, bytes: bytes.length, sha256, changed: true };
 }
 
 /** Waits until the host answers SSH with acceptable host keys, or times out. */
@@ -690,7 +787,11 @@ export async function waitConnection(
   const t = normalizeTarget(target);
   const timeoutS = options.timeout_s ?? 60;
   const pollS = options.poll_interval_s ?? 5;
-  const expected = t.host_key_policy === "strict" ? expectedKeys(t) : [];
+  // strict must have a pin; insecure_tofu may carry one recorded on first use,
+  // in which case this poll verifies against it instead of trusting anew.
+  const expected = t.host_key_policy === "strict"
+    ? expectedKeys(t)
+    : applicableKeys(t);
   const deadline = deps.now() + timeoutS * 1000;
   const scanTimeout = Math.min(Math.max(t.connect_timeout_s, 1), 10);
   while (true) {

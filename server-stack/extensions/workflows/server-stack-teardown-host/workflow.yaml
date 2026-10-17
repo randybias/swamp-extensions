@@ -189,6 +189,15 @@ jobs:
           - step: check-record
             condition:
               type: succeeded
+          - step: check-inputs
+            condition:
+              type: succeeded
+          - step: check-ownership
+            condition:
+              type: succeeded
+          - step: sync-server
+            condition:
+              type: succeeded
         guard: >-
           ${{ inputs.publish_dns == false ||
               data.latest("host-dns", "main").attributes.records.size() == 0 }}
@@ -206,6 +215,9 @@ jobs:
         description: Stop and reset k0s over the mesh via SSH
         dependsOn:
           - step: check-ownership
+            condition:
+              type: succeeded
+          - step: check-inputs
             condition:
               type: succeeded
           - step: sync-server
@@ -242,6 +254,9 @@ jobs:
         description: Delete the server after hostname and project checks
         dependsOn:
           - step: check-ownership
+            condition:
+              type: succeeded
+          - step: check-inputs
             condition:
               type: succeeded
           - step: sync-server

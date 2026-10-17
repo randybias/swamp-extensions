@@ -116,9 +116,13 @@ export function parseLeaseJson(body: unknown): Lease[] {
     const entry = row as Record<string, unknown>;
     const address = entry["ip-address"] ?? entry.ip_address;
     const subnet = entry["subnet-id"] ?? entry.subnet_id;
-    const expire = entry["cltt"] ?? entry.expire ?? entry["expire"];
+    const cltt = entry["cltt"] ?? entry.cltt;
+    const validLft = entry["valid-lft"] ?? entry.valid_lft;
+    const expire = entry.expire ?? entry["expire"];
     if (typeof address !== "string" || typeof subnet !== "number") return [];
-    const epoch = typeof expire === "number" ? expire + 3600 : undefined;
+    const epoch = typeof cltt === "number"
+      ? cltt + (typeof validLft === "number" ? validLft : 3600)
+      : (typeof expire === "number" ? expire : undefined);
     return [{
       ip_address: address,
       hw_address: typeof entry["hw-address"] === "string"

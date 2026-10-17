@@ -50,6 +50,7 @@ Deno.test("parseLeaseJson reads a lease_cmds answer", () => {
           "hw-address": "02:00:00:00:00:01",
           "subnet-id": 10,
           cltt: 1_900_000_000,
+          "valid-lft": 7200,
           hostname: "web-1",
         },
       ],
@@ -57,7 +58,7 @@ Deno.test("parseLeaseJson reads a lease_cmds answer", () => {
   });
   assertEquals(leases.length, 1);
   assertEquals(leases[0].ip_address, "192.0.2.10");
-  assertEquals(leases[0].expires_at, new Date(1_900_003_600_000).toISOString());
+  assertEquals(leases[0].expires_at, new Date(1_900_007_200_000).toISOString());
   assertThrows(() => parseLeaseJson({ result: 0 }), KeaInputError, "leases");
 });
 

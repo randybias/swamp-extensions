@@ -8,6 +8,7 @@ import {
   ipv4ToString,
   isCidr,
   isFqdn,
+  isHookLibraryPath,
   isInterfaceName,
   isIpv4,
   isLabel,
@@ -148,12 +149,14 @@ Deno.test("option rendering honours the allowlist and types", () => {
     name: "interface-mtu",
     data: "1500",
   });
-  assertEquals(
-    renderOption({
-      name: "classless-static-route",
-      value: [{ prefix: "198.51.100.0/24", router: "192.0.2.1" }],
-    }),
-    { name: "classless-static-route", data: "198.51.100.0/24,192.0.2.1" },
+  assertThrows(
+    () =>
+      renderOption({
+        name: "classless-static-route",
+        value: [{ prefix: "198.51.100.0/24", router: "192.0.2.1" }],
+      }),
+    KeaInputError,
+    "unknown",
   );
   assertThrows(
     () =>
@@ -169,4 +172,15 @@ Deno.test("option rendering honours the allowlist and types", () => {
     KeaInputError,
     "unknown",
   );
+});
+
+Deno.test("isHookLibraryPath accepts packaged hooks and refuses the rest", () => {
+  assertEquals(
+    isHookLibraryPath("/usr/lib/kea/hooks/libdhcp_lease_cmds.so"),
+    true,
+  );
+  assertEquals(isHookLibraryPath("libdhcp_lease_cmds.so"), false);
+  assertEquals(isHookLibraryPath("/tmp/libdhcp_lease_cmds.so"), false);
+  assertEquals(isHookLibraryPath("/usr/lib/kea/hooks/evil.so"), false);
+  assertEquals(isHookLibraryPath("/usr/lib/kea/hooks/../../tmp/x.so"), false);
 });

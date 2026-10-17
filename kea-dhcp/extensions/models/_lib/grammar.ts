@@ -232,11 +232,39 @@ const IPV4_LIST_OPTIONS = new Set([
   "ntp-servers",
 ]);
 
-/** True when `name` is in the closed option allowlist. */
+/**
+ * True when `name` is in the closed option allowlist.
+ *
+ * `classless-static-route` (option 121) is deliberately absent: the stock Kea
+ * 2.4 option dictionary has no definition for it, so `kea-dhcp4 -t` refuses a
+ * config that names it. Supporting it would require an `option-def` and the
+ * record data format, which is out of scope for this release.
+ */
 export function isKnownOption(name: string): boolean {
   return IPV4_LIST_OPTIONS.has(name) || name === "domain-name" ||
-    name === "domain-search" || name === "interface-mtu" ||
-    name === "classless-static-route";
+    name === "domain-search" || name === "interface-mtu";
+}
+
+const HOOK_BASENAME_RE = /^libdhcp_[A-Za-z0-9_.-]+\.so$/;
+
+/**
+ * True when `value` names a Kea hook library in a hooks directory.
+ *
+ * The value must be absolute, free of `..` and whitespace, live in a path
+ * segment named `hooks`, and have the packaged `libdhcp_*.so` basename. The
+ * exact directory is confirmed against the host in the model, because loading a
+ * hook runs its code as root during `kea-dhcp4 -t`.
+ */
+export function isHookLibraryPath(value: string): boolean {
+  if (typeof value !== "string" || value.length < 2 || value.length > 4096) {
+    return false;
+  }
+  if (!value.startsWith("/") || value.includes("..") || /\s/.test(value)) {
+    return false;
+  }
+  if (!value.includes("/hooks/")) return false;
+  const base = value.slice(value.lastIndexOf("/") + 1);
+  return HOOK_BASENAME_RE.test(base);
 }
 
 /**
@@ -274,30 +302,6 @@ export function renderOption(
       return entry;
     });
     return { name, data: values.join(", ") };
-  }
-  if (name === "classless-static-route") {
-    if (!Array.isArray(value) || value.length === 0) {
-      throw new KeaInputError(
-        "classless-static-route must be a non-empty list",
-      );
-    }
-    const parts: string[] = [];
-    for (const entry of value) {
-      const route = entry as { prefix?: unknown; router?: unknown };
-      const cidr = typeof route.prefix === "string"
-        ? parseCidr(route.prefix)
-        : null;
-      const router = typeof route.router === "string"
-        ? parseIpv4(route.router)
-        : null;
-      if (cidr === null || router === null) {
-        throw new KeaInputError(
-          "classless-static-route entries need prefix (CIDR) and router (IPv4)",
-        );
-      }
-      parts.push(`${route.prefix},${route.router}`);
-    }
-    return { name, data: parts.join(", ") };
   }
   // IPv4 list options.
   if (!Array.isArray(value) || value.length === 0) {

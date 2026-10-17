@@ -11,23 +11,25 @@ Ubuntu 24.04 and Debian.
 One DHCPv4 server. The definition holds no host, network or MAC: every method
 takes its target and DHCP inputs as arguments, and state is keyed by the target.
 
-| Method    | Description                                                                                         |
-| --------- | --------------------------------------------------------------------------------------------------- |
-| `install` | DESTRUCTIVE. Install Kea and socat; leave the service disabled until the first apply                |
-| `render`  | READ-ONLY. Render the config JSON, its sha256 and the ordered apply plan; touches no host           |
-| `apply`   | DESTRUCTIVE. Validate, arm the revert, write the file and config-set it; not permanent until commit |
-| `commit`  | DESTRUCTIVE. Re-verify over a fresh connection and cancel the armed revert                          |
-| `get`     | READ-ONLY. Probe the service, config, sockets and revert, then persist the observation              |
-| `sync`    | READ-ONLY. Re-probe, adopt a fired revert and report drift                                          |
-| `leases`  | READ-ONLY. Query current leases (memfile or lease_cmds), optionally filtered                        |
-| `remove`  | DESTRUCTIVE. Stop, disable and restore the package's original config; a second call is a no-op      |
+| Method    | Description                                                                                                                                                  |
+| --------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `install` | DESTRUCTIVE. Install Kea and socat; leave the service disabled until the first apply                                                                         |
+| `render`  | READ-ONLY. Render the config JSON, its sha256 and the ordered apply plan; touches no host                                                                    |
+| `apply`   | DESTRUCTIVE. Validate, arm the revert, write the file and config-set it; not permanent until commit                                                          |
+| `commit`  | DESTRUCTIVE. Re-verify over a fresh connection and cancel the armed revert                                                                                   |
+| `get`     | READ-ONLY. Probe the service, config, sockets and revert, then persist the observation                                                                       |
+| `sync`    | READ-ONLY. Re-probe, adopt a fired revert and report drift                                                                                                   |
+| `leases`  | READ-ONLY. Query current leases (memfile or lease_cmds), optionally filtered                                                                                 |
+| `remove`  | DESTRUCTIVE. Stop and disable, converge to the package's original config under the armed-revert protocol; run `commit` to finalize. A second call is a no-op |
 
 ## Dependencies
 
-- A Linux host on the Debian family with `systemd`, `apt`, `socat` and the
-  OpenSSH client tools on the runner.
+- A Linux host on the Debian family with `systemd`, `apt`, `socat`, `flock`
+  (util-linux) and the OpenSSH client tools on the runner.
 - The `kea-dhcp4-server` package. DHCPv6, DDNS, HA and SQL lease backends are
   out of scope.
+- The remote user must be `root`: every step (apt, systemd, `/etc/kea`, the
+  control socket) is privileged and this extension does not invoke `sudo`.
 
 ## Install
 
@@ -58,22 +60,37 @@ swamp model method run kea-dhcp apply \
   --input 'subnets:json=[{"id":10,"subnet":"192.0.2.0/24","pools":["192.0.2.10 - 192.0.2.50"],"reservations":[],"options":[]}]'
 ```
 
-`apply` returns a revert token and expiry; run `commit` before the window ends
-to make the change permanent. Otherwise the host restores the previous config.
+`apply` (and `remove`) returns a revert token and expiry; run `commit` before
+the window ends to make the change permanent. Otherwise the host restores the
+previous config.
 
 ## How it works
 
 - The config file (`/etc/kea/kea-dhcp4.conf`) is the source of truth; the live
   change is a `config-set` of the same JSON over the local control socket. It
-  never uses `config-reload`, a restart or `config-write`.
-- Every apply validates the render with `kea-dhcp4 -t`, snapshots the live file,
-  arms a host-side `systemd-run` restore timer, then writes the file atomically
-  and pushes it. The revert record is persisted before the first apply step.
-- `commit` re-verifies over a genuinely new connection and cancels the timer; it
-  refuses after expiry, after the revert fired, or on a hash drift, and it
-  refuses when a configured canary address is unreachable.
+  never uses `config-reload`, a restart or `config-write`. When the service is
+  not running yet (the state `install` leaves), the first apply starts it on the
+  new file under the armed revert, and `commit` enables it.
+- The file keeps the group the service runs as: the group is read from the unit
+  (`systemctl show -p User`), set on the staged file and the file is renamed
+  into place atomically. A `chgrp` that fails fails the apply.
+- Every apply validates the render with `kea-dhcp4 -t`, claims the revert under
+  a host-side `flock` (refuse-active and snapshot together), arms a host-side
+  `systemd-run` restore timer, then installs and pushes the file. On any later
+  failure the file is restored and the revert disarmed. The restore script
+  records pass/fail and a recovery note.
+- `commit` checks the fired marker and the live hash, checks the running hash
+  and canaries, then stops the timer (it must succeed), re-checks the race and
+  only then clears the marker. `sync` adopts a fired revert.
+- `remove` runs the same arm/verify protocol, converging the service disabled
+  and the package's original config back regardless of its prior state.
 - `render` is deterministic: subnets sort by id, pools by start, reservations by
   address and options by name.
+- `classless-static-route` (option 121) is not offered: the stock Kea 2.4 option
+  dictionary has no definition for it, so a config that names it fails
+  `kea-dhcp4 -t`. The `lease_cmds` hook path must be the packaged library in the
+  host's hooks directory, owned by root and not writable by others (loading a
+  hook runs its code as root during `-t`).
 - The model holds no secret: lease backends with credentials are refused, and
   `config-get` output is never returned or persisted, only its hash.
 

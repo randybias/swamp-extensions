@@ -2,8 +2,9 @@
  * Push half: applies a rendered config to one node through the canonical
  * vendored SSH transport (`_lib/ssh.ts`). Every value that reaches the remote
  * shell is validated against a grammar and quoted, and each script is a fixed
- * template; the private key and the config travel in an uploaded temp file
- * piped into the script, never on argv. An ssh exit 255 is the transport's
+ * template; the private key and the config are streamed to the script over
+ * ssh stdin, never on argv and never written to the node by the transport (a
+ * tool that reads a path gets the script's own private staging). An ssh exit 255 is the transport's
  * typed `SshError`, and supplied host-key pins that do not apply to the host
  * are refused rather than silently accepted.
  *
@@ -20,7 +21,6 @@ import {
   type SshDeps,
   SshError,
   type SshTarget as CanonicalTarget,
-  upload,
   waitConnection,
 } from "./ssh.ts";
 
@@ -66,9 +66,14 @@ export interface SshTarget {
   private_key?: string;
   /** Connection timeout in seconds. */
   connect_timeout_s?: number;
+  /** Deadline in seconds for one remote command; a hung session is killed. */
+  command_timeout_s?: number;
   /** Cap in bytes on captured output. */
   max_output_bytes?: number;
 }
+
+/** Default deadline for one remote command, in seconds. */
+export const DEFAULT_COMMAND_TIMEOUT_S = 300;
 
 /** A transport failure: unreachable host, rejected auth or host key. */
 export class TransportError extends Error {
@@ -128,13 +133,17 @@ function knownHostsLines(
  * Builds the ssh-backed transport on the canonical `_lib/ssh.ts`. A first
  * `insecure_tofu` call with no pins learns the host keys (returned in
  * `known_hosts`, `[host]:port` for a non-default port) and pins them for the
- * rest of the operation; `stdin` is written to a private `mktemp -d` directory
- * and the script unlinks it as soon as it is opened on fd 3, so the key and
- * config are unlinked before the script runs (removed by a checked cleanup) and never on argv. An ssh exit 255 is the canonical
- * typed `SshError`, rethrown here as a `TransportError`.
+ * rest of the operation. `stdin` is streamed straight into the remote command
+ * through ssh, so the private key and config never touch remote disk and never
+ * appear on argv. Any file a tool must read by path (the WireGuard key and the
+ * config) is staged by the script itself under a private `mktemp -d` and
+ * committed with a guarded `mv`. An ssh exit 255 is the canonical typed
+ * `SshError`, rethrown here as a `TransportError`, and a per-command
+ * `timeoutMs` kills a hung session and is typed the same way.
  */
 export function sshTransport(t: SshTarget, deps: SshDeps): Transport {
   const target = canonicalTarget(t);
+  const timeoutMs = (t.command_timeout_s ?? DEFAULT_COMMAND_TIMEOUT_S) * 1000;
   return async (script, stdin) => {
     let learnedLines: string | undefined;
     if (
@@ -155,105 +164,21 @@ export function sshTransport(t: SshTarget, deps: SshDeps): Transport {
       learnedLines = knownHostsLines(t.host, t.port, waited.host_keys);
       target.host_keys = learnedLines.split("\n").filter((l) => l !== "");
     }
-    let dir: string | undefined;
-    let tmp: string | undefined;
-    let result: TransportResult | undefined;
-    let failure: TransportError | undefined;
+    let res: ExecResult;
     try {
-      if (stdin !== undefined) {
-        let made: ExecResult;
-        try {
-          made = await exec(deps, target, [
-            "mktemp",
-            "-d",
-            "-p",
-            "/tmp",
-            "wgmesh.XXXXXXXX",
-          ]);
-        } catch (e) {
-          throw toTransportError(e);
-        }
-        if (made.exit_code !== 0) {
-          throw new TransportError(
-            "remote",
-            "could not create a private temp directory on the node",
-          );
-        }
-        dir = made.stdout.trim();
-        if (!/^\/tmp\/wgmesh\.[A-Za-z0-9]{6,}$/.test(dir)) {
-          throw new TransportError(
-            "remote",
-            "mktemp returned an unexpected path",
-          );
-        }
-        tmp = `${dir}/stdin`;
-        try {
-          await upload(deps, target, {
-            path: tmp,
-            content: stdin,
-            mode: "0600",
-          });
-        } catch (e) {
-          throw toTransportError(e);
-        }
-      }
-      const body = tmp === undefined || dir === undefined ? script : [
-        "umask 077",
-        // Open the file, then unlink it before the script body runs. Each step
-        // is checked, so a failed open or unlink stops before the script can
-        // touch the host.
-        `exec 3<'${tmp}' || exit 70`,
-        `rm -f -- '${tmp}' || exit 70`,
-        `[ ! -e '${tmp}' ] || exit 70`,
-        // The EXIT trap does the cleanup; a signal makes the shell exit (with
-        // the conventional status) so the trap runs and the script stops.
-        `trap 'rm -f -- "${tmp}"; rmdir -- "${dir}" 2>/dev/null || true' EXIT`,
-        "trap 'exit 129' HUP",
-        "trap 'exit 130' INT",
-        "trap 'exit 143' TERM",
-        "{",
-        script,
-        "} <&3",
-      ].join("\n");
-      let res: ExecResult;
-      try {
-        res = await exec(deps, target, ["sh", "-c", body]);
-      } catch (e) {
-        throw toTransportError(e);
-      }
-      result = {
-        code: res.exit_code,
-        stdout: res.stdout,
-        stderr: res.stderr,
-        ...(learnedLines !== undefined ? { known_hosts: learnedLines } : {}),
-      };
+      res = await exec(deps, target, ["sh", "-c", script], {
+        ...(stdin !== undefined ? { stdin } : {}),
+        timeoutMs,
+      });
     } catch (e) {
-      failure = e instanceof TransportError ? e : toTransportError(e);
+      throw toTransportError(e);
     }
-    let cleanupFailure: TransportError | undefined;
-    if (tmp !== undefined) {
-      let cleaned: ExecResult | undefined;
-      try {
-        cleaned = await exec(deps, target, [
-          "sh",
-          "-c",
-          // Only a failed rm of the key file is an error; an absent directory
-          // (or one still holding the file) is handled by the trailing test.
-          `rm -f -- '${tmp}' && { rmdir -- '${dir}' 2>/dev/null || [ ! -e '${dir}/stdin' ]; }`,
-        ]);
-      } catch {
-        cleaned = undefined;
-      }
-      if (cleaned === undefined || cleaned.exit_code !== 0) {
-        cleanupFailure = new TransportError(
-          "remote",
-          `the remote temp file ${tmp} may still hold the key; remove it by hand`,
-        );
-      }
-    }
-    if (cleanupFailure !== undefined) throw cleanupFailure;
-    if (failure !== undefined) throw failure;
-    return result!;
+    return {
+      code: res.exit_code,
+      stdout: res.stdout,
+      stderr: res.stderr,
+      ...(learnedLines !== undefined ? { known_hosts: learnedLines } : {}),
+    };
   };
 }
 

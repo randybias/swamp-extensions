@@ -422,3 +422,29 @@ Residuals (follow-ups, not failures):
   capitalization is reported unreadable instead of reused (astra, Medium).
 - Different spellings of one IPv6 address, and a name with a trailing dot, get
   separate pins (Low).
+
+## 2026.10.17.6 — canonical transport re-vendor; secrets over stdin
+
+- Re-vendored `_lib/ssh.ts` byte-identical from `ssh-host` on `origin/main`
+  (blob `8f132c4329c9e64bed686731cd5a0e02980194ea`, `ssh_test.ts`
+  `4e8ac15fcd6bce797c523a221fe58fe9a8d9b386`). The new transport adds
+  `exec(argv, {stdin, timeoutMs, maxOutputBytes})`, a typed `SshErrorKind`
+  `"timeout"`, and `truncated`/`duration_ms` on `ExecResult`.
+- **Dropped the remote temp-file workaround.** `sshTransport` used to
+  `mktemp
+  -d` a directory on the node, `upload` the private key and config
+  into it, and open that file on fd 3 for the script. It now calls
+  `exec(["sh","-c",script], { stdin })`, so the bytes stream through ssh
+  straight into the consuming command and the transport never writes a secret to
+  remote disk. The remote script text is unchanged (`applyScript` still reads
+  the key line then the config from stdin).
+- **Files a tool must read by path** (the WireGuard key and config) are still
+  staged by the script itself under a private `mktemp -d` at mode 0600 with an
+  `EXIT` trap, then committed with a guarded `mv`; that is the only remote write
+  of the secret and it is the file WireGuard requires.
+- **Bounded remote steps.** `sshTransport` passes `timeoutMs` (from a new
+  `ssh.command_timeout_s`, default 300 s) to every `exec`, so a hung session is
+  killed and reported as a transport error. The detached rollback redirects its
+  stdin from `/dev/null`, so killing the local ssh cannot kill it.
+- No input or stored-attribute changes; a literal no-op `upgrades[]` entry is
+  added.

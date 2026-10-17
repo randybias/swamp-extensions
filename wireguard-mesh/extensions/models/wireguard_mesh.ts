@@ -13,6 +13,7 @@ import {
   applyScript,
   CONFIRM_REFUSED,
   confirmScript,
+  DEFAULT_COMMAND_TIMEOUT_S,
   deleteScript,
   getScript,
   isHostKeyLine,
@@ -82,6 +83,11 @@ const SshSchema = z.strictObject({
     ),
   connect_timeout_s: z.number().int().min(1).max(120).default(15).describe(
     "Connection timeout in seconds.",
+  ),
+  command_timeout_s: z.number().int().min(10).max(3600).default(
+    DEFAULT_COMMAND_TIMEOUT_S,
+  ).describe(
+    "Deadline in seconds for one remote command; a hung session is killed and reported as a transport error.",
   ),
   max_output_bytes: z.number().int().min(1).max(104857600).optional().describe(
     "Cap in bytes on captured output.",
@@ -223,6 +229,7 @@ export function createModel(deps: Partial<Deps> = {}) {
         ? { private_key: ssh.private_key }
         : {}),
       connect_timeout_s: ssh.connect_timeout_s,
+      command_timeout_s: ssh.command_timeout_s,
       ...(ssh.max_output_bytes !== undefined
         ? { max_output_bytes: ssh.max_output_bytes }
         : {}),
@@ -439,7 +446,7 @@ export function createModel(deps: Partial<Deps> = {}) {
 
   return {
     type,
-    version: "2026.10.17.5",
+    version: "2026.10.17.6",
     description:
       "Render one WireGuard node's wg0.conf from mesh data and apply it to that node over SSH. One generic model for any node of any mesh; the private key is delivered over stdin and never appears in the config text.",
     upgrades: [
@@ -465,6 +472,12 @@ export function createModel(deps: Partial<Deps> = {}) {
         toVersion: "2026.10.17.5",
         description:
           "Replaced the local SSH transport with the canonical vendored ssh.ts (typed exit-255 error, authoritative host-key pins, no content digest on argv); host_key_policy is strict|insecure_tofu (accept-new maps to insecure_tofu, insecure is refused); legacy {type,key} host_keys are converted to ssh-keyscan lines on read. TOFU pins are kept per node, host and port (<node>-hostkeys-<host>-<port>); a <node>-hostkeys record written by 2026.10.17.4 pins its own host and port and moves to the keyed record on first use, and a record for another endpoint is never overwritten.",
+        upgradeAttributes: (old: Record<string, unknown>) => old,
+      },
+      {
+        toVersion: "2026.10.17.6",
+        description:
+          "Re-vendored the canonical ssh.ts (blob 8f132c43) and dropped the remote temp-file workaround: the private key and config are streamed straight into the remote command over stdin, so no secret bytes touch remote disk; every remote command carries a bounded timeout. No stored-attribute changes.",
         upgradeAttributes: (old: Record<string, unknown>) => old,
       },
     ],
@@ -638,5 +651,5 @@ export function createModel(deps: Partial<Deps> = {}) {
 export const model = {
   ...createModel(),
   type: "@randybias/wireguard-mesh",
-  version: "2026.10.17.5",
+  version: "2026.10.17.6",
 } satisfies ReturnType<typeof createModel>;

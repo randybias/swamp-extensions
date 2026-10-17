@@ -140,9 +140,11 @@ echoes method arguments, so pass the key as a vault reference only.
   re-learn: delete it to re-learn. The transport is the canonical vendored
   `_lib/ssh.ts`: an ssh exit 255 is a typed error, supplied pins that apply to
   no host are refused, and no config, key or digest is ever placed on `argv`.
-  The key and config are written to a private `mktemp -d` directory and the
-  script unlinks the file as soon as it opens it, so they are unlinked before
-  the script runs and removed by a checked cleanup.
+  The private key and config are streamed straight into the remote command over
+  ssh stdin, never on `argv` and never written to the node by the transport; the
+  key file WireGuard reads is staged by the script itself, at mode 0600, under
+  its own trap. Every remote command carries a bounded deadline, and a session
+  that outlives it is killed and reported as a transport error.
 - Upgrading from 2026.10.17.4: `host_key_policy: accept-new` now maps to
   `insecure_tofu` and `insecure` is refused (the transport cannot honour it
   safely); `ssh.host_keys` entries that are `{type, key}` objects are accepted

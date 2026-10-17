@@ -182,6 +182,23 @@ export function volsizeToBytes(size: string): number {
   return value * 1024 ** (unit ? power[unit] : 0);
 }
 
+/**
+ * Parses an observed size: a byte count or a ZFS literal. Returns null when the
+ * value is empty, `-`, or not a size, so callers can refuse instead of treating
+ * an unreadable value as a match.
+ */
+export function parseSize(value: string): number | null {
+  const trimmed = value.trim();
+  if (trimmed === "" || trimmed === "-") return null;
+  const numeric = Number(trimmed);
+  if (Number.isFinite(numeric)) return numeric;
+  try {
+    return volsizeToBytes(trimmed);
+  } catch {
+    return null;
+  }
+}
+
 /** Throws unless every property is known and its value is safe. */
 export function assertProperties(
   properties: Record<string, string>,
@@ -421,8 +438,25 @@ export function laterSnapshots(
     .sort((a, b) => Number(a.creation) - Number(b.creation));
 }
 
-/** A stable, filesystem-safe state key for one identity and operand. */
+/** 32-bit FNV-1a hash, as 8 hex characters, for a collision-free key suffix. */
+function shortHash(text: string): string {
+  let hash = 0x811c9dc5;
+  for (let i = 0; i < text.length; i++) {
+    hash ^= text.charCodeAt(i);
+    hash = Math.imul(hash, 0x01000193) >>> 0;
+  }
+  return hash.toString(16).padStart(8, "0");
+}
+
+/**
+ * A stable, filesystem-safe state key for one identity and operand. `_` is
+ * escaped before other separators collapse to `_`, and a hash of the raw tuple
+ * is appended so two distinct operands (e.g. `tank/a_b` and `tank_a/b`) cannot
+ * collide and overwrite each other's state.
+ */
 export function instanceKey(identity: ZfsIdentity, name: string): string {
   const raw = `${identity.host}-${identity.port}-${identity.user}-${name}`;
-  return raw.replace(/[^A-Za-z0-9._-]/g, "_").slice(0, 255);
+  const encoded = raw.replace(/_/g, "__").replace(/[^A-Za-z0-9._-]/g, "_");
+  const suffix = shortHash(raw);
+  return `${encoded.slice(0, 255 - suffix.length - 1)}-${suffix}`;
 }

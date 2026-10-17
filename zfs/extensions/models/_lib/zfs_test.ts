@@ -16,6 +16,7 @@ import {
   parseDatasets,
   parsePoolList,
   parsePoolVdevs,
+  parseSize,
   parseSnapshots,
   parseTabbed,
   poolCreateArgv,
@@ -224,6 +225,14 @@ Deno.test("volsizeToBytes normalizes literals and byte counts", () => {
   assertThrows(() => volsizeToBytes("lots"), Error);
 });
 
+Deno.test("parseSize returns null for an empty or unparseable value", () => {
+  assertEquals(parseSize("10737418240"), 10737418240);
+  assertEquals(parseSize("10G"), 10737418240);
+  assertEquals(parseSize(""), null);
+  assertEquals(parseSize("-"), null);
+  assertEquals(parseSize("lots"), null);
+});
+
 Deno.test("vdevsMatch and diffProperties compare state", () => {
   assertEquals(vdevsMatch(["/dev/sdb"], ["/dev/sdb"]), true);
   assertEquals(vdevsMatch(["/dev/sdb"], ["/dev/sdc"]), false);
@@ -270,9 +279,18 @@ Deno.test("laterSnapshots finds snapshots newer than the target", () => {
   assertEquals(laterSnapshots(snapshots, snapshots[1]), []);
 });
 
-Deno.test("instanceKey is stable and filesystem-safe", () => {
+Deno.test("instanceKey is stable, filesystem-safe and collision-free", () => {
+  const identity = { host: "192.0.2.10", port: 22, user: "root" };
   assertEquals(
-    instanceKey({ host: "192.0.2.10", port: 22, user: "root" }, "tank/data@a"),
-    "192.0.2.10-22-root-tank_data_a",
+    instanceKey(identity, "tank/data@a"),
+    "192.0.2.10-22-root-tank_data_a-1878a54d",
   );
+  // The `_` escape plus the hash suffix keep these two distinct.
+  assertEquals(
+    instanceKey(identity, "tank/a_b") !== instanceKey(identity, "tank_a/b"),
+    true,
+  );
+  const key = instanceKey(identity, "tank/data@a");
+  assertEquals(/^[A-Za-z0-9._-]+$/.test(key), true);
+  assertEquals(key.length <= 255, true);
 });

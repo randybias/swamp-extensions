@@ -26,6 +26,7 @@ import {
 } from "./_lib/ssh.ts";
 import {
   assertDatasetName,
+  assertDevicePath,
   assertPoolName,
   assertProperties,
   assertSnapshotTag,
@@ -42,6 +43,7 @@ import {
   parseDatasets,
   parsePoolList,
   parsePoolVdevs,
+  parseSize,
   parseSnapshots,
   POOL_RE,
   poolCreateArgv,
@@ -62,7 +64,6 @@ import {
 import {
   assertProtectedRefsResolvable,
   assertVdevsSafe,
-  type BlockDevice,
   collectProtectedRefs,
   computeProtectedDevices,
   parseFstab,
@@ -245,6 +246,35 @@ function requireOk(
   return result;
 }
 
+/** zfs/zpool "absent" diagnostics; any other non-zero exit is an error. */
+const MISSING_RE =
+  /does not exist|no such dataset|no such pool|no such snapshot|dataset is not a snapshot/i;
+
+/**
+ * True when the named dataset, zvol or snapshot exists; false only when the
+ * tool explicitly reports it missing. Any other failure throws, so an
+ * operational error is never mistaken for an absent target.
+ */
+async function zfsExists(
+  deps: ZfsDeps,
+  target: SshTarget,
+  name: string,
+): Promise<boolean> {
+  const probe = await exec(deps.ssh, target, [
+    "zfs",
+    "list",
+    "-H",
+    "-o",
+    "name",
+    name,
+  ]);
+  if (probe.exit_code === 0) return probe.stdout.trim() !== "";
+  if (MISSING_RE.test(probe.stdout + probe.stderr)) return false;
+  throw new Error(
+    `could not check whether ${name} exists (exit ${probe.exit_code})`,
+  );
+}
+
 function toPropertyMap(
   properties: Record<string, string | number | boolean> | null | undefined,
 ): Record<string, string> {
@@ -257,11 +287,73 @@ function toPropertyMap(
   );
 }
 
-/** Reads the block-device tree and every host fact the safety check needs. */
-async function readBlockDevices(
+/** Raw host facts the boot-disk guard is decided from. */
+interface HostProbe {
+  /** `lsblk -J` tree. */
+  lsblk: string;
+  /** `/proc/mounts`. */
+  mounts: string;
+  /** `/etc/fstab`, or empty when confirmed absent. */
+  fstab: string;
+  /** `/proc/mdstat`, or empty when confirmed absent. */
+  mdstat: string;
+  /** `/proc/swaps`. */
+  swaps: string;
+  /** `zpool status -P` (empty when no pools are available). */
+  zpoolStatus: string;
+  /** `blkid` output, to resolve tags on hosts without a udev db. */
+  blkid: string;
+  /** `mdadm --examine` per candidate vdev, for unassembled members. */
+  mdadmExamine: { vdev: string; exit_code: number; stdout: string }[];
+}
+
+/** Reads a host file, allowing only an explicit not-exists to read as empty. */
+async function readFileFact(
   deps: ZfsDeps,
   target: SshTarget,
-): Promise<BlockDevice[]> {
+  path: string,
+): Promise<string> {
+  const result = await exec(deps.ssh, target, ["cat", path]);
+  if (result.exit_code === 0) return result.stdout;
+  const exists = await exec(deps.ssh, target, ["test", "-e", path]);
+  if (exists.exit_code === 0) {
+    throw new Error(
+      `could not read ${path} (exit ${result.exit_code}); refusing to create a pool`,
+    );
+  }
+  // Only exit 1 from `test -e` means "does not exist"; 2/126/127 are probe
+  // failures and must not be read as an absent file.
+  if (exists.exit_code === 1) return "";
+  throw new Error(
+    `could not confirm whether ${path} exists (test -e exited ${exists.exit_code}); refusing to create a pool`,
+  );
+}
+
+/** Resolves a validated `/dev/...` path to its kernel device path, or refuses. */
+async function resolveDevice(
+  deps: ZfsDeps,
+  target: SshTarget,
+  path: string,
+): Promise<string> {
+  assertDevicePath(path);
+  const link = await exec(deps.ssh, target, ["readlink", "-f", path]);
+  if (link.exit_code !== 0 || link.stdout.trim() === "") {
+    throw new Error(`could not resolve ${path}; refusing to create a pool`);
+  }
+  return link.stdout.trim();
+}
+
+/**
+ * Runs every read the boot-disk guard needs. Each fact fails closed: a read
+ * that cannot be performed refuses rather than reading as "nothing to protect".
+ * `blkid` and per-candidate `mdadm --examine` are captured so the shared
+ * protected-device module can resolve tags and unassembled array members.
+ */
+async function runHostProbes(
+  deps: ZfsDeps,
+  target: SshTarget,
+  vdevs: string[],
+): Promise<HostProbe> {
   const lsblk = await exec(deps.ssh, target, [
     "lsblk",
     "-J",
@@ -273,35 +365,49 @@ async function readBlockDevices(
       "could not read the block-device tree (lsblk); refusing to create a pool",
     );
   }
-  return parseLsblk(lsblk.stdout);
-}
-
-/** Reads a host file, allowing only a confirmed-absent file to read as empty. */
-async function readFileFact(
-  deps: ZfsDeps,
-  target: SshTarget,
-  path: string,
-): Promise<string> {
-  const result = await exec(deps.ssh, target, ["cat", path]);
-  if (result.exit_code === 0) return result.stdout;
-  const exists = await exec(deps.ssh, target, ["test", "-e", path]);
-  if (exists.exit_code !== 0) return "";
-  throw new Error(
-    `could not read ${path} (exit ${result.exit_code}); refusing to create a pool`,
-  );
-}
-
-/** Resolves a `/dev/...` path to its kernel device path, or refuses. */
-async function resolveDevice(
-  deps: ZfsDeps,
-  target: SshTarget,
-  path: string,
-): Promise<string> {
-  const link = await exec(deps.ssh, target, ["readlink", "-f", path]);
-  if (link.exit_code !== 0 || link.stdout.trim() === "") {
-    throw new Error(`could not resolve ${path}; refusing to create a pool`);
+  const mounts = await exec(deps.ssh, target, ["cat", "/proc/mounts"]);
+  if (mounts.exit_code !== 0) {
+    throw new Error(
+      `could not read /proc/mounts (exit ${mounts.exit_code}); refusing to create a pool`,
+    );
   }
-  return link.stdout.trim();
+  const swaps = await exec(deps.ssh, target, ["cat", "/proc/swaps"]);
+  if (swaps.exit_code !== 0) {
+    throw new Error(
+      `could not read /proc/swaps (exit ${swaps.exit_code}); refusing to create a pool`,
+    );
+  }
+  const fstab = await readFileFact(deps, target, "/etc/fstab");
+  const mdstat = await readFileFact(deps, target, "/proc/mdstat");
+  const status = await exec(deps.ssh, target, ["zpool", "status", "-P"]);
+  if (
+    status.exit_code !== 0 &&
+    !/no pools available/i.test(status.stdout + status.stderr)
+  ) {
+    throw new Error(
+      `could not read the existing ZFS pools (exit ${status.exit_code}); refusing to create a pool`,
+    );
+  }
+  const blkid = await exec(deps.ssh, target, ["blkid"]);
+  const mdadmExamine: HostProbe["mdadmExamine"] = [];
+  for (const vdev of vdevs) {
+    const examine = await exec(deps.ssh, target, ["mdadm", "--examine", vdev]);
+    mdadmExamine.push({
+      vdev,
+      exit_code: examine.exit_code,
+      stdout: examine.stdout,
+    });
+  }
+  return {
+    lsblk: lsblk.stdout,
+    mounts: mounts.stdout,
+    fstab,
+    mdstat,
+    swaps: swaps.stdout,
+    zpoolStatus: status.stdout,
+    blkid: blkid.stdout,
+    mdadmExamine,
+  };
 }
 
 /** Refuses candidate vdevs that carry the running system. */
@@ -310,41 +416,16 @@ async function assertDevicesSafe(
   target: SshTarget,
   vdevs: string[],
 ): Promise<Map<string, string>> {
-  const devices = await readBlockDevices(deps, target);
-  const mountsResult = await exec(deps.ssh, target, ["cat", "/proc/mounts"]);
-  if (mountsResult.exit_code !== 0) {
-    throw new Error(
-      `could not read /proc/mounts (exit ${mountsResult.exit_code}); refusing to create a pool`,
-    );
-  }
-  const mounts = parseMounts(mountsResult.stdout);
-  const fstab = parseFstab(await readFileFact(deps, target, "/etc/fstab"));
-  const mdMembers = parseMdstatMembers(
-    await readFileFact(deps, target, "/proc/mdstat"),
-  );
-  const status = await exec(deps.ssh, target, ["zpool", "status", "-P"]);
-  let zfsVdevs: string[] = [];
-  if (status.exit_code === 0) {
-    zfsVdevs = parsePoolVdevs(status.stdout);
-  } else if (/no pools available/i.test(status.stdout + status.stderr)) {
-    zfsVdevs = [];
-  } else {
-    throw new Error(
-      `could not read the existing ZFS pools (exit ${status.exit_code}); refusing to create a pool`,
-    );
-  }
-  const swapsResult = await exec(deps.ssh, target, ["cat", "/proc/swaps"]);
-  if (swapsResult.exit_code !== 0) {
-    throw new Error(
-      `could not read /proc/swaps (exit ${swapsResult.exit_code}); refusing to create a pool`,
-    );
-  }
-  const swaps = parseSwapSources(swapsResult.stdout);
+  const probe = await runHostProbes(deps, target, vdevs);
+  const devices = parseLsblk(probe.lsblk);
+  const mounts = parseMounts(probe.mounts);
+  const fstab = parseFstab(probe.fstab);
+  const mdMembers = parseMdstatMembers(probe.mdstat);
+  const swaps = parseSwapSources(probe.swaps);
+  const zfsVdevs = parsePoolVdevs(probe.zpoolStatus);
   // Resolve every protected `/dev/` reference before building the set, so a
   // by-id/by-uuid vdev or fstab entry protects the disk behind it. The set is
-  // computed once and every candidate is checked against it; a changed device
-  // role is picked up by the next call's fresh read, which is at least as
-  // protective as trusting a recorded set.
+  // computed once and every candidate is checked against it.
   const refs = collectProtectedRefs(mounts, fstab, zfsVdevs, swaps);
   const resolvedLinks = new Map<string, string>();
   for (const ref of refs) {
@@ -376,7 +457,9 @@ async function listPools(deps: ZfsDeps, target: SshTarget): Promise<string[]> {
     "-o",
     "name",
   ]);
-  return result.exit_code === 0 ? nonEmptyLines(result.stdout) : [];
+  if (result.exit_code === 0) return nonEmptyLines(result.stdout);
+  if (/no pools available/i.test(result.stdout + result.stderr)) return [];
+  throw new Error(`could not list ZFS pools (exit ${result.exit_code})`);
 }
 
 /** Resolves the pool a read targets, validating an auto-discovered name. */
@@ -432,7 +515,9 @@ async function readDatasets(
     "name,type,used,avail,refer,mountpoint",
     root,
   ]);
-  return result.exit_code === 0 ? parseDatasets(result.stdout) : [];
+  if (result.exit_code === 0) return parseDatasets(result.stdout);
+  if (MISSING_RE.test(result.stdout + result.stderr)) return [];
+  throw new Error(`zfs list failed (exit ${result.exit_code})`);
 }
 
 async function readSnapshots(
@@ -454,7 +539,9 @@ async function readSnapshots(
     "creation",
     root,
   ]);
-  return result.exit_code === 0 ? parseSnapshots(result.stdout) : [];
+  if (result.exit_code === 0) return parseSnapshots(result.stdout);
+  if (MISSING_RE.test(result.stdout + result.stderr)) return [];
+  throw new Error(`zfs list failed (exit ${result.exit_code})`);
 }
 
 async function livePoolState(
@@ -594,20 +681,18 @@ function buildZfsModel(deps: ZfsDeps) {
           assertProperties(requested, ZPOOL_PROPERTIES, "pool");
           const pools = await listPools(deps, target);
           if (pools.includes(args.pool)) {
-            const resolved = new Map<string, string>();
+            const requestedResolved: string[] = [];
             for (const vdev of args.vdevs) {
-              const link = await exec(deps.ssh, target, [
-                "readlink",
-                "-f",
-                vdev,
-              ]);
-              if (link.exit_code !== 0 || link.stdout.trim() === "") {
-                throw new Error(`could not resolve ${vdev}`);
-              }
-              resolved.set(vdev, link.stdout.trim());
+              requestedResolved.push(await resolveDevice(deps, target, vdev));
             }
             const { state, vdevs } = await readPool(deps, target, args.pool);
-            if (!vdevsMatch(vdevs, [...resolved.values()])) {
+            // `zpool status -P` may print by-id paths; resolve both sides to
+            // kernel paths so a by-id re-run is not a false diff.
+            const existingResolved: string[] = [];
+            for (const vdev of vdevs) {
+              existingResolved.push(await resolveDevice(deps, target, vdev));
+            }
+            if (!vdevsMatch(existingResolved, requestedResolved)) {
               throw new Error(
                 `pool ${args.pool} already exists with a different vdev set`,
               );
@@ -634,7 +719,7 @@ function buildZfsModel(deps: ZfsDeps) {
               dataHandles: [handle],
               result: {
                 pool: args.pool,
-                vdevs,
+                vdevs: existingResolved,
                 guid: state.guid,
                 changed: false,
               },
@@ -697,15 +782,7 @@ function buildZfsModel(deps: ZfsDeps) {
           assertDatasetName(args.name);
           const wanted = toPropertyMap(args.properties);
           assertProperties(wanted, DATASET_PROPERTIES, "dataset");
-          const probe = await exec(deps.ssh, target, [
-            "zfs",
-            "list",
-            "-H",
-            "-o",
-            "name",
-            args.name,
-          ]);
-          const exists = probe.exit_code === 0;
+          const exists = await zfsExists(deps, target, args.name);
           let changed: string[] = [];
           if (!exists) {
             context.logger.info("Creating dataset {name} on {host}", {
@@ -806,19 +883,13 @@ function buildZfsModel(deps: ZfsDeps) {
           ]);
           if (probe.exit_code === 0) {
             const row = probe.stdout.trim().split("\t");
-            const raw = row[1] ?? "";
-            const numeric = Number(raw);
-            let currentBytes: number | null = null;
-            if (Number.isFinite(numeric)) currentBytes = numeric;
-            else {
-              try {
-                currentBytes = volsizeToBytes(raw);
-              } catch {
-                currentBytes = null;
-              }
+            const currentBytes = parseSize(row[1] ?? "");
+            if (currentBytes === null) {
+              throw new Error(
+                `could not parse the existing volsize of ${args.name}; refusing to treat it as a match`,
+              );
             }
-            const wantedBytes = volsizeToBytes(args.volsize);
-            if (raw && currentBytes !== null && currentBytes !== wantedBytes) {
+            if (currentBytes !== volsizeToBytes(args.volsize)) {
               throw new Error(
                 `zvol ${args.name} exists with volsize ${
                   row[1]
@@ -828,7 +899,7 @@ function buildZfsModel(deps: ZfsDeps) {
             context.logger.info("zvol {name} already exists; no change", {
               name: args.name,
             });
-          } else {
+          } else if (MISSING_RE.test(probe.stdout + probe.stderr)) {
             requireOk(
               await exec(
                 deps.ssh,
@@ -836,6 +907,10 @@ function buildZfsModel(deps: ZfsDeps) {
                 zvolCreateArgv(args.name, args.volsize, args.sparse, wanted),
               ),
               `zfs create -V ${args.name}`,
+            );
+          } else {
+            throw new Error(
+              `could not check zvol ${args.name} (exit ${probe.exit_code})`,
             );
           }
           const datasets = await readDatasets(deps, target, args.name);
@@ -875,18 +950,8 @@ function buildZfsModel(deps: ZfsDeps) {
           if (!splitSnapshot(full)) {
             throw new Error(`invalid snapshot name: ${full}`);
           }
-          const probe = await exec(deps.ssh, target, [
-            "zfs",
-            "list",
-            "-H",
-            "-t",
-            "snapshot",
-            "-o",
-            "name",
-            full,
-          ]);
           let created = false;
-          if (probe.exit_code !== 0) {
+          if (!(await zfsExists(deps, target, full))) {
             requireOk(
               await exec(
                 deps.ssh,
@@ -930,30 +995,12 @@ function buildZfsModel(deps: ZfsDeps) {
           if (!splitSnapshot(source)) {
             throw new Error(`invalid snapshot name: ${source}`);
           }
-          const sourceProbe = await exec(deps.ssh, sshTarget, [
-            "zfs",
-            "list",
-            "-H",
-            "-t",
-            "snapshot",
-            "-o",
-            "name",
-            source,
-          ]);
-          if (sourceProbe.exit_code !== 0) {
+          if (!(await zfsExists(deps, sshTarget, source))) {
             throw new Error(`snapshot ${source} does not exist`);
           }
           const wanted = toPropertyMap(args.properties);
           assertProperties(wanted, DATASET_PROPERTIES, "dataset");
-          const probe = await exec(deps.ssh, sshTarget, [
-            "zfs",
-            "list",
-            "-H",
-            "-o",
-            "name",
-            args.target,
-          ]);
-          if (probe.exit_code === 0) {
+          if (await zfsExists(deps, sshTarget, args.target)) {
             const origin = await exec(deps.ssh, sshTarget, [
               "zfs",
               "get",
@@ -1072,16 +1119,8 @@ function buildZfsModel(deps: ZfsDeps) {
           } else {
             assertDatasetName(args.target);
           }
-          const probe = await exec(deps.ssh, sshTarget, [
-            "zfs",
-            "list",
-            "-H",
-            "-o",
-            "name",
-            args.target,
-          ]);
           let destroyed = false;
-          if (probe.exit_code === 0) {
+          if (await zfsExists(deps, sshTarget, args.target)) {
             requireOk(
               await exec(
                 deps.ssh,

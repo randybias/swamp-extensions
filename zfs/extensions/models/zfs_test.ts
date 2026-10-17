@@ -66,6 +66,11 @@ const DATASET_ROW = "tank/data\tfilesystem\t1G\t9G\t1G\t/tank/data\n";
 const SNAP_A = "tank/data@a\t0\t1G\t1700000100\n";
 const SNAP_B = "tank/data@b\t0\t1G\t1700000200\n";
 
+/** A confirmed-absent zfs target. */
+const ABSENT = { code: 1, stdout: "dataset does not exist\n" };
+/** The documented "no pools" result of `zpool`. */
+const NO_POOLS = { code: 1, stdout: "no pools available\n" };
+
 // The transport quotes every argv word, so these exact fragments identify a
 // command without colliding with a differently-shaped one.
 const P = {
@@ -152,7 +157,7 @@ function guardRoute(
   overrides: Route = () => undefined,
 ) {
   return (remote: string): RouteResult | undefined => {
-    if (has(remote, P.poolProbe)) return { code: 1 };
+    if (has(remote, P.poolProbe)) return NO_POOLS;
     if (has(remote, P.lsblk)) return { code: 0, stdout: LSBLK };
     if (has(remote, P.mounts)) return { code: 0, stdout: MOUNTS };
     if (has(remote, P.fstab)) return { code: 0, stdout: FSTAB };
@@ -242,7 +247,11 @@ Deno.test("create_pool is a no-op when the pool has the same vdevs", async () =>
 Deno.test("create_pool refuses an existing pool with a different vdev set", async () => {
   const zfs = model((remote) => {
     if (has(remote, P.poolProbe)) return { code: 0, stdout: "tank\n" };
-    if (has(remote, P.readlink)) return { code: 0, stdout: "/dev/sdc\n" };
+    if (has(remote, P.readlink)) {
+      return remote.includes("wwn-other")
+        ? { code: 0, stdout: "/dev/sdc\n" }
+        : { code: 0, stdout: "/dev/sdb\n" };
+    }
     if (has(remote, P.poolStatusTank)) return { code: 0, stdout: POOL_STATUS };
     if (has(remote, P.poolList)) return { code: 0, stdout: POOL_ROW };
     return { code: 0 };
@@ -266,7 +275,7 @@ Deno.test("create_dataset creates then only applies the diff", async () => {
   const zfs = model((remote) => {
     commands.push(remote);
     if (has(remote, P.dsProbe)) {
-      return created ? { code: 0, stdout: "tank/data\n" } : { code: 1 };
+      return created ? { code: 0, stdout: "tank/data\n" } : ABSENT;
     }
     if (has(remote, P.dsCreate)) {
       created = true;
@@ -321,7 +330,7 @@ Deno.test("create_zvol builds a sparse volume", async () => {
   const commands: string[] = [];
   const zfs = model((remote) => {
     commands.push(remote);
-    if (has(remote, P.zvolProbe)) return { code: 1 };
+    if (has(remote, P.zvolProbe)) return ABSENT;
     if (has(remote, P.dsCreate) && remote.includes("'-s'")) return { code: 0 };
     if (has(remote, P.datasetsList)) {
       return { code: 0, stdout: "tank/vol\tvolume\t0\t9G\t10G\t-\n" };
@@ -363,8 +372,8 @@ Deno.test("snapshot creates once and is then a no-op", async () => {
   let exists = false;
   const zfs = model((remote) => {
     commands.push(remote);
-    if (has(remote, P.snapProbe)) {
-      return exists ? { code: 0, stdout: "tank/data@a\n" } : { code: 1 };
+    if (has(remote, P.dsProbe)) {
+      return exists ? { code: 0, stdout: "tank/data@a\n" } : ABSENT;
     }
     if (has(remote, P.snapCreate)) {
       exists = true;
@@ -392,12 +401,14 @@ Deno.test("clone creates once and then converges on origin", async () => {
   let cloned = false;
   const zfs = model((remote) => {
     commands.push(remote);
-    if (has(remote, P.snapProbe)) return { code: 0, stdout: "tank/data@a\n" };
     if (has(remote, P.dsGet) && has(remote, P.origin)) {
       return { code: 0, stdout: "tank/data@a\n" };
     }
     if (has(remote, P.dsProbe)) {
-      return cloned ? { code: 0, stdout: "tank/clone\n" } : { code: 1 };
+      if (remote.includes("tank/data@a")) {
+        return { code: 0, stdout: "tank/data@a\n" };
+      }
+      return cloned ? { code: 0, stdout: "tank/clone\n" } : ABSENT;
     }
     if (has(remote, P.clone)) {
       cloned = true;
@@ -477,7 +488,7 @@ Deno.test("destroy is a clean no-op on an absent target", async () => {
   const commands: string[] = [];
   const zfs = model((remote) => {
     commands.push(remote);
-    if (has(remote, P.dsProbe)) return { code: 1 };
+    if (has(remote, P.dsProbe)) return ABSENT;
     return { code: 0 };
   });
   const args = zfs.methods.destroy.arguments.parse({
@@ -584,11 +595,36 @@ Deno.test("create_zvol is a no-op when the existing size matches in bytes", asyn
   assertEquals(commands.some((c) => has(c, P.dsCreate)), false);
 });
 
+Deno.test("create_pool refuses when the fact probe itself fails", async () => {
+  const zfs = model((remote) => {
+    if (has(remote, P.poolProbe)) return NO_POOLS;
+    if (has(remote, P.lsblk)) return { code: 0, stdout: LSBLK };
+    if (has(remote, P.mounts)) return { code: 0, stdout: MOUNTS };
+    if (has(remote, P.swaps)) return { code: 0, stdout: SWAPS };
+    // `cat` fails, then `test -e` fails with exit 2 (a probe failure), which
+    // must not be read as a confirmed-absent file.
+    if (has(remote, "'test'")) return { code: 2 };
+    if (has(remote, P.fstab)) return { code: 1, stderr: "I/O error" };
+    return { code: 0 };
+  });
+  const args = zfs.methods.create_pool.arguments.parse({
+    ssh: SSH,
+    pool: "tank",
+    vdevs: ["/dev/sdb"],
+  });
+  const { context } = createModelTestContext();
+  await assertRejects(
+    () => zfs.methods.create_pool.execute(args, context),
+    Error,
+    "could not confirm whether /etc/fstab exists",
+  );
+});
+
 Deno.test("create_pool refuses when a safety fact cannot be read", async () => {
   const commands: string[] = [];
   const zfs = model((remote) => {
     commands.push(remote);
-    if (has(remote, P.poolProbe)) return { code: 1 };
+    if (has(remote, P.poolProbe)) return NO_POOLS;
     if (has(remote, P.lsblk)) return { code: 0, stdout: LSBLK };
     if (has(remote, P.mounts)) {
       return { code: 1, stderr: "permission denied" };
@@ -611,7 +647,7 @@ Deno.test("create_pool refuses when a safety fact cannot be read", async () => {
 
 Deno.test("get refuses when no pool is named and the host has none", async () => {
   const zfs = model((remote) => {
-    if (has(remote, P.poolProbe)) return { code: 1 };
+    if (has(remote, P.poolProbe)) return NO_POOLS;
     return { code: 0 };
   });
   const args = zfs.methods.get.arguments.parse({ ssh: SSH });

@@ -123,3 +123,31 @@ Review round 1 (head `1cf833a`). All fixed.
 - LOW README example no longer uses `--json`, and warns against it for literal
   secrets.
 - LOW removed the unused `DATASET_COMPONENT_RE`.
+
+Review round 2 (head `429276f`). The four boot-disk CRITICALs are routed to a
+shared `_lib/protected_devices.ts` (b2) that zfs and cephadm will vendor
+byte-identical; `safety.ts`'s decision logic will be replaced by calls into it
+and only the probe-running code kept. The guard was NOT rewritten here.
+
+- CRITICAL (deferred to the shared module): fstab tag and md member references
+  that match no lsblk row protected nothing (empty udev columns), single-value
+  lsblk lookup maps lost a multi-parent holder's other parent, combined mdstat
+  flags like `sdc1[2](W)(F)` were dropped, and `readFileFact` read a failed
+  `test -e` as absent. The probes now capture `blkid` and per-candidate
+  `mdadm --examine` output for the shared module to consume.
+- MEDIUM `instanceKey` collided (`tank/a_b` vs `tank_a/b`). `_` is now escaped
+  before other separators collapse, and a short hash of the raw tuple is
+  appended, so distinct operands cannot overwrite each other's state.
+- MEDIUM existence probes and list calls read an operational error as absent or
+  empty. `zfsExists` treats only an explicit "does not exist" as absent and
+  throws otherwise; `listPools` accepts only exit 0 or "no pools available";
+  `readDatasets`/`readSnapshots` throw on any other non-zero exit, so `destroy`
+  cannot no-op and `get`/`sync` cannot write empty state on a broken host.
+- MEDIUM `create_zvol` passed when the observed size was empty or unparseable.
+  It now requires a parsed size equal to the requested size and refuses
+  otherwise.
+- MEDIUM a by-id pool re-run falsely reported a different vdev set. Both the
+  existing `zpool status -P` paths and the requested paths are resolved with
+  `readlink -f` before `vdevsMatch`.
+- MEDIUM `resolveDevice` passed host-fact paths to `readlink` unchecked. It now
+  applies `assertDevicePath` first and fails closed on a grammar mismatch.

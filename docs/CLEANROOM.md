@@ -62,3 +62,41 @@ sees the old code, builds from that spec and public documentation.
 | 2026-10-17 | Implementer lane d4 | RGW S3 plane (bucket inventory, inspect, ensure, policy, versioning); clean-room preamble |
 | 2026-10-17 | Implementer lane b2 | Disk-wipe guard, the shared protected-device module (`_lib/protected_devices.ts`) and integration of all lanes (`lane/cephadm-int`); clean-room preamble |
 | 2026-10-17 | Merged to main | `@randybias/cephadm` 2026.10.17.1 (beta), from `lane/cephadm-int` at `95517dc` |
+| 2026-10-17 | P2 specs approved by Randy | Seven P2 specs (see "Approved specs" below), approval relayed via the swamp-publisher session; written from public docs only, so no old-source clone exists to delete |
+
+## Approved specs
+
+The approved text of each spec is pinned by its sha256. An "editorial scrub"
+hash, where present, is a later commit that removed internal run jargon with
+purely editorial changes: no method, input, output, invariant or failure mode
+changed. Implementers build from the current file; if it no longer matches
+either hash, the spec needs re-approval before implementation continues.
+
+### P2 specs, approved 2026-10-17
+
+Approved by Randy on 2026-10-17, relayed via the swamp-publisher session. The
+specs were written from public documentation only; no prior implementation
+was consulted.
+
+| Spec | Approved sha256 | Editorial scrub sha256 (behaviour unchanged) |
+|---|---|---|
+| `docs/specs/kubevirt.md` | `07c1cdb1743178123fc3776b3d72d99b9e5052f5a6f65843dbb08a6c75663982` | — |
+| `docs/specs/k0s-multinode.md` | `6534cd73d873394725e06f72ca6d2efa65b8d7ce17f853d6aed24aba446d340d` | — |
+| `docs/specs/kea-dhcp.md` | `1bd3383b8fb51d619cf563da767fb5b15706a052fc570a2f0fb55aca497eb84d` | — |
+| `docs/specs/knot-dns.md` | `4063e65244c7279dd2dc17a579e1b62f35b74ea438786192e211c53a7fdbb1e6` | — |
+| `docs/specs/apt-cache.md` | `7c72f48649fc3b22b1abe69373a9ed5b65009a6f01a5e642599d49df27cd03e2` | — |
+| `docs/specs/artifact-server.md` | `fe7243f97cfd95a0a7a878e5777abfc01b53a318cad2f38953a10216ef735e4c` | — |
+| `docs/specs/ubuntu-autoinstall.md` | `aa444f483129ad43688cdc8e7f28948fd152aaa74c50edd82e2a18e088469a36` | — |
+
+Implementation-side rules for these specs:
+
+- Implementation starts only after this approval; implementers are fresh
+  subagents or sessions.
+- Rules 3–4 apply: implementers read only the approved spec, this repo, public
+  upstream documentation and swamp skills and docs; never any prior or
+  ex-employer implementation, and no summary of one.
+- Every implementer prompt carries the clean-room preamble (rules 3–4) and is
+  recorded in the provenance log above.
+- A behaviour change to an approved spec (methods, inputs, outputs,
+  idempotency, invariants, failure modes, test obligations) needs a fresh
+  approval and a new hash here before it is implemented.

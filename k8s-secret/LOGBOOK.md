@@ -2,12 +2,18 @@
 
 Not packaged. Notes for whoever maintains this extension.
 
-- 2026-10-17: initial model. Evaluated `@swamp/kubernetes` 2026.10.13.1 first:
-  its Secret type takes literal `data` arguments, returns decoded values from
+- 2026-10-17: initial model. Evaluated `@swamp/kubernetes` 2026.10.13.1 first
+  (its `secret` type is 2026.08.01.1; `@john/k8s` ships the same types): the
+  Secret type takes literal `data` arguments, returns decoded values from
   `get`/`create`/`update`, updates by read-then-replace (no hash no-op), and
-  exposes `delete` as a model method. That is the gap this extension fills.
-  Drafted by hand rather than with pi: the surface is small and every line is
-  secret-handling.
+  exposes `delete` as a plain model method. That is the gap this extension
+  fills; recommend building rather than adopting.
+- 2026-10-17 (lane/d2): adopted the offline-green base from lane/b2 commit
+  `9e136d4` rather than drafting cold. Hardened it: per-key hashes now digest
+  the stored bytes (binary-safe) instead of a lossy UTF-8 decode, a malformed
+  `kubectl -o json` body is a typed error that never echoes the payload, the
+  README gained the `Install` section and a two-instance example, and two
+  leak-regression tests were added.
 - Design: manifest streamed on stdin to
   `kubectl apply --server-side
   --force-conflicts -f -`, so removed keys owned

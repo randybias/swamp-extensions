@@ -89,9 +89,10 @@ Deno.test("apply creates: values on stdin only, never argv", async () => {
     const m = JSON.parse(ap.stdin!);
     assertEquals(m.data.password, b64(VAL));
     assertEquals(m.type, "Opaque");
-    // output and stored state carry no value
+    // output and stored state carry no value and no kubeconfig
     const dump = JSON.stringify([out.result, getWrittenResources()]);
     assert(!dump.includes(VAL) && !dump.includes(b64(VAL)));
+    assert(!dump.includes("kind: Config"));
     assertEquals(out.result.keys, ["password", "user"]);
     assertEquals(typeof out.result.data_sha256, "string");
     assertEquals(h.removed, h.written);
@@ -148,6 +149,7 @@ Deno.test("get returns hashes, never values", async () => {
     const out = await model.methods.get.execute(BASE, context);
     const dump = JSON.stringify([out, getWrittenResources()]);
     assert(!dump.includes(VAL) && !dump.includes(b64(VAL)));
+    assert(!dump.includes("kind: Config"));
     const st = getWrittenResources()[0].data as {
       key_sha256: Record<string, string>;
     };
@@ -238,6 +240,23 @@ Deno.test("failure modes are typed and scrubbed; kubeconfig removed", async () =
   }
 });
 
+Deno.test("malformed kubectl JSON is typed and leaks no value", async () => {
+  const h = harness((c) =>
+    verb(c) === "get" ? { stdout: `{"data":{"password":"${b64(VAL)}"` } : {}
+  );
+  try {
+    const { context } = createModelTestContext({ globalArgs: {} });
+    const e = await assertRejects(() =>
+      model.methods.get.execute(BASE, context)
+    ) as K8sSecretError;
+    assertEquals(e.code, "kubectl_failed");
+    assert(!e.message.includes(VAL) && !e.message.includes(b64(VAL)));
+    assertEquals(h.removed, h.written);
+  } finally {
+    h.restore();
+  }
+});
+
 Deno.test("get failure also removes the kubeconfig", async () => {
   const h = harness(() => ({ code: 1, stderr: "Unauthorized" }));
   try {
@@ -299,12 +318,32 @@ Deno.test("state is keyed by context/namespace/name", () => {
   assertEquals(stateName(BASE), "current-context_app_db-creds");
 });
 
-Deno.test("fixtures hold no real-looking secret material", async () => {
-  const src = await Deno.readTextFile(
-    new URL("./secret_test.ts", import.meta.url),
-  );
-  const pem = "-----" + "BEGIN";
-  const jwt = "eyJ" + "[A-Za-z0-9_-]{20,}";
-  assert(!src.includes(pem));
-  assert(!new RegExp(jwt + "|AKI" + "A[0-9A-Z]{16}").test(src));
+Deno.test("no fixture, source or doc carries real-looking secret material", async () => {
+  const patterns: [string, RegExp][] = [
+    ["PEM private key", /-----BEGIN [A-Z ]*PRIVATE KEY-----/],
+    [
+      "JWT",
+      /\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b/,
+    ],
+    ["AWS access key", /\b(?:AKIA|ASIA)[0-9A-Z]{16}\b/],
+    ["GitHub token", /\b(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{20,}\b/],
+    ["Slack token", /\bxox[baprs]-[A-Za-z0-9-]{10,}\b/],
+  ];
+  const files: URL[] = [];
+  async function walk(dir: URL): Promise<void> {
+    for await (const e of Deno.readDir(dir)) {
+      if (e.name === ".swamp" || e.name === ".gates") continue;
+      const child = new URL(e.name + (e.isDirectory ? "/" : ""), dir);
+      if (e.isDirectory) await walk(child);
+      else if (/\.(ts|md|ya?ml|json|txt)$/.test(e.name)) files.push(child);
+    }
+  }
+  await walk(new URL("../../", import.meta.url));
+  assert(files.length > 0);
+  for (const file of files) {
+    const text = await Deno.readTextFile(file);
+    for (const [name, re] of patterns) {
+      assertEquals(re.test(text), false, `${name} found in ${file.pathname}`);
+    }
+  }
 });

@@ -16,6 +16,7 @@ import {
   defaultDeps,
   type Deps,
   hashData,
+  hashObserved,
   isContext,
   isDataKey,
   isNamespace,
@@ -23,7 +24,6 @@ import {
   isSecretType,
   K8sSecretError,
   type Target,
-  unb64,
   withKubectl,
 } from "./_lib/kubectl.ts";
 
@@ -106,7 +106,13 @@ export function stateName(t: Target): string {
 interface Observed {
   type: string;
   resource_version: string;
-  decoded: Record<string, string>;
+  dataB64: Record<string, string>;
+}
+
+interface SecretJson {
+  type?: string;
+  metadata?: { resourceVersion?: string };
+  data?: Record<string, string>;
 }
 
 async function observe(
@@ -126,17 +132,17 @@ async function observe(
   ]);
   if (r.code !== 0) throw classify(r.stderr, t, secrets);
   if (!r.stdout.trim()) return null;
-  const raw = JSON.parse(r.stdout) as {
-    type?: string;
-    metadata?: { resourceVersion?: string };
-    data?: Record<string, string>;
-  };
-  const decoded: Record<string, string> = {};
-  for (const [k, v] of Object.entries(raw.data ?? {})) decoded[k] = unb64(v);
+  let raw: SecretJson;
+  try {
+    raw = JSON.parse(r.stdout) as SecretJson;
+  } catch {
+    // The body holds the Secret values; never surface it in the error.
+    throw new K8sSecretError("kubectl_failed", "kubectl returned invalid JSON");
+  }
   return {
     type: raw.type ?? "Opaque",
     resource_version: raw.metadata?.resourceVersion ?? "",
-    decoded,
+    dataB64: raw.data ?? {},
   };
 }
 
@@ -146,7 +152,7 @@ async function toState(
   status: SecretState["status"],
   now: Date,
 ): Promise<SecretState> {
-  const h = o ? await hashData(o.decoded) : { keys: {}, total: undefined };
+  const h = o ? await hashObserved(o.dataB64) : { keys: {}, total: undefined };
   return StateSchema.parse({
     context: t.context ?? "current-context",
     namespace: t.namespace,
@@ -198,7 +204,7 @@ export const model = {
         const state = await withKubectl(deps, t, secrets, async (kubectl) => {
           const before = await observe(kubectl, t, secrets);
           if (before) {
-            const have = await hashData(before.decoded);
+            const have = await hashObserved(before.dataB64);
             const same = before.type === a.type &&
               JSON.stringify(Object.keys(want.keys)) ===
                 JSON.stringify(Object.keys(have.keys)) &&

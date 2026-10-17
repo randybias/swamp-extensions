@@ -130,23 +130,57 @@ export const isSecretType = (s: string): boolean => TYPE_RE.test(s);
 export const isDataKey = (s: string): boolean =>
   KEY_RE.test(s) && s !== "." && s !== "..";
 
-/** Hex sha256 of a string. */
-export async function sha256Hex(s: string): Promise<string> {
-  const d = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(s));
+/** Decodes standard base64 to raw bytes. */
+export function b64ToBytes(s: string): Uint8Array<ArrayBuffer> {
+  const bin = atob(s);
+  return Uint8Array.from(bin, (c) => c.charCodeAt(0));
+}
+
+/** Hex sha256 of raw bytes. */
+export async function sha256HexBytes(
+  bytes: Uint8Array<ArrayBuffer>,
+): Promise<string> {
+  const d = await crypto.subtle.digest("SHA-256", bytes);
   return [...new Uint8Array(d)].map((b) => b.toString(16).padStart(2, "0"))
     .join("");
 }
 
-/** Per-key sha256 of the values, plus one digest over the sorted pairs. */
+/** Hex sha256 of a UTF-8 string. */
+export async function sha256Hex(s: string): Promise<string> {
+  return await sha256HexBytes(new TextEncoder().encode(s));
+}
+
+/** One digest over the per-key hashes, independent of key order. */
+async function totalDigest(keys: Record<string, string>): Promise<string> {
+  return await sha256Hex(
+    Object.entries(keys).map(([k, h]) => `${k}=${h}`).join("\n"),
+  );
+}
+
+/**
+ * Per-key sha256 of the desired values (their UTF-8 bytes), plus one digest
+ * over the sorted pairs.
+ */
 export async function hashData(
   data: Record<string, string>,
 ): Promise<{ keys: Record<string, string>; total: string }> {
   const keys: Record<string, string> = {};
   for (const k of Object.keys(data).sort()) keys[k] = await sha256Hex(data[k]);
-  const total = await sha256Hex(
-    Object.entries(keys).map(([k, h]) => `${k}=${h}`).join("\n"),
-  );
-  return { keys, total };
+  return { keys, total: await totalDigest(keys) };
+}
+
+/**
+ * Per-key sha256 of a live Secret's `data`, hashing the stored bytes rather
+ * than a decoded string, so a binary value hashes correctly.
+ */
+export async function hashObserved(
+  dataB64: Record<string, string>,
+): Promise<{ keys: Record<string, string>; total: string }> {
+  const keys: Record<string, string> = {};
+  for (const k of Object.keys(dataB64).sort()) {
+    keys[k] = await sha256HexBytes(b64ToBytes(dataB64[k]));
+  }
+  return { keys, total: await totalDigest(keys) };
 }
 
 /** Standard base64 of a UTF-8 string. */
@@ -158,8 +192,7 @@ export function b64(s: string): string {
 
 /** Decodes standard base64 to a UTF-8 string. */
 export function unb64(s: string): string {
-  const bin = atob(s);
-  return new TextDecoder().decode(Uint8Array.from(bin, (c) => c.charCodeAt(0)));
+  return new TextDecoder().decode(b64ToBytes(s));
 }
 
 /** Target of a kubectl call. */

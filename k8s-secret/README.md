@@ -1,7 +1,8 @@
 # @randybias/k8s-secret
 
 [Swamp](https://github.com/swamp-club/swamp) extension for writing a Kubernetes
-`Secret` from vault values. Built against kubectl v1.35 and the `v1` Secret API.
+`Secret` from vault values. Built against the Kubernetes `v1` Secret API and
+`kubectl apply --server-side`.
 
 ## Models
 
@@ -27,14 +28,26 @@ and show up in `keys` and `data_sha256`.
 
 `kubectl` on the PATH and a reachable API server.
 
+## Install
+
+```sh
+swamp extension pull @randybias/k8s-secret
+```
+
 ## Example
+
+One definition serves every Secret and cluster; the method arguments pick the
+namespace, name and kubeconfig.
 
 ```sh
 swamp model create @randybias/k8s-secret db-secret
-swamp model method run db-secret apply \
-  --input 'kubeconfig=${{ vault.get("cluster", "kubeconfig") }}' \
-  --input namespace=app --input name=db-creds \
-  --input 'data:json={"password":"${{ vault.get("app", "db-password") }}"}'
+
+for ns in app app-staging; do
+  swamp model method run db-secret apply \
+    --input 'kubeconfig=${{ vault.get("cluster", "kubeconfig") }}' \
+    --input namespace=$ns --input name=db-creds \
+    --input 'data:json={"password":"${{ vault.get("app", "db-password") }}"}'
+done
 ```
 
 Read it back (hashes only) and delete it:
@@ -48,9 +61,8 @@ swamp model method run db-secret delete \
   --input namespace=app --input name=db-creds
 ```
 
-Run it again with another `namespace` or kubeconfig for a second Secret. Do not
-capture `--json` output of a run that carries these arguments: the swamp CLI
-echoes sensitive arguments there.
+Do not capture `--json` output of a run that carries these arguments: the swamp
+CLI echoes sensitive arguments there.
 
 ## How it works
 

@@ -284,3 +284,66 @@ this environment.
 - README documents exactly which disks are deleted vs kept per
   `remove_attached_media`, including that a pool-managed CD-ROM is detached and
   kept when it is false.
+
+## 2026-10-17 live e2e
+
+Folded from the run receipts (`sp-20261017`); real addresses, hostnames and ids
+are redacted (`<bm1>` is the target). Every head was installed from
+`git archive` (tests excluded) into a separate repo. Target `<bm1>`: bare metal,
+Ubuntu 24.04, libvirt 10.0, `/dev/kvm` present, a dir pool `e2e-pool` holding
+the noble cloud image (`golden-noble.qcow2`, sha256 checked against SHA256SUMS),
+a 1 GiB data disk and a NoCloud seed ISO. `private_key` as a vault reference,
+`host_key_policy` strict with the pinned keys, no `--json` capture.
+
+Earlier run on lane/d4 0733670 (superseded): 37 of 41 cells passed, including
+networks (define, re-run no-op, differing config warns, undefine and again),
+clone_volume (clone, re-run no-op, missing golden refused), define_domain
+(define, re-run no-op, missing volume refused), power start/destroy/no-ops,
+get/sync, virsh non-zero errors, undefine_domain (kept and removed volumes,
+again a no-op), injection refusals (domain and network name, URI, target
+volume), transport refusals (wrong pin, wrong pin on a destructive call, pin for
+another host only, wrong private key) and a cloud-init NoCloud seed boot. Four
+failed: start on a stock host (AppArmor, volume-type disk), power shutdown (no
+ACPI in the render), console on a running domain (top-level `timeout -s KILL`
+mapped to ssh exit 255) and console capture. Those, plus define_network dropping
+the start error and the 15-char bridge-name limit, were fixed in the live-run,
+round-2/3 and escalation fixes above.
+
+### Final matrix on 08e8052
+
+| Cell                                                                           | Result | Detail                                                                                                   |
+| ------------------------------------------------------------------------------ | ------ | -------------------------------------------------------------------------------------------------------- |
+| define_network e2e-nat                                                         | PASS   | defined and listed                                                                                       |
+| clone_volume golden -> e2e-node1                                               | PASS   | clone present once                                                                                       |
+| [earlier fail] define_domain + start on a stock Ubuntu host (no AppArmor rule) | PASS   | running                                                                                                  |
+| [earlier fail] console on a running domain (timeout_s 20)                      | PASS   | returned in 24 s; capture stored in the sensitive resource as bytes + sha256 only                        |
+| console bound: timeout_s 5                                                     | PASS   | returned in 9 s (5 s bound plus ssh/virsh overhead)                                                      |
+| [earlier fail] power shutdown on a running guest                               | PASS   | shut off after 10 s                                                                                      |
+| power shutdown again (already off)                                             | PASS   | no-op                                                                                                    |
+| [earlier fail] console on a shut-off domain                                    | PASS   | typed error "it is not running"; no capture stored                                                       |
+| golden flow 1: define_domain with a data disk (vdb) and seed ISO (sda), start  | PASS   | running with vda (clone), vdb (data), sda (seed)                                                         |
+| golden flow 2: power shutdown                                                  | PASS   | shut off                                                                                                 |
+| golden flow 3: undefine_domain remove_volumes=true                             | PASS   | only the root volume deleted; data disk, seed ISO, golden image and the other clone survive; domain gone |
+| undefine_domain again                                                          | PASS   | clean no-op                                                                                              |
+| undefine_domain on a running domain (remove_volumes=false)                     | PASS   | destroyed and undefined; volume kept; no qemu process left                                               |
+| get (pool e2e-pool)                                                            | PASS   | networks, domains and volumes listed                                                                     |
+| sync                                                                           | PASS   | no error                                                                                                 |
+
+15 pass, 0 fail.
+
+### Residuals (accepted for beta)
+
+- `virsh define --validate` is not used (it needs a connection whose driver
+  accepts `type='kvm'`); renders are checked with `virt-xml-validate` in tests
+  when it is on PATH, and reported ignored otherwise.
+- MEDIUM (terra): `undefine_domain remove_volumes=true` destroys a running guest
+  before the `detach-disk --config` calls; a detach failure then leaves the
+  guest off and its persistent definition partly detached (the method throws;
+  nothing is deleted).
+- MEDIUM (astra, raised as High and downgraded at merge prep): `define_domain`
+  on an existing domain records `volume` as the root whenever it is attached,
+  even as a data disk; a later `remove_volumes=true` would then delete that
+  volume and keep the real boot disk. It requires the operator to name another
+  disk of an existing domain as its root volume.
+- MEDIUM (astra): the stateful test fake does not drop attachments on
+  `detach-disk`; the golden flow is covered live (cell golden flow 3).

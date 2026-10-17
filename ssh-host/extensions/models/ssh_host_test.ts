@@ -446,7 +446,7 @@ Deno.test("upload writes once and the second run is a true no-op", async () => {
           ? new TextEncoder().encode(options.stdin)
           : options.stdin;
         stored = { sha: contentSha, mode: "600" };
-        return { code: 0, stdout: "", stderr: "" };
+        return { code: 0, stdout: `${contentSha} 600\n`, stderr: "" };
       }
       // Convergence probe against the retained remote state.
       return stored
@@ -498,7 +498,13 @@ Deno.test("upload writes no resource when the remote bytes are unchanged", async
 
 Deno.test("upload decodes base64 and refuses ambiguous or missing content", async () => {
   const calls: Call[] = [];
-  const deps = fakeDeps(fakeRun(calls));
+  const blobSha = await sha256Hex(new Uint8Array([65, 66, 67]));
+  const deps = fakeDeps(fakeRun(calls, {
+    ssh: (args) =>
+      (args.at(-1) ?? "").includes("mktemp")
+        ? { code: 0, stdout: `${blobSha} 644\n`, stderr: "" }
+        : { code: 0, stdout: "", stderr: "" },
+  }));
   const m = createModel(deps);
   const { context } = testContext();
   const result = await m.methods.upload.execute({

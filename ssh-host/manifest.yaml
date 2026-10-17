@@ -1,6 +1,6 @@
 manifestVersion: 1
 name: "@randybias/ssh-host"
-version: "2026.10.17.1"
+version: "2026.10.17.2"
 description: "Run one argv vector, push bytes atomically, and wait for SSH host keys on any host, under an explicit strict or trust-on-first-use host-key policy. One generic model with no host in its definition; every method takes its target as arguments and stores data keyed by host."
 license: Apache-2.0
 repository: https://github.com/randybias/swamp-extensions

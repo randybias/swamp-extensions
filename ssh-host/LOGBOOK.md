@@ -283,3 +283,13 @@ the two heads, sha256 23074b45…): 23/23.
   version } satisfies SshHostModel`,
   because the dry run flagged `uncatalogued-model`. Lanes vendoring this model
   should resync it.
+
+- 2026-10-17: 2026.10.17.2 security fix in the vendored `_lib/ssh.ts`. The
+  upload's post-rename verification used to send the content's expected SHA-256
+  to the remote script, so it appeared on the local `ssh` argv and the remote
+  command line and a process listing could brute-force a low-entropy secret. The
+  write script now prints the destination's own SHA-256 and mode after the
+  rename and the check runs locally in TypeScript; the probe already worked that
+  way. `mv -T`, symlink and directory refusal, and mode convergence are
+  unchanged. A test asserts no 64-hex content-derived string appears in any
+  spawned argv or script text. Every vendor resyncs to this blob.

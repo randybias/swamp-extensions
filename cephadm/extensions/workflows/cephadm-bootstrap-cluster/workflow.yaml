@@ -1,0 +1,139 @@
+id: 1543b328-235e-4b81-8d3e-a80cf23c322c
+name: "@randybias/cephadm-bootstrap-cluster"
+description: Bootstrap a new cluster on one host and prove the first mon is in quorum
+version: 1
+inputs:
+  properties:
+    host:
+      type: string
+      description: Host to bootstrap, hostname or IPv4
+    port:
+      type: integer
+      description: SSH port on the bootstrap host
+    sshUser:
+      type: string
+      description: SSH login user on the bootstrap host
+    keyPath:
+      type: string
+      default: ""
+      description: Absolute local path to a private key; empty uses the runner default
+    strictHostKeyChecking:
+      type: string
+      enum: ["yes", "no"]
+      description: Host-key policy, yes strict or no explicitly insecure
+    monIp:
+      type: string
+      description: First monitor's IPv4 address
+    publicNet:
+      type: string
+      description: Ceph public network as an IPv4 CIDR, containing monIp
+    clusterNet:
+      type: string
+      description: Ceph cluster network as an IPv4 CIDR
+    cephImage:
+      type: string
+      description: Pinned OCI image reference for the cluster
+    expectedMonCount:
+      type: integer
+      description: Expected number of mons after bootstrap
+  required:
+    - host
+    - port
+    - sshUser
+    - strictHostKeyChecking
+    - monIp
+    - publicNet
+    - clusterNet
+    - cephImage
+    - expectedMonCount
+jobs:
+  - name: bootstrap
+    description: Approve and bootstrap a new cluster on the host
+    steps:
+      - name: approve
+        description: Approve bootstrapping a new cluster on the named host
+        task:
+          type: manual_approval
+          prompt: >-
+            Bootstrap a new Ceph cluster on ${{ inputs.host }} with monIp
+            ${{ inputs.monIp }} and image ${{ inputs.cephImage }}. This creates
+            cluster state on the host and cannot be undone by this workflow.
+          timeout: 3600
+      - name: bootstrap-cluster
+        description: Bootstrap the first mon and cluster via SSH
+        dependsOn:
+          - step: approve
+            condition:
+              type: succeeded
+        task:
+          type: model_method
+          modelIdOrName: cephadm
+          methodName: cephBootstrap
+          inputs:
+            host: ${{ inputs.host }}
+            port: ${{ inputs.port }}
+            sshUser: ${{ inputs.sshUser }}
+            keyPath: '${{ inputs.keyPath == "" ? dyn(null) : dyn(inputs.keyPath) }}'
+            strictHostKeyChecking: ${{ inputs.strictHostKeyChecking }}
+            monIp: ${{ inputs.monIp }}
+            publicNet: ${{ inputs.publicNet }}
+            clusterNet: ${{ inputs.clusterNet }}
+            cephImage: ${{ inputs.cephImage }}
+  - name: prove
+    description: Read mon quorum and assert the first mon is in quorum
+    dependsOn:
+      - job: bootstrap
+        condition:
+          type: succeeded
+    steps:
+      - name: verify-mon-quorum
+        description: Check the mon count and quorum via ceph, single-shot
+        task:
+          type: model_method
+          modelIdOrName: cephadm
+          methodName: cephVerifyMonQuorum
+          inputs:
+            host: ${{ inputs.host }}
+            port: ${{ inputs.port }}
+            sshUser: ${{ inputs.sshUser }}
+            keyPath: '${{ inputs.keyPath == "" ? dyn(null) : dyn(inputs.keyPath) }}'
+            strictHostKeyChecking: ${{ inputs.strictHostKeyChecking }}
+            expectedMonCount: ${{ inputs.expectedMonCount }}
+            throwOnFail: false
+      - name: assert-mon-quorum
+        description: Assert the first mon is in quorum
+        dependsOn:
+          - step: verify-mon-quorum
+            condition:
+              type: succeeded
+        task:
+          type: assert
+          expr: >-
+            data.latest("cephadm", "cephVerifyMonQuorum-" + inputs.host).attributes.pass == true
+          message: >-
+            Expected cephVerifyMonQuorum to pass for ${{ inputs.host }},
+            observed pass=${{ data.latest("cephadm", "cephVerifyMonQuorum-" + inputs.host).attributes.pass }},
+            bootstrap recovered=${{ data.latest("cephadm", "cephBootstrap-" + inputs.host).attributes.recoveredAfterTransportError }}
+          severity: high
+  - name: report-failure
+    description: Report that nothing was rolled back or retried
+    dependsOn:
+      - job: prove
+        condition:
+          type: or
+          conditions:
+            - type: failed
+            - type: skipped
+    steps:
+      - name: report-failure
+        description: State that the run changed nothing and was not remediated
+        allowFailure: true
+        task:
+          type: assert
+          expr: "true"
+          message: >-
+            Nothing was rolled back, retried or remediated. A run that stopped
+            at approval changed nothing. Any host in maintenance is still in
+            maintenance. Read the failing method's error from the
+            method-summary report before re-running.
+          severity: low

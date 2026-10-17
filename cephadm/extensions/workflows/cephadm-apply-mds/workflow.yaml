@@ -1,0 +1,132 @@
+id: 7108b353-c716-49b6-aba8-38c9c9f2e614
+name: "@randybias/cephadm-apply-mds"
+description: Place a filesystem's MDS daemons on an explicit list of hosts
+version: 1
+inputs:
+  properties:
+    adminHost:
+      type: string
+      description: Admin host where ceph runs
+    port:
+      type: integer
+      description: SSH port on the admin host
+    sshUser:
+      type: string
+      description: SSH login user on the admin host
+    keyPath:
+      type: string
+      default: ""
+      description: Absolute local path to a private key; empty uses the runner default
+    strictHostKeyChecking:
+      type: string
+      enum: ["yes", "no"]
+      description: Host-key policy, yes strict or no explicitly insecure
+    fsName:
+      type: string
+      description: Filesystem whose MDS placement to converge
+    placement:
+      type: array
+      items:
+        type: string
+      description: Hostnames that must run MDS daemons, unique
+    expectedDataPoolSize:
+      type: integer
+      description: Expected data pool replica count, read back after the apply
+  required:
+    - adminHost
+    - port
+    - sshUser
+    - strictHostKeyChecking
+    - fsName
+    - placement
+    - expectedDataPoolSize
+jobs:
+  - name: apply
+    description: Approve and place the filesystem MDS daemons
+    steps:
+      - name: approve
+        description: Approve placing the filesystem MDS on the listed hosts
+        task:
+          type: manual_approval
+          prompt: >-
+            Place MDS daemons for filesystem ${{ inputs.fsName }} on
+            ${{ inputs.placement }} through ${{ inputs.adminHost }}. This
+            changes daemon placement.
+          timeout: 3600
+      - name: apply-mds
+        description: Apply the explicit MDS placement through the orchestrator
+        dependsOn:
+          - step: approve
+            condition:
+              type: succeeded
+        task:
+          type: model_method
+          modelIdOrName: cephadm
+          methodName: cephApplyMds
+          inputs:
+            adminHost: ${{ inputs.adminHost }}
+            port: ${{ inputs.port }}
+            sshUser: ${{ inputs.sshUser }}
+            keyPath: '${{ inputs.keyPath == "" ? dyn(null) : dyn(inputs.keyPath) }}'
+            strictHostKeyChecking: ${{ inputs.strictHostKeyChecking }}
+            fsName: ${{ inputs.fsName }}
+            placement: ${{ inputs.placement }}
+  - name: prove
+    description: Read the filesystem data pool and MDS state, then assert
+    dependsOn:
+      - job: apply
+        condition:
+          type: succeeded
+    steps:
+      - name: verify-pool
+        description: Check the data pool and an active MDS via ceph
+        task:
+          type: model_method
+          modelIdOrName: cephadm
+          methodName: cephVerifyPool
+          inputs:
+            host: ${{ inputs.adminHost }}
+            port: ${{ inputs.port }}
+            sshUser: ${{ inputs.sshUser }}
+            keyPath: '${{ inputs.keyPath == "" ? dyn(null) : dyn(inputs.keyPath) }}'
+            strictHostKeyChecking: ${{ inputs.strictHostKeyChecking }}
+            poolName: "cephfs.${{ inputs.fsName }}.data"
+            expectedSize: ${{ inputs.expectedDataPoolSize }}
+            mds: '${{ dyn({"fsName": inputs.fsName, "expectedActive": 1, "expectedStandby": 0}) }}'
+            throwOnFail: false
+      - name: assert-mds
+        description: Assert the filesystem has an active MDS
+        dependsOn:
+          - step: verify-pool
+            condition:
+              type: succeeded
+        task:
+          type: assert
+          expr: >-
+            data.latest("cephadm", "cephVerifyPool-" + inputs.adminHost + "-cephfs." + inputs.fsName + ".data").attributes.pass == true
+          message: >-
+            Expected an active MDS for ${{ inputs.fsName }}, observed
+            pass=${{ data.latest("cephadm", "cephVerifyPool-" + inputs.adminHost + "-cephfs." + inputs.fsName + ".data").attributes.pass }}
+          severity: high
+  - name: report-failure
+    description: Report that nothing was rolled back or retried
+    dependsOn:
+      - job: prove
+        condition:
+          type: or
+          conditions:
+            - type: failed
+            - type: skipped
+    steps:
+      - name: report-failure
+        description: State that the run changed nothing and was not remediated
+        allowFailure: true
+        task:
+          type: assert
+          expr: "true"
+          message: >-
+            Nothing was rolled back, retried or remediated. A run that stopped
+            at approval changed nothing. Any host in maintenance is still in
+            maintenance. Read the failing method's error from the
+            method-summary report before re-running.
+          severity: low

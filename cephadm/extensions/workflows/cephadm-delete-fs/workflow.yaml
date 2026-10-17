@@ -1,0 +1,159 @@
+id: 13aa3a10-417e-46a7-8539-acc781085625
+name: "@randybias/cephadm-delete-fs"
+description: Delete one CephFS volume and its pools after a typed confirmation
+version: 1
+inputs:
+  properties:
+    host:
+      type: string
+      description: Admin host where ceph runs
+    port:
+      type: integer
+      description: SSH port on the admin host
+    sshUser:
+      type: string
+      description: SSH login user on the admin host
+    keyPath:
+      type: string
+      default: ""
+      description: Absolute local path to a private key; empty uses the runner default
+    strictHostKeyChecking:
+      type: string
+      enum: ["yes", "no"]
+      description: Host-key policy, yes strict or no explicitly insecure
+    fsName:
+      type: string
+      description: Volume to delete
+    confirmFsName:
+      type: string
+      description: The volume named a second time, as a guard
+  required:
+    - host
+    - port
+    - sshUser
+    - strictHostKeyChecking
+    - fsName
+    - confirmFsName
+jobs:
+  - name: delete
+    description: Capture evidence, confirm the volume, approve, then delete
+    steps:
+      - name: evidence-before
+        description: Capture the connection bundle before the deletion
+        task:
+          type: model_method
+          modelIdOrName: cephadm
+          methodName: cephGetConnBundle
+          inputs:
+            host: ${{ inputs.host }}
+            port: ${{ inputs.port }}
+            sshUser: ${{ inputs.sshUser }}
+            keyPath: '${{ inputs.keyPath == "" ? dyn(null) : dyn(inputs.keyPath) }}'
+            strictHostKeyChecking: ${{ inputs.strictHostKeyChecking }}
+      - name: assert-confirm
+        description: Assert the confirmation matches and the volume is present
+        dependsOn:
+          - step: evidence-before
+            condition:
+              type: succeeded
+        task:
+          type: assert
+          expr: >-
+            inputs.confirmFsName == inputs.fsName &&
+            data.latest("cephadm", "cephGetConnBundle-" + inputs.host).attributes.filesystems.exists(f, f == inputs.fsName)
+          message: >-
+            Expected confirmFsName to equal fsName and the volume to exist,
+            observed fsName=${{ inputs.fsName }}
+            confirmFsName=${{ inputs.confirmFsName }}
+            filesystems=${{ data.latest("cephadm", "cephGetConnBundle-" + inputs.host).attributes.filesystems }}
+          severity: high
+      - name: approve
+        description: Approve deleting the volume and its backing pools
+        dependsOn:
+          - step: assert-confirm
+            condition:
+              type: succeeded
+        task:
+          type: manual_approval
+          prompt: >-
+            Delete CephFS volume ${{ inputs.fsName }} and its pools on
+            ${{ inputs.host }}. The before-evidence record is
+            cephGetConnBundle-${{ inputs.host }}. This deletion cannot be
+            undone.
+          timeout: 3600
+      - name: delete-fs
+        description: Delete the volume, its MDS and its pools via ceph
+        dependsOn:
+          - step: approve
+            condition:
+              type: succeeded
+        task:
+          type: model_method
+          modelIdOrName: cephadm
+          methodName: cephDeleteFs
+          inputs:
+            host: ${{ inputs.host }}
+            port: ${{ inputs.port }}
+            sshUser: ${{ inputs.sshUser }}
+            keyPath: '${{ inputs.keyPath == "" ? dyn(null) : dyn(inputs.keyPath) }}'
+            strictHostKeyChecking: ${{ inputs.strictHostKeyChecking }}
+            fsName: ${{ inputs.fsName }}
+            confirmFsName: ${{ inputs.confirmFsName }}
+  - name: prove
+    description: Capture the connection bundle after and assert the volume is gone
+    dependsOn:
+      - job: delete
+        condition:
+          type: succeeded
+    steps:
+      - name: evidence-after
+        description: Capture the connection bundle after the deletion
+        task:
+          type: model_method
+          modelIdOrName: cephadm
+          methodName: cephGetConnBundle
+          inputs:
+            host: ${{ inputs.host }}
+            port: ${{ inputs.port }}
+            sshUser: ${{ inputs.sshUser }}
+            keyPath: '${{ inputs.keyPath == "" ? dyn(null) : dyn(inputs.keyPath) }}'
+            strictHostKeyChecking: ${{ inputs.strictHostKeyChecking }}
+      - name: assert-deleted
+        description: Assert the fresh bundle omits the volume
+        dependsOn:
+          - step: evidence-after
+            condition:
+              type: succeeded
+        task:
+          type: assert
+          expr: >-
+            data.latest("cephadm", "cephGetConnBundle-" + inputs.host).attributes.capturedAt >= run.startedAt &&
+            !data.latest("cephadm", "cephGetConnBundle-" + inputs.host).attributes.filesystems.exists(f, f == inputs.fsName)
+          message: >-
+            Expected volume ${{ inputs.fsName }} to be absent from a fresh
+            bundle, observed filesystems=${{ data.latest("cephadm", "cephGetConnBundle-" + inputs.host).attributes.filesystems }}
+            capturedAt=${{ data.latest("cephadm", "cephGetConnBundle-" + inputs.host).attributes.capturedAt }}
+          severity: high
+  - name: report-failure
+    description: Report that nothing was rolled back or retried
+    dependsOn:
+      - job: prove
+        condition:
+          type: or
+          conditions:
+            - type: failed
+            - type: skipped
+    steps:
+      - name: report-failure
+        description: State that the run changed nothing and was not remediated
+        allowFailure: true
+        task:
+          type: assert
+          expr: "true"
+          message: >-
+            Nothing was rolled back, retried or remediated. A run that stopped
+            at the pre-gate or approval changed nothing. Any host in maintenance
+            is still in maintenance. Read the failing method's error from the
+            method-summary report before re-running. A destructive workflow must
+            not be re-run as a debugging instrument.
+          severity: low

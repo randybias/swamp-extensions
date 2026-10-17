@@ -9,4 +9,26 @@ labels: [ceph, cephadm, storage, cluster, ssh, debian, infrastructure]
 additionalFiles: [README.md, LICENSE.txt]
 models:
   - cephadm.ts
-workflows: []
+workflows:
+  - cephadm-add-host/workflow.yaml
+  - cephadm-apply-mds/workflow.yaml
+  - cephadm-apply-mgr/workflow.yaml
+  - cephadm-apply-mon/workflow.yaml
+  - cephadm-apply-osds/workflow.yaml
+  - cephadm-bootstrap-cluster/workflow.yaml
+  - cephadm-create-csi-user/workflow.yaml
+  - cephadm-create-fs/workflow.yaml
+  - cephadm-create-pool/workflow.yaml
+  - cephadm-delete-fs/workflow.yaml
+  - cephadm-distribute-key/workflow.yaml
+  - cephadm-fetch-csi-key/workflow.yaml
+  - cephadm-get-conn-bundle/workflow.yaml
+  - cephadm-inventory-rgw-buckets/workflow.yaml
+  - cephadm-prep-host/workflow.yaml
+  - cephadm-remove-osds/workflow.yaml
+  - cephadm-verify-health/workflow.yaml
+  - cephadm-verify-host-prep/workflow.yaml
+  - cephadm-verify-mgr/workflow.yaml
+  - cephadm-verify-mon-quorum/workflow.yaml
+  - cephadm-verify-osds/workflow.yaml
+  - cephadm-wipe-disks/workflow.yaml

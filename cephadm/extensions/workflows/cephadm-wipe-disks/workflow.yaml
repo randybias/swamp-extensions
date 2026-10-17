@@ -1,0 +1,184 @@
+id: 3021c0cb-99c8-4879-a7df-05b54d8c393e
+name: "@randybias/cephadm-wipe-disks"
+description: Wipe one host's named data disks to raw, with a dry-run mode
+version: 1
+inputs:
+  properties:
+    host:
+      type: string
+      description: Target host, hostname or IPv4
+    port:
+      type: integer
+      description: SSH port on the target host
+    sshUser:
+      type: string
+      description: SSH login user on the target host
+    keyPath:
+      type: string
+      default: ""
+      description: Absolute local path to a private key; empty uses the runner default
+    strictHostKeyChecking:
+      type: string
+      enum: ["yes", "no"]
+      description: Host-key policy, yes strict or no explicitly insecure
+    dataDevices:
+      type: array
+      items:
+        type: object
+        properties:
+          serial:
+            type: string
+        required: ["serial"]
+      description: Data disks to wipe, selected by serial
+    excludeDevices:
+      type: array
+      items:
+        type: object
+        properties:
+          serial:
+            type: string
+          reason:
+            type: string
+        required: ["serial"]
+      description: Never-touch serials; must list every boot or system disk
+    dryRun:
+      type: boolean
+      default: false
+      description: Plan and prove the wipe without touching any disk
+  required:
+    - host
+    - port
+    - sshUser
+    - strictHostKeyChecking
+    - dataDevices
+    - excludeDevices
+jobs:
+  - name: wipe
+    description: Gate on raw disks, approve, then wipe or plan the wipe
+    steps:
+      - name: gate-disks
+        description: Read whether the named disks are already raw
+        task:
+          type: model_method
+          modelIdOrName: cephadm
+          methodName: cephVerifyDisksRaw
+          inputs:
+            host: ${{ inputs.host }}
+            port: ${{ inputs.port }}
+            sshUser: ${{ inputs.sshUser }}
+            keyPath: '${{ inputs.keyPath == "" ? dyn(null) : dyn(inputs.keyPath) }}'
+            strictHostKeyChecking: ${{ inputs.strictHostKeyChecking }}
+            dataDevices: ${{ inputs.dataDevices }}
+            throwOnFail: false
+      - name: assert-gate-raw
+        description: Assert no named disk is mounted or unobserved
+        dependsOn:
+          - step: gate-disks
+            condition:
+              type: succeeded
+        task:
+          type: assert
+          expr: >-
+            size(data.latest("cephadm", "cephVerifyDisksRaw-" + inputs.host).attributes.detail.mounted) == 0 &&
+            size(data.latest("cephadm", "cephVerifyDisksRaw-" + inputs.host).attributes.detail.unobserved) == 0
+          message: >-
+            Expected no mounted or unobserved disk before wiping, observed
+            mounted=${{ data.latest("cephadm", "cephVerifyDisksRaw-" + inputs.host).attributes.detail.mounted }}
+            unobserved=${{ data.latest("cephadm", "cephVerifyDisksRaw-" + inputs.host).attributes.detail.unobserved }}
+          severity: high
+      - name: approve
+        description: Approve the wipe after the mounted-disk pre-check
+        dependsOn:
+          - step: assert-gate-raw
+            condition:
+              type: succeeded
+        task:
+          type: manual_approval
+          prompt: >-
+            Wipe disks ${{ inputs.dataDevices }} on ${{ inputs.host }}, dryRun
+            ${{ inputs.dryRun }}. The pre-check record is
+            cephVerifyDisksRaw-${{ inputs.host }}. A real run destroys data and
+            cannot be undone.
+          timeout: 3600
+      - name: wipe-disks
+        description: Wipe or plan the named disks to raw via SSH
+        dependsOn:
+          - step: approve
+            condition:
+              type: succeeded
+        task:
+          type: model_method
+          modelIdOrName: cephadm
+          methodName: wipeDiskToRaw
+          inputs:
+            host: ${{ inputs.host }}
+            port: ${{ inputs.port }}
+            sshUser: ${{ inputs.sshUser }}
+            keyPath: '${{ inputs.keyPath == "" ? dyn(null) : dyn(inputs.keyPath) }}'
+            strictHostKeyChecking: ${{ inputs.strictHostKeyChecking }}
+            dataDevices: ${{ inputs.dataDevices }}
+            excludeDevices: ${{ inputs.excludeDevices }}
+            dryRun: ${{ inputs.dryRun }}
+  - name: prove
+    description: Re-read the named disks and assert the wipe result
+    dependsOn:
+      - job: wipe
+        condition:
+          type: succeeded
+    steps:
+      - name: verify-disks-raw
+        description: Re-read whether the named disks are raw, in both modes
+        task:
+          type: model_method
+          modelIdOrName: cephadm
+          methodName: cephVerifyDisksRaw
+          inputs:
+            host: ${{ inputs.host }}
+            port: ${{ inputs.port }}
+            sshUser: ${{ inputs.sshUser }}
+            keyPath: '${{ inputs.keyPath == "" ? dyn(null) : dyn(inputs.keyPath) }}'
+            strictHostKeyChecking: ${{ inputs.strictHostKeyChecking }}
+            dataDevices: ${{ inputs.dataDevices }}
+            throwOnFail: false
+      - name: assert-wipe
+        description: Assert the dry-run plan or the completed wipe
+        dependsOn:
+          - step: verify-disks-raw
+            condition:
+              type: succeeded
+        task:
+          type: assert
+          expr: >-
+            inputs.dryRun == true
+              ? (data.latest("cephadm", "wipeDiskToRaw-" + inputs.host).attributes.dryRun == true &&
+                 size(data.latest("cephadm", "wipeDiskToRaw-" + inputs.host).attributes.plannedDevices) == size(inputs.dataDevices))
+              : (data.latest("cephadm", "cephVerifyDisksRaw-" + inputs.host).attributes.pass == true &&
+                 data.latest("cephadm", "wipeDiskToRaw-" + inputs.host).attributes.dryRun == false)
+          message: >-
+            Expected dryRun=${{ inputs.dryRun }} on ${{ inputs.host }}, observed
+            wipe.dryRun=${{ data.latest("cephadm", "wipeDiskToRaw-" + inputs.host).attributes.dryRun }}
+            verify.pass=${{ data.latest("cephadm", "cephVerifyDisksRaw-" + inputs.host).attributes.pass }}
+            planned=${{ data.latest("cephadm", "wipeDiskToRaw-" + inputs.host).attributes.plannedDevices }}
+          severity: high
+  - name: report-failure
+    description: Report that nothing was rolled back or retried
+    dependsOn:
+      - job: prove
+        condition:
+          type: or
+          conditions:
+            - type: failed
+            - type: skipped
+    steps:
+      - name: report-failure
+        description: State that the run changed nothing and was not remediated
+        allowFailure: true
+        task:
+          type: assert
+          expr: "true"
+          message: >-
+            Nothing was rolled back, retried or remediated. A run that stopped
+            at the pre-gate or approval changed nothing. Any host in maintenance
+            is still in maintenance. Read the failing method's error from the
+            method-summary report before re-running.
+          severity: low

@@ -1,0 +1,154 @@
+id: ed4e079e-d2b1-4332-a76c-cb201fc0a65d
+name: "@randybias/cephadm-apply-mgr"
+description: Converge mgr daemons to an explicit host list after a placement check
+version: 1
+inputs:
+  properties:
+    adminHost:
+      type: string
+      description: Admin host where ceph runs
+    port:
+      type: integer
+      description: SSH port on the admin host
+    sshUser:
+      type: string
+      description: SSH login user on the admin host
+    keyPath:
+      type: string
+      default: ""
+      description: Absolute local path to a private key; empty uses the runner default
+    strictHostKeyChecking:
+      type: string
+      enum: ["yes", "no"]
+      description: Host-key policy, yes strict or no explicitly insecure
+    placement:
+      type: array
+      items:
+        type: string
+      description: Hostnames that must run mgr daemons, unique
+  required:
+    - adminHost
+    - port
+    - sshUser
+    - strictHostKeyChecking
+    - placement
+jobs:
+  - name: apply
+    description: Check mgr placement, approve, then converge the mgr set
+    steps:
+      - name: gate-mgr-placement
+        description: Judge the requested mgr placement without applying it
+        task:
+          type: model_method
+          modelIdOrName: cephadm
+          methodName: cephVerifyMgrPlacement
+          inputs:
+            host: ${{ inputs.adminHost }}
+            port: ${{ inputs.port }}
+            sshUser: ${{ inputs.sshUser }}
+            keyPath: '${{ inputs.keyPath == "" ? dyn(null) : dyn(inputs.keyPath) }}'
+            strictHostKeyChecking: ${{ inputs.strictHostKeyChecking }}
+            placement: ${{ inputs.placement }}
+            throwOnFail: false
+      - name: assert-mgr-placement
+        description: Assert the mgr placement is safe to apply
+        dependsOn:
+          - step: gate-mgr-placement
+            condition:
+              type: succeeded
+        task:
+          type: assert
+          expr: >-
+            data.latest("cephadm", "cephVerifyMgrPlacement-" + inputs.adminHost).attributes.pass == true
+          message: >-
+            Expected the mgr placement to pass pre-check, observed
+            reasons=${{ data.latest("cephadm", "cephVerifyMgrPlacement-" + inputs.adminHost).attributes.detail.reasons }}
+          severity: high
+      - name: approve
+        description: Approve converging the mgr set to the listed hosts
+        dependsOn:
+          - step: assert-mgr-placement
+            condition:
+              type: succeeded
+        task:
+          type: manual_approval
+          prompt: >-
+            Converge mgr daemons to ${{ inputs.placement }} through
+            ${{ inputs.adminHost }}. The pre-check record is
+            cephVerifyMgrPlacement-${{ inputs.adminHost }}. Dropping a host
+            removes its mgr.
+          timeout: 3600
+      - name: apply-mgr
+        description: Apply the explicit mgr placement through the orchestrator
+        dependsOn:
+          - step: approve
+            condition:
+              type: succeeded
+        task:
+          type: model_method
+          modelIdOrName: cephadm
+          methodName: cephApplyMgr
+          inputs:
+            adminHost: ${{ inputs.adminHost }}
+            port: ${{ inputs.port }}
+            sshUser: ${{ inputs.sshUser }}
+            keyPath: '${{ inputs.keyPath == "" ? dyn(null) : dyn(inputs.keyPath) }}'
+            strictHostKeyChecking: ${{ inputs.strictHostKeyChecking }}
+            placement: ${{ inputs.placement }}
+  - name: prove
+    description: Read mgr state and assert the expected count is active
+    dependsOn:
+      - job: apply
+        condition:
+          type: succeeded
+    steps:
+      - name: verify-mgr
+        description: Check the mgr count and active mgr via ceph
+        task:
+          type: model_method
+          modelIdOrName: cephadm
+          methodName: cephVerifyMgr
+          inputs:
+            host: ${{ inputs.adminHost }}
+            port: ${{ inputs.port }}
+            sshUser: ${{ inputs.sshUser }}
+            keyPath: '${{ inputs.keyPath == "" ? dyn(null) : dyn(inputs.keyPath) }}'
+            strictHostKeyChecking: ${{ inputs.strictHostKeyChecking }}
+            expectedCount: ${{ size(inputs.placement) }}
+            throwOnFail: false
+      - name: assert-mgr
+        description: Assert the mgr count and active mgr match
+        dependsOn:
+          - step: verify-mgr
+            condition:
+              type: succeeded
+        task:
+          type: assert
+          expr: >-
+            data.latest("cephadm", "cephVerifyMgr-" + inputs.adminHost).attributes.pass == true
+          message: >-
+            Expected ${{ size(inputs.placement) }} mgrs with one active,
+            observed pass=${{ data.latest("cephadm", "cephVerifyMgr-" + inputs.adminHost).attributes.pass }}
+          severity: high
+  - name: report-failure
+    description: Report that nothing was rolled back or retried
+    dependsOn:
+      - job: prove
+        condition:
+          type: or
+          conditions:
+            - type: failed
+            - type: skipped
+    steps:
+      - name: report-failure
+        description: State that the run changed nothing and was not remediated
+        allowFailure: true
+        task:
+          type: assert
+          expr: "true"
+          message: >-
+            Nothing was rolled back, retried or remediated. A run that stopped
+            at the pre-gate or approval changed nothing. Any host in maintenance
+            is still in maintenance. Read the failing method's error from the
+            method-summary report before re-running.
+          severity: low

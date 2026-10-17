@@ -242,3 +242,65 @@ a secret. Fixtures are synthetic only (RFC 5737 addresses, `.test` names).
 - The SQLite `pvs`/`mdadm` discovery, the atomic mdadm.conf rewrite and the
   boot-protection gate are unit-tested with scripted sessions; the live twin
   checks in the spec's [twin] items still apply.
+
+- 2026-10-17: group 08 workflow catalog complete: all 22 workflows from
+  `docs/specs/cephadm/08-workflows.md` §2 under
+  `extensions/workflows/<name>/workflow.yaml`, listed in the manifest, and a
+  `extensions/workflows/catalog_test.ts` covering §1.8 (D60 manifest-vs-disk,
+  naming, 40-90 char descriptions, `cephadm`/`cephadm-*` instances, D57 port and
+  host-key enum, the mutating gate shape, no `data.latest` in approval prompts,
+  and every `cephVerify*` read-back passing `throwOnFail: false`). Every
+  workflow validates with `swamp workflow validate`.
+- Real gaps found while authoring, where the method spec wins over 08:
+  - `cephadm-apply-mds` adds an `expectedDataPoolSize` input: §2.11 omits it,
+    but `cephVerifyPool` requires `expectedSize`. The MDS sub-check uses
+    expectedActive 1 and expectedStandby 0 (the spec gives no counts).
+  - `cephadm-add-host` proves hostname presence only: the
+    `cephHostMaintenanceState` record's `hosts[]` carries hostname, status,
+    nooutFlag and out, but no address, so §2.5's address comparison cannot be
+    made from that record.
+  - `cephadm-distribute-key` re-reads with the single `port` input because
+    `cephVerifyKeyDistributed` takes one port while the distribution uses
+    per-host ports; its multi-host record key is the sorted `host:port` list, so
+    the input documents that `hosts[]` must already be sorted (08 Unresolved 4).
+  - `cephadm-apply-osds` does not expose `crushRuleName`: `cephApplyOsd` has no
+    such argument (only `cephVerifyOsd` does, and the spec's prove call does not
+    pass it).
+  - No workflow depends on d4's four S3-plane methods. The only RGW workflow,
+    `cephadm-inventory-rgw-buckets`, uses the already-present
+    `cephRgwBucketInventory`; the ensure/policy/versioning methods have no
+    workflow by §2.23.
+  - `cephHostMaintenanceState`, `cephCephadmCheckHost` and `cephGetConnBundle`
+    are plain reads with no `throwOnFail`; the gate-shape test requires it only
+    on `cephVerify*` calls.
+
+## Delta review (round 1) of the workflow catalog
+
+- HIGH: `cephadm-create-pool` referenced the optional `size` and
+  `erasureProfile` inputs unguarded in the mode assert message and the approval
+  prompt, and in the verify call's `expectedSize`; a real run aborts with "No
+  such key". Every reference is now inside `has(inputs.X)` ternaries (the
+  `expectedSize` expression guards both branches), so either mode evaluates.
+- HIGH: `cephadm-apply-osds` referenced the optional `targetPort` unguarded in
+  the mode assert message and the approval prompt. Both now use
+  `has(inputs.targetPort) ? ... : "unset"`.
+- HIGH: the catalog test did not catch this class. Added two checks: "optional
+  inputs are referenced only inside has() ternaries" (static) and "every
+  workflow expression evaluates with optional inputs absent" (runs every
+  `${{ }}` expression through the CEL engine with required inputs synthesised
+  and optional inputs omitted, failing only on `No such key` for an optional
+  input). The run-based check found the create-pool `expectedSize` case as well.
+- MEDIUM: `cephadm-distribute-key` now has a pre-approval `assert-single-port`
+  step requiring every `hosts[].port` to equal the single `port` input, and the
+  multi-host prove assert matches the `cephVerifyKeyDistributed` record by
+  `data.findBySpec` and `method` plus `capturedAt >= run.startedAt` instead of
+  building a key from host order, so unsorted hosts no longer break it. The
+  single-port limit is documented on the input and in the README.
+- MEDIUM: `cephadm-create-csi-user` no longer claims the requested caps are
+  proven; the assert description and message say the entity exists and the caps
+  are set by the mutation, and the README records the limit.
+- MEDIUM: the catalog gate-shape test now classifies a mutating workflow by its
+  method names (anything not in the read-only set), not by the presence of an
+  approval, and requires every mutating step to sit behind an approval on its
+  step-dependency path. Deleting an approval now fails the test.
+- add-host limit recorded in the README: only hostname presence is proven.

@@ -1,0 +1,49 @@
+id: 1e34d83f-0d54-4525-9450-7f76b9fbb40a
+name: "@randybias/cephadm-verify-mgr"
+description: Check that the mgr count matches and one mgr is active
+version: 1
+inputs:
+  properties:
+    host:
+      type: string
+      description: Admin host, hostname or IPv4
+    port:
+      type: integer
+      description: SSH port on the admin host
+    sshUser:
+      type: string
+      description: SSH login user on the admin host
+    keyPath:
+      type: string
+      default: ""
+      description: Absolute local path to a private key; empty uses the runner default
+    strictHostKeyChecking:
+      type: string
+      enum: ["yes", "no"]
+      description: Host-key policy, yes strict or no explicitly insecure
+    expectedCount:
+      type: integer
+      description: Expected total mgr daemon count
+  required:
+    - host
+    - port
+    - sshUser
+    - strictHostKeyChecking
+    - expectedCount
+jobs:
+  - name: verify
+    description: Read mgr state and halt on a failed verdict
+    steps:
+      - name: verify-mgr
+        description: Check the mgr count and active mgr via ceph
+        task:
+          type: model_method
+          modelIdOrName: cephadm
+          methodName: cephVerifyMgr
+          inputs:
+            host: ${{ inputs.host }}
+            port: ${{ inputs.port }}
+            sshUser: ${{ inputs.sshUser }}
+            keyPath: '${{ inputs.keyPath == "" ? dyn(null) : dyn(inputs.keyPath) }}'
+            strictHostKeyChecking: ${{ inputs.strictHostKeyChecking }}
+            expectedCount: ${{ inputs.expectedCount }}

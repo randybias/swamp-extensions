@@ -1,0 +1,88 @@
+id: 8e09a594-c794-4ded-8706-e7d7203abe7a
+name: "@randybias/cephadm-inventory-rgw-buckets"
+description: List RGW buckets with per-bucket stats and flag any that cannot be read
+version: 1
+inputs:
+  properties:
+    host:
+      type: string
+      description: Admin host, hostname or IPv4
+    port:
+      type: integer
+      description: SSH port on the admin host
+    sshUser:
+      type: string
+      description: SSH login user on the admin host
+    keyPath:
+      type: string
+      default: ""
+      description: Absolute local path to a private key; empty uses the runner default
+    strictHostKeyChecking:
+      type: string
+      enum: ["yes", "no"]
+      description: Host-key policy, yes strict or no explicitly insecure
+    realm:
+      type: string
+      default: ""
+      description: RGW realm to read; empty means the default realm
+  required:
+    - host
+    - port
+    - sshUser
+    - strictHostKeyChecking
+jobs:
+  - name: capture
+    description: List every RGW bucket with stats
+    steps:
+      - name: bucket-inventory
+        description: Page the RGW bucket list with stats via ceph
+        task:
+          type: model_method
+          modelIdOrName: cephadm
+          methodName: cephRgwBucketInventory
+          inputs:
+            host: ${{ inputs.host }}
+            port: ${{ inputs.port }}
+            sshUser: ${{ inputs.sshUser }}
+            keyPath: '${{ inputs.keyPath == "" ? dyn(null) : dyn(inputs.keyPath) }}'
+            strictHostKeyChecking: ${{ inputs.strictHostKeyChecking }}
+            rgwRealm: '${{ inputs.realm == "" ? dyn(null) : dyn(inputs.realm) }}'
+  - name: assert
+    description: Assert every bucket was stat-able
+    dependsOn:
+      - job: capture
+        condition:
+          type: succeeded
+    steps:
+      - name: assert-buckets-readable
+        description: Assert no bucket was unstattable
+        task:
+          type: assert
+          expr: >-
+            size(data.latest("cephadm", inputs.realm == "" ? "rgwBucketInventory-" + inputs.host : "rgwBucketInventory-" + inputs.host + "-" + inputs.realm).attributes.unstattable) == 0
+          message: >-
+            Expected every bucket to be stat-able, observed
+            unstattable=${{ data.latest("cephadm", inputs.realm == "" ? "rgwBucketInventory-" + inputs.host : "rgwBucketInventory-" + inputs.host + "-" + inputs.realm).attributes.unstattable }}
+            bucketCount=${{ data.latest("cephadm", inputs.realm == "" ? "rgwBucketInventory-" + inputs.host : "rgwBucketInventory-" + inputs.host + "-" + inputs.realm).attributes.bucketCount }}
+          severity: high
+  - name: report-failure
+    description: Report that nothing was changed by this read
+    dependsOn:
+      - job: assert
+        condition:
+          type: or
+          conditions:
+            - type: failed
+            - type: skipped
+    steps:
+      - name: report-failure
+        description: State that every command was a read and nothing was changed
+        allowFailure: true
+        task:
+          type: assert
+          expr: "true"
+          message: >-
+            Every command was a read; nothing was changed, rolled back, retried
+            or remediated. Read the failing method's error from the
+            method-summary report before re-running.
+          severity: low

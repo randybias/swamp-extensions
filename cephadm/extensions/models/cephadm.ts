@@ -12,6 +12,7 @@
  */
 
 import { z } from "npm:zod@4.3.6";
+import { CEPH_ID_CREATE_RE } from "./_lib/validate.ts";
 import { PhaseError } from "./_lib/errors.ts";
 import {
   CEPHADM_PATH,
@@ -96,6 +97,7 @@ import {
   verifyPool,
   verifyRbdSmoke,
 } from "./_lib/verify.ts";
+import { bucketInventory } from "./_lib/rgw.ts";
 import {
   checkHost,
   disableOrchestration,
@@ -871,6 +873,40 @@ const HostTornDownResultSchema = z.strictObject({
   pass: z.boolean(),
   namedFsidGone: z.boolean(),
   findings: z.array(z.strictObject({ kind: z.string(), item: z.string() })),
+  capturedAt: z.string(),
+});
+
+const RgwRealmSchema = z.string().max(128).refine(
+  (v) => v === "" || CEPH_ID_CREATE_RE.test(v),
+  "an RGW realm name, or empty",
+).nullish();
+
+const BucketInventoryArgs = z.strictObject({
+  host: HOST_FIELD.describe("Admin host."),
+  ...SSH_FIELDS,
+  rgwRealm: RgwRealmSchema.describe(
+    "RGW realm to read; empty means the default realm.",
+  ),
+});
+
+const BucketInventoryResultSchema = z.strictObject({
+  method: z.string(),
+  host: z.string(),
+  rgwRealm: z.string(),
+  bucketCount: z.number(),
+  buckets: z.array(z.strictObject({
+    bucket: z.string(),
+    owner: z.string(),
+    numObjects: z.number(),
+    sizeBytes: z.number(),
+    sizeActualBytes: z.number(),
+    placementRule: z.string(),
+  })),
+  unstattable: z.array(z.string()),
+  pagesRead: z.number(),
+  totalObjects: z.number(),
+  totalSizeBytes: z.number(),
+  totalSizeActualBytes: z.number(),
   capturedAt: z.string(),
 });
 
@@ -2872,6 +2908,37 @@ export function createCephadmModel(overrides: Partial<CephadmDeps> = {}) {
         }
       },
     },
+    cephRgwBucketInventory: {
+      description:
+        "READ-ONLY. List every RGW bucket with owner, object count, logical and on-disk size and placement rule, plus cluster totals. Paged until exhausted; an unparseable answer is never an empty inventory.",
+      arguments: BucketInventoryArgs,
+      execute: async (
+        args: z.infer<typeof BucketInventoryArgs>,
+        context: MethodContext,
+      ) => {
+        const session = await sessionFor(args);
+        const realm = args.rgwRealm ?? "";
+        try {
+          const record = await bucketInventory(
+            deps,
+            session,
+            args.host,
+            realm,
+            context.logger,
+          );
+          const handle = await context.writeResource(
+            "cephRgwBucketInventoryResult",
+            realm === ""
+              ? `rgwBucketInventory-${args.host}`
+              : `rgwBucketInventory-${args.host}-${realm}`,
+            { ...record, capturedAt: new Date(deps.now()).toISOString() },
+          );
+          return { dataHandles: [handle] };
+        } finally {
+          await session.close();
+        }
+      },
+    },
   };
 
   const sshMethods = Object.keys(methods);
@@ -3018,6 +3085,12 @@ export function createCephadmModel(overrides: Partial<CephadmDeps> = {}) {
       cephHostTornDownResult: {
         description: "OS-disk teardown verdict",
         schema: HostTornDownResultSchema,
+        lifetime: "infinite" as const,
+        garbageCollection: 10,
+      },
+      cephRgwBucketInventoryResult: {
+        description: "RGW bucket inventory with placement and totals",
+        schema: BucketInventoryResultSchema,
         lifetime: "infinite" as const,
         garbageCollection: 10,
       },

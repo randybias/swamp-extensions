@@ -102,6 +102,13 @@ Not packaged. Notes for whoever maintains this extension.
   check-host, noout-clear, osd activate, host-cluster-state,
   verify-cluster-fsid, disable-orchestration, rm-cluster and
   verify-host-torn-down. 210 unit tests.
+- 2026-10-17: group 07 (RGW) started with the safe admin-plane parts: the secret
+  redactor, the secret-free user view/classifier, and cephRgwBucketInventory
+  (paged listing, safe-name charset, placement rule). cephRgwUserEnsure is
+  BLOCKED on the D50 twin decision (Path A radosgw-admin secret-from-file/stdin
+  vs Path B Admin Ops): a build must pick exactly one and never put the secret
+  on argv, so it is not guessed here. The four S3-plane methods (SigV4, pinned
+  XML parser, PAB probe) remain, as do the group 08 workflows.
 - The SQLite `pvs`/`mdadm` discovery, the atomic mdadm.conf rewrite and the
   boot-protection gate are unit-tested with scripted sessions; the live twin
   checks in the spec's [twin] items still apply.

@@ -52,6 +52,8 @@ function makeBmc() {
   let sessionLocationOverride: string | undefined;
   let taskOnReset = false;
   let taskState = "Completed";
+  let taskStatusText: string | undefined;
+  let taskHttpStatus: number | undefined;
   let taskEmpty = false;
   let taskLocationOverride: string | undefined;
   let restartTransition = true;
@@ -85,10 +87,16 @@ function makeBmc() {
       return Promise.resolve(new Response(null, { status: 204 }));
     }
     if (method === "GET" && path === "/redfish/v1/TaskService/Tasks/1") {
+      if (taskHttpStatus !== undefined) {
+        return Promise.resolve(new Response("", { status: taskHttpStatus }));
+      }
       if (taskEmpty) {
         return Promise.resolve(new Response(null, { status: 204 }));
       }
-      return Promise.resolve(json({ TaskState: taskState }));
+      return Promise.resolve(json({
+        TaskState: taskState,
+        ...(taskStatusText ? { TaskStatus: taskStatusText } : {}),
+      }));
     }
     if (method === "GET" && path === "/redfish/v1/Systems") {
       return Promise.resolve(json(systems));
@@ -189,6 +197,12 @@ function makeBmc() {
     },
     setTaskState: (v: string) => {
       taskState = v;
+    },
+    setTaskStatusText: (v: string) => {
+      taskStatusText = v;
+    },
+    setTaskHttpStatus: (v: number) => {
+      taskHttpStatus = v;
     },
     setRestartTransition: (v: boolean) => {
       restartTransition = v;
@@ -946,7 +960,7 @@ Deno.test("a completed task monitor is success without a transition", async () =
   }
 });
 
-Deno.test("a 204 task monitor means completed", async () => {
+Deno.test("a 204 task monitor is unconfirmed and falls through to the state poll", async () => {
   const bmc = makeBmc();
   bmc.setTaskOnReset(true);
   bmc.setTaskEmpty(true);
@@ -955,10 +969,89 @@ Deno.test("a 204 task monitor means completed", async () => {
   try {
     const { context } = createModelTestContext(ctxOptions);
     const out = await model.methods.power.execute(
-      { ...BASE, action: "ForceRestart", timeout_seconds: 30 },
+      { ...BASE, action: "ForceRestart", timeout_seconds: 5 },
       context,
     ) as { result: Record<string, unknown> };
     assertEquals(out.result.power_state, "On");
+  } finally {
+    u.restore();
+  }
+});
+
+Deno.test("a 404 task with the host still On times out (ForceOff)", async () => {
+  const bmc = makeBmc();
+  bmc.setTaskOnReset(true);
+  bmc.setTaskHttpStatus(404);
+  bmc.setIgnoreReset(true);
+  const u = useBmc(bmc);
+  try {
+    const { context } = createModelTestContext(ctxOptions);
+    const e = await assertRejects(() =>
+      model.methods.power.execute(
+        { ...BASE, action: "ForceOff", timeout_seconds: 5 },
+        context,
+      )
+    ) as RedfishError;
+    assertEquals(e.code, "timeout");
+  } finally {
+    u.restore();
+  }
+});
+
+Deno.test("an empty 500 task read throws", async () => {
+  const bmc = makeBmc();
+  bmc.setTaskOnReset(true);
+  bmc.setTaskHttpStatus(500);
+  const u = useBmc(bmc);
+  try {
+    const { context } = createModelTestContext(ctxOptions);
+    const e = await assertRejects(() =>
+      model.methods.power.execute(
+        { ...BASE, action: "ForceRestart", timeout_seconds: 5 },
+        context,
+      )
+    ) as RedfishError;
+    assertEquals(e.code, "redfish_failed");
+  } finally {
+    u.restore();
+  }
+});
+
+Deno.test("a completed task with a non-OK status throws", async () => {
+  const bmc = makeBmc();
+  bmc.setTaskOnReset(true);
+  bmc.setTaskState("Completed");
+  bmc.setTaskStatusText("Critical");
+  const u = useBmc(bmc);
+  try {
+    const { context } = createModelTestContext(ctxOptions);
+    const e = await assertRejects(() =>
+      model.methods.power.execute(
+        { ...BASE, action: "ForceRestart", timeout_seconds: 5 },
+        context,
+      )
+    ) as RedfishError;
+    assertEquals(e.code, "redfish_failed");
+  } finally {
+    u.restore();
+  }
+});
+
+Deno.test("a completed task does not confirm a non-restart action that stays On", async () => {
+  const bmc = makeBmc();
+  bmc.setTaskOnReset(true);
+  bmc.setTaskState("Completed");
+  bmc.setIgnoreReset(true);
+  const u = useBmc(bmc);
+  try {
+    const { context } = createModelTestContext(ctxOptions);
+    const e = await assertRejects(() =>
+      model.methods.power.execute(
+        { ...BASE, action: "ForceOff", timeout_seconds: 5 },
+        context,
+      )
+    ) as RedfishError;
+    assertEquals(e.code, "timeout");
   } finally {
     u.restore();
   }

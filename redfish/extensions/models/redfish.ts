@@ -266,7 +266,7 @@ export const model = {
     power: {
       kind: "action" as const,
       description:
-        "DESTRUCTIVE. Power on, power off or restart the ComputerSystem, then wait until the resulting state is observed. On and the off actions are a no-op when the system is already there; a restart is accepted only after an observed state change or a completed Redfish task. Returns the observed state.",
+        "DESTRUCTIVE. Power on, power off or restart the ComputerSystem, then wait until the resulting state is observed. On and the off actions are a no-op when already there. A restart is confirmed by a completed Redfish task or an observed state change; a restart that shows no transition is accepted with a warning at the timeout. Returns the observed state.",
       arguments: PowerArgs,
       execute: async (args: z.input<typeof PowerArgs>, context: Ctx) => {
         const a = PowerArgs.parse(args);
@@ -317,16 +317,16 @@ export const model = {
                 again.etag,
               );
             };
-            if (reset.taskLocation) {
-              // A completed task monitor is success; the state need not change
-              // again before we read it.
-              await api.awaitTask(reset.taskLocation, pollMs);
-              return await readNow();
-            }
             if (isFireAndForget(action)) {
               // Nmi injects an event; the 2xx response is the whole result.
               return await readNow();
             }
+            const taskCompleted = reset.taskLocation
+              ? await api.awaitTask(reset.taskLocation, pollMs)
+              : false;
+            // A confirmed task is enough on its own only for a restart; every
+            // other action is confirmed by the power state below.
+            if (taskCompleted && restart) return await readNow();
             let transitions = 0;
             let last = initial;
             for (let first = true;; first = false) {
@@ -338,14 +338,17 @@ export const model = {
               if (current.power_state !== last) transitions++;
               last = current.power_state;
               if (current.power_state === desired) {
-                if (restart && transitions === 0) {
-                  context.logger.info(
-                    "System {id} restart accepted without an observed transition",
-                    { id: current.system_id },
-                  );
-                }
-                return current;
+                if (!restart || transitions > 0) return current;
+                // A restart with no observed transition keeps polling for one
+                // until the deadline, then is accepted with a warning.
               }
+            }
+            if (restart && current.power_state === desired) {
+              context.logger.warn(
+                "System {id} restart accepted without an observed transition",
+                { id: current.system_id },
+              );
+              return current;
             }
             throw new RedfishError(
               "timeout",

@@ -83,9 +83,13 @@ keep `strict` verification. `power` validates the requested `ResetType` against
 the system's advertised allowables (only values this model knows are echoed
 back), is a no-op when the system is already in the target state, follows a
 returned Redfish task monitor, and accepts a restart once the system is back at
-the desired state (polling immediately, so a fast restart is not missed); `Nmi`
-is fire-and-forget. `set_boot` patches the override, sending `If-Match` when the
-BMC provides an ETag, and reads it back to confirm.
+the desired state. Only an explicit `TaskState` of `Completed` with an `OK` (or
+absent) `TaskStatus` is a confirmed task; a `404`/`204`/empty task read is
+unconfirmed and falls through to the power-state poll, and every action other
+than a restart must read back the desired state. A restart with no observed
+transition is accepted with a warning at the timeout; `Nmi` is fire-and-forget.
+`set_boot` patches the override, sending `If-Match` when the BMC provides an
+ETag, and reads it back to confirm.
 
 The endpoint must be an https origin: no path, query, fragment or embedded
 credentials, and every `@odata.id` is resolved back onto that origin. The TLS

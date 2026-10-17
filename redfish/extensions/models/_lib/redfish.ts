@@ -20,7 +20,6 @@ import {
   readBounded,
   RedfishError,
   statusError,
-  timeoutError,
   type TlsPolicy,
 } from "./http.ts";
 
@@ -514,13 +513,6 @@ function requireSystemId(raw: Record<string, unknown>): void {
   }
 }
 
-const TERMINAL_TASK = new Set([
-  "Completed",
-  "Killed",
-  "Exception",
-  "Interrupted",
-  "Cancelled",
-]);
 const FAILED_TASK = new Set([
   "Killed",
   "Exception",
@@ -659,28 +651,52 @@ export class RedfishApi {
    * Waits for a Redfish task to reach a terminal state. A 204, an empty body
    * after the 202, or a 404 (the task was purged once done) means completed.
    */
-  async awaitTask(location: string, pollMs: number): Promise<void> {
+  /** True when the caller's deadline has passed. */
+  #expired(): boolean {
+    return this.#deadline !== undefined &&
+      this.#deps.now().getTime() >= this.#deadline;
+  }
+
+  /**
+   * Waits for a Redfish task to reach a terminal state. Returns true only for
+   * an explicit `TaskState` of `Completed` with an `OK` (or absent)
+   * `TaskStatus`. A 404/204, an empty body, or a task still pending at the
+   * deadline returns false, so the caller confirms through the power state
+   * instead of trusting the task endpoint.
+   */
+  async awaitTask(location: string, pollMs: number): Promise<boolean> {
     for (;;) {
       const r = await this.#send("GET", location);
-      if (r.status === 204 || r.status === 404 || !r.text.trim()) return;
+      // The task URI is gone or has no body: unconfirmed, not success.
+      if (r.status === 404 || r.status === 204) return false;
+      // A real failure is checked before the empty-body case is considered.
       if (r.status < 200 || r.status >= 300) throw statusError(r.status);
+      if (!r.text.trim()) {
+        // An empty 2xx means the task is still in progress.
+        if (this.#expired()) return false;
+        await this.#deps.sleep(pollMs);
+        continue;
+      }
       const raw = parseJson(r.text);
       const taskState = str(raw.TaskState);
-      if (taskState && TERMINAL_TASK.has(taskState)) {
-        if (FAILED_TASK.has(taskState)) {
+      if (taskState === "Completed") {
+        const taskStatus = str(raw.TaskStatus) ??
+          str(asRecord(raw.Status)?.Health);
+        if (taskStatus && taskStatus.toUpperCase() !== "OK") {
           throw new RedfishError(
             "redfish_failed",
-            `Redfish task ended ${taskState}`,
+            "Redfish task completed with a non-OK status",
           );
         }
-        return;
+        return true;
       }
-      if (
-        this.#deadline !== undefined &&
-        this.#deps.now().getTime() >= this.#deadline
-      ) {
-        throw timeoutError();
+      if (taskState && FAILED_TASK.has(taskState)) {
+        throw new RedfishError(
+          "redfish_failed",
+          "Redfish task did not complete successfully",
+        );
       }
+      if (this.#expired()) return false;
       await this.#deps.sleep(pollMs);
     }
   }

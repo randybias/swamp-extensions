@@ -66,3 +66,16 @@ Not packaged. Notes for whoever maintains this extension.
     instead of throwing.
   - TEST: stalled DELETE, cross-origin session URI and cross-origin task monitor
     added.
+- 2026-10-17 (lane/d2-redfish): review round 3 (b3e629a). Dispositions:
+  - HIGH: `awaitTask` checks the HTTP status first and returns true only for an
+    explicit `TaskState` `Completed` with an `OK`/absent `TaskStatus`; 404/204
+    or an empty body are unconfirmed and fall through to the power-state poll,
+    and a non-2xx other than 404 throws (an empty 500 is an error). `power` no
+    longer trusts a task alone for a non-restart action: every action except a
+    restart reads back the desired `PowerState` before returning.
+  - MEDIUM: a restart without a task polls until the deadline for an observed
+    transition and is accepted with a warning (not a spurious timeout) if none
+    is seen; a stuck restart still times out.
+  - TEST: 404 task with the host still on times out; an empty 500 throws; a
+    Completed task with a non-OK status throws; a confirmed task does not
+    confirm a non-restart action that stays On.

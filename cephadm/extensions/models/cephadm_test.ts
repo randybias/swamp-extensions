@@ -115,8 +115,15 @@ Deno.test(
 
 Deno.test("the upgrade chain ends at the model version", () => {
   const upgrades = model.upgrades as unknown as { toVersion: string }[];
-  assertEquals(upgrades.length, 1);
+  assertEquals(upgrades.length, 2);
   assertEquals(upgrades.at(-1)!.toVersion, model.version);
+  const factory = createCephadmModel().upgrades as unknown as {
+    toVersion: string;
+  }[];
+  assertEquals(
+    factory.map((u) => u.toVersion),
+    upgrades.map((u) => u.toVersion),
+  );
 });
 
 Deno.test("host preparation rejects hostile hosts, packages, URLs and budgets", () => {

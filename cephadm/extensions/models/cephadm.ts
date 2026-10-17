@@ -1261,6 +1261,21 @@ const ApplyMdsResultSchema = z.strictObject({
   capturedAt: z.string(),
 });
 
+/** Model upgrade chain; the last entry is the model version. */
+const MODEL_UPGRADES = [
+  {
+    toVersion: "2026.10.17.1",
+    description: "First published version; no schema changes",
+    upgradeAttributes: (old: Record<string, unknown>) => old,
+  },
+  {
+    toVersion: VERSION,
+    description:
+      "Workflow catalog safety fixes and wipe-guard fixes; no schema changes",
+    upgradeAttributes: (old: Record<string, unknown>) => old,
+  },
+];
+
 /**
  * Builds the cephadm model. Overrides replace the production dependencies and
  * are used by tests, so no test opens a socket or touches a host.
@@ -3287,19 +3302,7 @@ export function createCephadmModel(overrides: Partial<CephadmDeps> = {}) {
     version: "2026.10.17.2",
     description:
       "Install and operate a standalone Ceph cluster managed by cephadm on Debian-family hosts reached over SSH. One model type serves any number of hosts and clusters; every method takes its own target.",
-    upgrades: [
-      {
-        toVersion: "2026.10.17.1",
-        description: "First published version; no schema changes",
-        upgradeAttributes: (old: Record<string, unknown>) => old,
-      },
-      {
-        toVersion: VERSION,
-        description:
-          "Workflow catalog safety fixes and wipe-guard fixes; no schema changes",
-        upgradeAttributes: (old: Record<string, unknown>) => old,
-      },
-    ],
+    upgrades: MODEL_UPGRADES,
     globalArguments: GlobalArgsSchema,
     resources: {
       cephVerifyResult: {
@@ -3551,6 +3554,21 @@ export const model = {
   ...createCephadmModel(),
   type: "@randybias/cephadm",
   version: "2026.10.17.2",
+  // The registry's upgrade check reads this literal chain from the export; a
+  // test keeps it equal to MODEL_UPGRADES.
+  upgrades: [
+    {
+      toVersion: "2026.10.17.1",
+      description: "First published version; no schema changes",
+      upgradeAttributes: (old: Record<string, unknown>) => old,
+    },
+    {
+      toVersion: "2026.10.17.2",
+      description:
+        "Workflow catalog safety fixes and wipe-guard fixes; no schema changes",
+      upgradeAttributes: (old: Record<string, unknown>) => old,
+    },
+  ],
 } satisfies ReturnType<typeof createCephadmModel>;
 
 /** Outcome of the package-source check. */

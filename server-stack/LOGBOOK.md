@@ -246,3 +246,33 @@ Residuals on 2026.10.17.3 (beta):
   for the k0s reset is operator input not bound to the owned server (strict pins
   and `confirm_host` still apply); `cluster_secrets` must be empty, so its
   forwarding branch is dormant; `nats_chart.values` is unconstrained.
+
+## Live e2e 2026-10-17, 2026.10.17.4 (run sp-20261017)
+
+A fresh throwaway Cherry VPS (`<stack3>`), end to end with NATS auth on and the
+README chart values: 13 of 15 cells passed. Addresses, hostnames, DNS names and
+provider ids are redacted. The two failures:
+
+| Cell                     | Result | Disposition                                                                                                                                                              |
+| ------------------------ | ------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| NATS auth Secret written | FAIL   | written with `k8s-secret` from the control host, which cannot reach 6443. Fixed in c7a115e: the Secret is written on the host through `k0s-cluster` `apply_manifests`    |
+| teardown `reset-k0s`     | FAIL   | not server-stack's: the published `k0s-cluster` 2026.10.17.2 reset rebuilds the vault key from the masked host in its stored record. Fixed in `k0s-cluster` 2026.10.17.3 |
+
+Merge prep (quality pass a493a21): `nats_chart.namespace` takes the DNS-1123
+pattern of `cluster_namespaces`, and `check-inputs` requires it to be listed
+there when NATS auth is on (a test evaluates the real expression with cel-js);
+the README says `cluster_secrets` is disabled because the control host cannot
+reach 6443.
+
+Residuals on 2026.10.17.4 (beta):
+
+- **Teardown needs `k0s-cluster` 2026.10.17.3.** `reset-k0s` depends on its
+  reset fix; until 2026.10.17.3 is published, teardown fails at `reset-k0s` on
+  the published 2026.10.17.2 and the server is not deleted. The README says so
+  under the teardown workflow.
+- TLS and token rotation are not done (a new vault value rewrites the Secret,
+  but the NATS pods need a roll).
+- `wait-mesh`'s give-up path (no handshake within `mesh_handshake_wait_s`) was
+  tested offline only, against closed and black-holed ports.
+- The NATS token must be 16-256 printable characters from `[A-Za-z0-9._~+=-]`;
+  `check-nats-token` refuses anything else before it reaches a manifest.

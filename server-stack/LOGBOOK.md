@@ -284,3 +284,44 @@ Residuals on 2026.10.17.4 (beta):
   tested offline only, against closed and black-holed ports.
 - The NATS token must be 16-256 printable characters from `[A-Za-z0-9._~+=-]`;
   `check-nats-token` refuses anything else before it reaches a manifest.
+
+## 2026.10.17.5 (NATS token must start with a letter), 2026-10-17
+
+A fix to validation and workflow ordering only; no model code changed. The
+published 2026.10.17.4 accepted tokens that NATS cannot start with: through
+`<< $NATS_TOKEN >>` the environment value is parsed as a config value, and a
+token that looks like a number, exponent or date (`6e5…`, `2026-10-17…`) stops
+`nats-server`. `check-nats-token` now requires a leading letter.
+
+Live evidence: there was no new host run. The changed paths are the token check
+and step dependencies, and their tests run against real NATS (`nats:2.10-alpine`
+in docker), so these count as the live evidence for this release:
+
+| Cell                                                                                                                                                                                                    | Result | Evidence                                                    |
+| ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------ | ----------------------------------------------------------- |
+| 30 letter-first tokens (every allowed character; `true`/`false`/`null`/`yes`/`on` words, `NaN`/`Infinity`, `10k`/`1h` suffixes, `e1000` exponents, runs of `=` `+` `~` `.` `-` `_`, lengths 16 and 256) | PASS   | each starts nats-server, authenticates, wrong token refused |
+| digit- and symbol-first tokens (`0…`, `6e5…`, a date, `-`, `.`, `_`)                                                                                                                                    | PASS   | refused by the `check-nats-token` regex                     |
+| a refused token applies nothing                                                                                                                                                                         | PASS   | scratch swamp repo, same dependency chain as the workflow   |
+| no token configured (check guarded off)                                                                                                                                                                 | PASS   | namespaces and chart still run                              |
+| `check-kubeconfig` fails (token check skipped by its dependency)                                                                                                                                        | PASS   | namespaces, Secret and chart all skipped                    |
+| `probes_test.ts` README values through `helm template` and real NATS                                                                                                                                    | PASS   | 21 of 21 tests, docker tests not ignored                    |
+
+- Ordering fix at review (9aa2b60): a failed `check-nats-token` only skipped
+  `apply-nats-auth`, and that skip satisfied `apply-nats`'s
+  `or[succeeded,
+  skipped]`, so the chart was applied after the refusal
+  (reproduced in a scratch repo). `apply-namespaces`, `apply-nats` and
+  `apply-nats-after-secrets` now depend on `check-nats-token` directly. Its only
+  dependency is `check-kubeconfig`, which each of them also requires to succeed,
+  so a token check skipped because its dependency failed cannot let the chart
+  run.
+- Test deflake: docker-assigned host ports, polling for the port mapping and the
+  INFO line (2 s read bound) instead of a fixed sleep, ephemeral ports for the
+  mesh wait test.
+
+Residuals on 2026.10.17.5 (beta), all from review, none blocking:
+
+- The dependency regression test matches YAML text, not parsed conditions.
+- `answersInfo`'s 2 s bound covers the read, not the connect.
+- The `--auth` probe test passes a synthetic token on the docker argv (test
+  only, never a real secret).

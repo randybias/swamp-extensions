@@ -66,6 +66,27 @@ addresses and `.test` names only.
     spread) so tooling can catalogue it; `createModel(deps)` remains a thin
     compatibility wrapper that sets the transport for tests.
 
+## Quality pass
+
+After the review rounds, one deliberate simplification pass:
+
+- The model is split by concern: `artifact_server.ts` is the plain object
+  literal; `_lib/schema.ts` and `_lib/types.ts` hold the grammars and types;
+  `_lib/methods_lifecycle.ts`, `_lib/methods_objects.ts` and
+  `_lib/methods_admin.ts` hold the method bodies; and `_lib/target.ts`,
+  `_lib/render.ts`, `_lib/install.ts`, `_lib/fetch.ts`, `_lib/verify.ts`,
+  `_lib/snapshots.ts`, `_lib/artifacts.ts` and `_lib/runtime.ts` hold the
+  helpers. Every file is under 800 lines.
+- One grammar per format: the object-file-name grammar lives once in
+  `layout.ts`; `schema.ts`, `observe.ts` and `ops.ts` import it. `posixQuote` is
+  the only remote-shell quoter. `normalizeMode` has one implementation.
+- `install` is split into snapshot, install, layout, site, credentials, rollback
+  and verify-and-reload steps, each a small function.
+- `parseLayout`, `parseVerifyOutput`, `parseSha256Sums` and `parseOpenSslDate`
+  are the single parsers for their formats.
+- Tests share one `modelFor(host)` setup helper, and the shell builders are run
+  through a real `sh`.
+
 ## Open spec questions resolved by the simplest safe option
 
 - **Listen port vs URL** — see decision 3.

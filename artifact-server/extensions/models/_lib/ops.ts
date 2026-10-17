@@ -13,10 +13,14 @@
  */
 
 import { posixQuote, type SshDeps, SshError, type SshTarget } from "./ssh.ts";
-import { BLOB_DIR, LOCK_FILE, REFS_DIR, SHA256SUMS_FILE } from "./layout.ts";
+import {
+  BLOB_DIR,
+  BLOB_REL_RE,
+  LOCK_FILE,
+  REFS_DIR,
+  SHA256SUMS_FILE,
+} from "./layout.ts";
 import { execSudo, probeFile, runScript } from "./remote.ts";
-
-const BLOB_REL_RE = /^([0-9a-f]{64})\/([A-Za-z0-9][A-Za-z0-9._-]{0,127})$/;
 
 /** The `SHA256SUMS` rebuild script: records each blob's path hash. */
 export function regenerateSumsScript(root: string): string {
@@ -94,7 +98,7 @@ export function removeObjectsScript(root: string, paths: string[]): string {
 }
 
 /** Returns whether a relative path is an accepted blob or bundle path. */
-export function isSafeObjectPath(path: string): boolean {
+function isSafeObjectPath(path: string): boolean {
   if (/^bundles\/[0-9a-f]{64}$/.test(path)) return true;
   return BLOB_REL_RE.test(path.replace(/^sha256\//, ""));
 }

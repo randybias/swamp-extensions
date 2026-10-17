@@ -26,6 +26,11 @@ function base(overrides: Record<string, unknown> = {}) {
   return { ssh: SSH, root: ROOT, ...overrides };
 }
 
+/** Binds the model to a fake transport and returns a fresh test context. */
+function modelFor(host: ReturnType<typeof makeFakeRemote>) {
+  return { host, m: createModel(host.deps), ...createModelTestContext({}) };
+}
+
 Deno.test("the model type, version and empty global arguments are as specified", () => {
   const m = createModel(makeFakeRemote().deps);
   assertEquals(m.type, "@randybias/artifact-server");
@@ -149,7 +154,7 @@ Deno.test("the ssh block requires a pinned strict host key and rejects unknown f
 });
 
 Deno.test("basic auth over plain HTTP must be acknowledged at run time", async () => {
-  const m = createModel(makeFakeRemote().deps);
+  const { m, context } = modelFor(makeFakeRemote());
   assertEquals(
     m.methods.render_config.arguments.safeParse(
       base({ ...SITE_ARGS, tls: { mode: "none" } }),
@@ -162,7 +167,6 @@ Deno.test("basic auth over plain HTTP must be acknowledged at run time", async (
     basic_auth: { realm: "r", users: [{ name: "u", hash: "$6$abcdefgh$xyz" }] },
   });
   assertEquals(m.methods.render_config.arguments.safeParse(auth).success, true);
-  const { context } = createModelTestContext({});
   await assertRejects(
     () => m.methods.render_config.execute(auth, context),
     Error,
@@ -224,8 +228,7 @@ Deno.test("fetch.url must be https with no userinfo, quote or semicolon", () => 
 });
 
 Deno.test("render_config is deterministic and contains no secret", async () => {
-  const m = createModel(makeFakeRemote().deps);
-  const { context, getWrittenResources } = createModelTestContext({});
+  const { m, context, getWrittenResources } = modelFor(makeFakeRemote());
   const result = await m.methods.render_config.execute(
     base({ ...SITE_ARGS, tls: { mode: "none", plaintext_ack: true } }),
     context,
@@ -252,8 +255,7 @@ Deno.test("render_config is deterministic and contains no secret", async () => {
 
 Deno.test("upload refuses when the computed hash differs from the pin, changing nothing", async () => {
   const host = makeFakeRemote();
-  const m = createModel(host.deps);
-  const { context } = createModelTestContext({});
+  const { m, context } = modelFor(host);
   await assertRejects(
     () =>
       m.methods.upload.execute(
@@ -268,8 +270,7 @@ Deno.test("upload refuses when the computed hash differs from the pin, changing 
 
 Deno.test("upload stores the blob and regenerates SHA256SUMS", async () => {
   const host = makeFakeRemote();
-  const m = createModel(host.deps);
-  const { context, getWrittenResources } = createModelTestContext({});
+  const { m, context, getWrittenResources } = modelFor(host);
   const hash = await sha256Hex("hello");
   const result = await m.methods.upload.execute(
     base({ filename: "a.txt", content: "hello", ref: "stable" }),
@@ -301,8 +302,7 @@ Deno.test("upload stores the blob and regenerates SHA256SUMS", async () => {
 Deno.test("fetch refuses a download whose hash differs from the pin and leaves no object", async () => {
   const host = makeFakeRemote();
   host.curl = () => "tampered";
-  const m = createModel(host.deps);
-  const { context } = createModelTestContext({});
+  const { m, context } = modelFor(host);
   const good = await sha256Hex("expected");
   await assertRejects(
     () =>
@@ -327,8 +327,7 @@ Deno.test("fetch refuses a download whose hash differs from the pin and leaves n
 Deno.test("fetch stores a pinned download and indexes it", async () => {
   const host = makeFakeRemote();
   host.curl = () => "payload";
-  const m = createModel(host.deps);
-  const { context } = createModelTestContext({});
+  const { m, context } = modelFor(host);
   const hash = await sha256Hex("payload");
   const result = await m.methods.fetch.execute(
     base({
@@ -347,8 +346,7 @@ Deno.test("fetch stores a pinned download and indexes it", async () => {
 
 Deno.test("publish_bundle writes files under the tree hash", async () => {
   const host = makeFakeRemote();
-  const m = createModel(host.deps);
-  const { context } = createModelTestContext({});
+  const { m, context } = modelFor(host);
   const result = await m.methods.publish_bundle.execute(
     base({
       files: [{ name: "a", content: "one" }, { name: "b", content: "two" }],
@@ -376,8 +374,7 @@ Deno.test("publish_bundle writes files under the tree hash", async () => {
 
 Deno.test("ref writes and unref removes a ref, idempotently", async () => {
   const host = makeFakeRemote();
-  const m = createModel(host.deps);
-  const { context } = createModelTestContext({});
+  const { m, context } = modelFor(host);
   await m.methods.ref.execute(
     base({ ref: "stable", kind: "blob", hash: HOST }),
     context,
@@ -416,8 +413,7 @@ async function seed(host: ReturnType<typeof makeFakeRemote>) {
 Deno.test("list reads refs, blobs and bundles and persists a listing", async () => {
   const host = makeFakeRemote();
   await seed(host);
-  const m = createModel(host.deps);
-  const { context, getWrittenResources } = createModelTestContext({});
+  const { m, context, getWrittenResources } = modelFor(host);
   const result = await m.methods.list.execute(base(), context);
   assertEquals(result.result, { refs: 1, blobs: 1, bundles: 0 });
   assertEquals(getWrittenResources()[0].specName, "listing");
@@ -426,8 +422,7 @@ Deno.test("list reads refs, blobs and bundles and persists a listing", async () 
 Deno.test("verify reports ok for an intact blob and extra/missing correctly", async () => {
   const host = makeFakeRemote();
   await seed(host);
-  const m = createModel(host.deps);
-  const { context } = createModelTestContext({});
+  const { m, context } = modelFor(host);
   const result = await m.methods.verify.execute(base(), context);
   assertEquals(result.result, { ok: 1, corrupt: 0, missing: 0, extra: 0 });
 });
@@ -443,8 +438,7 @@ Deno.test("verify reports a corrupted blob", async () => {
     "user",
     "user",
   );
-  const m = createModel(host.deps);
-  const { context } = createModelTestContext({});
+  const { m, context } = modelFor(host);
   const result = await m.methods.verify.execute(base(), context);
   assertEquals((result.result as { corrupt: number }).corrupt, 1);
 });
@@ -453,8 +447,7 @@ Deno.test("get observes nginx state and the layout summary", async () => {
   const host = makeFakeRemote();
   await seed(host);
   host.setFile(NGINX_SITE_PATH, "server { listen *:8080; }\n", "644");
-  const m = createModel(host.deps);
-  const { context, getWrittenResources } = createModelTestContext({});
+  const { m, context, getWrittenResources } = modelFor(host);
   const result = await m.methods.get.execute(base(), context);
   const res = result.result as {
     nginx_active: string;
@@ -478,8 +471,7 @@ Deno.test("plan_prune leaves referenced objects and hashes the rest", async () =
     "user",
     "user",
   );
-  const m = createModel(host.deps);
-  const { context, getWrittenResources } = createModelTestContext({});
+  const { m, context, getWrittenResources } = modelFor(host);
   const result = await m.methods.plan_prune.execute(base(), context);
   const plan = result.result as {
     objects: { hash: string }[];
@@ -511,8 +503,7 @@ Deno.test("plan_prune leaves referenced objects and hashes the rest", async () =
 
 Deno.test("install writes the site, enables it and reports the change", async () => {
   const host = makeFakeRemote();
-  const m = createModel(host.deps);
-  const { context, getWrittenResources } = createModelTestContext({});
+  const { m, context, getWrittenResources } = modelFor(host);
   const result = await m.methods.install.execute(
     base({ ...SITE_ARGS, tls: { mode: "none", plaintext_ack: true } }),
     context,
@@ -536,8 +527,7 @@ Deno.test("install restores the previous config and never reloads when nginx -t 
   const host = makeFakeRemote();
   host.setFile(NGINX_SITE_PATH, "previous\n", "644");
   host.failNginxTest = true;
-  const m = createModel(host.deps);
-  const { context } = createModelTestContext({});
+  const { m, context } = modelFor(host);
   await assertRejects(
     () =>
       m.methods.install.execute(
@@ -556,8 +546,7 @@ Deno.test("install restores the previous config and never reloads when nginx -t 
 
 Deno.test("uninstall is a clean no-op when the site is absent", async () => {
   const host = makeFakeRemote();
-  const m = createModel(host.deps);
-  const { context } = createModelTestContext({});
+  const { m, context } = modelFor(host);
   const result = await m.methods.uninstall.execute(base(), context);
   assertEquals(result.result, {
     removed: false,
@@ -571,8 +560,7 @@ Deno.test("uninstall removes the site and, when asked, the data root", async () 
   await seed(host);
   host.setFile(NGINX_SITE_PATH, "server {}\n", "644");
   host.symlinks.add(NGINX_ENABLED_PATH);
-  const m = createModel(host.deps);
-  const { context } = createModelTestContext({});
+  const { m, context } = modelFor(host);
   const result = await m.methods.uninstall.execute(
     base({ remove_data: true }),
     context,
@@ -593,8 +581,7 @@ Deno.test("uninstall removes the site and, when asked, the data root", async () 
 Deno.test("install refuses a populated root that holds no sentinel", async () => {
   const host = makeFakeRemote();
   host.setFile(`${ROOT}/not-ours.conf`, "x\n", "644", "user", "user");
-  const m = createModel(host.deps);
-  const { context } = createModelTestContext({});
+  const { m, context } = modelFor(host);
   await assertRejects(
     () =>
       m.methods.install.execute(
@@ -612,8 +599,7 @@ Deno.test("install refuses a populated root that holds no sentinel", async () =>
 Deno.test("install rollback removes the enabled link and the site on a first install", async () => {
   const host = makeFakeRemote();
   host.failNginxTest = true;
-  const m = createModel(host.deps);
-  const { context } = createModelTestContext({});
+  const { m, context } = modelFor(host);
   await assertRejects(
     () =>
       m.methods.install.execute(
@@ -647,8 +633,7 @@ Deno.test("fetch is idempotent when the pinned object is already present", async
     "user",
     "user",
   );
-  const m = createModel(host.deps);
-  const { context } = createModelTestContext({});
+  const { m, context } = modelFor(host);
   const result = await m.methods.fetch.execute(
     base({
       url: "https://up.example.test/p.bin",
@@ -667,8 +652,7 @@ Deno.test("fetch is idempotent when the pinned object is already present", async
 
 Deno.test("publish_bundle refuses duplicate file names", async () => {
   const host = makeFakeRemote();
-  const m = createModel(host.deps);
-  const { context } = createModelTestContext({});
+  const { m, context } = modelFor(host);
   await assertRejects(
     () =>
       m.methods.publish_bundle.execute(
@@ -694,8 +678,7 @@ Deno.test("prune refuses a symlinked hash directory and deletes nothing", async 
   );
   // The hash directory is a symlink pointing outside the root.
   host.symlinks.add(`${ROOT}/sha256/${orphan}`);
-  const m = createModel(host.deps);
-  const { context } = createModelTestContext({});
+  const { m, context } = modelFor(host);
   const plan = (await m.methods.plan_prune.execute(base(), context)).result as {
     planSha256: string;
   };
@@ -724,8 +707,7 @@ Deno.test("list drops an object whose name contains a newline", async () => {
     "user",
     "user",
   );
-  const m = createModel(host.deps);
-  const { context } = createModelTestContext({});
+  const { m, context } = modelFor(host);
   const result = await m.methods.list.execute(base(), context);
   assertEquals((result.result as { blobs: number }).blobs, 1);
 });

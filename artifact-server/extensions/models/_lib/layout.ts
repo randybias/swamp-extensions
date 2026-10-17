@@ -23,6 +23,17 @@ export const LOCK_FILE = ".lock";
 /** Layout version file. */
 export const LAYOUT_VERSION_FILE = ".layout-version";
 
+/** The one object-file-name grammar; the blob path builds on it. */
+const FILENAME_SRC = "[A-Za-z0-9][A-Za-z0-9._-]{0,127}";
+/** A served object file name. */
+export const FILENAME_RE = new RegExp(`^${FILENAME_SRC}$`);
+/** A blob path relative to `<root>`: `<64-hex>/<name>` (captures both). */
+export const BLOB_REL_RE = new RegExp(`^([0-9a-f]{64})/(${FILENAME_SRC})$`);
+/** A bundle directory name: a 64-hex tree hash. */
+export const BUNDLE_NAME_RE = /^[0-9a-f]{64}$/;
+/** A ref name. */
+export const REF_NAME_RE = /^[a-z0-9][a-z0-9._-]{0,63}$/;
+
 /** One blob: its content hash and file name. */
 export interface Blob {
   /** Lowercase hex SHA-256 of the content. */

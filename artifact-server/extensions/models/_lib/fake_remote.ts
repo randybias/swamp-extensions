@@ -15,6 +15,8 @@ import {
   sha256Hex,
   type SshDeps,
 } from "./ssh.ts";
+import { renderSha256Sums } from "./layout.ts";
+import { normalizeMode } from "./remote.ts";
 
 /** One file in the fake remote filesystem. */
 export interface FakeFile {
@@ -67,7 +69,7 @@ export interface FakeRemote {
 }
 
 /** Recovers the argv from a `quoteArgv`-produced command string. */
-export function unquoteRemote(command: string): string[] {
+function unquoteRemote(command: string): string[] {
   const out: string[] = [];
   let i = 0;
   while (i < command.length) {
@@ -222,7 +224,7 @@ async function handle(
       if (!file) return { code: 1, stdout: "", stderr: "no stage" };
       host.files.set(dest, {
         content: file.content,
-        mode: normalizeMode(argv[argv.indexOf("-m") + 1]),
+        mode: normalizeMode(argv[argv.indexOf("-m") + 1]) ?? "600",
         owner: argv[argv.indexOf("-o") + 1],
         group: argv[argv.indexOf("-g") + 1],
       });
@@ -282,7 +284,7 @@ async function handle(
     const f = assign(script, "f")!;
     const mode = normalizeMode(
       (script.match(/chmod '([^']+)' "\$t"/) ?? [])[1] ?? "600",
-    );
+    ) ?? "600";
     host.files.set(f, { content: stdin, mode, owner: "user", group: "user" });
     return ok(`${await sha256Hex(stdin)} ${mode}\n`);
   }
@@ -500,25 +502,20 @@ function renderNginx(host: FakeRemote, script: string): string {
 
 /** Rebuilds `SHA256SUMS` in the fake host from the blobs present. */
 function regenerate(host: FakeRemote, r: string): void {
-  const rows: { hash: string; rel: string }[] = [];
+  const blobs = [];
   for (const p of host.files.keys()) {
     if (p.startsWith(`${r}/sha256/`)) {
-      const rel = p.slice(r.length + 1);
-      rows.push({ hash: rel.split("/")[1] ?? "", rel });
+      const parts = p.slice(r.length + 1).split("/");
+      blobs.push({
+        sha256: parts[1] ?? "",
+        filename: parts.slice(2).join("/"),
+      });
     }
   }
-  rows.sort((a, b) => (a.rel < b.rel ? -1 : a.rel > b.rel ? 1 : 0));
   host.files.set(`${r}/SHA256SUMS`, {
-    content: rows.map((x) => `${x.hash}  ${x.rel}`).join("\n") +
-      (rows.length ? "\n" : ""),
+    content: renderSha256Sums(blobs),
     mode: "644",
     owner: "user",
     group: "user",
   });
-}
-
-/** Local octal-mode normalizer mirroring the transport's. */
-function normalizeMode(mode: string): string {
-  const trimmed = mode.replace(/^0+/, "");
-  return trimmed === "" ? "0" : trimmed;
 }

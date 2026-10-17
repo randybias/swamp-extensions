@@ -1,0 +1,143 @@
+/**
+ * Snapshot and restore of the host files an install may touch, so a failed
+ * `nginx -t` can put the host back exactly as it was.
+ *
+ * @module
+ */
+
+import { execSudo, probeFile, putRootFile } from "./remote.ts";
+import { readFileText, readLink } from "./observe.ts";
+import { LAYOUT_VERSION_FILE } from "./layout.ts";
+import type { SshDeps, SshTarget } from "./ssh.ts";
+
+/**
+ * Classifies a served root: `missing`, `ours` when it is a real directory that
+ * holds a regular `.layout-version` sentinel, or `foreign` otherwise.
+ */
+export async function rootState(
+  activeDeps: SshDeps,
+  target: SshTarget,
+  root: string,
+): Promise<"missing" | "ours" | "foreign"> {
+  const probe = await probeFile(activeDeps, target, root, true);
+  if (probe.state === "missing") return "missing";
+  if (probe.state !== "dir") return "foreign";
+  const sentinel = await probeFile(
+    activeDeps,
+    target,
+    `${root}/${LAYOUT_VERSION_FILE}`,
+    true,
+  );
+  return sentinel.state === "file" ? "ours" : "foreign";
+}
+
+/** One root-owned file's state before a run. */
+export interface FileSnap {
+  path: string;
+  existed: boolean;
+  content: string;
+  mode: string;
+  owner: string;
+  group: string;
+}
+
+/** Captures a file's bytes, mode and owner so a rollback can restore it. */
+export async function snapFile(
+  activeDeps: SshDeps,
+  target: SshTarget,
+  path: string,
+): Promise<FileSnap> {
+  const probe = await probeFile(activeDeps, target, path, true);
+  if (probe.state !== "file") {
+    return {
+      path,
+      existed: false,
+      content: "",
+      mode: "0644",
+      owner: "root",
+      group: "root",
+    };
+  }
+  return {
+    path,
+    existed: true,
+    content: (await readFileText(activeDeps, target, path, true)) ?? "",
+    mode: probe.mode ?? "0644",
+    owner: probe.owner ?? "root",
+    group: probe.group ?? "root",
+  };
+}
+
+/** Restores a file captured by {@link snapFile}, or removes it if it was absent. */
+export async function restoreFile(
+  activeDeps: SshDeps,
+  target: SshTarget,
+  snap: FileSnap,
+): Promise<void> {
+  if (!snap.existed) {
+    await execSudo(activeDeps, target, ["rm", "-f", snap.path]);
+    return;
+  }
+  await putRootFile(activeDeps, target, {
+    path: snap.path,
+    content: snap.content,
+    mode: snap.mode,
+    owner: snap.owner,
+    group: snap.group,
+  });
+}
+
+/** A link or file at a fixed path, before a run. */
+export interface LinkSnap {
+  path: string;
+  state: "missing" | "symlink" | "file" | "dir";
+  target: string | null;
+  content: string | null;
+}
+
+/** Captures a link or file so a rollback can restore it. */
+export async function snapLink(
+  activeDeps: SshDeps,
+  target: SshTarget,
+  path: string,
+): Promise<LinkSnap> {
+  const probe = await probeFile(activeDeps, target, path, true);
+  if (probe.state === "symlink") {
+    return {
+      path,
+      state: "symlink",
+      target: await readLink(activeDeps, target, path, true),
+      content: null,
+    };
+  }
+  if (probe.state === "file") {
+    return {
+      path,
+      state: "file",
+      target: null,
+      content: await readFileText(activeDeps, target, path, true),
+    };
+  }
+  return { path, state: probe.state, target: null, content: null };
+}
+
+/** Restores a link or file captured by {@link snapLink}, or removes it. */
+export async function restoreLink(
+  activeDeps: SshDeps,
+  target: SshTarget,
+  snap: LinkSnap,
+): Promise<void> {
+  if (snap.state === "symlink" && snap.target !== null) {
+    await execSudo(activeDeps, target, ["ln", "-sfn", snap.target, snap.path]);
+  } else if (snap.state === "file" && snap.content !== null) {
+    await putRootFile(activeDeps, target, {
+      path: snap.path,
+      content: snap.content,
+      mode: "0644",
+      owner: "root",
+      group: "root",
+    });
+  } else {
+    await execSudo(activeDeps, target, ["rm", "-f", snap.path]);
+  }
+}

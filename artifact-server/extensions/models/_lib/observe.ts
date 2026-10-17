@@ -11,20 +11,16 @@
 import { posixQuote, type SshDeps, SshError, type SshTarget } from "./ssh.ts";
 import {
   BLOB_DIR,
+  BLOB_REL_RE,
+  BUNDLE_DIR,
+  BUNDLE_NAME_RE,
   bundleRelPath,
   LAYOUT_VERSION_FILE,
-  LOCK_FILE,
+  REF_NAME_RE,
   REFS_DIR,
   SHA256SUMS_FILE,
 } from "./layout.ts";
 import { probeFile, runScript } from "./remote.ts";
-
-/** Accepted blob relative path: `sha256/<64-hex>/<safe filename>`. */
-const BLOB_REL_RE = /^([0-9a-f]{64})\/([A-Za-z0-9][A-Za-z0-9._-]{0,127})$/;
-/** Accepted bundle directory name: a 64-hex tree hash. */
-const BUNDLE_NAME_RE = /^[0-9a-f]{64}$/;
-/** Accepted ref name. */
-const REF_NAME_RE = /^[a-z0-9][a-z0-9._-]{0,63}$/;
 
 /** One ref as stored on disk. */
 export interface RefEntry {
@@ -66,14 +62,10 @@ export interface Layout {
   sha256sums: string | null;
 }
 
-/** Reads the layout in one round trip. */
-export async function readLayout(
-  deps: SshDeps,
-  target: SshTarget,
-  root: string,
-): Promise<Layout> {
+/** The layout read script: one marked section per concern. */
+function layoutScript(root: string): string {
   const r = posixQuote(root);
-  const script = [
+  return [
     `set -u`,
     `r=${r}`,
     `echo "##VERSION"`,
@@ -92,16 +84,33 @@ export async function readLayout(
     `  find "$r/${BLOB_DIR}" -type f -printf '%P\\t%s\\t%T@\\n' 2>/dev/null | sort`,
     `fi`,
     `echo "##BUNDLES"`,
-    `if [ -d "$r/bundles" ]; then`,
-    `  find "$r/bundles" -mindepth 1 -maxdepth 1 -type d -printf '%f\\t%s\\t%T@\\n' 2>/dev/null | sort`,
+    `if [ -d "$r/${BUNDLE_DIR}" ]; then`,
+    `  find "$r/${BUNDLE_DIR}" -mindepth 1 -maxdepth 1 -type d -printf '%f\\t%s\\t%T@\\n' 2>/dev/null | sort`,
     `fi`,
     `echo "##END"`,
   ].join("\n");
-  const result = await runScript(deps, target, script);
+}
+
+/** Reads the layout in one round trip. */
+export async function readLayout(
+  deps: SshDeps,
+  target: SshTarget,
+  root: string,
+): Promise<Layout> {
+  const result = await runScript(deps, target, layoutScript(root));
   if (result.exit_code !== 0) {
     throw new SshError(`could not read the layout at ${root}`);
   }
-  const sections = splitSections(result.stdout);
+  return parseLayout(result.stdout);
+}
+
+/**
+ * Parses the layout script output. Every object path must match the layout
+ * grammar, so a crafted file name (a newline, a tab, an unsafe character) is
+ * dropped rather than trusted.
+ */
+export function parseLayout(stdout: string): Layout {
+  const sections = splitSections(stdout);
   const refs: RefEntry[] = [];
   for (const line of sections.refs) {
     const [name, value] = line.split("\t");
@@ -305,14 +314,4 @@ export async function readLink(
   );
   const text = result.stdout.trim();
   return result.exit_code === 0 && text !== "" ? text : null;
-}
-
-/** True when the lock file exists. */
-export async function lockExists(
-  deps: SshDeps,
-  target: SshTarget,
-  root: string,
-): Promise<boolean> {
-  const probe = await probeFile(deps, target, `${root}/${LOCK_FILE}`);
-  return probe.state === "file";
 }

@@ -197,7 +197,7 @@ export const verifyArgsSchema = VERIFY_ARGS;
 /** Strict schema for `remove` arguments. */
 export const removeArgsSchema = REMOVE_ARGS;
 
-const SecretFileStateSchema = z.strictObject({
+const FileStateSchema = z.strictObject({
   host: z.string(),
   port: z.number().int(),
   user: z.string(),
@@ -214,7 +214,7 @@ const SecretFileStateSchema = z.strictObject({
 });
 
 /** Stored state of one secret file. */
-export type SecretFileState = z.infer<typeof SecretFileStateSchema>;
+export type SecretFileState = z.infer<typeof FileStateSchema>;
 
 /** Arguments shared by every method. */
 interface TargetArgs {
@@ -547,7 +547,7 @@ async function writeState(
   for (const [key, value] of Object.entries(record)) {
     if (value === undefined) delete record[key];
   }
-  const full = SecretFileStateSchema.parse(record);
+  const full = FileStateSchema.parse(record);
   return await context.writeResource(
     "secretFile",
     await secretInstanceName(args.host, args.port, args.user, state.path),
@@ -571,7 +571,7 @@ export function createModel(deps: SshDeps = denoDeps): SecretFileModel {
       secretFile: {
         description:
           "Secret-file metadata: path, mode, owner, group, byte count and change flag",
-        schema: SecretFileStateSchema,
+        schema: FileStateSchema,
         lifetime: "infinite",
         garbageCollection: 10,
       },
@@ -807,4 +807,8 @@ export function createModel(deps: SshDeps = denoDeps): SecretFileModel {
 }
 
 /** Production model: the factory with no overrides. */
-export const model: SecretFileModel = createModel();
+export const model = {
+  ...createModel(),
+  type: "@randybias/secret-file",
+  version: "2026.10.17.1",
+} satisfies SecretFileModel;

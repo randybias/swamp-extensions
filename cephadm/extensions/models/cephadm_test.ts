@@ -375,6 +375,47 @@ Deno.test("the distribute-key schema rejects option backdoors and needs a port p
   );
 });
 
+Deno.test("the data-plane resources are declared, strict and csiKey keeps 2", () => {
+  const res = model.resources as unknown as Record<
+    string,
+    {
+      schema: {
+        safeParse: (v: unknown) => { success: boolean };
+        shape?: Record<string, { meta?: () => Record<string, unknown> }>;
+      };
+      garbageCollection: number;
+    }
+  >;
+  for (
+    const name of [
+      "poolResult",
+      "fsResult",
+      "csiUserResult",
+      "connBundleResult",
+      "csiKey",
+      "fsDeleteResult",
+      "osdRemoveResult",
+    ]
+  ) assertEquals(typeof res[name], "object", name);
+  assertEquals(res.csiKey.garbageCollection, 2);
+  const keyMeta = res.csiKey.schema.shape?.key?.meta?.();
+  if (keyMeta !== undefined) assertEquals(keyMeta.sensitive, true);
+  // A strict schema rejects an undeclared field.
+  assertEquals(
+    res.poolResult.schema.safeParse({
+      name: "x",
+      scheme: "replicated",
+      application: "rbd",
+      failureDomain: "host",
+      existed: false,
+      changed: [],
+      capturedAt: "t",
+      extra: 1,
+    }).success,
+    false,
+  );
+});
+
 Deno.test("the OSD schema enforces exactly one mode and rejects injection", () => {
   const schema = model.methods.cephApplyOsd.arguments;
   const base = {

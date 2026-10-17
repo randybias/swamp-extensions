@@ -38,6 +38,7 @@ import {
   toTarget,
 } from "./_lib/ssh.ts";
 import {
+  CAPS_SCHEMA,
   CEPH_ID_SCHEMA,
   CEPHADM_VERSION_SCHEMA,
   CIDR_SCHEMA,
@@ -67,6 +68,15 @@ import {
   hostAdd,
 } from "./_lib/lifecycle.ts";
 import { applyOsd, validateOsdMode } from "./_lib/osd.ts";
+import {
+  createCsiUser,
+  createFs,
+  createPool,
+  deleteFs,
+  fetchCsiKey,
+  getConnBundle,
+  removeOsds,
+} from "./_lib/dataplane.ts";
 import { TransportError } from "./_lib/errors.ts";
 import { wipeDiskToRaw, type WipeRecord } from "./_lib/wipe.ts";
 
@@ -323,6 +333,153 @@ const ApplyOsdResultSchema = z.strictObject({
   excludeDevices: z.array(z.strictObject({ serial: z.string() })),
   applied: z.boolean(),
   staleServicesRemoved: z.array(z.string()),
+  capturedAt: z.string(),
+});
+
+const ReadHostArgs = z.strictObject({
+  host: HOST_FIELD.describe("Admin host."),
+  ...SSH_FIELDS,
+});
+
+const CreatePoolArgs = z.strictObject({
+  host: HOST_FIELD.describe("Admin host."),
+  ...SSH_FIELDS,
+  name: CEPH_ID_SCHEMA.describe("Pool name."),
+  scheme: z.enum(["replicated", "erasure"]).describe("Redundancy scheme."),
+  size: z.number().int().min(1).nullish().describe(
+    "Replica count (replicated only).",
+  ),
+  erasureProfile: z.strictObject({
+    k: z.number().int().min(1),
+    m: z.number().int().min(1),
+  }).nullish().describe("EC data and coding chunks (erasure only)."),
+  application: CEPH_ID_SCHEMA.describe("Application tag."),
+  failureDomain: CEPH_ID_SCHEMA.describe("CRUSH failure domain."),
+});
+
+const CreateFsArgs = z.strictObject({
+  host: HOST_FIELD.describe("Admin host."),
+  ...SSH_FIELDS,
+  name: CEPH_ID_SCHEMA.describe("CephFS volume name."),
+  placement: PLACEMENT_SCHEMA.describe("Hosts that must run MDS daemons."),
+  timeoutMs: z.number().int().positive().max(3600000).nullish().describe(
+    "Budget for the create and apply commands; defaults to 600000.",
+  ),
+});
+
+const CsiCapsSchema = z.strictObject({
+  mon: CAPS_SCHEMA.describe("mon caps."),
+  mgr: CAPS_SCHEMA.describe("mgr caps."),
+  osd: CAPS_SCHEMA.describe("osd caps."),
+  mds: CAPS_SCHEMA.nullish().describe("mds caps (optional)."),
+});
+
+const CreateCsiUserArgs = z.strictObject({
+  host: HOST_FIELD.describe("Admin host."),
+  ...SSH_FIELDS,
+  name: CEPH_ID_SCHEMA.describe(
+    "Bare entity name, without the client. prefix.",
+  ),
+  caps: CsiCapsSchema.describe("Requested caps by subsystem."),
+});
+
+const FetchCsiKeyArgs = z.strictObject({
+  host: HOST_FIELD.describe("Admin host."),
+  ...SSH_FIELDS,
+  userName: CEPH_ID_SCHEMA.describe(
+    "Bare entity name, without the client. prefix.",
+  ),
+});
+
+const DeleteFsArgs = z.strictObject({
+  host: HOST_FIELD.describe("Admin host."),
+  ...SSH_FIELDS,
+  fsName: CEPH_ID_SCHEMA.describe("Volume to delete."),
+  confirmFsName: z.string().min(1).max(128).describe(
+    "The target named a second time.",
+  ),
+  maxPolls: z.number().int().positive().nullish().describe(
+    "MDS-removal poll budget.",
+  ),
+  pollIntervalMs: z.number().int().positive().nullish().describe(
+    "Time between polls, in milliseconds.",
+  ),
+});
+
+const RemoveOsdsArgs = z.strictObject({
+  host: HOST_FIELD.describe("Admin host."),
+  ...SSH_FIELDS,
+  osdIds: z.array(z.number().int().min(0)).min(1).describe(
+    "OSD ids to remove.",
+  ),
+  zap: z.boolean().nullish().describe(
+    "Add --zap to the orchestrator removal; defaults to true.",
+  ),
+  maxPolls: z.number().int().positive().nullish().describe(
+    "Effect poll budget.",
+  ),
+  pollIntervalMs: z.number().int().positive().nullish().describe(
+    "Time between polls, in milliseconds.",
+  ),
+});
+
+const PoolResultSchema = z.strictObject({
+  name: z.string(),
+  scheme: z.string(),
+  application: z.string(),
+  failureDomain: z.string(),
+  size: z.number().optional(),
+  crushRule: z.string().optional(),
+  erasureCodeProfile: z.string().optional(),
+  existed: z.boolean(),
+  changed: z.array(z.string()),
+  capturedAt: z.string(),
+});
+
+const FsResultSchema = z.strictObject({
+  name: z.string(),
+  mdsHosts: z.array(z.string()),
+  creationPath: z.string(),
+  existed: z.boolean(),
+  capturedAt: z.string(),
+});
+
+const CsiUserResultSchema = z.strictObject({
+  name: z.string(),
+  caps: z.record(z.string(), z.string()),
+  capturedAt: z.string(),
+});
+
+const ConnBundleResultSchema = z.strictObject({
+  fsid: z.string(),
+  monEndpoints: z.array(z.string()),
+  pools: z.array(z.string()),
+  filesystems: z.array(z.string()),
+  csiUserNames: z.array(z.string()),
+  capturedAt: z.string(),
+});
+
+const CsiKeySchema = z.strictObject({
+  userName: z.string(),
+  key: z.string().meta({ sensitive: true }),
+});
+
+const FsDeleteResultSchema = z.strictObject({
+  fsName: z.string(),
+  deleted: z.boolean(),
+  alreadyAbsent: z.boolean(),
+  mdsServiceRemoved: z.boolean(),
+  poolsDeleted: z.array(z.string()),
+  poolsRemaining: z.array(z.string()),
+  gateRestored: z.boolean(),
+  capturedAt: z.string(),
+});
+
+const OsdRemoveResultSchema = z.strictObject({
+  requested: z.array(z.number()),
+  removed: z.array(z.number()),
+  skippedAbsent: z.array(z.number()),
+  zap: z.boolean(),
   capturedAt: z.string(),
 });
 
@@ -961,6 +1118,273 @@ export function createCephadmModel(overrides: Partial<CephadmDeps> = {}) {
         }
       },
     },
+
+    cephCreatePool: {
+      description:
+        "Ensure a replicated or erasure-coded pool exists with the requested redundancy, CRUSH failure domain and application. Idempotent; an existing pool that matches is left in place, and a mismatched pool is refused rather than converged.",
+      arguments: CreatePoolArgs,
+      execute: async (
+        args: z.infer<typeof CreatePoolArgs>,
+        context: MethodContext,
+      ) => {
+        const session = await openSession(
+          deps,
+          toTarget({
+            host: args.host,
+            sshUser: args.sshUser,
+            port: args.port,
+            keyPath: args.keyPath,
+            privateKey: args.privateKey,
+            strictHostKeyChecking: args.strictHostKeyChecking,
+          }),
+          { multiplex: args.multiplex ?? false },
+        );
+        try {
+          const result = await createPool(deps, session, {
+            name: args.name,
+            scheme: args.scheme,
+            size: args.size,
+            erasureProfile: args.erasureProfile,
+            application: args.application,
+            failureDomain: args.failureDomain,
+          }, context.logger);
+          const handle = await context.writeResource(
+            "poolResult",
+            `cephCreatePool-${args.host}-${args.name}`,
+            { ...result, capturedAt: new Date(deps.now()).toISOString() },
+          );
+          return { dataHandles: [handle] };
+        } finally {
+          await session.close();
+        }
+      },
+    },
+
+    cephCreateFs: {
+      description:
+        "Ensure a CephFS volume exists and its MDS daemons are placed on an explicit host list, creating the volume or adopting pre-created pools. Idempotent; the MDS placement is re-applied on every run.",
+      arguments: CreateFsArgs,
+      execute: async (
+        args: z.infer<typeof CreateFsArgs>,
+        context: MethodContext,
+      ) => {
+        const session = await openSession(
+          deps,
+          toTarget({
+            host: args.host,
+            sshUser: args.sshUser,
+            port: args.port,
+            keyPath: args.keyPath,
+            privateKey: args.privateKey,
+            strictHostKeyChecking: args.strictHostKeyChecking,
+          }),
+          { multiplex: args.multiplex ?? false },
+        );
+        try {
+          const result = await createFs(deps, session, {
+            name: args.name,
+            placement: args.placement,
+            timeoutMs: args.timeoutMs,
+          }, context.logger);
+          const handle = await context.writeResource(
+            "fsResult",
+            `cephCreateFs-${args.host}-${args.name}`,
+            { ...result, capturedAt: new Date(deps.now()).toISOString() },
+          );
+          return { dataHandles: [handle] };
+        } finally {
+          await session.close();
+        }
+      },
+    },
+
+    cephCreateCsiUser: {
+      description:
+        "Create a Ceph client entity, or set an existing one's caps to exactly the request, then read the caps back. Idempotent; never returns a key.",
+      arguments: CreateCsiUserArgs,
+      execute: async (
+        args: z.infer<typeof CreateCsiUserArgs>,
+        context: MethodContext,
+      ) => {
+        const session = await openSession(
+          deps,
+          toTarget({
+            host: args.host,
+            sshUser: args.sshUser,
+            port: args.port,
+            keyPath: args.keyPath,
+            privateKey: args.privateKey,
+            strictHostKeyChecking: args.strictHostKeyChecking,
+          }),
+          { multiplex: args.multiplex ?? false },
+        );
+        try {
+          const result = await createCsiUser(deps, session, {
+            name: args.name,
+            caps: args.caps,
+          }, context.logger);
+          const handle = await context.writeResource(
+            "csiUserResult",
+            `cephCreateCsiUser-${args.host}-${args.name}`,
+            { ...result, capturedAt: new Date(deps.now()).toISOString() },
+          );
+          return { dataHandles: [handle] };
+        } finally {
+          await session.close();
+        }
+      },
+    },
+
+    cephGetConnBundle: {
+      description:
+        "READ-ONLY. Produce the non-secret connection facts a client needs: fsid, mon v2 endpoints, pool names, CephFS names and client entity names.",
+      arguments: ReadHostArgs,
+      execute: async (
+        args: z.infer<typeof ReadHostArgs>,
+        context: MethodContext,
+      ) => {
+        const session = await openSession(
+          deps,
+          toTarget({
+            host: args.host,
+            sshUser: args.sshUser,
+            port: args.port,
+            keyPath: args.keyPath,
+            privateKey: args.privateKey,
+            strictHostKeyChecking: args.strictHostKeyChecking,
+          }),
+          { multiplex: args.multiplex ?? false },
+        );
+        try {
+          const result = await getConnBundle(deps, session, context.logger);
+          const handle = await context.writeResource(
+            "connBundleResult",
+            `cephGetConnBundle-${args.host}`,
+            { ...result, capturedAt: new Date(deps.now()).toISOString() },
+          );
+          return { dataHandles: [handle] };
+        } finally {
+          await session.close();
+        }
+      },
+    },
+
+    cephFetchCsiKey: {
+      description:
+        "SENSITIVE. Read one client entity's key into a sensitive field, which the platform stores in its vault. Each run writes a new version and 2 are kept.",
+      arguments: FetchCsiKeyArgs,
+      execute: async (
+        args: z.infer<typeof FetchCsiKeyArgs>,
+        context: MethodContext,
+      ) => {
+        const session = await openSession(
+          deps,
+          toTarget({
+            host: args.host,
+            sshUser: args.sshUser,
+            port: args.port,
+            keyPath: args.keyPath,
+            privateKey: args.privateKey,
+            strictHostKeyChecking: args.strictHostKeyChecking,
+          }),
+          { multiplex: args.multiplex ?? false },
+        );
+        try {
+          const result = await fetchCsiKey(
+            deps,
+            session,
+            args.userName,
+            context.logger,
+          );
+          const handle = await context.writeResource(
+            "csiKey",
+            `cephFetchCsiKey-${args.host}-${args.userName}`,
+            result,
+          );
+          return { dataHandles: [handle] };
+        } finally {
+          await session.close();
+        }
+      },
+    },
+
+    cephDeleteFs: {
+      description:
+        "DESTRUCTIVE. Delete a CephFS volume and its backing pools, after a double confirmation, proven MDS removal and a pool-delete gate that is always closed again. A no-op when the volume is absent.",
+      arguments: DeleteFsArgs,
+      execute: async (
+        args: z.infer<typeof DeleteFsArgs>,
+        context: MethodContext,
+      ) => {
+        const session = await openSession(
+          deps,
+          toTarget({
+            host: args.host,
+            sshUser: args.sshUser,
+            port: args.port,
+            keyPath: args.keyPath,
+            privateKey: args.privateKey,
+            strictHostKeyChecking: args.strictHostKeyChecking,
+          }),
+          { multiplex: args.multiplex ?? false },
+        );
+        try {
+          const result = await deleteFs(deps, session, {
+            fsName: args.fsName,
+            confirmFsName: args.confirmFsName,
+            maxPolls: args.maxPolls,
+            pollIntervalMs: args.pollIntervalMs,
+          }, context.logger);
+          const handle = await context.writeResource(
+            "fsDeleteResult",
+            `cephDeleteFs-${args.host}-${args.fsName}`,
+            { ...result, capturedAt: new Date(deps.now()).toISOString() },
+          );
+          return { dataHandles: [handle] };
+        } finally {
+          await session.close();
+        }
+      },
+    },
+
+    cephRemoveOsds: {
+      description:
+        "DESTRUCTIVE. Remove OSDs through the orchestrator (draining and, by default, zapping the disks) and prove they are gone from the OSD tree. Idempotent per id.",
+      arguments: RemoveOsdsArgs,
+      execute: async (
+        args: z.infer<typeof RemoveOsdsArgs>,
+        context: MethodContext,
+      ) => {
+        const session = await openSession(
+          deps,
+          toTarget({
+            host: args.host,
+            sshUser: args.sshUser,
+            port: args.port,
+            keyPath: args.keyPath,
+            privateKey: args.privateKey,
+            strictHostKeyChecking: args.strictHostKeyChecking,
+          }),
+          { multiplex: args.multiplex ?? false },
+        );
+        try {
+          const result = await removeOsds(deps, session, {
+            osdIds: args.osdIds,
+            zap: args.zap,
+            maxPolls: args.maxPolls,
+            pollIntervalMs: args.pollIntervalMs,
+          }, context.logger);
+          const handle = await context.writeResource(
+            "osdRemoveResult",
+            `cephRemoveOsds-${args.host}-${result.requested.join("-")}`,
+            { ...result, capturedAt: new Date(deps.now()).toISOString() },
+          );
+          return { dataHandles: [handle] };
+        } finally {
+          await session.close();
+        }
+      },
+    },
   };
 
   const sshMethods = Object.keys(methods);
@@ -1040,6 +1464,49 @@ export function createCephadmModel(overrides: Partial<CephadmDeps> = {}) {
       cephApplyOsdResult: {
         description: "OSD service application evidence",
         schema: ApplyOsdResultSchema,
+        lifetime: "infinite" as const,
+        garbageCollection: 10,
+      },
+      poolResult: {
+        description: "Pool creation and convergence evidence",
+        schema: PoolResultSchema,
+        lifetime: "infinite" as const,
+        garbageCollection: 10,
+      },
+      fsResult: {
+        description: "CephFS volume creation evidence",
+        schema: FsResultSchema,
+        lifetime: "infinite" as const,
+        garbageCollection: 10,
+      },
+      csiUserResult: {
+        description: "CSI client entity caps as read back",
+        schema: CsiUserResultSchema,
+        lifetime: "infinite" as const,
+        garbageCollection: 10,
+      },
+      connBundleResult: {
+        description: "Non-secret connection facts",
+        schema: ConnBundleResultSchema,
+        lifetime: "infinite" as const,
+        garbageCollection: 10,
+      },
+      csiKey: {
+        description:
+          "One client entity's key, stored via a sensitive field in the vault",
+        schema: CsiKeySchema,
+        lifetime: "infinite" as const,
+        garbageCollection: 2,
+      },
+      fsDeleteResult: {
+        description: "CephFS deletion evidence",
+        schema: FsDeleteResultSchema,
+        lifetime: "infinite" as const,
+        garbageCollection: 10,
+      },
+      osdRemoveResult: {
+        description: "OSD removal evidence",
+        schema: OsdRemoveResultSchema,
         lifetime: "infinite" as const,
         garbageCollection: 10,
       },

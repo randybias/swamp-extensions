@@ -11,6 +11,7 @@
 
 import { z } from "npm:zod@4.3.6";
 import {
+  CAPS_RE,
   CEPH_ID_CREATE_RE,
   CEPHADM_VERSION_RE,
   DEB_PACKAGE_RE,
@@ -147,6 +148,12 @@ export const PLACEMENT_SCHEMA = z.array(PLACEMENT_HOST_SCHEMA).min(1).max(64)
     (hosts) => new Set(hosts).size === hosts.length,
     "placement hosts must be unique",
   );
+
+/** A Ceph caps expression. */
+export const CAPS_SCHEMA = z.string().regex(
+  CAPS_RE,
+  "a Ceph caps expression (letters, digits, spaces, quotes and = * / , . _ - +)",
+);
 
 /** Ceph identifier in the create direction. */
 export const CEPH_ID_SCHEMA = z.string().regex(

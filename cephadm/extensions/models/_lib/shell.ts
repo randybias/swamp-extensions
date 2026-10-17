@@ -30,6 +30,8 @@ export interface CephRunOptions {
   resend?: ResendPolicy;
   /** Return a non-zero exit instead of throwing (transport errors still throw). */
   allowNonZero?: boolean;
+  /** Never quote stdout in an error; set for commands that can carry key material. */
+  redactStdout?: boolean;
 }
 
 /** Result of one cephadm-shell command. */
@@ -66,6 +68,8 @@ export interface CephScriptOptions {
   resend?: ResendPolicy;
   /** Return a non-zero exit instead of throwing (transport errors still throw). */
   allowNonZero?: boolean;
+  /** Never quote stdout in an error; set for commands that can carry key material. */
+  redactStdout?: boolean;
 }
 
 /** A short random hex string from the injected randomness source. */
@@ -104,16 +108,22 @@ export function shellRunCommand(dir: string, scriptPath: string): string {
 }
 
 /** Parses JSON stdout, reading the lone "No <things> reported" line as an empty list. */
-export function parseCephJson(stdout: string, phase: string): unknown {
+export function parseCephJson(
+  stdout: string,
+  phase: string,
+  redact = false,
+): unknown {
   const trimmed = stdout.trim();
   if (trimmed === "") return null;
   if (/^No .+ reported$/.test(trimmed)) return [];
   try {
     return JSON.parse(trimmed);
   } catch {
-    fail(`${phase}.json`, "ceph returned output that is not JSON", {
-      stdout: truncate(trimmed, 300),
-    });
+    fail(
+      `${phase}.json`,
+      "ceph returned output that is not JSON",
+      redact ? {} : { stdout: truncate(trimmed, 300) },
+    );
   }
 }
 
@@ -169,7 +179,15 @@ export async function runCephScript(
     });
     result = {
       result: run,
-      ...(opts.json ? { json: parseCephJson(run.stdout, opts.phase) } : {}),
+      ...(opts.json && run.code === 0
+        ? {
+          json: parseCephJson(
+            run.stdout,
+            opts.phase,
+            opts.redactStdout ?? false,
+          ),
+        }
+        : {}),
     };
   } finally {
     // Best effort: a removal failure must not mask the command's own result.
@@ -206,6 +224,7 @@ export async function runCeph(
       phase: opts.phase,
       resend: opts.resend,
       allowNonZero: opts.allowNonZero,
+      redactStdout: opts.redactStdout,
     },
     log,
   );

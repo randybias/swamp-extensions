@@ -66,6 +66,12 @@ Not packaged. Notes for whoever maintains this extension.
 - 2026-10-17: group 03 completed with cephApplyOsd (all-available and by-serial
   selector modes, device-inventory exclusion check, leftover-service sweep,
   by-id spec apply) and the generalised cephadm-shell script runner.
+- 2026-10-17: group 04 completed: cephCreatePool, cephCreateFs,
+  cephCreateCsiUser, cephGetConnBundle, cephFetchCsiKey (sensitive),
+  cephDeleteFs and cephRemoveOsds. Key material from auth commands is parsed and
+  discarded; the shell runner gained a redacted-stdout mode so an error from a
+  key-bearing command never quotes stdout. No D-number references in packaged
+  source.
 - The SQLite `pvs`/`mdadm` discovery, the atomic mdadm.conf rewrite and the
   boot-protection gate are unit-tested with scripted sessions; the live twin
   checks in the spec's [twin] items still apply.

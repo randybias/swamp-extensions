@@ -173,10 +173,14 @@ manifest where possible.
   holds many hosts; it verifies that `k0s stop`, `k0s reset` and the config
   removal all succeed before recording the host as reset, and is a clean no-op
   on a host with no k0s unit. It removes the systemd unit, `k0s.yaml`,
-  `/var/lib/k0s` and the running k0s process, then removes the `/etc/k0s`
+  `/var/lib/k0s` and the running k0s process, then removes the whole `/etc/k0s`
   directory (including k0s's own `containerd*` placeholders) and the k0s binary
-  — but only the binary at the recorded path whose SHA-256 still matches what
-  `install` recorded, so a binary this model did not install is never removed.
+  at its fixed `/usr/local/bin/k0s` path — but only when that binary's SHA-256
+  still matches what `install` recorded, so a binary this model did not install
+  is never removed. Removing `/etc/k0s` wholesale also deletes anything you put
+  there yourself (a `containerd.d` drop-in, registry credentials); on an adopted
+  host, move those out first. If a cleanup step fails after `k0s reset` has run,
+  the state keeps `cleanup_pending` and the next `reset` finishes the cleanup.
 - Every caller-supplied value that reaches the remote shell is validated against
   an allowlist grammar and quoted as a single argv element; remote exit codes
   are returned as data, except a local `ssh` failure (exit 255), which is raised

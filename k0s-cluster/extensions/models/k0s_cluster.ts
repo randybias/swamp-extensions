@@ -299,6 +299,7 @@ const StateSchema = z.strictObject({
   service: z.string().nullable(),
   installed: z.boolean(),
   adopted: z.boolean(),
+  cleanup_pending: z.boolean().optional(),
   observed_at: z.string(),
 });
 
@@ -823,6 +824,57 @@ async function readLive(
       : [],
     observed_at: iso(now),
   });
+}
+
+/** A reset cleanup step failed after k0s was already reset. */
+export class ResetCleanupError extends Error {
+  /** Creates a typed error for a failed post-reset cleanup. */
+  constructor(message: string) {
+    super(message);
+    this.name = "ResetCleanupError";
+  }
+}
+
+/**
+ * Removes what `k0s reset` leaves behind: the /etc/k0s directory (k0s's own
+ * containerd* placeholders live there) and the k0s binary, but only when the
+ * recorded digest still matches, so a binary this model did not install is
+ * never removed. Throws {@link ResetCleanupError} when a step fails, so the
+ * caller can record that cleanup is still pending.
+ */
+async function cleanupK0sResidue(
+  deps: K0sDeps,
+  target: SshTarget,
+  recorded: { binary_sha256?: string | null } | null,
+  context: Ctx,
+): Promise<void> {
+  const dirGone = await deps.ssh.exec(target, ["rm", "-rf", K0S_CONFIG_DIR]);
+  if (!ok(dirGone)) {
+    throw new ResetCleanupError(
+      `could not remove ${K0S_CONFIG_DIR} on ${target.host} (exit ${dirGone.exit_code})`,
+    );
+  }
+  if (!recorded?.binary_sha256) return;
+  const sum = await deps.ssh.exec(target, ["sha256sum", K0S_BINARY_PATH]);
+  if (!ok(sum)) {
+    throw new ResetCleanupError(
+      `could not hash ${K0S_BINARY_PATH} on ${target.host} (exit ${sum.exit_code})`,
+    );
+  }
+  const remote = sum.stdout.trim().split(/\s+/)[0]?.toLowerCase();
+  if (remote !== recorded.binary_sha256.toLowerCase()) {
+    context.logger.info(
+      "Leaving {path} on {host}: its digest is not the installed binary",
+      { path: K0S_BINARY_PATH, host: target.host },
+    );
+    return;
+  }
+  const binGone = await deps.ssh.exec(target, ["rm", "-f", K0S_BINARY_PATH]);
+  if (!ok(binGone)) {
+    throw new ResetCleanupError(
+      `could not remove the k0s binary on ${target.host} (exit ${binGone.exit_code})`,
+    );
+  }
 }
 
 function buildK0sModel(deps: K0sDeps) {
@@ -1806,15 +1858,18 @@ function buildK0sModel(deps: K0sDeps) {
               `confirm_host ${args.confirm_host} does not match the SSH host ${target.host}`,
             );
           }
-          const unitInstalled =
-            await unitExists(deps, target, serviceName("single")) ||
-            await unitExists(deps, target, serviceName("worker"));
-          if (!unitInstalled) {
-            context.logger.info(
-              "No k0s service on {host}; reset is a no-op",
-              { host: target.host },
-            );
-            const handle = await context.writeResource(
+          const recorded = await context.readResource(targetId(target)) as
+            | { binary_sha256?: string | null; cleanup_pending?: boolean }
+            | null;
+          const pending = Boolean(recorded?.binary_sha256) ||
+            recorded?.cleanup_pending === true;
+          const writeState = (
+            extra: {
+              binary_sha256?: string | null;
+              cleanup_pending?: boolean;
+            },
+          ) =>
+            context.writeResource(
               "state",
               targetId(target),
               StateSchema.parse({
@@ -1828,11 +1883,41 @@ function buildK0sModel(deps: K0sDeps) {
                 installed: false,
                 adopted: false,
                 observed_at: iso(deps.now()),
+                ...extra,
               }),
             );
+          const unitInstalled =
+            await unitExists(deps, target, serviceName("single")) ||
+            await unitExists(deps, target, serviceName("worker"));
+          if (!unitInstalled) {
+            if (!pending) {
+              context.logger.info(
+                "No k0s service on {host}; reset is a no-op",
+                { host: target.host },
+              );
+              const handle = await writeState({});
+              return {
+                dataHandles: [...handles, handle],
+                result: { reset: false },
+              };
+            }
+            // An earlier reset removed the unit but did not finish its cleanup.
+            try {
+              await cleanupK0sResidue(deps, target, recorded, context);
+            } catch (e) {
+              await writeState({
+                binary_sha256: recorded?.binary_sha256 ?? null,
+                cleanup_pending: true,
+              });
+              throw e;
+            }
+            context.logger.info("Finished reset cleanup on {host}", {
+              host: target.host,
+            });
+            const handle = await writeState({});
             return {
               dataHandles: [...handles, handle],
-              result: { reset: false },
+              result: { reset: true },
             };
           }
           const stopped = await deps.ssh.exec(target, [
@@ -1864,64 +1949,17 @@ function buildK0sModel(deps: K0sDeps) {
               `could not remove the k0s configuration on ${target.host} (exit ${cleaned.exit_code})`,
             );
           }
-          // `k0s reset` leaves its containerd* placeholders in the config
-          // directory; the directory is the model's to remove.
-          const dirGone = await deps.ssh.exec(target, [
-            "rm",
-            "-rf",
-            K0S_CONFIG_DIR,
-          ]);
-          if (!ok(dirGone)) {
-            throw new Error(
-              `could not remove ${K0S_CONFIG_DIR} on ${target.host} (exit ${dirGone.exit_code})`,
-            );
-          }
-          // Remove the binary only when the host still has exactly the binary
-          // this model installed; never remove one it did not install.
-          const recorded = await context.readResource(targetId(target)) as
-            | { binary_sha256?: string | null }
-            | null;
-          if (recorded?.binary_sha256) {
-            const sum = await deps.ssh.exec(target, [
-              "sha256sum",
-              K0S_BINARY_PATH,
-            ]);
-            const remote = sum.stdout.trim().split(/\s+/)[0]?.toLowerCase();
-            if (ok(sum) && remote === recorded.binary_sha256.toLowerCase()) {
-              const binGone = await deps.ssh.exec(target, [
-                "rm",
-                "-f",
-                K0S_BINARY_PATH,
-              ]);
-              if (!ok(binGone)) {
-                throw new Error(
-                  `could not remove the k0s binary on ${target.host} (exit ${binGone.exit_code})`,
-                );
-              }
-            } else {
-              context.logger.info(
-                "Leaving {path} on {host}: its digest is not the installed binary",
-                { path: K0S_BINARY_PATH, host: target.host },
-              );
-            }
+          try {
+            await cleanupK0sResidue(deps, target, recorded, context);
+          } catch (e) {
+            await writeState({
+              binary_sha256: recorded?.binary_sha256 ?? null,
+              cleanup_pending: true,
+            });
+            throw e;
           }
           context.logger.info("Reset k0s on {host}", { host: target.host });
-          const handle = await context.writeResource(
-            "state",
-            targetId(target),
-            StateSchema.parse({
-              ...whoOf(target),
-              role: null,
-              k0s_version: null,
-              binary_sha256: null,
-              config_sha256: null,
-              config_file_sha256: null,
-              service: null,
-              installed: false,
-              adopted: false,
-              observed_at: iso(deps.now()),
-            }),
-          );
+          const handle = await writeState({});
           return { dataHandles: [...handles, handle], result: { reset: true } };
         },
       },

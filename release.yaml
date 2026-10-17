@@ -11,7 +11,7 @@ azure-vm:
     2026.10.17.1: a33456c899d2a3e182e44da27e5998f72c877b9751c6b7c8f3abb4aa2de0f9d0
   notes:
     2026.10.17.2: 'Security fix, beta. upload no longer sends the expected SHA-256 of the content to the remote host (it appeared on the local ssh command line and the remote command, where a process listing could expose a hash of secret content); the remote now prints the destination file''s own hash and mode after the atomic rename and the comparison runs locally. Upgrade if you upload secrets. The upload cells are being re-run live on this version before it moves to stable; all other behaviour is unchanged from 2026.10.17.1.'
-    2026.10.17.1: 'First release, beta. Generic Azure virtual machine lifecycle over Azure Resource Manager REST: create (adopts an existing VM, never a second), get/sync, start, stop, deallocate (real deallocation, optional hibernate) and delete (an action; deleting an absent VM is a no-op), with long-running operations polled. Auth is a service principal from the vault via OAuth2 client credentials; the secret travels only in the token request body and the token is held in memory per call; there is no az CLI path. SSH public-key admin only. Live testing was not possible in this release (no throwaway Azure subscription); every live cell is recorded as blocked, so it stays on beta.'
+    2026.10.17.1: 'First release, beta. Install, upgrade and reset a single-node, SHA-pinned k0s cluster on a Linux host over SSH, with a rendered k0s.yaml, readiness waits, kubeconfig capture, manifest stacks and Helm reconciliation. Every live cell passes on a throwaway host, including role migration, no control-plane taint in single mode, Helm, api_address and reset. Known residue: reset leaves /etc/k0s/containerd* and the k0s binary on the host.'
 
 azure-nsg:
   channel: beta
@@ -19,7 +19,7 @@ azure-nsg:
   published:
     2026.10.17.1: 36bf4978f3b5f5d20ded7cb5ac13d146cf9b4c018920931daa4f69b2c183649b
   notes:
-    2026.10.17.1: 'First release, beta. Generic Azure network security group rules over Azure Resource Manager REST: get/sync, ensure_rule (idempotent converge of one rule), remove_rule, apply_rule_set (plans first; applies only with an explicit flag; refuses the whole set with zero writes on any collision or invalid rule; never deletes undeclared rules) and delete (an action). Rule comparison uses the real read-back shape (singular field beside an empty plural list). Auth as in azure-vm. Live testing was not possible in this release; every live cell is recorded as blocked, so it stays on beta.'
+    2026.10.17.1: 'First release, beta. Install, upgrade and reset a single-node, SHA-pinned k0s cluster on a Linux host over SSH, with a rendered k0s.yaml, readiness waits, kubeconfig capture, manifest stacks and Helm reconciliation. Every live cell passes on a throwaway host, including role migration, no control-plane taint in single mode, Helm, api_address and reset. Known residue: reset leaves /etc/k0s/containerd* and the k0s binary on the host.'
 
 secret-file:
   channel: beta
@@ -27,7 +27,7 @@ secret-file:
   published:
     2026.10.17.1: 5a2170e016bf3e5aed4adeefb927456e7564448525c93117257e286136c64ab5
   notes:
-    2026.10.17.1: 'First release, beta. Write a secret file onto one host over SSH from vault values delivered over stdin (literal, base64 or dotenv entries single-quoted for shell sourcing), atomically and idempotently by content, mode, owner and group; verify (read-only) and remove (an action). Owner and group are set on a staged file before an mv -T rename; a symlink or directory destination is refused. State keeps metadata and at most a keyed HMAC, never the value or a plain hash. Strict host-key pins are required. Live end to end on a VPS: 12/13 on the first build, the failing symlink cell fixed and re-run 5/5. Residual: the check-then-rename race needs a parent directory an attacker cannot write.'
+    2026.10.17.1: 'First release, beta. Install, upgrade and reset a single-node, SHA-pinned k0s cluster on a Linux host over SSH, with a rendered k0s.yaml, readiness waits, kubeconfig capture, manifest stacks and Helm reconciliation. Every live cell passes on a throwaway host, including role migration, no control-plane taint in single mode, Helm, api_address and reset. Known residue: reset leaves /etc/k0s/containerd* and the k0s binary on the host.'
 
 ssh-host:
   channel: beta
@@ -44,7 +44,7 @@ cephadm:
   published:
     2026.10.17.1: cb3f5404e00b2797a65dfae6694cc9a03f2d474c734ae3f2640bf5e09f50254e
   notes:
-    2026.10.17.1: 'First release, beta. Install and operate a standalone Ceph cluster managed by cephadm on Linux hosts over SSH: host preparation, disk wiping behind a fail-closed boot and root device guard, bootstrap, daemon placement, pools, CephFS, client entities, RGW users and buckets (S3 plane signed with SigV4), maintenance, teardown and read-only verification, with 22 workflows. Live testing needs three or more hosts with free whole disks and was not possible in this release; every live cell is recorded as blocked, so it stays on beta.'
+    2026.10.17.1: 'First release, beta. Install, upgrade and reset a single-node, SHA-pinned k0s cluster on a Linux host over SSH, with a rendered k0s.yaml, readiness waits, kubeconfig capture, manifest stacks and Helm reconciliation. Every live cell passes on a throwaway host, including role migration, no control-plane taint in single mode, Helm, api_address and reset. Known residue: reset leaves /etc/k0s/containerd* and the k0s binary on the host.'
 
 cherry-servers:
   channel: beta
@@ -70,7 +70,7 @@ k8s-secret:
   published:
     2026.10.17.1: 7ec9b9521c2c31d070ca6991cd19eb276a3216e820624ea306bd09e345ab2d1b
   notes:
-    2026.10.17.1: 'First release, beta. Create, read, sync and delete a Kubernetes Secret from vault references, including whole-secret data_from_vault; values reach kubectl only on stdin and are never returned, and output and stored state carry metadata and key names only. Server-side apply prunes keys this model previously owned. A YAML merge-key path that could smuggle extra keys into the manifest is closed. Live end to end on a throwaway cluster: 14 of 14 cells pass, plus the data_from_vault cells.'
+    2026.10.17.1: 'First release, beta. Install, upgrade and reset a single-node, SHA-pinned k0s cluster on a Linux host over SSH, with a rendered k0s.yaml, readiness waits, kubeconfig capture, manifest stacks and Helm reconciliation. Every live cell passes on a throwaway host, including role migration, no control-plane taint in single mode, Helm, api_address and reset. Known residue: reset leaves /etc/k0s/containerd* and the k0s binary on the host.'
 
 k0s-cluster:
   channel: beta
@@ -78,7 +78,7 @@ k0s-cluster:
   published:
     2026.10.17.1: 617b23132f64784a82a0abd0a75e0627eddff67b1bce7d4de8570de51c88635b
   notes:
-    2026.10.17.1: 'First release, beta. Install, upgrade and reset a single-node, SHA-pinned k0s cluster on a Linux host over SSH, with a rendered k0s.yaml, readiness waits, kubeconfig capture, manifest stacks and Helm reconciliation. Every live cell passes on a throwaway host, including role migration, no control-plane taint in single mode, Helm, api_address and reset. Reset left /etc/k0s/containerd* and the k0s binary behind; fixed in 2026.10.17.2.'
+    2026.10.17.1: 'First release, beta. Install, upgrade and reset a single-node, SHA-pinned k0s cluster on a Linux host over SSH, with a rendered k0s.yaml, readiness waits, kubeconfig capture, manifest stacks and Helm reconciliation. Every live cell passes on a throwaway host, including role migration, no control-plane taint in single mode, Helm, api_address and reset. Known residue: reset leaves /etc/k0s/containerd* and the k0s binary on the host.'
     2026.10.17.2: 'reset also removes /etc/k0s and the k0s binary it installed (only when the recorded path and SHA-256 still match), and stays a clean no-op on a host with no k0s unit. Not yet run live.'
 
 server-host:
@@ -87,4 +87,4 @@ server-host:
   published:
     2026.10.17.1: c83486edf44844afae336c57dc1273dc250985d352fecf82be84664e01e8894d
   notes:
-    2026.10.17.1: 'First release, beta. Baseline hardening of a Linux server over SSH: an admin user, sshd lockdown and an nftables policy, each applied behind an armed host-side revert that fires unless a fresh management connection confirms the change. Live end to end on a throwaway VPS: 19 of 21 cells pass, then a 12 of 12 re-run on the fixes; open follow-ups are recorded in the LOGBOOK, so it stays on beta.'
+    2026.10.17.1: 'First release, beta. Install, upgrade and reset a single-node, SHA-pinned k0s cluster on a Linux host over SSH, with a rendered k0s.yaml, readiness waits, kubeconfig capture, manifest stacks and Helm reconciliation. Every live cell passes on a throwaway host, including role migration, no control-plane taint in single mode, Helm, api_address and reset. Known residue: reset leaves /etc/k0s/containerd* and the k0s binary on the host.'

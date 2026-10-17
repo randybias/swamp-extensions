@@ -109,6 +109,15 @@ Not packaged. Notes for whoever maintains this extension.
   vs Path B Admin Ops): a build must pick exactly one and never put the secret
   on argv, so it is not guessed here. The four S3-plane methods (SigV4, pinned
   XML parser, PAB probe) remain, as do the group 08 workflows.
+- 2026-10-17: RGW secret path settled provisionally (P1 option a, per the lead;
+  P1 is still listed as pending Randy in the overview, so flag it in STATUS).
+  cephRgwUserEnsure has RGW generate the key (--gen-access-key --gen-secret) and
+  stores it only in a sensitive, vaulted field like cephFetchCsiKey. Rationale:
+  no caller secret ever reaches a command line or script text, and no Admin Ops
+  path/credential is needed. Exactly one path is implemented; no runtime probing
+  or fallback. Idempotent: an existing user is read, keys are not regenerated
+  unless rotateKeys is set. The fetch dependency is approved for the four
+  S3-plane methods only.
 - The SQLite `pvs`/`mdadm` discovery, the atomic mdadm.conf rewrite and the
   boot-protection gate are unit-tested with scripted sessions; the live twin
   checks in the spec's [twin] items still apply.

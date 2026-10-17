@@ -4,6 +4,7 @@ import type { CommandResult, RunOptions, SshSession } from "./ssh.ts";
 import {
   bucketInventory,
   classifyUserInfo,
+  ensureRgwUser,
   INVENTORY_PAGE_SIZE,
   parseBucketListPage,
   parseUserView,
@@ -243,5 +244,137 @@ Deno.test("the inventory refuses a no-progress or unsafe page", async () => {
     () => bucketInventory(deps, unsafeSession, "192.0.2.10", ""),
     PhaseError,
     "unsafe name",
+  );
+});
+
+Deno.test(
+  "RGW user ensure generates and stores the key on create", // leak-allow(decision D50)
+  async () => {
+    const created = JSON.stringify({
+      user_id: "app-user",
+      display_name: "App User",
+      keys: [{
+        user: "app-user",
+        access_key: "AKIAEXAMPLE",
+        secret_key: "GENERATEDSECRET",
+      }],
+    });
+    let infoCalls = 0;
+    const s = rgwSession((body) => {
+      if (body.includes("user info")) {
+        infoCalls++;
+        return infoCalls === 1
+          ? {
+            code: 2,
+            stdout: "could not fetch user info: (2) No such file",
+            stderr: "",
+          }
+          : { code: 0, stdout: created, stderr: "" };
+      }
+      if (body.includes("user create")) {
+        return { code: 0, stdout: created, stderr: "" };
+      }
+      return { code: 1, stdout: "", stderr: "unrouted" };
+    });
+    const record = await ensureRgwUser(deps, s, {
+      host: "192.0.2.10",
+      uid: "app-user",
+      displayName: "App User",
+    });
+    assertEquals(record.existedBefore, false);
+    assertEquals(record.changes, ["created user"]);
+    assertEquals(record.accessKey, "AKIAEXAMPLE");
+    assertEquals(record.key, "GENERATEDSECRET");
+    assertEquals(record.secretDelivery, "generated");
+  },
+);
+
+Deno.test("RGW user ensure is idempotent and only rotates when asked", async () => {
+  const present = JSON.stringify({
+    user_id: "app-user",
+    display_name: "App User",
+    keys: [{ access_key: "AKIAEXAMPLE", secret_key: "SECRET" }],
+  });
+  const bodies: string[] = [];
+  let keyCreated = false;
+  let displayName = "App User";
+  const s = rgwSession((body) => {
+    bodies.push(body);
+    if (body.includes("user info")) {
+      const keys = keyCreated
+        ? [{ access_key: "AKIAEXAMPLE" }, { access_key: "NEWKEY" }]
+        : [{ access_key: "AKIAEXAMPLE" }];
+      return {
+        code: 0,
+        stdout: JSON.stringify({
+          user_id: "app-user",
+          display_name: displayName,
+          keys,
+        }),
+        stderr: "",
+      };
+    }
+    if (body.includes("user modify")) {
+      const m = body.match(/--display-name='([^']*)'/);
+      if (m) displayName = m[1];
+      return { code: 0, stdout: present, stderr: "" };
+    }
+    if (body.includes("key create")) {
+      keyCreated = true;
+      return {
+        code: 0,
+        stdout: JSON.stringify({
+          keys: [{ access_key: "NEWKEY", secret_key: "NEWSECRET" }],
+        }),
+        stderr: "",
+      };
+    }
+    return { code: 0, stdout: present, stderr: "" };
+  });
+  const noop = await ensureRgwUser(deps, s, {
+    host: "h",
+    uid: "app-user",
+    displayName: "App User",
+  });
+  assertEquals(noop.changes, []);
+  assertEquals(noop.existedBefore, true);
+  assertEquals(bodies.some((b) => b.includes("key create")), false);
+
+  const rotated = await ensureRgwUser(deps, s, {
+    host: "h",
+    uid: "app-user",
+    displayName: "App User",
+    rotateKeys: true,
+  });
+  assertEquals(rotated.changes, ["rotated s3 access key"]);
+  assertEquals(rotated.accessKey, "NEWKEY");
+
+  const renamed = await ensureRgwUser(deps, s, {
+    host: "h",
+    uid: "app-user",
+    displayName: "New Name",
+  });
+  assertEquals(renamed.changes, ["set display-name"]);
+  assertEquals(
+    bodies.some((b) => b.includes("--display-name='New Name'")),
+    true,
+  );
+});
+
+Deno.test("RGW user ensure refuses an unreadable initial read", async () => {
+  const s = rgwSession((body) =>
+    body.includes("user info")
+      ? { code: 0, stdout: "garbage", stderr: "" }
+      : { code: 0, stdout: "", stderr: "" }
+  );
+  await assertRejects(
+    () =>
+      ensureRgwUser(deps, s, {
+        host: "h",
+        uid: "app-user",
+        displayName: "App User",
+      }),
+    PhaseError,
+    "unreadable",
   );
 });

@@ -1,0 +1,6 @@
+# Managed by @randybias/apt-cache. Do not edit; re-applied by the model.
+BindAddress: 192.0.2.10
+Port: 3142
+CacheDir: /var/cache/apt-cacher-ng
+ExThreshold: 4
+PassThroughPattern: ^(bugs\.debian\.org|changelogs\.ubuntu\.com):443$

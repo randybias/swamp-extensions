@@ -1,0 +1,5 @@
+// Managed by @randybias/apt-cache. Do not edit; re-applied by the model.
+Acquire::http::Proxy "http://192.0.2.10:3142";
+Acquire::https::Proxy "http://192.0.2.10:3142";
+Acquire::http::Proxy::archive.example.test "DIRECT";
+Acquire::http::Proxy-Auto-Detect "/usr/local/lib/apt-cache/proxy-detect";

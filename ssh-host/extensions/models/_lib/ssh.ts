@@ -127,8 +127,9 @@ export interface ExecOptions {
    */
   timeoutMs?: number;
   /**
-   * Capture cap; exceeding it sets `truncated` instead of throwing. At most the
-   * target's `max_output_bytes`.
+   * Stdout capture cap; exceeding it sets `truncated` instead of throwing. At
+   * most the target's `max_output_bytes`. Stderr is not cut to this cap: it is
+   * bounded by the target's `max_output_bytes` and throws over it.
    */
   maxOutputBytes?: number;
 }
@@ -1030,7 +1031,6 @@ function assertExecOptions(
  * quotes inside an element can never split into a second command. Optional
  * `stdin`, `timeoutMs` and `maxOutputBytes` are validated before connecting.
  */
-
 export async function exec(
   deps: SshDeps,
   target: SshTarget,

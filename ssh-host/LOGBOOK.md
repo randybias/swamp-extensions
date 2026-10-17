@@ -356,7 +356,7 @@ commits as deletions and was discarded):
   the local ssh (the remote command keeps running; bound it with the remote
   `timeout`) and raises `SshError` with `kind: "timeout"`; a timeout never
   returns partial output. `maxOutputBytes` must be an integer 1..the target's
-  `max_output_bytes` and caps stdout/stderr; exceeding it sets
+  `max_output_bytes` and caps stdout only (round 2 below); exceeding it sets
   `truncated: true`, stops reading and kills ssh instead of draining an endless
   writer. `ExecResult` gained `truncated` (the exit code is not meaningful when
   set) and `duration_ms`. Exit 255 is still a transport error unless the result
@@ -381,11 +381,55 @@ commits as deletions and was discarded):
   use with cap 64 runs the command with the 85-byte warning intact.
 - MEDIUM: `readCappedStream` rethrows a real read error; only the abort-sourced
   cancel breaks quietly.
-- MEDIUM: `upgrades` is a shared `UPGRADES` const referenced literally on the
-  exported `model`, so the registry check sees it (dry run free of the
-  version-bump warning).
+- MEDIUM: `upgrades` is a literal array on the exported `model` object (no
+  longer inside `createModel()`), so the registry check sees it (dry run free of
+  the version-bump warning).
 - MEDIUM: stdin is read in the same `Promise.all` as the readers, so a real
   stdin failure is handled immediately rather than becoming an unhandled
   rejection; the race's abort listener is removed in a `finally`.
 - LOW: `MAX_EXEC_TIMEOUT_MS`/`assertExecOptions` moved above `exec`'s doc; the
   readers are one `Promise.all` and the redundant `work.catch` is gone.
+
+### Review round 3 (5cc589d) — clean
+
+- conformance-astra, adversarial-terra and tightness-astra rc=0, plus the
+  advisory GLM seat (no findings). 0 Critical/High; verdict CLEAN.
+- Residual MEDIUM (terra): `maxOutputBytes` caps stdout only. Remote stderr
+  cannot be told apart from ssh's own diagnostics, so it stays bounded by the
+  target's `max_output_bytes` and throws over it. This is the round-2 design.
+  The `ExecOptions` doc and the README now say so.
+- LOW (astra): the long-stderr test now uses a 100-byte stdout cap below the
+  500-byte stderr. It asserts that the runner gets a separate stderr cap.
+- LOW (astra): the stale shared-`UPGRADES` wording in round 2 is corrected.
+- tightness-astra: COULD-BE-TIGHTER, about 5 lines. The unused `calls` bindings
+  are gone and the stderr loop is shared, both at merge prep.
+
+### Container sshd round trip, 2026-10-17 (5cc589d)
+
+The test target was a throwaway `ubuntu:24.04` openssh-server on 127.0.0.1. It
+used a pinned host key and a key over ssh-agent, and was driven through the
+vendored `exec()`:
+
+| Cell                                                         | Result                                                         |
+| ------------------------------------------------------------ | -------------------------------------------------------------- |
+| wrong pin, cap 16/64/4096                                    | throws host key verification failed (3/3)                      |
+| bad credential, cap 16/64/4096                               | throws authentication failed (3/3)                             |
+| connection killed, cap 16/64/4096, with and without truncate | throws transport failed, exit 255 (6/6)                        |
+| `insecure_tofu` first use, cap 64                            | exit 0, command ran, 85-byte "Permanently added" warning whole |
+| `yes`, cap 128 / cap 16 + timeoutMs 3000                     | truncated, killed in 336 / 374 ms                              |
+| 20 MB stderr flood, no options                               | throws at 10485760 bytes, as before                            |
+| 4 KB stderr, target max 1000, cap 64                         | throws at the 1000-byte stderr limit                           |
+| 500 B stderr, target max 1000, cap 16                        | exit 0, stderr whole (500 B)                                   |
+| stdin with NUL / 4 MiB / 64 MiB                              | remote sha256 matches (3/3)                                    |
+| 4 MiB stdin + 8 MB stderr                                    | match, stderr whole, not truncated                             |
+| timeout during a 64 MiB / 4 MiB (+ cap) stdin write          | throws `SshError` kind `timeout` at about 2 s (2/2)            |
+| no-options echo; remote exit 255                             | same result shape; 255 throws as transport                     |
+
+- Every failure cell throws: pin, credential and kill at each cap (9/9), plus
+  kill with truncate (3/3).
+- A no-options call spawns ssh with an argv that is byte-identical to the
+  fe0139f0 transport (scripted comparison of the old and new `_lib/ssh.ts`).
+- On a timeout, only the local ssh is killed. The remote command keeps running
+  (as documented); bound it with the remote `timeout` inside a surviving shell.
+- `_lib/ssh.ts` stays one file of 1250 lines. Vendors copy it byte for byte and
+  check it by blob hash, so it is not split.

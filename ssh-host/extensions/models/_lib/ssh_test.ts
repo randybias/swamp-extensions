@@ -668,8 +668,7 @@ Deno.test("denoRunner times out a large stdin write and leaves no child", async 
 });
 
 Deno.test("exec still throws on a transport 255 whose stderr exceeds a small cap", async () => {
-  const calls: Call[] = [];
-  const deps = fakeDeps(fakeRun(calls, {
+  const deps = fakeDeps(fakeRun([], {
     ssh: () => ({
       code: 255,
       stdout: "",
@@ -684,25 +683,28 @@ Deno.test("exec still throws on a transport 255 whose stderr exceeds a small cap
 });
 
 Deno.test("a long stderr warning does not fail a successful command", async () => {
-  const calls: Call[] = [];
-  const deps = fakeDeps(fakeRun(calls, {
-    ssh: () => ({ code: 0, stdout: "ok\n", stderr: "w".repeat(500) }),
+  let seen: RunOptions = {};
+  const deps = fakeDeps(fakeRun([], {
+    ssh: (_args, options) => {
+      seen = options;
+      return { code: 0, stdout: "ok\n", stderr: "w".repeat(500) };
+    },
   }));
-  const res = await exec(deps, STRICT_TARGET, ["true"], {
-    maxOutputBytes: 1000,
-  });
+  const target = { ...STRICT_TARGET, max_output_bytes: 1000 };
+  const res = await exec(deps, target, ["true"], { maxOutputBytes: 100 });
+  assertEquals(seen.maxOutputBytes, 100);
+  assertEquals(seen.stderrMaxOutputBytes, 1000);
   assertEquals(res.exit_code, 0);
   assertEquals(res.stderr.length, 500);
   assertEquals(res.truncated, false);
 });
 
+const WARN_50 = "i=0; while [ $i -lt 50 ]; do echo warn >&2; i=$((i+1)); done";
+
 Deno.test("denoRunner keeps a stderr warning whole under a small stdout cap", async () => {
   const res = await denoRunner(
     "sh",
-    [
-      "-c",
-      "i=0; while [ $i -lt 50 ]; do echo warn >&2; i=$((i+1)); done; echo hi",
-    ],
+    ["-c", `${WARN_50}; echo hi`],
     { maxOutputBytes: 4, truncate: true, stderrMaxOutputBytes: 4096 },
   );
   assertEquals(res.code, 0);
@@ -716,10 +718,7 @@ Deno.test("denoRunner throws when stderr exceeds its own cap", async () => {
     () =>
       denoRunner(
         "sh",
-        [
-          "-c",
-          "i=0; while [ $i -lt 50 ]; do echo warn >&2; i=$((i+1)); done",
-        ],
+        ["-c", WARN_50],
         { maxOutputBytes: 4, truncate: true, stderrMaxOutputBytes: 16 },
       ),
     SshError,

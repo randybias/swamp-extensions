@@ -126,7 +126,8 @@ swamp CLI echoes method arguments, sensitive ones included, in `--json` output
   ssh's stdin and never placed on argv. `timeoutMs` kills only the local `ssh`;
   the remote command keeps running, so bound a mutating remote command with the
   remote `timeout` inside a shell that survives. `maxOutputBytes` caps the
-  captured output and sets `truncated` instead of throwing. This model's `exec`
+  captured stdout and sets `truncated` instead of throwing; stderr stays bounded
+  by the target's `max_output_bytes` and throws over it. This model's `exec`
   does not use these options and keeps its `max_output_bytes` behaviour.
 - On Ubuntu 24.04, `sshd` is socket-activated: a cloud-init that changes the SSH
   port must restart `ssh.socket`, or the new port never accepts a connection.

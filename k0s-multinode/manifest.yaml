@@ -11,3 +11,4 @@ models:
   - k0s_multinode.ts
 workflows:
   - k0s-multinode-create-cluster/workflow.yaml
+  - k0s-multinode-join-node/workflow.yaml

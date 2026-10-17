@@ -168,3 +168,30 @@ distribution.
 - The model export is still `createModel()` (not a plain literal), so swamp's
   static type read may warn (gate 7); transport.ts keeps unused upload/learn
   adapters; `fakeJoinToken` is duplicated in two test files.
+
+## Review round 2 follow-up: per-node child workflow, validated live
+
+- **Per-node child workflow** `@randybias/k0s-multinode-join-node`: mint ->
+  install (dependsOn mint succeeded) -> wait (dependsOn install succeeded) ->
+  invalidate (dependsOn wait completed) + invalidate-failed (dependsOn install
+  failed). The create workflow's join job calls it once per node with forEach
+  concurrency 1, controllers before workers. This removes the forEach
+  group-barrier bug: each node's mint/install/wait/invalidate is a real per-step
+  DAG inside the child.
+- **Scratch validation** (correction: `swamp workflow validate` CAN run
+  locally): in a scratch repo, `swamp extension source add <ext dir>` then
+  `swamp workflow validate` — both workflows load and every validation passes (0
+  failures). The earlier load error ("Workflow not found") was the broken
+  workflow, now fixed.
+- **Mock run** with two local mock model sources named
+  `@randybias/k0s-multinode` and `@randybias/k0s-cluster` (models only, log
+  every call), vault `k0s-multinode` created:
+  - install fails (`mock install failed`): calls are `mint:tok-w1`,
+    `install:...`, `invalidate:tok-w1`; `wait` and `invalidate` skipped,
+    `invalidate-failed` succeeded. Every minted token is invalidated.
+  - install succeeds: calls are `mint:tok-w1`, `install:...`,
+    `invalidate:tok-w1`; `invalidate-failed` skipped. So a failed install leaves
+    no live token.
+- Live evidence from the mock run also confirmed the nested-default gap: swamp
+  does not apply the child's nested `ssh_port`/`api_address` defaults, so the
+  caller must supply them (or the fields must be made required). Still to fix.

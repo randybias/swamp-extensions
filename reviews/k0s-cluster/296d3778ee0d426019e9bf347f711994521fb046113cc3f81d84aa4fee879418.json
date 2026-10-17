@@ -1,0 +1,90 @@
+{
+  "extension": "@randybias/k0s-cluster",
+  "version": "2026.10.17.2",
+  "reviewedAt": "2026-10-17T15:42:14Z",
+  "dimensions": [
+    {
+      "id": "credentials-secrets",
+      "verdict": "pass",
+      "note": "The SSH private key reaches a short-lived ssh-agent over stdin (canonical _lib/ssh.ts blob fe0139f0, which also keeps the upload content digest off every argv and remote script). Config, join token and manifest uploads are mode 0600 under umask 077. The admin kubeconfig is returned only as a sensitive value or written to a caller-named vault key through context.vaultService.put; a vault write failure is a fixed message with no backend text. Helm values are redacted from stored and returned renders. Download tokens come from a vault reference or K0S_DOWNLOAD_TOKEN and go in an Authorization header; URLs with user info, query or fragment are rejected. Live: kubeconfig-shaped console text 0 (store_in_vault cells). Residual MEDIUM (terra, delta, carried from ssh-host): the vendored upload result returns the content SHA-256. Known external issue swamp-club lab 3555: README examples use vault references only and warn against --json."
+    },
+    {
+      "id": "logging-quality",
+      "verdict": "pass",
+      "note": "Methods log with structured placeholders (host, version, role, counts); no key, token, kubeconfig, manifest content or Helm values in log fields; remote stderr is never reflected into messages."
+    },
+    {
+      "id": "error-handling",
+      "verdict": "pass",
+      "note": "Every ssh exit 255 is a typed transport error; remote non-zero exits are checked for install, restart, reset (stop, reset and config removal each verified) and uploads. A failed restart restores the previous k0s.yaml, or removes a first-time one. wait_ready returns ready false on timeout but raises on connection, auth or host-key failure. Residual MEDIUM (astra, terra; raised HIGH and downgraded): a failed cat of an existing k0s.yaml is treated as absence, so a later failed restart removes it; as root this needs an I/O error, the file is a deterministic render of the caller's inputs and install recreates it, and the error says it was removed. Residual MEDIUM (terra): get/sync and apply_helm observation helpers turn some non-zero kubectl/ls exits into empty results; rollback ignores the exit of rm and the recovery restart. 2026.10.17.2 reset: k0s stop is skipped when systemctl is-active reports inactive or failed, and a stop failure continues only when a re-check reports inactive or failed; any other unit state is a typed ResetStateError (no stderr matching). A failing k0s reset removes nothing (unit-tested, live 6a/6b). A failed sha256sum is a typed error, not a mismatch. A failed post-reset cleanup is a typed ResetCleanupError with cleanup_pending kept in state."
+    },
+    {
+      "id": "testing-completeness",
+      "verdict": "pass",
+      "note": "151 unit tests with injected SSH, download and clock fakes, plus golden render fixtures; reset is driven through a plain-object context. Live end-to-end for 2026.10.17.1 on an Ubuntu 24.04 VPS with strict pins across 6554ea0, 3cc23a3 and 27a214e (every cell passes). Live for 2026.10.17.2: cells 1-6 pass on 356bb45 (install, reset, reset again, foreign binary kept, immutable file then pending cleanup finished, failing k0s reset and non-executable binary change nothing); F1 (reset of a stopped unit) failed there and passes on 3832bdf with F1b and reset-again; 4-prime passes on behaviour (the binary_removed/reason result fields are not printed by swamp without --json). 50e2f2d (unknown unit states refused, removal outcome persisted) is covered by unit tests only. Residual LOW (astra, delta): the ExecStart fixture copies live-host output; three reset tests could be table-driven."
+    },
+    {
+      "id": "idempotency-resilience",
+      "verdict": "pass",
+      "note": "install re-verifies the installed binary digest and version and adopts an active unit without a second install (live: MainPID and config SHA unchanged); apply_manifests uploads only changed files and removes undeclared ones (live: resourceVersion unchanged); apply_helm restarts only when k0s.yaml changes; reset on a host with no unit is a clean no-op (live). Re-running install without the helm block after apply_helm rewrites k0s.yaml without those extensions and restarts the controller; the README says to always pass the full desired helm set. Residual: manifest stacks are not applied atomically. 2026.10.17.2: a reset whose cleanup failed keeps cleanup_pending and the binary digest, and a rerun with no unit finishes the cleanup (live 5a/5b); reset again on a clean host is a no-op (live)."
+    },
+    {
+      "id": "api-contracts",
+      "verdict": "pass",
+      "note": "Targets k0s on Linux with systemd over the canonical OpenSSH transport; single installs k0s install controller --enable-worker --no-taints (live-verified: no control-plane taint), k0s.k0sproject.io/v1beta1 config. The installed role is read from systemctl show -p ExecStart (real struct format recorded live). Residual MEDIUM (astra, terra, delta): the ExecStart classifier matches tokens anywhere in argv[] and the first true flag, so a hand-modified unit could be misclassified; require /usr/local/bin/k0s then controller and last-occurrence flags."
+    },
+    {
+      "id": "resource-management",
+      "verdict": "pass",
+      "note": "Temporary agent and known_hosts files are removed by the transport; remote output is capped. 2026.10.17.2 reset removes the unit, /var/lib/k0s, /etc/k0s and the process, and the binary at the fixed path /usr/local/bin/k0s only when its SHA-256 equals the digest install recorded (live: nothing left; a foreign binary is kept). Residual MEDIUM (terra HIGH, downgraded; README warns): /etc/k0s is removed wholesale, including user drop-ins such as containerd.d or registry credentials. Residual MEDIUM (live cell 4): reset still runs a foreign binary for k0s stop and k0s reset and trusts their exit 0. Residual LOW (terra HIGH, downgraded: needs a concurrent root writer on the target; astra MEDIUM): a hash-then-rm race on the binary."
+    },
+    {
+      "id": "published-surface-hygiene",
+      "verdict": "pass",
+      "note": "Manifest @randybias/k0s-cluster 2026.10.17.2 (model version literals match), Apache-2.0, additionalFiles README.md and LICENSE.txt, LOGBOOK not packaged. install, apply_manifests, apply_helm and reset descriptions start DESTRUCTIVE. Plain-object model export so the catalog sees type and version. Fixtures use RFC 5737 addresses; leak scan, gitleaks and fixture guard pass. Residual MEDIUM (astra): kubeconfig is described READ-ONLY while store_in_vault overwrites the named vault key. LOW (astra): SSH grammars duplicate the transport's; test-only YAML serializer; unused digests in tests."
+    },
+    {
+      "id": "schema-strictness",
+      "verdict": "pass",
+      "note": "Strict argument objects; every caller value reaching the remote shell has an allowlist grammar and is quoted as one argv element; k0s version, SHA-256, CIDRs (IPv6 parsed strictly), api_address (validated IP), Helm charts and values (bounded depth and size) and manifest paths (no duplicates, no traversal) are bounded. pod_cidr and service_cidr are required with no defaults. Residual LOW (terra): confirm_host and confirm_role_change lack a length bound and host grammar."
+    },
+    {
+      "id": "lifetime-gc",
+      "verdict": "pass",
+      "note": "state, hostkeys, kubeconfig, readiness, manifests, helm, status and config resources: lifetime infinite, garbageCollection 10."
+    },
+    {
+      "id": "crud-completeness",
+      "verdict": "pass",
+      "note": "install (create/update/adopt), get and sync (read), apply_manifests and apply_helm (reconcile), reset (destroy). reset is kind action, not a model delete, because one definition holds many hosts (run ruling 1); requires confirm_host equal to the SSH host (live-verified)."
+    },
+    {
+      "id": "preflight-checks",
+      "verdict": "pass",
+      "note": "The release binary SHA-256 is verified before anything runs (live: a bad SHA installs nothing); host keys are pinned or persisted TOFU before any operation; a role change is refused without confirm_role_change equal to the host and happens only after the replacement binary is verified (live)."
+    },
+    {
+      "id": "instance-names",
+      "verdict": "pass",
+      "note": "Records are keyed by user, host and port (host:22 never shares a record with host:2222); helm and manifest records add a suffix per target."
+    },
+    {
+      "id": "data-access",
+      "verdict": "pass",
+      "note": "Methods read only this model's own records (host keys, state) for the target given in the arguments, so one definition drives a fleet."
+    },
+    {
+      "id": "version-upgrades",
+      "verdict": "pass",
+      "note": "2026.10.17.2 adds a no-op upgrade entry 2026.10.17.1 -> 2026.10.17.2: the state resource gains only optional fields (cleanup_pending, binary_removed, binary_removal_reason), so existing records stay valid. A host installed by an earlier lane build as controller+worker with the control-plane taint is detected from the unit ExecStart and migrated only with confirm_role_change (live-verified in 2026.10.17.1)."
+    }
+  ],
+  "panel": {
+    "codex-astra": "codex gpt-6-astra conformance seat over the 2026.10.17.2 diff at c5c84ab (base 735733f): 1 High (a failed cleanup after k0s reset could never be retried; fixed in 356bb45 with cleanup_pending), 2 Medium (binary ownership checked by digest only at the fixed path, documented as a constant path; hash-then-rm race, residual), 1 Low (table-drivable tests).",
+    "codex-terra": "codex gpt-5.6-terra adversarial seat over the same diff: 2 High, both downgraded (rm -rf /etc/k0s deletes user drop-ins: documented in the README and residual MEDIUM; hash-then-rm race: residual LOW, needs a concurrent root writer), 1 Medium (sha256sum failure treated as a mismatch; fixed in 356bb45 as a typed error).",
+    "triage": "c5c84ab CLEAN after triage; 356bb45 polish (pending cleanup, typed digest error, README warning, failing-reset test); 3832bdf stopped-unit fix reviewed by the live worker, no Critical/High; 50e2f2d self-reviewed at merge prep against TRIAGE 4b-4h (no new remote command, no hash on argv, unknown unit states refused), no Critical/High.",
+    "merge-prep": "Merged lane/d3-k0s f43ff10 (code at 50e2f2d; f43ff10 restores release.yaml) on main after host-net and libvirt; diff scope k0s-cluster/ plus one release.yaml note line, _lib/ssh.ts equals fe0139f0. release.yaml conflict at end of file resolved as main plus the note line. No code change at merge prep.",
+    "live": "receipts: 6/6 cells on 356bb45, F1 found and fixed, F1/F1b/3 pass on 3832bdf, 4-prime passes on behaviour; redacted matrix in the LOGBOOK.",
+    "ocr-llm": "OCR sonnet5 and glm seats were not run"
+  }
+}

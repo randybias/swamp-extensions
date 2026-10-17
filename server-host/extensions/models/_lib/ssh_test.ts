@@ -300,13 +300,8 @@ Deno.test("ssh argv: strict pins, no config, no secret, no shell metacharacters"
   assertEquals(strict.includes("BatchMode=yes"), true);
   assertEquals(strict.slice(0, 2), ["-F", "/dev/null"]);
   assertEquals(strict.join(" ").includes("BEGIN"), false);
-  const tofu = baseSshArgs(
-    { ...T, hostKeyPolicy: "insecure_tofu" },
-    "/tmp/s.sock",
-    "/tmp/kh",
-  );
-  assertEquals(tofu.includes("StrictHostKeyChecking=accept-new"), true);
-  assertEquals(tofu.includes("StrictHostKeyChecking=no"), false);
+  assertEquals(strict.includes("StrictHostKeyChecking=accept-new"), false);
+  assertEquals(strict.includes("StrictHostKeyChecking=no"), false);
 });
 
 // session / exec
@@ -350,14 +345,23 @@ Deno.test("exec: injection attempts reach ssh as one quoted word each", async ()
   }
 });
 
-Deno.test("exec: insecure_tofu writes an empty known_hosts and needs no pins", async () => {
+Deno.test("exec: trust-on-first-use is not offered; the policy must be strict", async () => {
   const f = fakeDeps();
-  await exec(f.deps, {
-    ...T,
-    hostKeyPolicy: "insecure_tofu",
-    hostKeys: undefined,
-  }, ["id"]);
-  assertEquals(f.files.get("/tmp/ssh-host-test/known_hosts"), "");
+  for (const policy of ["insecure_tofu", "accept-new", "none"]) {
+    await assertRejects(
+      () =>
+        exec(f.deps, {
+          ...T,
+          hostKeyPolicy: policy as never,
+          hostKeys: undefined,
+        }, [
+          "id",
+        ]),
+      SshError,
+      "must be strict",
+    );
+  }
+  assertEquals(f.calls.length, 0);
 });
 
 Deno.test("exec: strict without host_keys refuses before spawning anything", async () => {
@@ -366,11 +370,6 @@ Deno.test("exec: strict without host_keys refuses before spawning anything", asy
     () => exec(f.deps, { ...T, hostKeys: [] }, ["id"]),
     SshError,
     "requires host_keys",
-  );
-  await assertRejects(
-    () => exec(f.deps, { ...T, hostKeyPolicy: "none" as never }, ["id"]),
-    SshError,
-    "strict or insecure_tofu",
   );
   assertEquals(f.calls.length, 0);
 });
@@ -575,15 +574,19 @@ Deno.test("waitConnection: unreachable host times out cleanly", async () => {
   assertMatch(r.reason!, /did not present/);
 });
 
-Deno.test("waitConnection: insecure_tofu accepts any key; strict without pins refuses", async () => {
+Deno.test("waitConnection: strict without pins refuses, and so does any other policy", async () => {
   const f = fakeDeps({}, `192.0.2.10 ssh-ed25519 ${KEY2}\n`);
-  const r = await waitConnection(
-    f.deps,
-    { ...WT, hostKeyPolicy: "insecure_tofu", hostKeys: undefined },
-    10,
-    5,
+  await assertRejects(
+    () =>
+      waitConnection(
+        f.deps,
+        { ...WT, hostKeyPolicy: "insecure_tofu" as never, hostKeys: undefined },
+        10,
+        5,
+      ),
+    SshError,
+    "must be strict",
   );
-  assertEquals(r.reachable, true);
   await assertRejects(
     () => waitConnection(f.deps, { ...WT, hostKeys: [] }, 10, 5),
     SshError,

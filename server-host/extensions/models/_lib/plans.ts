@@ -55,8 +55,10 @@ export interface Step {
   argv: string[];
   /** Content delivered on stdin, if any. */
   stdin?: Uint8Array;
-  /** When true, a non-zero remote exit stops the plan. */
+  /** When true, a remote exit outside `okExit` stops the plan. */
   check?: boolean;
+  /** Exit codes that count as success for a checked step; default `[0]`. */
+  okExit?: number[];
   /** Per-step transport timeout in seconds; defaults to {@link STEP_TIMEOUT_S}. */
   timeoutS?: number;
 }
@@ -127,17 +129,39 @@ fi
  * Takes back what an earlier run granted a previous managed account: the
  * managed authorized_keys file, and the sudo membership only if this tool added
  * it (a marker on the host records that). The account itself stays.
+ *
+ * Exit 0: revoked. Exit 3: the keys file was left alone because `~/.ssh` is a
+ * symlink or not the account's own directory (removing through it could delete
+ * another account's keys); the sudo part is still done. Any other non-zero
+ * exit: the sudo membership could not be removed, and the marker is kept so a
+ * rerun retries.
  */
+export const REVOKE_SKIPPED = 3;
 const REVOKE_SCRIPT = `set -e
 user=$1
+rc=0
 home=$(getent passwd "$user" | cut -d: -f6 || true)
-if [ -n "$home" ]; then rm -f "$home/.ssh/authorized_keys"; fi
+if [ -n "$home" ]; then
+  d="$home/.ssh"
+  if [ -L "$d" ] || [ ! -d "$d" ] || [ "$(stat -c %U "$d")" != "$user" ]; then
+    if [ -e "$d" ] || [ -L "$d" ]; then
+      echo "left $d alone: not the account's own directory" >&2
+      rc=${REVOKE_SKIPPED}
+    fi
+  else
+    rm -f "$d/authorized_keys"
+  fi
+fi
 m="${STATE_DIR}/sudo-granted-$user"
 if [ -e "$m" ]; then
   gpasswd -d "$user" sudo >/dev/null 2>&1 || true
+  if id -nG "$user" 2>/dev/null | tr ' ' '\\n' | grep -qx sudo; then
+    echo "could not remove $user from sudo" >&2
+    exit 1
+  fi
   rm -f "$m"
 fi
-printf 'revoked %s\\n' "$user"
+exit $rc
 `;
 
 const KEYS_SCRIPT = `set -e
@@ -172,8 +196,8 @@ export interface BaseInput {
   sysctl: Record<string, string>;
   /** Time zone to set. */
   timezone: string;
-  /** Previous managed account whose grants are revoked first, if any. */
-  previousAdmin?: string;
+  /** Previous managed accounts whose grants are revoked first. */
+  revoke?: string[];
 }
 
 /** Renders the managed sysctl drop-in with sorted keys. */
@@ -236,19 +260,18 @@ export function planApplyBase(
 ): Step[] {
   const steps: Step[] = [];
   const want = (name: string) => changed.includes(name);
-  if (want("revoke_previous") && input.previousAdmin) {
-    steps.push({
-      kind: "base",
-      label: "revoke previous admin account grants",
-      argv: withSudo(input.sudo, [
-        "sh",
-        "-c",
-        REVOKE_SCRIPT,
-        "sh",
-        input.previousAdmin,
-      ]),
-      check: true,
-    });
+  if (want("revoke_previous")) {
+    for (const user of input.revoke ?? []) {
+      steps.push({
+        kind: "base",
+        label: `revoke grants of ${user}`,
+        argv: withSudo(input.sudo, ["sh", "-c", REVOKE_SCRIPT, "sh", user]),
+        // 0 = revoked, 3 = keys left alone (the caller reads it); anything else
+        // stops the plan before the new account is granted anything.
+        check: true,
+        okExit: [0, REVOKE_SKIPPED],
+      });
+    }
   }
   if (want("packages") && input.packages.length > 0) {
     steps.push({
@@ -596,7 +619,7 @@ export async function executePlan(
       stdin: step.stdin,
       timeoutS: step.timeoutS ?? STEP_TIMEOUT_S,
     });
-    if (step.check && res.exit_code !== 0) {
+    if (step.check && !(step.okExit ?? [0]).includes(res.exit_code)) {
       throw new HostOpsError(
         `Remote step "${step.label}" failed with exit code ${res.exit_code}`,
         step.kind,

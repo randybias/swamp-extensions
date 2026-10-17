@@ -290,3 +290,22 @@ Round 11 (live findings):
   path cannot be cut. Tested under `sh` with stubs, and disabling it fails the
   tests. Accounts created before this version have no marker, so their sudo
   membership is not revoked (only the keys file).
+
+Round 12 (delta review of f66c8d0, lead ruling 4g):
+
+- HIGH revoke ignored a failing `gpasswd` and deleted its marker. Fixed: the
+  marker is removed only after `id -nG` no longer lists sudo (or the account is
+  gone); otherwise the step exits non-zero and the plan stops before the new
+  account is granted anything, so nothing is recorded and a rerun retries.
+- HIGH logging in as the previous admin skipped the revoke and forgot it. Fixed:
+  `host_state.pending_revoke` keeps those accounts; the next run that logs in as
+  another account revokes them first and clears the list. The observation shows
+  the list.
+- MEDIUM the keys removal could follow a symlinked `~/.ssh`. Fixed: it is left
+  alone, with exit 3 (reported, kept pending), unless `~/.ssh` is a real
+  directory owned by the account.
+- MEDIUM `ssh_exposure` in the observation was the recorded intent; it is now
+  `unknown` whenever drift is reported.
+- Ruling 4g: `insecure_tofu` is gone. `host_key_policy` accepts only `strict`
+  and `host_keys` is required (at least one), in the schema and the transport;
+  `pinHostKeys` and the first-contact scan are removed.

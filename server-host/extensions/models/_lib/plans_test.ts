@@ -23,7 +23,10 @@ const TARGET: Target = {
   host: "192.0.2.10",
   port: 22,
   user: "root",
-  hostKeyPolicy: "insecure_tofu",
+  hostKeyPolicy: "strict",
+  hostKeys: [
+    "192.0.2.10 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFakeKeyMaterialForTests",
+  ],
   privateKey:
     "-----BEGIN OPENSSH PRIVATE KEY-----\nZmFrZS1rZXktbWF0ZXJpYWw=\n-----END OPENSSH PRIVATE KEY-----",
   connectTimeoutS: 15,

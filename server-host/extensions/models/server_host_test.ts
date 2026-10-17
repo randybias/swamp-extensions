@@ -1,4 +1,8 @@
-import { assertEquals, assertRejects } from "jsr:@std/assert@1.0.19";
+import {
+  assertEquals,
+  assertRejects,
+  assertThrows,
+} from "jsr:@std/assert@1.0.19";
 import { createModelTestContext } from "jsr:@swamp-club/swamp-testing@0.20261014.55";
 import { createModel, type HostDeps, hostInstance } from "./server_host.ts";
 import { type CommandRunner } from "./_lib/ssh.ts";
@@ -32,7 +36,8 @@ const SSH = {
   host: "192.0.2.10",
   port: 22,
   user: "root",
-  host_key_policy: "insecure_tofu" as const,
+  host_key_policy: "strict" as const,
+  host_keys: [`192.0.2.10 ${KEY}`],
   ssh_key_ref: { vault: "prod", key: "ssh-key" },
   connect_timeout_s: 15,
   sudo: true,
@@ -194,7 +199,8 @@ Deno.test("schema: a literal private_key is rejected; ssh_key_ref is required", 
     host: SSH.host,
     port: 22,
     user: "root",
-    host_key_policy: "insecure_tofu",
+    host_key_policy: "strict",
+    host_keys: [`192.0.2.10 ${KEY}`],
     private_key: PEM,
   };
   assertEquals(
@@ -832,21 +838,10 @@ Deno.test("injection: metacharacters in a valid-looking user are refused by gram
   }
 });
 
-Deno.test("host key policy: strict without pinned keys is refused before any spawn", async () => {
+Deno.test("host key policy: strict without pinned keys is refused by the schema, before any spawn", () => {
   const f = fakeTransport();
   const m = modelWith(f);
-  const { context } = createModelTestContext({ globalArgs: {} });
-  await assertRejects(
-    () =>
-      m.methods.get.execute(
-        m.methods.get.arguments.parse({
-          ...SSH,
-          host_key_policy: "strict",
-        }),
-        context,
-      ),
-    Error,
-  );
+  assertThrows(() => m.methods.get.arguments.parse({ ...SSH, host_keys: [] }));
   assertEquals(f.commands.length, 0);
 });
 
@@ -962,7 +957,27 @@ Deno.test("apply_firewall: a retry after a failed change does not depend on any 
   );
 });
 
-Deno.test("insecure_tofu: the host key is scanned once and pinned strictly for every step", async () => {
+Deno.test("strict is the only host-key policy: trust-on-first-use is rejected and host_keys is required", () => {
+  const m = createModel();
+  const ok = m.methods.get.arguments.safeParse({ ...SSH });
+  assertEquals(ok.success, true);
+  for (const policy of ["insecure_tofu", "accept-new", "insecure", ""]) {
+    assertEquals(
+      m.methods.get.arguments.safeParse({ ...SSH, host_key_policy: policy })
+        .success,
+      false,
+      policy,
+    );
+  }
+  const { host_keys: _k, ...noKeys } = SSH;
+  assertEquals(m.methods.get.arguments.safeParse(noKeys).success, false);
+  assertEquals(
+    m.methods.get.arguments.safeParse({ ...SSH, host_keys: [] }).success,
+    false,
+  );
+});
+
+Deno.test("every ssh step runs with the same pinned known_hosts and nothing is scanned", async () => {
   const f = fakeTransport();
   const m = modelWith(f);
   const ctx = createModelTestContext({ globalArgs: {} });
@@ -970,48 +985,10 @@ Deno.test("insecure_tofu: the host key is scanned once and pinned strictly for e
     m.methods.apply_firewall.arguments.parse(FIREWALL_ARGS),
     ctx.context,
   );
-  assertEquals(f.scans.length, 1);
-  assertEquals(f.scans[0].at(-1), SSH.host);
-  // Every ssh step ran with the same pinned known_hosts, none with an empty one.
+  assertEquals(f.scans.length, 0);
   assertEquals(f.knownHosts.length, f.commands.length);
   assertEquals(new Set(f.knownHosts).size, 1);
   assertEquals(f.knownHosts[0], `${SSH.host} ${KEY}\n`);
-});
-
-Deno.test("insecure_tofu: a host offering no key fails before any command runs", async () => {
-  const f = fakeTransport();
-  const run = f.deps.run!;
-  f.deps.run = (cmd, args, o) =>
-    cmd === "ssh-keyscan"
-      ? Promise.resolve({ code: 0, stdout: "", stderr: "" })
-      : run(cmd, args, o);
-  const m = modelWith(f);
-  const ctx = createModelTestContext({ globalArgs: {} });
-  await assertRejects(
-    () =>
-      m.methods.apply_firewall.execute(
-        m.methods.apply_firewall.arguments.parse(FIREWALL_ARGS),
-        ctx.context,
-      ),
-    Error,
-    "No host keys",
-  );
-  assertEquals(f.commands.length, 0);
-});
-
-Deno.test("strict: pinned keys are used as given and nothing is scanned", async () => {
-  const f = fakeTransport();
-  const m = modelWith(f);
-  const ctx = createModelTestContext({ globalArgs: {} });
-  await m.methods.apply_firewall.execute(
-    m.methods.apply_firewall.arguments.parse({
-      ...FIREWALL_ARGS,
-      host_key_policy: "strict",
-      host_keys: [`${SSH.host} ${KEY}`],
-    }),
-    ctx.context,
-  );
-  assertEquals(f.scans.length, 0);
 });
 
 Deno.test("commit: an armed revert the model never recorded is found through the host's marker", async () => {
@@ -1569,4 +1546,150 @@ Deno.test("sync records drift: a revert that fired, and a changed ruleset", asyn
   assertEquals(o.managed_table, false);
   assertEquals(o.drift.includes("ruleset"), true);
   assertEquals(o.drift.includes("revert_fired"), true);
+});
+
+Deno.test("apply_base: logging in as the previous admin defers its revoke; the next run completes it", async () => {
+  const resources = await baseStored("oldops");
+  const f1 = fakeTransport();
+  const ctx1 = createModelTestContext({
+    globalArgs: {},
+    storedResources: resources,
+  });
+  // Run 1 logs in AS oldops, so oldops cannot be revoked yet.
+  await modelWith(f1).methods.apply_base.execute(
+    modelWith(f1).methods.apply_base.arguments.parse({
+      ...BASE_ARGS,
+      user: "oldops",
+      admin_user: "newops",
+    }),
+    ctx1.context,
+  );
+  assertEquals(
+    f1.commands.some((c) => c.includes("sudo-granted-$user")),
+    false,
+  );
+  const state1 = ctx1.getWrittenResources().find((r) =>
+    r.name.startsWith("state-")
+  )!.data as { base: { admin_user: string }; pending_revoke?: string[] };
+  assertEquals(state1.base.admin_user, "newops");
+  assertEquals(state1.pending_revoke, ["oldops"]);
+
+  // Run 2 logs in as root with the same inputs: the pending revoke is done.
+  const f2 = fakeTransport();
+  const ctx2 = createModelTestContext({
+    globalArgs: {},
+    storedResources: {
+      [`state-${hostInstance(SSH.host)}`]: {
+        ...state1,
+        host: SSH.host,
+        observed_at: "2026-01-01T00:00:00.000Z",
+      },
+    },
+  });
+  const out = await modelWith(f2).methods.apply_base.execute(
+    modelWith(f2).methods.apply_base.arguments.parse({
+      ...BASE_ARGS,
+      admin_user: "newops",
+    }),
+    ctx2.context,
+  );
+  assertEquals(out.result.changed.includes("revoke_previous"), true);
+  assertEquals(
+    f2.commands.some((c) =>
+      c.includes("sudo-granted-$user") && c.includes("'oldops'")
+    ),
+    true,
+  );
+  const state2 = ctx2.getWrittenResources().find((r) =>
+    r.name.startsWith("state-")
+  )!.data as { pending_revoke?: string[] };
+  assertEquals(state2.pending_revoke, undefined);
+});
+
+Deno.test("apply_base: a revoke that fails stops the run and records nothing, so a rerun retries", async () => {
+  const f = fakeTransport((c) =>
+    c.includes("sudo-granted-$user") ? { code: 1 } : { code: 0 }
+  );
+  const m = modelWith(f);
+  const ctx = createModelTestContext({
+    globalArgs: {},
+    storedResources: await baseStored("oldops"),
+  });
+  await assertRejects(
+    () =>
+      m.methods.apply_base.execute(
+        m.methods.apply_base.arguments.parse({
+          ...BASE_ARGS,
+          admin_user: "newops",
+        }),
+        ctx.context,
+      ),
+    Error,
+    "failed with exit code 1",
+  );
+  assertEquals(ctx.getWrittenResources().length, 0);
+  // The new account was not granted anything either: the revoke comes first.
+  assertEquals(f.commands.some((c) => c.includes("useradd")), false);
+});
+
+Deno.test("apply_base: keys left alone (exit 3) keep the account on the pending list", async () => {
+  const f = fakeTransport((c) =>
+    c.includes("sudo-granted-$user") ? { code: 3 } : { code: 0 }
+  );
+  const m = modelWith(f);
+  const ctx = createModelTestContext({
+    globalArgs: {},
+    storedResources: await baseStored("oldops"),
+  });
+  await m.methods.apply_base.execute(
+    m.methods.apply_base.arguments.parse({
+      ...BASE_ARGS,
+      admin_user: "newops",
+    }),
+    ctx.context,
+  );
+  const st = ctx.getWrittenResources().find((r) => r.name.startsWith("state-"))!
+    .data as { pending_revoke?: string[] };
+  assertEquals(st.pending_revoke, ["oldops"]);
+});
+
+Deno.test("observation: ssh_exposure is unknown when the host disagrees with the record, and pending revokes are listed", async () => {
+  const f = fakeTransport((c) =>
+    c.includes("'systemctl' 'is-active'")
+      ? { code: 3, stdout: "inactive\n" }
+      : { code: 0 }
+  );
+  const m = modelWith(f);
+  const { context, getWrittenResources } = createModelTestContext({
+    globalArgs: {},
+    storedResources: {
+      [`state-${hostInstance(SSH.host)}`]: {
+        host: SSH.host,
+        pending_revoke: ["oldops"],
+        firewall: {
+          ruleset_sha256: "x",
+          managed_sha256: await expectedManagedSha256(FIREWALL),
+          mode: "lockdown",
+          ssh_exposure: "management-only",
+          applied_at: "2026-01-01T00:00:00.000Z",
+        },
+        observed_at: "2026-01-01T00:00:00.000Z",
+      },
+    },
+  });
+  await m.methods.get.execute(
+    m.methods.get.arguments.parse({ ...SSH }),
+    context,
+  );
+  const o = getWrittenResources().find((r) =>
+    r.name.startsWith("observation-")
+  )!
+    .data as {
+      ssh_exposure: string;
+      drift: string[];
+      pending_revoke: string[];
+    };
+  assertEquals(o.drift.includes("ruleset"), true);
+  assertEquals(o.ssh_exposure, "unknown");
+  assertEquals(o.pending_revoke, ["oldops"]);
 });

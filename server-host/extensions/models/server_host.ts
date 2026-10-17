@@ -16,12 +16,7 @@
  */
 
 import { z } from "npm:zod@4.3.6";
-import {
-  denoDeps,
-  pinHostKeys,
-  type SshDeps,
-  type Target,
-} from "./_lib/ssh.ts";
+import { denoDeps, type SshDeps, type Target } from "./_lib/ssh.ts";
 import {
   assertAuthorizedKey,
   assertCidr,
@@ -57,6 +52,7 @@ import {
   planFirewallChange,
   probeState,
   renderSysctlConf,
+  REVOKE_SKIPPED,
 } from "./_lib/plans.ts";
 import { TOKEN_RE, unitName } from "./_lib/armed_revert.ts";
 
@@ -89,8 +85,8 @@ export const denoHostDeps: HostDeps = { ...denoDeps, token: randomToken };
 
 const GlobalArgsSchema = z.strictObject({});
 
-const HostKeyPolicy = z.enum(["strict", "insecure_tofu"]).describe(
-  "strict trusts only host_keys; insecure_tofu trusts whatever key the host presents on first contact and records nothing",
+const HostKeyPolicy = z.literal("strict").describe(
+  "Host keys are verified against host_keys; no other policy is offered, because nothing would pin a key accepted on first contact",
 );
 
 /** Vault name and secret key of the SSH private key. */
@@ -106,8 +102,8 @@ const SshFields = {
   port: z.number().int().min(1).max(65535).default(22).describe("SSH port"),
   user: z.string().regex(USER_RE).describe("Remote login name"),
   host_key_policy: HostKeyPolicy,
-  host_keys: z.array(z.string().max(2048)).max(16).optional().describe(
-    "Pinned host keys in ssh-keyscan format, one per entry; required for strict",
+  host_keys: z.array(z.string().max(2048)).min(1).max(16).describe(
+    "Pinned host keys in ssh-keyscan format, one per entry",
   ),
   ssh_key_ref: SecretRef.describe(
     "Vault reference to the SSH private key; the key is read inside the method and never appears in arguments or logs",
@@ -218,6 +214,8 @@ const HostStateSchema = z.strictObject({
   host: z.string(),
   base: BaseStateSchema.optional(),
   firewall: FirewallStateSchema.optional(),
+  // Previous managed accounts whose grants could not be taken back yet.
+  pending_revoke: z.array(z.string()).optional(),
   observed_at: z.string(),
 });
 
@@ -251,6 +249,7 @@ const ObservationSchema = z.strictObject({
   revert_token: z.string().nullable(),
   revert_expires_at: z.string().nullable(),
   drift: z.array(z.string()),
+  pending_revoke: z.array(z.string()),
 });
 
 const RenderStateSchema = z.strictObject({
@@ -358,8 +357,8 @@ function target(
     host: string;
     port: number;
     user: string;
-    host_key_policy: "strict" | "insecure_tofu";
-    host_keys?: string[];
+    host_key_policy: "strict";
+    host_keys: string[];
     connect_timeout_s: number;
   },
   privateKey: string,
@@ -403,7 +402,7 @@ function sameStrings(a: readonly string[], b: readonly string[]): boolean {
 export function createModel(overrides: Partial<HostDeps> = {}) {
   const deps: HostDeps = { ...denoHostDeps, ...overrides };
 
-  /** Resolves the key and fixes the host identity once for a whole operation. */
+  /** Resolves the SSH private key and builds the strict, pinned target. */
   async function openTarget(
     context: Ctx,
     a: Parameters<typeof target>[0] & {
@@ -411,7 +410,7 @@ export function createModel(overrides: Partial<HostDeps> = {}) {
     },
   ): Promise<Target> {
     const key = await resolvePrivateKey(deps, context, a.ssh_key_ref);
-    return await pinHostKeys(deps, target(a, key));
+    return target(a, key);
   }
 
   /**
@@ -626,7 +625,10 @@ export function createModel(overrides: Partial<HostDeps> = {}) {
       base_applied: Boolean(stored?.base),
       admin_user: stored?.base?.admin_user ?? null,
       firewall_mode: stored?.firewall?.mode ?? null,
-      ssh_exposure: stored?.firewall?.ssh_exposure ?? "unknown",
+      // The recorded intent is only trusted while the host agrees with it.
+      ssh_exposure: drift.length === 0
+        ? stored?.firewall?.ssh_exposure ?? "unknown"
+        : "unknown",
       managed_table: probe.managed_table,
       ruleset_sha256: probe.ruleset_sha256,
       managed_sha256: probe.managed_sha256,
@@ -635,6 +637,7 @@ export function createModel(overrides: Partial<HostDeps> = {}) {
       revert_expires_at: active?.expires_at ?? probe.current_expires_at ??
         null,
       drift,
+      pending_revoke: stored?.pending_revoke ?? [],
     };
     const state = await context.writeResource(
       "host_state",
@@ -742,17 +745,29 @@ export function createModel(overrides: Partial<HostDeps> = {}) {
             changed.push("timezone");
           }
           if (!prev) changed.push("journald", "time_sync");
-          // Take back what the previous managed account was granted, before the
-          // new one is granted. Never root, and never the account this run logs
-          // in with: that would cut the management path.
-          const previousAdmin = prev && prev.admin_user !== args.admin_user &&
-              prev.admin_user !== "root" && prev.admin_user !== args.user
-            ? prev.admin_user
-            : undefined;
-          if (previousAdmin) {
-            assertUser(previousAdmin);
-            changed.push("revoke_previous");
+          // Take back what earlier managed accounts were granted, before the
+          // new one is granted: the previous account, and any account an
+          // earlier run could not revoke. Never root, never the account being
+          // granted, and never the account this run logs in with (that would
+          // cut the management path): those stay on the pending list.
+          const owed = [
+            ...(prev && prev.admin_user !== args.admin_user
+              ? [prev.admin_user]
+              : []),
+            ...(stored?.pending_revoke ?? []),
+          ].filter((u, i, all) =>
+            all.indexOf(u) === i && u !== args.admin_user && u !== "root"
+          );
+          for (const u of owed) assertUser(u);
+          const toRevoke = owed.filter((u) => u !== args.user);
+          const deferred = owed.filter((u) => u === args.user);
+          for (const u of deferred) {
+            context.logger.warning(
+              "Not revoking {user}: this run logs in as that account; it stays pending until a run logs in as another account",
+              { user: u },
+            );
           }
+          if (toRevoke.length > 0) changed.push("revoke_previous");
           // A changed account must receive the managed keys even when the key
           // material is unchanged, and an empty list too: the managed file is
           // rewritten empty rather than leaving the new account with old keys.
@@ -769,9 +784,28 @@ export function createModel(overrides: Partial<HostDeps> = {}) {
             authorizedKeys: keys,
             sysctl: args.sysctl,
             timezone: args.timezone,
-            previousAdmin,
+            revoke: toRevoke,
           }, changed);
           const emitted = await executePlan(deps, t, steps);
+          // The revoke steps are not "checked" so that their exit code can say
+          // whether the keys file was left alone; any other failure is fatal.
+          const stillPending = [...deferred];
+          for (const u of toRevoke) {
+            const done = emitted.find((e) =>
+              e.label === `revoke grants of ${u}`
+            );
+            if (done && done.exit_code === REVOKE_SKIPPED) {
+              stillPending.push(u);
+              context.logger.warning(
+                "Left the ssh directory of {user} alone (symlink or not its own); remove its authorized_keys by hand",
+                { user: u },
+              );
+            } else if (!done || done.exit_code !== 0) {
+              throw new HostOpsError(
+                `Revoking the previous admin account ${u} failed (exit ${done?.exit_code}); not recording the change so a rerun retries`,
+              );
+            }
+          }
           context.logger.info("apply_base on {host}: {count} steps", {
             host: args.host,
             count: emitted.length,
@@ -787,6 +821,9 @@ export function createModel(overrides: Partial<HostDeps> = {}) {
               applied_at: new Date(deps.now()).toISOString(),
             },
             ...(stored?.firewall ? { firewall: stored.firewall } : {}),
+            ...(stillPending.length > 0
+              ? { pending_revoke: stillPending }
+              : {}),
             observed_at: new Date(deps.now()).toISOString(),
           };
           const handle = await context.writeResource(
@@ -1026,6 +1063,9 @@ function mergeState(
     host: merged.host,
     ...(merged.base ? { base: merged.base } : {}),
     ...(merged.firewall ? { firewall: merged.firewall } : {}),
+    ...(merged.pending_revoke?.length
+      ? { pending_revoke: merged.pending_revoke }
+      : {}),
     observed_at: merged.observed_at ?? new Date().toISOString(),
   };
 }
@@ -1043,6 +1083,9 @@ async function writeFirewallState(
   return await context.writeResource("host_state", name, {
     host,
     ...(stored?.base ? { base: stored.base } : {}),
+    ...(stored?.pending_revoke?.length
+      ? { pending_revoke: stored.pending_revoke }
+      : {}),
     firewall: {
       ruleset_sha256: sha.ruleset_sha256,
       managed_sha256: sha.managed_sha256,

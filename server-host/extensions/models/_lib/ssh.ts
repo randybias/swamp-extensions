@@ -3,10 +3,9 @@
  * atomically, and wait for a host to answer with the expected host keys.
  *
  * Security properties:
- * - The host-key policy is explicit. `strict` trusts only the pinned keys
- *   (written to a private temporary known_hosts file); `insecure_tofu` trusts
- *   whatever the host presents on first contact within one call and records
- *   nothing.
+ * - The host-key policy is `strict` and nothing else: only the pinned keys are
+ *   trusted (written to a private temporary known_hosts file). Trusting
+ *   whatever a host presents is not offered, because nothing would pin it.
  * - The private key is loaded into a short-lived ssh-agent over stdin. It never
  *   appears on a command line and is never written to disk.
  * - Every caller value that reaches the remote shell is validated against an
@@ -19,7 +18,7 @@
  */
 
 /** How the host's identity is established. */
-export type HostKeyPolicy = "strict" | "insecure_tofu";
+export type HostKeyPolicy = "strict";
 
 /** Output of one local command. */
 export interface CommandResult {
@@ -298,16 +297,11 @@ export function assertTarget(t: Target): void {
   assertHost(t.host);
   assertPort(t.port);
   assertUser(t.user);
-  if (t.hostKeyPolicy !== "strict" && t.hostKeyPolicy !== "insecure_tofu") {
-    throw new SshError(
-      "config",
-      "host_key_policy must be strict or insecure_tofu",
-    );
+  if (t.hostKeyPolicy !== "strict") {
+    throw new SshError("config", "host_key_policy must be strict");
   }
-  if (t.hostKeyPolicy === "strict") {
-    if (parseHostKeys(t.hostKeys ?? []).length === 0) {
-      throw new SshError("config", "host_key_policy strict requires host_keys");
-    }
+  if (parseHostKeys(t.hostKeys ?? []).length === 0) {
+    throw new SshError("config", "host_key_policy strict requires host_keys");
   }
   if (
     !Number.isInteger(t.connectTimeoutS) || t.connectTimeoutS < 1 ||
@@ -354,9 +348,7 @@ export function baseSshArgs(
     "-o",
     "BatchMode=yes",
     "-o",
-    `StrictHostKeyChecking=${
-      t.hostKeyPolicy === "strict" ? "yes" : "accept-new"
-    }`,
+    "StrictHostKeyChecking=yes",
     "-o",
     `UserKnownHostsFile=${knownHostsFile}`,
     "-o",
@@ -422,38 +414,6 @@ export function classifyFailure(
   return new SshError("transport", `SSH to ${t.host} failed`);
 }
 
-/**
- * Fixes the host identity for one logical operation. Under `strict` the
- * target is returned unchanged. Under `insecure_tofu` the host's keys are
- * scanned ONCE and the returned target pins them with strict checking, so
- * every later `exec` of the operation must see the same keys: a host that
- * offers a different key on a later step fails with a `host_key` error
- * instead of being trusted afresh each time. Nothing is persisted.
- */
-export async function pinHostKeys(
-  deps: SshDeps,
-  t: Target,
-): Promise<Target> {
-  assertTarget(t);
-  if (t.hostKeyPolicy === "strict") return t;
-  const scanned = await deps.run("ssh-keyscan", [
-    "-T",
-    String(t.connectTimeoutS),
-    "-p",
-    String(t.port),
-    t.host,
-  ]);
-  const keys = parseKeyscan(scanned.stdout);
-  if (keys.length === 0) {
-    throw new SshError("host_key", `No host keys offered by ${t.host}`);
-  }
-  return {
-    ...t,
-    hostKeyPolicy: "strict",
-    hostKeys: formatHostKeys(keys, t.host, t.port),
-  };
-}
-
 /** The result of `exec`. */
 export interface ExecResult {
   /** The remote command's exit status. */
@@ -486,9 +446,7 @@ export interface Session {
 
 /**
  * Prepares a session for `t`, runs `fn`, and always tears the agent and the
- * temporary files down. In `strict` mode the pinned keys are written to a
- * private known_hosts; in `insecure_tofu` mode an empty one is used so nothing
- * persists.
+ * temporary files down. The pinned keys are written to a private known_hosts.
  */
 export async function withSession<T>(
   deps: SshDeps,
@@ -517,9 +475,7 @@ export async function withSession<T>(
     const known = `${dir}/known_hosts`;
     await deps.writeFile(
       known,
-      t.hostKeyPolicy === "strict"
-        ? renderKnownHosts(parseHostKeys(t.hostKeys ?? []), t.host, t.port)
-        : "",
+      renderKnownHosts(parseHostKeys(t.hostKeys ?? []), t.host, t.port),
     );
     const base = baseSshArgs(t, sock, known);
     return await fn({
@@ -673,9 +629,8 @@ export interface WaitResult {
 
 /**
  * Polls ssh-keyscan until the host presents acceptable host keys or the
- * deadline passes. In `strict` mode the keys must match the pinned set;
- * `insecure_tofu` accepts any key. READ-ONLY: authenticates nothing and
- * changes nothing on either side.
+ * deadline passes. The keys must match the pinned set. READ-ONLY:
+ * authenticates nothing and changes nothing on either side.
  */
 export async function waitConnection(
   deps: SshDeps,
@@ -688,16 +643,11 @@ export async function waitConnection(
 ): Promise<WaitResult> {
   assertHost(t.host);
   assertPort(t.port);
-  if (t.hostKeyPolicy !== "strict" && t.hostKeyPolicy !== "insecure_tofu") {
-    throw new SshError(
-      "config",
-      "host_key_policy must be strict or insecure_tofu",
-    );
+  if (t.hostKeyPolicy !== "strict") {
+    throw new SshError("config", "host_key_policy must be strict");
   }
-  const pinned = t.hostKeyPolicy === "strict"
-    ? parseHostKeys(t.hostKeys ?? [])
-    : [];
-  if (t.hostKeyPolicy === "strict" && pinned.length === 0) {
+  const pinned = parseHostKeys(t.hostKeys ?? []);
+  if (pinned.length === 0) {
     throw new SshError("config", "host_key_policy strict requires host_keys");
   }
   const deadline = deps.now() + timeoutS * 1000;
@@ -718,9 +668,7 @@ export async function waitConnection(
       reason = "host did not present SSH host keys";
     } else {
       try {
-        const keys = t.hostKeyPolicy === "strict"
-          ? verifyHostKeys(observed, pinned, t.host)
-          : observed;
+        const keys = verifyHostKeys(observed, pinned, t.host);
         return {
           reachable: true,
           host_keys: formatHostKeys(keys, t.host, t.port),

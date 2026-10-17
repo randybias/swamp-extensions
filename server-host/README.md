@@ -46,9 +46,9 @@ expiry. If a step fails after arming and the outcome is unknown, the timer stays
 armed and restores the host; if the apply was definitely rejected, the change
 cancels its own timer.
 
-Under `insecure_tofu` the host key is read once at the start of a method and
-pinned for every step of it, so a host cannot present a different key to a later
-step.
+Host keys are always verified against the `host_keys` you pass; the only policy
+is `strict`, because a key accepted on first contact would have nothing to pin
+it.
 
 `get` and `sync` write what they saw as the `observation` resource, because
 swamp does not show a method's returned result: read it with
@@ -57,8 +57,11 @@ opaque revert token, never a key.
 
 When `admin_user` changes, `apply_base` first takes back what it granted the
 previous managed account: its managed `authorized_keys` file, and its `sudo`
-membership if this tool added it. The account is not deleted, and root and the
-account the run logs in with are never touched.
+membership if this tool added it, and fails the run, keeping the record, if the
+sudo membership cannot be removed. The account is not deleted; root is never
+touched, a `~/.ssh` that is a symlink or not the account's own is left alone,
+and the account the run logs in with is kept on a `pending_revoke` list (shown
+in the observation) until a run logs in as another account.
 
 ## Install
 
@@ -99,13 +102,13 @@ swamp behavior run @randybias/server-host apply_base hardened-host \
 
 swamp behavior run @randybias/server-host lockdown hardened-host \
   --input host=192.0.2.10 --input user=root \
-  --input host_key_policy=insecure_tofu \
+  --input host_key_policy=strict \
   --input 'ssh_key_ref={"vault":"prod","key":"server-host-key"}' \
   --input 'management_cidrs=["192.0.2.0/24"]' --input ssh_port=22
 
 swamp behavior run @randybias/server-host commit hardened-host \
   --input host=192.0.2.10 --input user=root \
-  --input host_key_policy=insecure_tofu \
+  --input host_key_policy=strict \
   --input 'ssh_key_ref={"vault":"prod","key":"server-host-key"}'
 ```
 

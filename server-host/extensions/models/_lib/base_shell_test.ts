@@ -1,7 +1,7 @@
 // Runs the generated account scripts under a real POSIX shell with stub
 // `getent`, `id`, `usermod` and `gpasswd`, in a scratch state directory.
 import { assertEquals } from "jsr:@std/assert@1.0.19";
-import { planApplyBase } from "./plans.ts";
+import { planApplyBase, REVOKE_SKIPPED } from "./plans.ts";
 import { STATE_DIR } from "./armed_revert.ts";
 
 const INPUT = {
@@ -11,7 +11,7 @@ const INPUT = {
   authorizedKeys: [],
   sysctl: {},
   timezone: "UTC",
-  previousAdmin: "oldops",
+  revoke: ["oldops"],
 };
 
 const script = (label: string) => {
@@ -35,12 +35,24 @@ async function box() {
     await Deno.chmod(`${bin}/${n}`, 0o755);
   };
   await stub("getent", `echo "$2:x:1:1::${dir}/home/$2:/bin/bash"`);
-  await stub("gpasswd", `echo "$@" >> "${dir}/gpasswd.log"`);
+  // gpasswd -d USER sudo: removes the group from the stub's group list unless
+  // ${dir}/gpasswd-fails exists (a lock held, an NSS error).
+  await stub(
+    "gpasswd",
+    `echo "$@" >> "${dir}/gpasswd.log"
+[ ! -e "${dir}/gpasswd-fails" ] || exit 1
+sed -i 's/ sudo//' "${dir}/groups"`,
+  );
+  // stat -c %U PATH: the owner is the account whose home holds the path.
+  await stub(
+    "stat",
+    `case "$3" in */home/*/.ssh) basename "$(dirname "$3")";; *) echo root;; esac`,
+  );
   await stub("usermod", `echo "$@" >> "${dir}/usermod.log"`);
   // `id -u` succeeds; `id -nG` lists the groups in ${dir}/groups.
   await stub(
     "id",
-    `case "$1" in -u) exit 0;; -nG) cat "${dir}/groups" 2>/dev/null;; esac`,
+    `case "$1" in -u) exit 0;; -nG) [ -e "${dir}/groups" ] && cat "${dir}/groups";; esac`,
   );
   const run = async (s: { script: string; args: string[] }) => {
     const out = await new Deno.Command("sh", {
@@ -63,8 +75,9 @@ Deno.test("revoke: removes the managed keys file, and the sudo grant only when t
   try {
     // We granted sudo earlier: the marker is on the host.
     await Deno.writeTextFile(`${b.state}/sudo-granted-oldops`, "");
+    await Deno.writeTextFile(`${b.dir}/groups`, "oldops sudo\n");
     assertEquals(
-      await b.run(script("revoke previous admin account grants")),
+      await b.run(script("revoke grants of oldops")),
       0,
     );
     assertEquals(
@@ -84,7 +97,7 @@ Deno.test("revoke: a sudo membership this tool did not add is left alone", async
   const b = await box();
   try {
     assertEquals(
-      await b.run(script("revoke previous admin account grants")),
+      await b.run(script("revoke grants of oldops")),
       0,
     );
     assertEquals(await b.read("gpasswd.log"), null);
@@ -115,5 +128,74 @@ Deno.test("create: marks the sudo grant only when it added the membership", asyn
     assertEquals(await c.exists(`${c.state}/sudo-granted-newops`), false);
   } finally {
     await Deno.remove(c.dir, { recursive: true });
+  }
+});
+
+Deno.test("revoke: a failing gpasswd keeps the marker and fails the step so a rerun retries", async () => {
+  const b = await box();
+  try {
+    await Deno.writeTextFile(`${b.state}/sudo-granted-oldops`, "");
+    await Deno.writeTextFile(`${b.dir}/groups`, "oldops sudo\n");
+    await Deno.writeTextFile(`${b.dir}/gpasswd-fails`, "");
+    const code = await b.run(script("revoke grants of oldops"));
+    assertEquals(code !== 0 && code !== 3, true);
+    assertEquals(await b.exists(`${b.state}/sudo-granted-oldops`), true);
+  } finally {
+    await Deno.remove(b.dir, { recursive: true });
+  }
+});
+
+Deno.test("revoke: an account that no longer exists counts as revoked", async () => {
+  const b = await box();
+  try {
+    await Deno.writeTextFile(`${b.state}/sudo-granted-oldops`, "");
+    // No groups file: `id -nG` fails, as it does for a deleted account.
+    assertEquals(await b.run(script("revoke grants of oldops")), 0);
+    assertEquals(await b.exists(`${b.state}/sudo-granted-oldops`), false);
+  } finally {
+    await Deno.remove(b.dir, { recursive: true });
+  }
+});
+
+Deno.test("revoke: a symlinked ~/.ssh is left alone (exit 3) and nothing behind it is deleted", async () => {
+  const b = await box();
+  try {
+    // oldops/.ssh points at another account's directory with live keys.
+    await Deno.mkdir(`${b.dir}/home/login/.ssh`, { recursive: true });
+    await Deno.writeTextFile(
+      `${b.dir}/home/login/.ssh/authorized_keys`,
+      "login-key\n",
+    );
+    await Deno.remove(`${b.dir}/home/oldops/.ssh`, { recursive: true });
+    await Deno.symlink(`${b.dir}/home/login/.ssh`, `${b.dir}/home/oldops/.ssh`);
+    await Deno.writeTextFile(`${b.state}/sudo-granted-oldops`, "");
+    await Deno.writeTextFile(`${b.dir}/groups`, "oldops sudo\n");
+    const code = await b.run(script("revoke grants of oldops"));
+    assertEquals(code, REVOKE_SKIPPED);
+    assertEquals(
+      await b.read("home/login/.ssh/authorized_keys"),
+      "login-key\n",
+    );
+    // The sudo part is still taken back.
+    assertEquals(await b.read("gpasswd.log"), "-d oldops sudo\n");
+  } finally {
+    await Deno.remove(b.dir, { recursive: true });
+  }
+});
+
+Deno.test("revoke: a ~/.ssh owned by someone else is left alone", async () => {
+  const b = await box();
+  try {
+    // The stat stub reports the owner as the directory's parent name; make it differ.
+    await Deno.mkdir(`${b.dir}/home/oldops/x`, { recursive: true });
+    await Deno.writeTextFile(
+      `${b.dir}/bin/stat`,
+      "#!/bin/sh\necho someone-else\n",
+    );
+    const code = await b.run(script("revoke grants of oldops"));
+    assertEquals(code, REVOKE_SKIPPED);
+    assertEquals(await b.read("home/oldops/.ssh/authorized_keys"), "k\n");
+  } finally {
+    await Deno.remove(b.dir, { recursive: true });
   }
 });

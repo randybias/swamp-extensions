@@ -248,3 +248,107 @@ the `local2` image plus `iproute2 psmisc procps`).
   records persist install/apply/remove results.
 - Quality: install and the resolver methods moved out of knot_dns.ts
   (`install.ts`, `resolver_methods.ts`, shared `runtime.ts`).
+
+## Prior art (re-checked at merge, 2026-10-17)
+
+`swamp extension search` for knot, dns, bind and resolver, on stable and beta:
+no package manages Knot DNS or Knot Resolver, and none is a zone-file
+authoritative server over SSH. Adjacent only, each driving another product
+through its API: @jamesakeech/technitium and @thomas/technitium (Technitium DNS
+Server), @shrug/freeipa/dns (FreeIPA's integrated DNS), @magistr/pihole and
+@lint/adguard (filtering resolvers), @lint/dns-policy, @svendowideit/mdns, and
+the cloud DNS packages (@swamp/cloudflare/dns and secondary-dns, @swamp/gcp/dns,
+@swamp/aws/route53). None renders and validates a Knot zone or a Knot Resolver 6
+config, so there is nothing to file upstream.
+
+## Decisions for Randy (merge summary)
+
+1. **Per-zone fragments.** Each zone has its own
+   `knot.conf.d/50-managed-<apex>.conf` instead of the spec's single shared
+   file, so removing one zone never touches another (decision 2 above).
+2. **Knot Resolver 6 only.** No 5.x Lua rendering (decision 3 above).
+3. **DDNS refused.** Managed zones are whole-file declarations that own all
+   their records (decision 1 above).
+4. **Secondaries as configuration.** `notify_secondaries`, `allow_transfer` and
+   `tsig_keys` render into the fragment; no secondary is verified (decision 4
+   above).
+5. **The CZ.NIC repository, pinned.** Ubuntu 24.04 ships Knot Resolver 5.7, so
+   `install resolver: true` adds the CZ.NIC Labs repository. Its signing key is
+   refused unless the primary fingerprint is
+   `9C71D59CD4CE8BD2966A7A3EAB6A303124019B64` (read from pkg.labs.nic.cz/gpg and
+   confirmed independently on keys.openpgp.org and pkg.labs.nic.cz/doc). The
+   repository is pinned at apt priority 100, so Knot DNS stays at the archive
+   version and only knot-resolver6 and its own libraries come from CZ.NIC
+   (confirmed live: knot stayed 3.3.4).
+
+## Merge prep (2026-10-17)
+
+- Merged `lane/b2-knot` at 37fa21e. The history holds d2's `lane/d2-knot-dns`
+  (review rounds 1-3), b3's `lane/b3-knot` escalation (c7f35ea, reviewed CLEAN
+  with real knotd/kresd in `host_test.ts`) and b2's live fixes (37fa21e). Gate 5
+  scans that history: no secret-like literal.
+- Never published before, so the version is 2026.10.17.1 (the branch carried
+  .3). The earlier version numbers in this logbook were lane-internal, so the
+  "state written by 2026.10.17.1" migration note above concerns no released
+  data.
+- Self-review of c7f35ea..37fa21e against the runtime-shape,
+  parser-differential, render-vs-live, remote-command, TOFU and argv-hash
+  checks: no Critical/High. The vault is read as a plain `{get, put}` object
+  (tested through a plain-object context), resolver configs are validated by
+  `kresctl` on the host, host keys are strict only, and no content hash reaches
+  an argv.
+- Quality pass: the version, the fingerprint comments (now independently
+  confirmed), and `systemctl reset-failed knot-resolver` after install disables
+  the unit, so a package start that failed on a port knotd holds no longer
+  leaves the unit reading `failed`.
+- 112 offline tests, 0 failed.
+
+## Live e2e (2026-10-17)
+
+Target `<vps1>` (fresh Ubuntu 24.04.5), root over SSH with strict pinned host
+keys and a vault `ssh_key_ref`; a throwaway TSIG secret was generated straight
+into the vault and never printed. Loopback only: knotd on 127.0.0.1 and
+127.0.0.2, the resolver on 127.0.0.3; data under `a.example.test` and
+`b.example.test` with RFC 5737 addresses. A `tcpdump` guard for outbound DNS on
+both NICs recorded 0 packets on the final run. The host was returned to its
+baseline afterwards (dpkg, users, apt sources, keyrings, `:53` listeners).
+
+First run on c7f35ea: 11/13 (install lacked `kzonecheck`; the resolver path got
+Knot Resolver 5 and its self-test asked a name the upstream refuses). Final run
+on 37fa21e from a clean baseline, with nothing installed by hand:
+
+| Cell                                                                    | Result |
+| ----------------------------------------------------------------------- | ------ |
+| 1 install (knot, knot-dnsutils, knot-dnssecutils 3.3.4; outcome record) | PASS   |
+| 2 render_zone + apply_zone A (unsigned, 127.0.0.1)                      | PASS   |
+| 3 apply_zone B signed (127.0.0.2; listen union, restart)                | PASS   |
+| 4 re-apply A: `changed: false`, no reload or restart                    | PASS   |
+| 5 get_ds B (matches `keymgr ds`)                                        | PASS   |
+| 6 TSIG transfer: AXFR with key 6 RRs, without key NOTAUTH               | PASS   |
+| 7 unsign B: refused without the ack, then signing off                   | PASS   |
+| 8 install resolver + apply_resolver forwarding example.test.            | PASS   |
+| 9 injection (owner, allow_transfer, notify, NS, TXT) refused, no change | PASS   |
+| 10 remove_zone B twice (second a no-op)                                 | PASS   |
+| 11 remove_resolver (package config restored, disabled)                  | PASS   |
+| 12 get / sync (no drift; outcome records listed)                        | PASS   |
+| 13 argv scan: 0 hits for the TSIG secret or its sha256                  | PASS   |
+
+Result: 13/13. Cell 8 confirmed the pinned key fingerprint on the host, knot
+held at 3.3.4 with knot-resolver6 6.5.0 from CZ.NIC, and a self-test name of
+`a.example.test.` chosen from the served zones.
+
+## Residuals (beta)
+
+- `remove_zone` does not purge the zone's KASP keys; use `keymgr` if they must
+  go.
+- `parent_ds_check` is accepted but not rendered into the Knot config.
+- `install resolver: true` installs `ca-certificates curl gnupg`, which upgraded
+  curl and libcurl as a dependency side effect live (`--no-upgrade` would avoid
+  it).
+- The resolver unit read `failed` after install live (the package's start could
+  not bind 127.0.0.1:53 held by knotd). The quality pass adds
+  `systemctl reset-failed`; not re-run live.
+- The resolver self-test queries the first listen address; when
+  `allow_query_from` excludes that address the query is refused and the apply
+  rolls back (documented in the README: add the address to `allow_query_from`).
+- Unsigning drops DNSKEY and RRSIG immediately (no delete-algorithm path).

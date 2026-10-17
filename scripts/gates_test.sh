@@ -39,6 +39,7 @@ expect 2 "bad ext name: double dash" bash "$here/gates.sh" "a--b"
 expect 2 "bad ext name: path" bash "$here/gates.sh" "../x"
 expect 2 "bad ext name: space" bash "$here/gates.sh" "a b"
 expect 2 "dir without manifest" bash "$here/gates.sh" "scripts"
+expect 2 "tree mode takes no extension" bash "$here/gates.sh" --tree zfs
 expect 2 "quality with no factors" verdict_quality "$td/quality-nofactors.json"
 expect 2 "dry missing registry checks" verdict_dry "$td/dry-partial.json" beta
 expect 0 "dry missing warnings field means none (beta)" verdict_dry "$td/dry-nowarnings.json" beta

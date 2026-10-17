@@ -2,7 +2,9 @@
  * Leak scan: denylisted names, private addresses, foreign emails and
  * unresolvable references. The denylist is never committed: it comes from
  * $LEAK_DENYLIST or ~/.config/swamp-extensions/denylist.
- * Usage: leak-scan.ts <extension-dir>. Exit 0 clean, 1 findings, 2 cannot run.
+ * Usage: leak-scan.ts <extension-dir>   tracked and untracked files of one extension
+ *        leak-scan.ts --tree [<dir>]    every tracked file of the repo (untracked drafts skipped)
+ * Exit 0 clean, 1 findings, 2 cannot run.
  */
 import { findAddresses, isPrivateIpv4, isPrivateIpv6 } from "./lib/addresses.ts";
 import { allowReason } from "./lib/allow.ts";
@@ -71,16 +73,35 @@ function redact(line: string, deny: string[]): string {
   return shown;
 }
 
+/** Classes the whole-tree scan reports; email and reference stay per-extension. */
+const TREE_CLASSES = new Set(["denylist-path", "denylist", "private-address"]);
+/** The scanner's own sources and tests, which hold private addresses on purpose. */
+const TREE_ADDRESS_EXEMPT = new Set([
+  "scripts/lib/addresses.ts",
+  "scripts/lib/addresses_test.ts",
+  "scripts/leak-scan_test.ts",
+  "scripts/fixture-guard_test.ts",
+]);
+
+/** Keep the whole-tree findings: every denylist hit, private addresses outside the scanner itself. */
+export function treeFindings(rel: string, findings: string[]): string[] {
+  return findings.filter((l) => {
+    const cls = l.split(" ")[1];
+    return TREE_CLASSES.has(cls) && !(cls === "private-address" && TREE_ADDRESS_EXEMPT.has(rel));
+  });
+}
+
 function isPackaged(rel: string): boolean {
   return rel === "README.md" || rel === "manifest.yaml" || rel.startsWith("extensions/");
 }
 
 if (import.meta.main) {
-  const dir = Deno.args[0]?.replace(/\/$/, "");
+  const tree = Deno.args[0] === "--tree";
+  const dir = (tree ? Deno.args[1] ?? "." : Deno.args[0])?.replace(/\/$/, "");
   let deny: string[];
   try {
-    if (!dir || !(await Deno.stat(`${dir}/manifest.yaml`)).isFile) {
-      throw new Error("usage: leak-scan.ts <extension-dir>");
+    if (!dir || (!tree && !(await Deno.stat(`${dir}/manifest.yaml`)).isFile)) {
+      throw new Error("usage: leak-scan.ts <extension-dir> | --tree [<dir>]");
     }
     deny = await loadDenylist(
       Deno.env.get("LEAK_DENYLIST"),
@@ -91,7 +112,9 @@ if (import.meta.main) {
     Deno.exit(2);
   }
   const ls = new Deno.Command("git", {
-    args: ["ls-files", "-z", "--cached", "--others", "--exclude-standard", "--", "."],
+    args: tree
+      ? ["ls-files", "-z", "--cached", "--", "."]
+      : ["ls-files", "-z", "--cached", "--others", "--exclude-standard", "--", "."],
     cwd: dir,
   }).outputSync();
   if (!ls.success) {
@@ -111,7 +134,8 @@ if (import.meta.main) {
       Deno.exit(2);
     }
     if (text.includes("\0")) continue; // binary
-    findings.push(...scanText(rel, text, deny, isPackaged(rel)));
+    const found = scanText(rel, text, deny, !tree && isPackaged(rel));
+    findings.push(...(tree ? treeFindings(rel, found) : found));
   }
   findings.forEach((l) => console.log(l));
   Deno.exit(findings.length ? 1 : 0);

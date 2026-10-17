@@ -1,5 +1,5 @@
 import { assertEquals, assertRejects } from "jsr:@std/assert@1.0.13";
-import { loadDenylist, scanText } from "./leak-scan.ts";
+import { loadDenylist, scanText, treeFindings } from "./leak-scan.ts";
 
 Deno.test("denylist from env, comments and blanks dropped, lowercased", async () => {
   assertEquals(await loadDenylist("# c\n\nAcmeCorp\nlab-7\n", "/nonexistent"), [
@@ -88,5 +88,20 @@ Deno.test("a denylisted term inside an email detail is redacted", () => {
   assertEquals(scanText("a.ts", "ops@acmecorp.io", ["acmecorp"], true), [
     "a.ts:1 denylist <denylisted:0>",
     "a.ts:1 email ops@<denylisted:0>.io",
+  ]);
+});
+
+Deno.test("whole-tree scan keeps denylist and private addresses, drops email", () => {
+  const text = "acmecorp on 10.0.0.1 by ops@realcorp.io";
+  assertEquals(treeFindings("docs/x.md", scanText("docs/x.md", text, ["acmecorp"], false)), [
+    "docs/x.md:1 denylist <denylisted:0>",
+    "docs/x.md:1 private-address 10.0.0.1",
+  ]);
+});
+
+Deno.test("whole-tree scan exempts only the scanner's own addresses, never the denylist", () => {
+  const rel = "scripts/lib/addresses_test.ts";
+  assertEquals(treeFindings(rel, scanText(rel, "acmecorp 10.0.0.1", ["acmecorp"], false)), [
+    `${rel}:1 denylist <denylisted:0>`,
   ]);
 });

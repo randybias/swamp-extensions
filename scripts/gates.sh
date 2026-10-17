@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # Run every gate for one extension directory, in increasing-risk order.
+# Gates 4 and 5 also scan every tracked file in the repo, whatever the extension.
 # Usage: scripts/gates.sh [--offline] <extension-dir>
+#        scripts/gates.sh --tree   (gates 4 and 5 on the whole tracked tree only)
 # Exit: 0 all passed, 1 a gate failed, 2 a gate could not run, 3 incomplete (--offline).
 set -uo pipefail
 
@@ -9,10 +11,18 @@ source "$(dirname "$0")/lib/verdicts.sh"
 
 root="$(cd "$(dirname "$0")/.." && pwd)"
 offline=0
+tree=0
 [[ ${1:-} == --offline ]] && { offline=1; shift; }
+[[ ${1:-} == --tree ]] && { tree=1; shift; }
 ext=${1:-}
-if ! [[ $ext =~ ^[a-z0-9]+(-[a-z0-9]+)*$ ]] || [[ ! -f $root/$ext/manifest.yaml ]]; then
+if ((tree)); then
+  if [[ -n $ext ]]; then
+    echo "usage: gates.sh --tree  (takes no extension)" >&2
+    exit 2
+  fi
+elif ! [[ $ext =~ ^[a-z0-9]+(-[a-z0-9]+)*$ ]] || [[ ! -f $root/$ext/manifest.yaml ]]; then
   echo "usage: gates.sh [--offline] <extension-dir>  (a top-level dir holding manifest.yaml)" >&2
+  echo "       gates.sh --tree" >&2
   exit 2
 fi
 for t in deno swamp jq yq gitleaks git; do
@@ -20,7 +30,7 @@ for t in deno swamp jq yq gitleaks git; do
 done
 
 cd "$root" || exit 2
-out="$root/.gates/$ext"
+out="$root/.gates/${ext:-_tree}"
 mkdir -p "$out"
 worst=0
 note() { # <rc> <n> <name> [detail]
@@ -34,6 +44,66 @@ note() { # <rc> <n> <name> [detail]
   fi
 }
 in_ext() { (cd "$ext" && "$@"); }
+worse() { # <rc> <rc>: a failure beats could-not-run beats pass
+  if (($1 == 1 || $2 == 1)); then echo 1
+  elif (($1 == 2 || $2 == 2)); then echo 2
+  else echo 0
+  fi
+}
+
+# 4 leak scan: the extension (tracked and untracked files), then every tracked file in the repo
+gate_leaks() {
+  local rc=0
+  : >"$out/leaks.txt"
+  if [[ -n $ext ]]; then
+    deno run --allow-read --allow-env --allow-run=git scripts/leak-scan.ts "$ext" \
+      >>"$out/leaks.txt" 2>&1
+    rc=$?
+  fi
+  deno run --allow-read --allow-env --allow-run=git scripts/leak-scan.ts --tree . \
+    >>"$out/leaks.txt" 2>&1
+  rc=$(worse "$rc" $?)
+  note $rc 4 "leak scan" "$( ((rc)) && head -5 "$out/leaks.txt" | tr '\n' ';')"
+}
+
+# Copy every tracked file (as in the working tree) into a temp dir and gitleaks it, so
+# untracked drafts are never scanned. Exit 0 clean, 1 findings, 2 cannot run.
+gitleaks_tree() {
+  local tmp rc
+  tmp=$(mktemp -d) || return 2
+  git ls-files -z --cached | while IFS= read -r -d '' f; do
+    [[ -f $f || -L $f ]] && printf '%s\0' "$f"
+  done | tar --null -T - -cf - | tar -xf - -C "$tmp" || {
+    rm -rf "$tmp"
+    return 2
+  }
+  echo "== tracked tree" >>"$out/gitleaks.txt"
+  gitleaks dir "$tmp" --redact --no-banner >>"$out/gitleaks.txt" 2>&1
+  rc=$?
+  rm -rf "$tmp"
+  ((rc == 0)) || rc=1
+  return $rc
+}
+
+# 5 gitleaks: the extension dir, the whole tracked tree, then full history
+gate_gitleaks() {
+  local rc=0
+  : >"$out/gitleaks.txt"
+  if [[ -n $ext ]]; then
+    gitleaks dir "$ext" --redact --no-banner >>"$out/gitleaks.txt" 2>&1 || rc=1
+  fi
+  gitleaks_tree
+  rc=$(worse "$rc" $?)
+  echo "== history" >>"$out/gitleaks.txt"
+  gitleaks git . --redact --no-banner >>"$out/gitleaks.txt" 2>&1 || rc=$(worse "$rc" 1)
+  note $rc 5 gitleaks "$( ((rc)) && echo "log: .gates/${ext:-_tree}/gitleaks.txt")"
+}
+
+if ((tree)); then
+  gate_leaks
+  gate_gitleaks
+  exit $worst
+fi
 
 channel=$(yq -r ".\"$ext\".channel // \"\"" release.yaml)
 if [[ $channel != beta && $channel != stable ]]; then
@@ -91,18 +161,8 @@ if ((rc == 0)); then
 fi
 note $rc 3 quality
 
-# 4 leak scan
-deno run --allow-read --allow-env --allow-run=git scripts/leak-scan.ts "$ext" \
-  >"$out/leaks.txt" 2>&1
-rc=$?
-note $rc 4 "leak scan" "$( ((rc)) && head -5 "$out/leaks.txt" | tr '\n' ';')"
-
-# 5 gitleaks: tree, then full history
-gitleaks dir "$ext" --redact --no-banner >"$out/gitleaks.txt" 2>&1 &&
-  gitleaks git . --redact --no-banner >>"$out/gitleaks.txt" 2>&1
-rc=$?
-((rc == 0)) || rc=1
-note $rc 5 gitleaks
+gate_leaks
+gate_gitleaks
 
 # 6 fixture guard
 deno run --allow-read scripts/fixture-guard.ts "$ext" >"$out/fixtures.txt" 2>&1

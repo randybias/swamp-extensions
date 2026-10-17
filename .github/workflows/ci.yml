@@ -19,6 +19,10 @@ jobs:
         run: bash scripts/ci-install.sh
       - name: Script tests
         run: deno task test && bash scripts/gates_test.sh
+      - name: Leak scan and gitleaks on the whole tracked tree
+        env:
+          LEAK_DENYLIST: ${{ secrets.LEAK_DENYLIST }}
+        run: bash scripts/gates.sh --tree
       - name: Gates per changed extension
         env:
           SWAMP_API_KEY: ${{ secrets.SWAMP_API_KEY }}

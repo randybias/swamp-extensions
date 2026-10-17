@@ -60,3 +60,8 @@ k8s-secret:
   channel: beta
   ci: false
   published: {}
+
+k0s-cluster:
+  channel: beta
+  ci: false
+  published: {}

@@ -74,7 +74,14 @@ swamp behavior run cephadm cephHostPrep --input host=node1.example.com \
 - `wipeDiskToRaw` selects disks by serial and resolves them to a stable by-id
   path, proving each serial names exactly one device. Every safety gate runs
   before anything destructive, and a device nobody could observe is never
-  reported raw.
+  reported raw. The disk wiper refuses any device that is, contains, is a member
+  of or is an ancestor of whatever backs the root or boot filesystems, an
+  `/etc/fstab` entry, swap, an md array, an LVM volume group or a ZFS pool, and
+  it refuses everything when a read of the host fails or is empty. Its reads run
+  as root, so a host without udev still reports types and UUIDs. Limits: an
+  external filesystem journal or log device, and a `resume=` partition named
+  only on the kernel command line, are not modelled; the kernel refuses a write
+  to a device that is mounted, swapped on or claimed by an assembled array.
 - Records are strict and declare every field written. No secret reaches a
   record, a log line or an error message.
 

@@ -96,7 +96,7 @@ const HEALTHY: Probes = {
   pvs: done("", 127),
 };
 
-const NO_SUPERBLOCK = done("mdadm: No md superblock detected\n", 1);
+const NO_SUPERBLOCK = done("", 1, "mdadm: No md superblock detected\n");
 
 /** Answers the guard's probes, or returns undefined for any other command. */
 function probeAnswer(
@@ -649,7 +649,9 @@ Deno.test("sudo is used for the probes that need root", async () => {
     excludeDevices: [],
     dryRun: true,
   });
-  for (const cmd of [BLKID_COMMAND, ZPOOL_COMMAND, PVS_COMMAND]) {
+  for (
+    const cmd of [LSBLK_COMMAND, BLKID_COMMAND, ZPOOL_COMMAND, PVS_COMMAND]
+  ) {
     assertEquals(calls.find((c) => c.command === cmd)?.sudo, true, cmd);
   }
 });
@@ -711,4 +713,28 @@ Deno.test("a healthy host passes both reads and the wipe proceeds", async () => 
   assertEquals(record.dryRun, false);
   // Two reads of the root mount table: the gate and the re-validation.
   assertEquals(calls.filter((c) => c.command === FINDMNT_COMMAND).length, 2);
+});
+
+Deno.test("a udev-less host (empty lsblk type columns, no blkid) refuses before any mutation", async () => {
+  await refusedWith({
+    lsblk: guardLsblk(
+      guardRow("sda", "disk", {}, [
+        guardRow("sda1", "part", { mountpoints: ["/"] }),
+      ]),
+      guardRow("nvme0n1", "disk"),
+    ),
+    blkid: done("", 127),
+  }, "wipe.boot-unverifiable");
+});
+
+Deno.test("mdadm's not-a-member answer is read from stderr", async () => {
+  // The default NO_SUPERBLOCK fixture puts the text on stderr like real mdadm;
+  // a host where only stdout carries it would be refused as unverifiable.
+  await refusedWith({
+    "examine:/dev/nvme0n1": done(
+      "",
+      1,
+      "mdadm: cannot open /dev/nvme0n1: Permission denied\n",
+    ),
+  }, "wipe.boot-unverifiable");
 });

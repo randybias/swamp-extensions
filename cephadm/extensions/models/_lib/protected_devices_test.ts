@@ -50,9 +50,11 @@ function row(d: Dev): Record<string, unknown> {
 const ok = (stdout: string): CommandProbe => ({ code: 0, stdout });
 const missing: CommandProbe = { code: 127, stdout: "" };
 const file = (text: string): FileProbe => ({ state: "ok", text });
+/** What real mdadm prints for a device that is not an array member: on stderr. */
 const NO_SB: CommandProbe = {
   code: 1,
-  stdout: "mdadm: No md superblock detected on /dev/x.\n",
+  stdout: "",
+  stderr: "mdadm: No md superblock detected on /dev/x.\n",
 };
 const SWAP_HEADER = "Filename\t\t\t\tType\t\tSize\t\tUsed\t\tPriority\n";
 
@@ -117,12 +119,21 @@ function plain(overrides: Partial<ProbeInputs> = {}): ProbeInputs {
   };
 }
 
+/** Answers "not a member" for every examine target the test did not script. */
+function withExamine(input: ProbeInputs, candidates: string[]): ProbeInputs {
+  const mdExamine = { ...input.mdExamine };
+  for (const path of examineTargets(input, candidates)) {
+    mdExamine[path] ??= NO_SB;
+  }
+  return { ...input, mdExamine };
+}
+
 function refusal(
   input: ProbeInputs,
   candidates: string[],
   previous?: ProtectedSet,
 ) {
-  const result = assess(input, candidates, previous);
+  const result = assess(withExamine(input, candidates), candidates, previous);
   assert(!result.ok, "expected a refusal");
   return result.refusal;
 }
@@ -133,8 +144,9 @@ function refused(
   candidates: string[],
   code: "protected" | "unverifiable" = "protected",
   note = "",
+  previous?: ProtectedSet,
 ): void {
-  const r = refusal(input, candidates);
+  const r = refusal(input, candidates, previous);
   assertEquals(
     r.code,
     code,
@@ -143,7 +155,7 @@ function refused(
 }
 
 function safe(input: ProbeInputs, candidates: string[]) {
-  const result = assess(input, candidates);
+  const result = assess(withExamine(input, candidates), candidates);
   assert(result.ok, result.ok ? "" : JSON.stringify(result.refusal));
   return result.set;
 }
@@ -1008,7 +1020,7 @@ Deno.test("9 the protected set is never smaller after a re-read", () => {
   const reread = plain({
     lsblk: lsblk(
       { name: "sda", type: "disk" },
-      { name: "sdb", type: "disk" },
+      { name: "sdb", type: "disk", fstype: "ext4", mounts: ["/"] },
       { name: "sdc", type: "disk" },
     ),
     findmnt: findmnt({ target: "/", source: "/dev/sdb", fstype: "ext4" }),
@@ -1024,14 +1036,17 @@ Deno.test("9 the protected set is never smaller after a re-read", () => {
 
 Deno.test("examineTargets lists members and the candidates' partitions", () => {
   const input = raidHost();
-  const targets = examineTargets(input.lsblk, ["/dev/sdd"]);
+  const targets = examineTargets(input, ["/dev/sdd"]);
   assertEquals(targets, [
     "/dev/sda1",
     "/dev/sdb1",
     "/dev/sdc1",
     "/dev/sdd",
   ]);
-  assertEquals(examineTargets(NO_SB, ["/dev/sdd"]), []);
+  assertEquals(
+    examineTargets({ ...input, lsblk: NO_SB }, ["/dev/sdd"]),
+    [],
+  );
 });
 
 Deno.test("parsers", () => {
@@ -1105,4 +1120,353 @@ Deno.test("11 an mdadm examine that fails for any reason but 'not a member' refu
     input.mdExamine["/dev/sdd"] = probe;
     refused(input, ["/dev/sdd"], "unverifiable", `exit ${probe.code}`);
   }
+});
+
+// --- round 2: hosts without udev, links, stderr, fixpoint -----------------------
+
+/** lsblk rows as an unprivileged or udev-less host prints them: no types, no UUIDs. */
+function bare(...devs: Dev[]): CommandProbe {
+  const strip = (d: Dev): Dev => ({
+    name: d.name,
+    type: d.type,
+    mounts: d.mounts,
+    children: d.children?.map(strip),
+  });
+  return lsblk(...devs.map(strip));
+}
+
+const BTRFS_UUID = "99999999-8888-7777-6666-555555555555";
+const btrfsDevs = (): Dev[] => [
+  {
+    name: "sda",
+    type: "disk",
+    children: [{
+      name: "sda2",
+      type: "part",
+      fstype: "btrfs",
+      uuid: BTRFS_UUID,
+      mounts: ["/"],
+    }],
+  },
+  {
+    name: "sdb",
+    type: "disk",
+    children: [{
+      name: "sdb2",
+      type: "part",
+      fstype: "btrfs",
+      uuid: BTRFS_UUID,
+    }],
+  },
+  { name: "sdc", type: "disk" },
+];
+const btrfsBlkid = ok(
+  `/dev/sda2: UUID="${BTRFS_UUID}" UUID_SUB="aaaa" TYPE="btrfs"\n` +
+    `/dev/sdb2: UUID="${BTRFS_UUID}" UUID_SUB="bbbb" TYPE="btrfs"\n`,
+);
+
+Deno.test("12a udev-less btrfs root: blkid fills the empty columns, so the sibling is protected", () => {
+  const input = plain({
+    lsblk: bare(...btrfsDevs()),
+    findmnt: findmnt({ target: "/", source: "/dev/sda2[/@]", fstype: "btrfs" }),
+    fstab: file(""),
+    blkid: btrfsBlkid,
+  });
+  refused(input, ["/dev/sdb"], "protected");
+  safe(input, ["/dev/sdc"]);
+});
+
+Deno.test("12b udev-less and no blkid: the missing filesystem type refuses", () => {
+  const input = plain({
+    lsblk: bare(...btrfsDevs()),
+    findmnt: findmnt({ target: "/", source: "/dev/sda2", fstype: "btrfs" }),
+    fstab: file(""),
+    blkid: missing,
+  });
+  // Neither candidate may be wiped: the mounted root has no known type.
+  refused(input, ["/dev/sdb"], "unverifiable");
+  refused(input, ["/dev/sdc"], "unverifiable");
+  // The same when blkid runs but knows nothing.
+  refused(
+    { ...input, blkid: { code: 2, stdout: "" } },
+    ["/dev/sdc"],
+    "unverifiable",
+  );
+});
+
+Deno.test("13a udev-less dropped array member: blkid and the examine UUID both find it", () => {
+  const md = (name: string): Dev => ({
+    name,
+    type: "part",
+    children: [{ name: "md0", type: "raid1", mounts: ["/"] }],
+  });
+  const lsblkOut = bare(
+    { name: "sda", type: "disk", children: [md("sda1")] },
+    { name: "sdb", type: "disk", children: [md("sdb1")] },
+    { name: "sdc", type: "disk", children: [{ name: "sdc1", type: "part" }] },
+    { name: "sdd", type: "disk" },
+  );
+  const u = ARRAY_UUID.replaceAll(":", "-");
+  const input = plain({
+    lsblk: lsblkOut,
+    findmnt: findmnt({ target: "/", source: "/dev/md0", fstype: "ext4" }),
+    fstab: file("/dev/md0 / ext4 defaults 0 1\n"),
+    mdstat: file("md0 : active raid1 sdb1[1] sda1[0]\n"),
+    blkid: ok(
+      `/dev/sda1: UUID="${u}" TYPE="linux_raid_member"\n` +
+        `/dev/sdb1: UUID="${u}" TYPE="linux_raid_member"\n` +
+        `/dev/sdc1: UUID="${u}" TYPE="linux_raid_member"\n` +
+        `/dev/md0: UUID="11111111-2222-3333-4444-555555555555" TYPE="ext4"\n`,
+    ),
+    mdExamine: {
+      "/dev/sda1": ok(examineOut(ARRAY_UUID)),
+      "/dev/sdb1": ok(examineOut(ARRAY_UUID)),
+      "/dev/sdc1": ok(examineOut(ARRAY_UUID)),
+    },
+  });
+  refused(input, ["/dev/sdc"], "protected");
+  safe(input, ["/dev/sdd"]);
+  // Without blkid the same host cannot be judged, so it refuses everything.
+  refused({ ...input, blkid: missing }, ["/dev/sdd"], "unverifiable");
+});
+
+Deno.test("13b the examine UUID alone finds a dropped member when types are known", () => {
+  const input = raidHost();
+  // Drop the lsblk type of the dropped member: only mdadm still knows it.
+  input.lsblk = lsblk(
+    {
+      name: "sda",
+      type: "disk",
+      children: [{
+        name: "sda1",
+        type: "part",
+        fstype: "linux_raid_member",
+        children: [{
+          name: "md0",
+          type: "raid1",
+          fstype: "ext4",
+          mounts: ["/"],
+        }],
+      }],
+    },
+    { name: "sdc", type: "disk", children: [{ name: "sdc1", type: "part" }] },
+    { name: "sdd", type: "disk" },
+  );
+  input.mdstat = file("md0 : active raid1 sda1[0]\n");
+  refused(input, ["/dev/sdc"], "protected");
+});
+
+Deno.test("14 a by-id or by-path candidate is resolved and examined", () => {
+  const input = raidHost({
+    links: ok(
+      "/dev/disk/by-id/ata-EXAMPLE_D /dev/sdd\n/dev/disk/by-id/ata-EXAMPLE_C /dev/sdc\n",
+    ),
+  });
+  assert(
+    examineTargets(input, ["/dev/disk/by-id/ata-EXAMPLE_D"]).includes(
+      "/dev/sdd",
+    ),
+  );
+  safe(input, ["/dev/disk/by-id/ata-EXAMPLE_D"]);
+  // The dropped member reached through its by-id name is still refused.
+  refused(input, ["/dev/disk/by-id/ata-EXAMPLE_C"], "protected");
+  // A candidate that was never examined cannot be judged.
+  const unexamined = { ...input, mdExamine: { ...input.mdExamine } };
+  delete unexamined.mdExamine["/dev/sdd"];
+  const bare = assess(unexamined, ["/dev/sdd"]);
+  assert(!bare.ok && bare.refusal.code === "unverifiable");
+});
+
+Deno.test("15 mdadm's 'not a member' answer is accepted on stderr or stdout", () => {
+  const onStdout: CommandProbe = {
+    code: 1,
+    stdout: "mdadm: No md superblock detected on /dev/x.\n",
+  };
+  for (const probe of [NO_SB, onStdout]) {
+    const input = raidHost();
+    input.mdExamine["/dev/sdd"] = probe;
+    safe(input, ["/dev/sdd"]);
+  }
+});
+
+Deno.test("16 a protected ZFS volume protects its pool; an unmapped one refuses", () => {
+  const input = plain({
+    findmnt: findmnt({ target: "/", source: "/dev/sda1", fstype: "ext4" }),
+    fstab: file(""),
+    lsblk: lsblk(
+      {
+        name: "sda",
+        type: "disk",
+        children: [
+          { name: "sda1", type: "part", fstype: "ext4", mounts: ["/"] },
+          { name: "sda3", type: "part", fstype: "zfs_member", label: "tank" },
+        ],
+      },
+      { name: "zd0", type: "disk", fstype: "swap" },
+      {
+        name: "sdb",
+        type: "disk",
+        children: [{
+          name: "sdb1",
+          type: "part",
+          fstype: "zfs_member",
+          label: "tank",
+        }],
+      },
+      { name: "sdc", type: "disk" },
+    ),
+    swaps: file(
+      SWAP_HEADER +
+        "/dev/zd0\\t\\t\\t\\tpartition\\t1048572\\t0\\t-2\\n".replaceAll(
+          "\\t",
+          "\t",
+        ),
+    ),
+    links: ok("/dev/zvol/tank/swap /dev/zd0\\n".replaceAll("\\n", "\n")),
+    zpool: ok(
+      "  pool: tank\nconfig:\n\n\tNAME  STATE\n\ttank  ONLINE\n\t  /dev/sda3  ONLINE\n\t  /dev/sdb1  ONLINE\n\nerrors: none\n",
+    ),
+  });
+  refused(input, ["/dev/sdb"], "protected");
+  safe(input, ["/dev/sdc"]);
+  refused({ ...input, links: ok("") }, ["/dev/sdc"], "unverifiable");
+});
+
+Deno.test("17 expansion repeats: an md PV added by LVM protects its own dropped member", () => {
+  const u = ARRAY_UUID.replaceAll(":", "-");
+  const member = (name: string, kids?: Dev[]): Dev => ({
+    name,
+    type: "part",
+    fstype: "linux_raid_member",
+    uuid: u,
+    children: kids,
+  });
+  const input = plain({
+    lsblk: lsblk(
+      {
+        name: "sda",
+        type: "disk",
+        children: [{
+          name: "sda1",
+          type: "part",
+          fstype: "LVM2_member",
+          children: [{
+            name: "vg0-root",
+            type: "lvm",
+            fstype: "ext4",
+            mounts: ["/"],
+          }],
+        }],
+      },
+      {
+        name: "sdb",
+        type: "disk",
+        children: [
+          member("sdb1", [{
+            name: "md2",
+            type: "raid1",
+            fstype: "LVM2_member",
+          }]),
+        ],
+      },
+      {
+        name: "sdc",
+        type: "disk",
+        children: [
+          member("sdc1", [{
+            name: "md2",
+            type: "raid1",
+            fstype: "LVM2_member",
+          }]),
+        ],
+      },
+      { name: "sdd", type: "disk", children: [member("sdd1")] },
+      { name: "sde", type: "disk" },
+    ),
+    findmnt: findmnt({
+      target: "/",
+      source: "/dev/mapper/vg0-root",
+      fstype: "ext4",
+    }),
+    fstab: file("/dev/mapper/vg0-root / ext4 defaults 0 1\n"),
+    links: ok("/dev/mapper/vg0-root /dev/dm-0\n"),
+    mdstat: file("md2 : active raid1 sdc1[1] sdb1[0]\n"),
+    pvs: ok("  /dev/sda1  vg0\n  /dev/md2  vg0\n"),
+    mdExamine: {
+      "/dev/sdb1": ok(examineOut(ARRAY_UUID)),
+      "/dev/sdc1": ok(examineOut(ARRAY_UUID)),
+      "/dev/sdd1": ok(examineOut(ARRAY_UUID)),
+    },
+  });
+  refused(input, ["/dev/sdd"], "protected");
+  safe(input, ["/dev/sde"]);
+});
+
+Deno.test("18 a protected volume group needs its own pvs row, and a failed re-read refuses", () => {
+  const lvm = (pvs: CommandProbe): ProbeInputs =>
+    plain({
+      lsblk: lsblk(
+        {
+          name: "sda",
+          type: "disk",
+          children: [{
+            name: "sda1",
+            type: "part",
+            fstype: "LVM2_member",
+            children: [{
+              name: "vg0-root",
+              type: "lvm",
+              fstype: "ext4",
+              mounts: ["/"],
+            }],
+          }],
+        },
+        { name: "sdb", type: "disk" },
+      ),
+      findmnt: findmnt({
+        target: "/",
+        source: "/dev/mapper/vg0-root",
+        fstype: "ext4",
+      }),
+      fstab: file(""),
+      links: ok("/dev/mapper/vg0-root /dev/dm-0\n"),
+      pvs,
+    });
+  refused(lvm(ok("  /dev/sdz  other\n")), ["/dev/sdb"], "unverifiable");
+  const first = safe(lvm(ok("  /dev/sda1  vg0\n")), ["/dev/sdb"]);
+  // A later read of a host with no LVM tools cannot clear the earlier set.
+  refused(plain({ pvs: missing }), ["/dev/sdb"], "unverifiable", "", first);
+});
+
+Deno.test("19 a systemd automount /boot/efi is accepted only beside a block-backed mount", () => {
+  const efi = { target: "/boot/efi", source: "systemd-1", fstype: "autofs" };
+  const root = { target: "/", source: "/dev/sda2", fstype: "ext4" };
+  const real = { target: "/boot/efi", source: "/dev/sda1", fstype: "vfat" };
+  refused(plain({ findmnt: findmnt(root, efi) }), ["/dev/sdb"], "unverifiable");
+  safe(plain({ findmnt: findmnt(root, efi, real) }), ["/dev/sdb"]);
+});
+
+Deno.test("20 /proc/swaps must have its header and well-formed rows", () => {
+  refused(plain({ swaps: file("") }), ["/dev/sdb"], "unverifiable");
+  refused(plain({ swaps: file("/dev/sdc1 partition 100 0 -2\n") }), [
+    "/dev/sdb",
+  ], "unverifiable");
+  refused(
+    plain({ swaps: file(SWAP_HEADER + "/dev/sdc1 partition\n") }),
+    ["/dev/sdb"],
+    "unverifiable",
+  );
+});
+
+Deno.test("21 any /dev-sourced mount is seeded, whatever its filesystem type", () => {
+  const input = plain({
+    lsblk: lsblk(
+      ...withExtraDisk(),
+    ),
+    findmnt: findmnt(
+      { target: "/", source: "/dev/sda2", fstype: "ext4" },
+      { target: "/mnt/odd", source: "/dev/sdb1", fstype: "squashfs" },
+    ),
+  });
+  refused(input, ["/dev/sdb"], "protected");
 });

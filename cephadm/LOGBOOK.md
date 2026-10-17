@@ -121,3 +121,13 @@ Not packaged. Notes for whoever maintains this extension.
 - The SQLite `pvs`/`mdadm` discovery, the atomic mdadm.conf rewrite and the
   boot-protection gate are unit-tested with scripted sessions; the live twin
   checks in the spec's [twin] items still apply.
+- 2026-10-17 wipe guard, round 2: the protected-device module is pure and
+  import-free (blob recorded in the ledger). lsblk, blkid and every examine run
+  as root; empty type/UUID columns are filled from blkid and a mounted or
+  configured filesystem with no known type refuses; md array UUIDs come from
+  `mdadm --examine` of every mdstat member and candidate (stderr read for the
+  not-a-member answer); candidates given as by-id/by-path links are resolved;
+  expansion repeats to a fixed point; ZFS volumes map to their pool; each
+  protected volume group needs a pvs row. Accepted limits: external fs
+  journal/log devices and `resume=` (the kernel's exclusive open refuses a write
+  to a mounted, swapped or claimed device).

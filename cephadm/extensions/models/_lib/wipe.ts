@@ -30,6 +30,7 @@ import {
   LINKS_COMMAND,
   LSBLK_COMMAND,
   mdExamineCommand,
+  parseExamineUuid,
   type ProbeInputs,
   type ProtectedSet,
   PVS_COMMAND,
@@ -254,7 +255,7 @@ async function collectProbes(
     const r = sudo
       ? await root(session, cmd, { allowNonZero: true })
       : await session.run({ command: cmd, allowNonZero: true });
-    return { code: r.code, stdout: r.stdout };
+    return { code: r.code, stdout: r.stdout, stderr: r.stderr };
   };
   const readFile = async (path: string): Promise<FileProbe> => {
     const r = await session.run({
@@ -267,9 +268,20 @@ async function collectProbes(
     }
     return { state: "error", detail: `exit ${r.code}` };
   };
-  const lsblk = await command(LSBLK_COMMAND, false);
+  // Everything that reads device contents runs as root: unprivileged, lsblk
+  // and blkid come back with empty type and UUID columns on a host without
+  // udev, and the guard must never read that as "unrelated".
+  const lsblk = await command(LSBLK_COMMAND, true);
+  const links = await command(LINKS_COMMAND, false);
+  const blkid = await command(BLKID_COMMAND, true);
+  const mdstat = await readFile("/proc/mdstat");
   const mdExamine: Record<string, CommandProbe> = {};
-  for (const path of examineTargets(lsblk, candidates)) {
+  for (
+    const path of examineTargets(
+      { lsblk, links, blkid, mdstat },
+      candidates,
+    )
+  ) {
     mdExamine[path] = await command(mdExamineCommand(path), true);
   }
   return {
@@ -277,9 +289,9 @@ async function collectProbes(
     findmnt: await command(FINDMNT_COMMAND, false),
     fstab: await readFile("/etc/fstab"),
     swaps: await readFile("/proc/swaps"),
-    mdstat: await readFile("/proc/mdstat"),
-    links: await command(LINKS_COMMAND, false),
-    blkid: await command(BLKID_COMMAND, true),
+    mdstat,
+    links,
+    blkid,
     zpool: await command(ZPOOL_COMMAND, true),
     pvs: await command(PVS_COMMAND, true),
     mdExamine,
@@ -372,6 +384,38 @@ async function examineArray(
     allowNonZero: true,
   });
   return firstArrayPath(r.stdout);
+}
+
+/**
+ * Refuses to stop an array that backs the system. Compared by array UUID, not
+ * by name: `mdadm --examine --scan` prints `/dev/md/<name>` where lsblk shows
+ * `/dev/mdN`.
+ */
+async function assertArrayNotProtected(
+  session: SshSession,
+  protectedSet: ProtectedSet,
+  device: string,
+  arrayPath: string,
+  what: string,
+): Promise<void> {
+  const host = session.target.host;
+  if (protectedSet.devices[arrayPath] !== undefined) {
+    fail("wipe.boot-protected", what, { host, array: arrayPath });
+  }
+  const r = await root(session, mdExamineCommand(device), {
+    allowNonZero: true,
+  });
+  const uuid = r.code === 0 ? parseExamineUuid(r.stdout) : null;
+  if (r.code === 0 && !uuid) {
+    fail(
+      "wipe.boot-unverifiable",
+      "the array about to be stopped cannot be identified",
+      { host, array: arrayPath },
+    );
+  }
+  if (uuid && protectedSet.arrayUuids.includes(uuid)) {
+    fail("wipe.boot-protected", what, { host, array: arrayPath });
+  }
 }
 
 /** A read-only poll of `/proc/mdstat` until an array's line disappears. */
@@ -705,13 +749,13 @@ export async function wipeDiskToRaw(
     const arrayPath = await examineArray(session, device.device);
     if (!arrayPath || stoppedArrays.includes(arrayPath)) continue;
     assertMdArrayPath("array", arrayPath);
-    if (protectedSet.devices[arrayPath] !== undefined) {
-      fail(
-        "wipe.boot-protected",
-        "an array about to be stopped backs the root or boot filesystem",
-        { host, array: arrayPath },
-      );
-    }
+    await assertArrayNotProtected(
+      session,
+      protectedSet,
+      device.device,
+      arrayPath,
+      "an array about to be stopped backs the root or boot filesystem",
+    );
     await root(session, `mdadm --stop -- ${quote(arrayPath)}`, {
       allowNonZero: true,
     });
@@ -777,13 +821,13 @@ export async function wipeDiskToRaw(
       const rebuilt = await examineArray(session, device.device);
       if (rebuilt) {
         assertMdArrayPath("array", rebuilt);
-        if (protectedSet.devices[rebuilt] !== undefined) {
-          fail(
-            "wipe.boot-protected",
-            "an array about to be re-stopped backs the root or boot filesystem",
-            { host, array: rebuilt },
-          );
-        }
+        await assertArrayNotProtected(
+          session,
+          protectedSet,
+          device.device,
+          rebuilt,
+          "an array about to be re-stopped backs the root or boot filesystem",
+        );
         await root(session, `mdadm --stop -- ${quote(rebuilt)}`, {
           allowNonZero: true,
         });

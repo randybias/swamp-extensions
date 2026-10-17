@@ -17,6 +17,14 @@
  * ZFS pool that backs one. Device-mapper and md devices that sit on several
  * disks protect all of them.
  *
+ * Accepted limits, because the kernel refuses the destructive write anyway
+ * when it opens a device that is mounted, in use as swap or claimed by an
+ * assembled md array or device-mapper target (it opens block devices
+ * exclusively): external filesystem journal or log devices (an ext4 journal
+ * or XFS log on a separate disk), and a `resume=` hibernation partition named
+ * only on the kernel command line, are not modelled. Everything else that
+ * backs the system is, and a probe that cannot show it fails closed.
+ *
  * The module imports nothing, so it can be copied unchanged into another
  * extension.
  *
@@ -29,6 +37,8 @@ export interface CommandProbe {
   code: number;
   /** Standard output. */
   stdout: string;
+  /** Standard error; mdadm reports "no md superblock" here. */
+  stderr?: string;
 }
 
 /** The result of reading one file. */
@@ -211,7 +221,10 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 }
 
 /** Parses lsblk JSON into a graph, merging a device listed under several parents. */
-function parseLsblkGraph(probe: CommandProbe): Graph {
+function parseLsblkGraph(
+  probe: CommandProbe,
+  blkid: CommandProbe | null = null,
+): Graph {
   if (probe.code !== 0) {
     unverifiable("lsblk failed", { exit: probe.code });
   }
@@ -283,6 +296,19 @@ function parseLsblkGraph(probe: CommandProbe): Graph {
       parent.children.add(node.path);
     }
   }
+  // A host without udev gives lsblk empty identifier columns; blkid, read as
+  // root, still knows them. Fill what is empty, never overwrite.
+  if (blkid) {
+    const ids = parseBlkid(blkid);
+    for (const node of nodes.values()) {
+      const have = ids.get(node.path);
+      if (!have) continue;
+      if (!node.fstype && have.TYPE) node.fstype = have.TYPE;
+      if (!node.uuid && have.UUID) node.uuid = have.UUID;
+      if (!node.partuuid && have.PARTUUID) node.partuuid = have.PARTUUID;
+      if (!node.label && have.LABEL) node.label = have.LABEL;
+    }
+  }
   return { nodes, byName };
 }
 
@@ -319,6 +345,11 @@ class Resolver {
         this.aliases.set(target, link);
       }
     }
+  }
+
+  /** Every link that points at `target`. */
+  linksTo(target: string): string[] {
+    return [...this.links].filter(([, t]) => t === target).map(([l]) => l);
   }
 
   /** The lsblk path for `path`, or null when it cannot be resolved. */
@@ -589,11 +620,14 @@ function resolveSpec(
 
 /** Computes the protected set from the probes, or throws {@link Unverifiable}. */
 function compute(input: ProbeInputs): ProtectedSet {
-  const graph = parseLsblkGraph(input.lsblk);
+  const graph = parseLsblkGraph(input.lsblk, input.blkid);
   const resolver = new Resolver(graph, input.links);
   const mounts = parseFindmnt(input.findmnt);
   const collector = new Collector(graph);
   const blkid = parseBlkid(input.blkid);
+  // Paths whose filesystem type must be known: a mounted or configured
+  // filesystem always has one, so an empty type means missing evidence.
+  const mustHaveFs = new Set<string>();
 
   const mdEvidence = [...graph.nodes.values()].some((n) =>
     n.fstype === "linux_raid_member" || n.path.startsWith("/dev/md")
@@ -675,17 +709,28 @@ function compute(input: ProbeInputs): ProtectedSet {
       noteZfs(m.source);
       continue;
     }
-    if (NON_BLOCK_FS.has(m.fstype) && !strict) continue;
-    if (!m.source.startsWith("/dev/")) {
-      if (strict) {
+    // Any /dev source is seeded, whatever its fstype: a squashfs on a loop
+    // device or an unexpected type still sits on a real device.
+    if (m.source.startsWith("/dev/")) {
+      seedDevice(m.source, `mounted at ${m.target}`);
+      const path = resolver.resolve(m.source);
+      if (strict && path) mustHaveFs.add(path);
+      continue;
+    }
+    if (strict) {
+      // A systemd automount stands in for the real mount until it is used;
+      // accept it only when a block-backed mount at the same target exists.
+      const backed = m.fstype === "autofs" && m.target !== "/" &&
+        mounts.some((o) =>
+          o !== m && o.target === m.target && o.source.startsWith("/dev/")
+        );
+      if (!backed) {
         unverifiable("a root or boot mount has no block device source", {
           target: m.target,
           source: m.source,
         });
       }
-      continue;
     }
-    seedDevice(m.source, `mounted at ${m.target}`);
   }
 
   // 2. Every fstab entry, mounted or not.
@@ -721,15 +766,21 @@ function compute(input: ProbeInputs): ProtectedSet {
     }
     for (const p of found) {
       collector.protect(p, `listed in /etc/fstab for ${entry.target}`);
+      mustHaveFs.add(p);
     }
   }
 
   // 3. Active swap.
   if (input.swaps.state === "ok") {
-    const lines = input.swaps.text.split("\n").slice(1);
-    for (const line of lines) {
+    const lines = input.swaps.text.split("\n").filter((l) => l.trim() !== "");
+    if (lines.length === 0 || !/^Filename\s/.test(lines[0])) {
+      unverifiable("/proc/swaps has no header, so it cannot be trusted");
+    }
+    for (const line of lines.slice(1)) {
       const f = line.trim().split(/\s+/);
-      if (f.length < 2 || f[0] === "") continue;
+      if (f.length < 5) {
+        unverifiable("a /proc/swaps row cannot be parsed", { row: f[0] });
+      }
       if (f[1] === "file") continue; // lives on a mounted filesystem
       if (!f[0].startsWith("/dev/")) {
         unverifiable("a swap device cannot be classified", { swap: f[0] });
@@ -738,50 +789,15 @@ function compute(input: ProbeInputs): ProtectedSet {
     }
   }
 
-  // 3b. A multi-device filesystem is reported under one device in the mount
-  // table but lives on every device carrying its UUID.
-  for (const path of Object.keys(collector.devices)) {
-    const node = graph.nodes.get(path);
-    if (!node || !node.uuid || !MULTI_DEVICE_FS.has(node.fstype)) continue;
-    for (const other of graph.nodes.values()) {
-      if (
-        other.path !== path && other.fstype === node.fstype &&
-        other.uuid === node.uuid
-      ) {
-        collector.protect(
-          other.path,
-          `shares ${node.fstype} filesystem ${node.uuid} with ${path}`,
-        );
-      }
-    }
-  }
-
-  // 4. md arrays: members from mdstat (any flag), and by array UUID.
-  const protectedNow = (): string[] => Object.keys(collector.devices);
-  for (const array of mdArrays) {
-    const arrayPath = resolver.resolve(`/dev/${array.name}`);
-    const backing = (arrayPath && collector.devices[arrayPath]) ||
-      array.members.some((m) => {
-        const p = resolver.resolve(`/dev/${m}`);
-        return p !== null && collector.devices[p] !== undefined;
-      });
-    if (!backing) continue;
-    for (const member of array.members) {
-      const p = resolver.resolve(`/dev/${member}`);
-      if (!p) {
-        unverifiable("an md array member cannot be resolved", {
-          array: array.name,
-          member,
-        });
-      }
-      collector.protect(p, `member of protected array ${array.name}`);
-    }
-  }
+  // The examine answers must be clean before anything is derived from them.
   for (const [path, probe] of Object.entries(input.mdExamine)) {
     if (probe.code === 0) continue;
     // Only mdadm's explicit "not a member" answer is a clean negative. A
     // missing binary, a permission or I/O error says nothing about the device.
-    if (probe.code === 127 || !NOT_A_MEMBER.test(probe.stdout)) {
+    if (
+      probe.code === 127 ||
+      !NOT_A_MEMBER.test(`${probe.stdout}\n${probe.stderr ?? ""}`)
+    ) {
       unverifiable("mdadm could not examine a device", {
         device: path,
         exit: probe.code,
@@ -790,121 +806,239 @@ function compute(input: ProbeInputs): ProtectedSet {
   }
   const examineFor = (path: string): string | null => {
     const probe = input.mdExamine[path];
-    if (!probe) return null;
-    if (probe.code !== 0) return null;
+    if (!probe || probe.code !== 0) return null;
     return parseExamineUuid(probe.stdout);
   };
-  for (const path of protectedNow()) {
-    const node = graph.nodes.get(path);
-    if (!node || node.fstype !== "linux_raid_member") continue;
-    const probe = input.mdExamine[path];
-    if (!probe) {
-      unverifiable("a protected md member was not examined", { device: path });
-    }
-    const uuid = examineFor(path);
-    if (!uuid) {
-      unverifiable("mdadm could not identify a protected md member", {
-        device: path,
-        exit: probe.code,
-      });
-    }
-    collector.arrayUuids.add(uuid);
-    if (node.uuid) collector.arrayUuids.add(normalizeUuid(node.uuid));
-  }
-  // Any other member of a protected array, assembled or not.
-  for (const node of graph.nodes.values()) {
-    if (collector.devices[node.path]) continue;
-    const examined = examineFor(node.path);
-    const lsblkUuid = node.fstype === "linux_raid_member" && node.uuid
-      ? normalizeUuid(node.uuid)
-      : null;
-    if (
-      (examined && collector.arrayUuids.has(examined)) ||
-      (lsblkUuid && collector.arrayUuids.has(lsblkUuid))
-    ) {
-      collector.protect(node.path, "member of a protected md array (by UUID)");
-    }
-  }
+  const protectedNow = (): string[] => Object.keys(collector.devices);
 
-  // 5. LVM: a protected logical volume protects every PV of its volume group.
-  for (const path of protectedNow()) {
-    const node = graph.nodes.get(path);
-    if (node?.type !== "lvm") continue;
-    const vg = volumeGroupOf(node.name);
-    if (!vg) {
-      unverifiable("a protected logical volume has an unreadable name", {
-        device: path,
-      });
-    }
-    collector.volumeGroups.add(vg);
-  }
-  if (collector.volumeGroups.size > 0) {
-    if (input.pvs.code !== 0 || input.pvs.stdout.trim() === "") {
-      unverifiable("the LVM physical volumes could not be listed", {
-        exit: input.pvs.code,
-      });
-    }
-    for (const line of input.pvs.stdout.split("\n")) {
-      const f = line.trim().split(/\s+/);
-      if (f.length < 2 || !collector.volumeGroups.has(f[1])) continue;
-      const pv = resolver.resolve(f[0]);
-      if (!pv) {
-        unverifiable(
-          "a physical volume of a protected group cannot be resolved",
-          {
-            volumeGroup: f[1],
-            device: f[0],
-          },
-        );
+  // Steps 3b-6 feed each other (an md PV added by LVM has members of its own,
+  // a btrfs sibling may be an md member), so repeat until nothing new appears.
+  const size = (): string =>
+    [
+      protectedNow().length,
+      collector.volumeGroups.size,
+      collector.arrayUuids.size,
+      collector.pools.size,
+      zfsPools.size,
+    ].join(",");
+  for (let pass = 0, before = ""; before !== size(); pass++) {
+    if (pass > 32) unverifiable("the protected topology did not settle");
+    before = size();
+    // 3b. A multi-device filesystem is reported under one device in the mount
+    // table but lives on every device carrying its UUID.
+    for (const path of Object.keys(collector.devices)) {
+      const node = graph.nodes.get(path);
+      if (!node || !node.uuid || !MULTI_DEVICE_FS.has(node.fstype)) continue;
+      for (const other of graph.nodes.values()) {
+        if (
+          other.path !== path && other.fstype === node.fstype &&
+          other.uuid === node.uuid
+        ) {
+          collector.protect(
+            other.path,
+            `shares ${node.fstype} filesystem ${node.uuid} with ${path}`,
+          );
+        }
       }
-      collector.protect(
-        pv,
-        `physical volume of protected volume group ${f[1]}`,
-      );
     }
-  }
 
-  // 6. ZFS: every vdev of a pool behind a protected mount.
-  const zfsPresent = zfsPools.size > 0 ||
-    [...graph.nodes.values()].some((n) => n.fstype === "zfs_member");
-  if (zfsPools.size > 0 || zfsPresent) {
-    if (input.zpool.code === 127 && zfsPools.size === 0) {
-      // ZFS is not installed and nothing mounted uses it: nothing to protect.
-    } else {
-      if (input.zpool.code !== 0) {
-        unverifiable("zpool status failed", { exit: input.zpool.code });
-      }
-      const status = parseZpoolStatus(input.zpool.stdout);
-      for (const pool of zfsPools) {
-        const vdevs = status.get(pool);
-        if (!vdevs) {
-          unverifiable("a ZFS pool behind a mount is not in zpool status", {
-            pool,
+    // 4. md arrays: members from mdstat (any flag), and by array UUID.
+    for (const array of mdArrays) {
+      const arrayPath = resolver.resolve(`/dev/${array.name}`);
+      const backing = (arrayPath && collector.devices[arrayPath]) ||
+        array.members.some((m) => {
+          const p = resolver.resolve(`/dev/${m}`);
+          return p !== null && collector.devices[p] !== undefined;
+        });
+      if (!backing) continue;
+      for (const member of array.members) {
+        const p = resolver.resolve(`/dev/${member}`);
+        if (!p) {
+          unverifiable("an md array member cannot be resolved", {
+            array: array.name,
+            member,
           });
         }
-        if (vdevs.length === 0) {
-          unverifiable("a ZFS pool behind a mount lists no devices", { pool });
+        collector.protect(p, `member of protected array ${array.name}`);
+      }
+    }
+    for (const path of protectedNow()) {
+      const node = graph.nodes.get(path);
+      const probe = input.mdExamine[path];
+      const uuid = examineFor(path);
+      if (node?.fstype === "linux_raid_member") {
+        if (!probe) {
+          unverifiable("a protected md member was not examined", {
+            device: path,
+          });
         }
-        collector.pools.add(pool);
-        for (const vdev of vdevs) {
-          const path = resolver.resolve(
-            vdev.startsWith("/") ? vdev : `/dev/${vdev}`,
+        if (!uuid) {
+          unverifiable("mdadm could not identify a protected md member", {
+            device: path,
+            exit: probe.code,
+          });
+        }
+        if (node.uuid) collector.arrayUuids.add(normalizeUuid(node.uuid));
+      }
+      // The examine answer is the source of the array UUID, whatever lsblk or
+      // blkid say about the device's type.
+      if (uuid) collector.arrayUuids.add(uuid);
+    }
+    // Any other member of a protected array, assembled or not.
+    for (const node of graph.nodes.values()) {
+      if (collector.devices[node.path]) continue;
+      const examined = examineFor(node.path);
+      const lsblkUuid = node.fstype === "linux_raid_member" && node.uuid
+        ? normalizeUuid(node.uuid)
+        : null;
+      if (
+        (examined && collector.arrayUuids.has(examined)) ||
+        (lsblkUuid && collector.arrayUuids.has(lsblkUuid))
+      ) {
+        collector.protect(
+          node.path,
+          "member of a protected md array (by UUID)",
+        );
+      }
+    }
+
+    // 5. LVM: a protected logical volume protects every PV of its volume group.
+    for (const path of protectedNow()) {
+      const node = graph.nodes.get(path);
+      if (node?.type !== "lvm") continue;
+      const vg = volumeGroupOf(node.name);
+      if (!vg) {
+        unverifiable("a protected logical volume has an unreadable name", {
+          device: path,
+        });
+      }
+      collector.volumeGroups.add(vg);
+    }
+    if (collector.volumeGroups.size > 0) {
+      if (input.pvs.code !== 0 || input.pvs.stdout.trim() === "") {
+        unverifiable("the LVM physical volumes could not be listed", {
+          exit: input.pvs.code,
+        });
+      }
+      const seenVgs = new Set<string>();
+      for (const line of input.pvs.stdout.split("\n")) {
+        const f = line.trim().split(/\s+/);
+        if (f.length < 2 || !collector.volumeGroups.has(f[1])) continue;
+        seenVgs.add(f[1]);
+        const pv = resolver.resolve(f[0]);
+        if (!pv) {
+          unverifiable(
+            "a physical volume of a protected group cannot be resolved",
+            {
+              volumeGroup: f[1],
+              device: f[0],
+            },
           );
-          if (!path) {
-            unverifiable("a ZFS vdev cannot be resolved to a device", {
-              pool,
-              vdev,
-            });
-          }
-          collector.protect(path, `vdev of ZFS pool ${pool}`);
+        }
+        collector.protect(
+          pv,
+          `physical volume of protected volume group ${f[1]}`,
+        );
+      }
+      for (const vg of collector.volumeGroups) {
+        if (!seenVgs.has(vg)) {
+          unverifiable(
+            "a protected volume group has no physical volumes listed",
+            {
+              volumeGroup: vg,
+            },
+          );
         }
       }
-      // A member whose label names a protected pool is protected even when
-      // zpool printed it under a name this host cannot resolve.
-      for (const node of graph.nodes.values()) {
-        if (node.fstype === "zfs_member" && collector.pools.has(node.label)) {
-          collector.protect(node.path, `member of ZFS pool ${node.label}`);
+    }
+
+    // 5b. A ZFS volume (/dev/zdN) lives in the pool named by its /dev/zvol link.
+    for (const path of protectedNow()) {
+      if (!/^\/dev\/zd\d+$/.test(path)) continue;
+      const pools = resolver.linksTo(path)
+        .filter((l) => l.startsWith("/dev/zvol/"))
+        .map((l) => l.split("/")[3])
+        .filter((p) => p);
+      if (pools.length === 0) {
+        unverifiable("a protected ZFS volume cannot be mapped to its pool", {
+          device: path,
+        });
+      }
+      for (const pool of pools) zfsPools.add(pool);
+    }
+
+    // 6. ZFS: every vdev of a pool behind a protected mount.
+    const zfsPresent = zfsPools.size > 0 ||
+      [...graph.nodes.values()].some((n) => n.fstype === "zfs_member");
+    if (zfsPools.size > 0 || zfsPresent) {
+      if (input.zpool.code === 127 && zfsPools.size === 0) {
+        // ZFS is not installed and nothing mounted uses it: nothing to protect.
+      } else {
+        if (input.zpool.code !== 0) {
+          unverifiable("zpool status failed", { exit: input.zpool.code });
         }
+        const status = parseZpoolStatus(input.zpool.stdout);
+        for (const pool of zfsPools) {
+          const vdevs = status.get(pool);
+          if (!vdevs) {
+            unverifiable("a ZFS pool behind a mount is not in zpool status", {
+              pool,
+            });
+          }
+          if (vdevs.length === 0) {
+            unverifiable("a ZFS pool behind a mount lists no devices", {
+              pool,
+            });
+          }
+          collector.pools.add(pool);
+          for (const vdev of vdevs) {
+            const path = resolver.resolve(
+              vdev.startsWith("/") ? vdev : `/dev/${vdev}`,
+            );
+            if (!path) {
+              unverifiable("a ZFS vdev cannot be resolved to a device", {
+                pool,
+                vdev,
+              });
+            }
+            collector.protect(path, `vdev of ZFS pool ${pool}`);
+          }
+        }
+        // A member whose label names a protected pool is protected even when
+        // zpool printed it under a name this host cannot resolve.
+        for (const node of graph.nodes.values()) {
+          if (node.fstype === "zfs_member" && collector.pools.has(node.label)) {
+            collector.protect(node.path, `member of ZFS pool ${node.label}`);
+          }
+        }
+      }
+    }
+  }
+
+  // Missing evidence is never "not related". A mounted or configured
+  // filesystem always has a type; and when blkid gave nothing either, a
+  // protected device that carries data with no type at all cannot be told
+  // apart from one whose probe simply failed.
+  for (const path of mustHaveFs) {
+    if (!graph.nodes.get(path)?.fstype) {
+      unverifiable("a mounted or configured filesystem has no known type", {
+        device: path,
+      });
+    }
+  }
+  const blkidUsable = input.blkid.code === 0 && blkid.size > 0;
+  if (!blkidUsable) {
+    for (const path of protectedNow()) {
+      const node = graph.nodes.get(path)!;
+      const carriesData = node.type !== "disk" || node.children.size === 0;
+      // A device mdadm positively identified as an array member is known.
+      if (
+        carriesData && node.fstype === "" && examineFor(path) === null &&
+        !/^\/dev\/(loop|ram)/.test(path)
+      ) {
+        unverifiable("a protected device has no identifiable content", {
+          device: path,
+        });
       }
     }
   }
@@ -919,16 +1053,20 @@ function compute(input: ProbeInputs): ProtectedSet {
 
 /**
  * The paths whose `mdadm --examine` output the module needs: every md member
- * lsblk lists, plus the disk and each partition of every candidate. Returns an
- * empty list when lsblk cannot be read; {@link assess} then refuses.
+ * lsblk or blkid identify, every member listed in `/proc/mdstat`, and the disk
+ * and each partition of every candidate (candidates may be given as by-id or
+ * by-path links). Returns an empty list when the host cannot be read;
+ * {@link assess} then refuses.
  */
 export function examineTargets(
-  lsblk: CommandProbe,
+  probes: Pick<ProbeInputs, "lsblk" | "links" | "blkid" | "mdstat">,
   candidates: string[],
 ): string[] {
   let graph: Graph;
+  let resolver: Resolver;
   try {
-    graph = parseLsblkGraph(lsblk);
+    graph = parseLsblkGraph(probes.lsblk, probes.blkid);
+    resolver = new Resolver(graph, probes.links);
   } catch {
     return [];
   }
@@ -936,8 +1074,18 @@ export function examineTargets(
   for (const node of graph.nodes.values()) {
     if (node.fstype === "linux_raid_member") out.add(node.path);
   }
+  if (probes.mdstat.state === "ok") {
+    for (const array of parseMdstat(probes.mdstat.text)) {
+      for (const member of array.members) {
+        const p = resolver.resolve(`/dev/${member}`);
+        if (p) out.add(p);
+      }
+    }
+  }
   for (const c of candidates) {
-    for (const p of subtree(graph, c)) {
+    const path = resolver.resolve(c);
+    if (!path) continue;
+    for (const p of subtree(graph, path)) {
       const t = graph.nodes.get(p)?.type;
       if (t === "disk" || t === "part") out.add(p);
     }
@@ -969,8 +1117,15 @@ function conflict(
   input: ProbeInputs,
   candidates: string[],
 ): Refusal | null {
-  const graph = parseLsblkGraph(input.lsblk);
+  const graph = parseLsblkGraph(input.lsblk, input.blkid);
   const resolver = new Resolver(graph, input.links);
+  if (set.volumeGroups.length > 0 && input.pvs.code !== 0) {
+    return {
+      code: "unverifiable",
+      message: "the LVM physical volumes could not be re-read",
+      detail: { exit: input.pvs.code },
+    };
+  }
   const pvs = new Map<string, string>();
   if (input.pvs.code === 0) {
     for (const line of input.pvs.stdout.split("\n")) {
@@ -1006,6 +1161,13 @@ function conflict(
       }
       const node = graph.nodes.get(p)!;
       const probe = input.mdExamine[p];
+      if (!probe && (node.type === "disk" || node.type === "part")) {
+        return {
+          code: "unverifiable",
+          message: "a candidate disk or partition was not examined for md",
+          detail: { device: path, member: p },
+        };
+      }
       if (probe && probe.code === 0) {
         const uuid = parseExamineUuid(probe.stdout);
         if (uuid && uuids.has(uuid)) {

@@ -132,6 +132,12 @@ export const HOSTNAME_SCHEMA = z.string().regex(
   "an RFC 1122 hostname",
 );
 
+/** Hostname or IPv4, or an empty string meaning absent. */
+export const OPTIONAL_HOST_SCHEMA = z.string().max(253).refine(
+  (v) => v === "" || isHostTarget(v),
+  "a hostname or IPv4 address, or empty",
+).nullish();
+
 /** A cephadm-registered hostname for a placement list. */
 export const PLACEMENT_HOST_SCHEMA = HOSTNAME_SCHEMA;
 

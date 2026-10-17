@@ -375,6 +375,64 @@ Deno.test("the distribute-key schema rejects option backdoors and needs a port p
   );
 });
 
+Deno.test("the OSD schema enforces exactly one mode and rejects injection", () => {
+  const schema = model.methods.cephApplyOsd.arguments;
+  const base = {
+    adminHost: "192.0.2.10",
+    ...SSH_NULLS,
+    allAvailableDevices: null,
+    targetHost: null,
+    targetAddr: null,
+    targetPort: null,
+    dataDevices: null,
+    excludeDevices: null,
+  };
+  assertEquals(
+    schema.safeParse({
+      ...base,
+      targetHost: "node1",
+      dataDevices: [{ serial: "SN0001" }],
+    }).success,
+    true,
+  );
+  assertEquals(
+    schema.safeParse({
+      ...base,
+      allAvailableDevices: true,
+      excludeDevices: [{ serial: "SN0001" }],
+    }).success,
+    true,
+  );
+  // An empty string and empty list are accepted and mean absent.
+  assertEquals(
+    schema.safeParse({
+      ...base,
+      allAvailableDevices: true,
+      targetHost: "",
+      excludeDevices: [{ serial: "SN0001" }],
+    }).success,
+    true,
+  );
+  for (
+    const bad of [
+      { ...base, targetHost: "a;id", dataDevices: [{ serial: "SN0001" }] },
+      { ...base, targetHost: "node1", dataDevices: [{ serial: "SN*" }] },
+      {
+        ...base,
+        adminHost: "a;id",
+        targetHost: "node1",
+        dataDevices: [{ serial: "SN1" }],
+      },
+      {
+        ...base,
+        targetHost: "node1",
+        dataDevices: [{ serial: "SN1" }],
+        targetPort: 0,
+      },
+    ]
+  ) assertEquals(schema.safeParse(bad).success, false);
+});
+
 Deno.test("the host-add and apply schemas reject injection and duplicates", () => {
   const addSchema = model.methods.cephHostAdd.arguments;
   const addBase = {

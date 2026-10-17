@@ -49,7 +49,7 @@ Deno.test(
     assertEquals(run.includes("bash -c"), false);
     const write = writeScriptCommand("/tmp/x/run.sh");
     assertEquals(write.includes("cat > '/tmp/x/run.sh'"), true);
-    assertEquals(write.includes("chmod 0700 '/tmp/x/run.sh'"), true);
+    assertEquals(write.includes("chmod '0700' '/tmp/x/run.sh'"), true);
   },
 );
 

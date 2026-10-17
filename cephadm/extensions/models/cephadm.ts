@@ -42,11 +42,14 @@ import {
   CEPHADM_VERSION_SCHEMA,
   CIDR_SCHEMA,
   CONTAINER_IMAGE_SCHEMA,
+  DATA_DEVICE_SCHEMA,
+  EXCLUDE_DEVICE_SCHEMA,
   FSID_SCHEMA,
   HOST_FIELD,
   HOSTNAME_SCHEMA,
   HTTP_URL_SCHEMA,
   IPV4_SCHEMA,
+  OPTIONAL_HOST_SCHEMA,
   PACKAGE_SCHEMA,
   PLACEMENT_SCHEMA,
   SERIAL_SCHEMA,
@@ -63,6 +66,7 @@ import {
   distributeRecordKey,
   hostAdd,
 } from "./_lib/lifecycle.ts";
+import { applyOsd, validateOsdMode } from "./_lib/osd.ts";
 import { TransportError } from "./_lib/errors.ts";
 import { wipeDiskToRaw, type WipeRecord } from "./_lib/wipe.ts";
 
@@ -285,6 +289,41 @@ const ApplyMdsArgs = z.strictObject({
     "Filesystem whose MDS placement to converge.",
   ),
   placement: PLACEMENT_SCHEMA.describe("Hosts that must run MDS daemons."),
+});
+
+const ApplyOsdArgs = z.strictObject({
+  adminHost: HOST_FIELD.describe("Where ceph orch runs."),
+  ...SSH_FIELDS,
+  allAvailableDevices: z.boolean().nullish().describe(
+    "Claim every empty device fleet-wide; needs excludeDevices.",
+  ),
+  targetHost: OPTIONAL_HOST_SCHEMA.describe(
+    "Selector mode: the disk owner's registered name; empty means absent.",
+  ),
+  targetAddr: OPTIONAL_HOST_SCHEMA.describe(
+    "How the control host reaches targetHost; empty means absent, defaulting to targetHost.",
+  ),
+  targetPort: z.number().int().min(1).max(65535).nullish().describe(
+    "SSH port for targetAddr; defaults to port.",
+  ),
+  dataDevices: z.array(DATA_DEVICE_SCHEMA).max(128).nullish().describe(
+    "Selector mode: disks to make OSDs; an empty list means absent.",
+  ),
+  excludeDevices: z.array(EXCLUDE_DEVICE_SCHEMA).max(256).nullish().describe(
+    "Disks that must never be claimed; required in all-available mode.",
+  ),
+});
+
+const ApplyOsdResultSchema = z.strictObject({
+  serviceId: z.string(),
+  allAvailableDevices: z.boolean(),
+  targetHost: z.string().nullable(),
+  dataDevices: z.array(z.strictObject({ serial: z.string() })),
+  resolvedPaths: z.array(z.string()),
+  excludeDevices: z.array(z.strictObject({ serial: z.string() })),
+  applied: z.boolean(),
+  staleServicesRemoved: z.array(z.string()),
+  capturedAt: z.string(),
 });
 
 const BootstrapResultSchema = z.strictObject({
@@ -854,6 +893,74 @@ export function createCephadmModel(overrides: Partial<CephadmDeps> = {}) {
         }
       },
     },
+
+    cephApplyOsd: {
+      description:
+        "Apply an OSD service: fleet-wide all-available devices, or one by-serial service per disk-owning host. All-available mode is presence-only: once the service exists, a changed exclude list or new disks never trigger a re-apply. Selector mode resolves every serial to a by-id path first, so a resolution failure leaves the cluster untouched.",
+      arguments: ApplyOsdArgs,
+      execute: async (
+        args: z.infer<typeof ApplyOsdArgs>,
+        context: MethodContext,
+      ) => {
+        // Mode rules are re-checked here, before any SSH call.
+        const mode = validateOsdMode(args);
+        const adminSession = await openSession(
+          deps,
+          toTarget({
+            host: args.adminHost,
+            sshUser: args.sshUser,
+            port: args.port,
+            keyPath: args.keyPath,
+            privateKey: args.privateKey,
+            strictHostKeyChecking: args.strictHostKeyChecking,
+          }),
+          { multiplex: args.multiplex ?? false },
+        );
+        let targetSession: SshSession | null = null;
+        try {
+          if (mode.mode === "selector") {
+            targetSession = await openSession(
+              deps,
+              toTarget({
+                host: args.targetAddr ?? mode.targetHost!,
+                sshUser: args.sshUser,
+                port: args.targetPort ?? args.port,
+                keyPath: args.keyPath,
+                privateKey: args.privateKey,
+                strictHostKeyChecking: args.strictHostKeyChecking,
+              }),
+              { multiplex: args.multiplex ?? false },
+            );
+          }
+          const result = await applyOsd(
+            deps,
+            adminSession,
+            targetSession,
+            args,
+            context.logger,
+          );
+          const handle = await context.writeResource(
+            "cephApplyOsdResult",
+            `cephApplyOsd-${args.adminHost}-${result.serviceId}`,
+            {
+              serviceId: result.serviceId,
+              allAvailableDevices: result.allAvailableDevices,
+              targetHost: result.targetHost,
+              dataDevices: result.dataDevices,
+              resolvedPaths: result.resolvedPaths,
+              excludeDevices: result.excludeDevices,
+              applied: result.applied,
+              staleServicesRemoved: result.staleServicesRemoved,
+              capturedAt: new Date(deps.now()).toISOString(),
+            },
+          );
+          return { dataHandles: [handle] };
+        } finally {
+          if (targetSession !== null) await targetSession.close();
+          await adminSession.close();
+        }
+      },
+    },
   };
 
   const sshMethods = Object.keys(methods);
@@ -927,6 +1034,12 @@ export function createCephadmModel(overrides: Partial<CephadmDeps> = {}) {
       cephApplyMdsResult: {
         description: "MDS placement convergence evidence",
         schema: ApplyMdsResultSchema,
+        lifetime: "infinite" as const,
+        garbageCollection: 10,
+      },
+      cephApplyOsdResult: {
+        description: "OSD service application evidence",
+        schema: ApplyOsdResultSchema,
         lifetime: "infinite" as const,
         garbageCollection: 10,
       },

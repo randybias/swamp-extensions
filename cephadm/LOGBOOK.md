@@ -35,15 +35,15 @@ Not packaged. Notes for whoever maintains this extension.
     before any mutation from the mounted and configured root/boot filesystems
     and the member devices of any array that backs them (active or inactive),
     refusing a selected disk behind root/boot with `wipe.boot-protected`.
-  - HIGH-2 fstab credentials: the durable wipe record now stores only a
-    SHA-256 of /etc/fstab and its line count, never its contents.
+  - HIGH-2 fstab credentials: the durable wipe record now stores only a SHA-256
+    of /etc/fstab and its line count, never its contents.
   - HIGH-3 proxy credentials: apt proxy lines are sanitized (userinfo and
     password/token values removed) before they reach the record.
-  - HIGH-4 URL handling: V8 is now a character allowlist, userinfo-bearing
-    URLs are refused, and URLs are redacted in errors.
-  - HIGH-5 mdadm.conf rewrite: written to a same-directory temp file, read
-    back byte-for-byte, synced, atomically renamed, with the stable backup
-    restored on a later failure.
+  - HIGH-4 URL handling: V8 is now a character allowlist, userinfo-bearing URLs
+    are refused, and URLs are redacted in errors.
+  - HIGH-5 mdadm.conf rewrite: written to a same-directory temp file, read back
+    byte-for-byte, synced, atomically renamed, with the stable backup restored
+    on a later failure.
   - HIGH-6 remote-derived names: LVM VG names and md array paths get runtime
     grammars and `--` option terminators before appearing in destructive
     commands.
@@ -60,9 +60,12 @@ Not packaged. Notes for whoever maintains this extension.
   - LOW: quay.io removed from test fixtures; unused fetch/S3/resource-reader
     scaffolding removed; retry-delay calculation consolidated.
 - 2026-10-17: cluster-lifecycle milestone added: cephBootstrap,
-  cephDistributeKey, cephHostAdd, cephApplyMon, cephApplyMgr, cephApplyMds,
-  with the cephadm-shell execution layer (`_lib/shell.ts`). cephApplyOsd and
-  the data-plane, verify, maintenance and RGW groups remain.
+  cephDistributeKey, cephHostAdd, cephApplyMon, cephApplyMgr, cephApplyMds, with
+  the cephadm-shell execution layer (`_lib/shell.ts`). cephApplyOsd and the
+  data-plane, verify, maintenance and RGW groups remain.
+- 2026-10-17: group 03 completed with cephApplyOsd (all-available and by-serial
+  selector modes, device-inventory exclusion check, leftover-service sweep,
+  by-id spec apply) and the generalised cephadm-shell script runner.
 - The SQLite `pvs`/`mdadm` discovery, the atomic mdadm.conf rewrite and the
   boot-protection gate are unit-tested with scripted sessions; the live twin
   checks in the spec's [twin] items still apply.

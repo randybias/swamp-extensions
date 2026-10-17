@@ -7,6 +7,7 @@
     "jsr:@std/path@^1.1.4": "1.1.6",
     "jsr:@swamp-club/swamp-testing@0.20261014.55": "0.20261014.55",
     "npm:@marcbachmann/cel-js@7.6.1": "7.6.1",
+    "npm:yaml@2.9.1": "2.9.1",
     "npm:zod@4.3.6": "4.3.6",
     "npm:zod@^4.3.6": "4.3.6"
   },
@@ -39,6 +40,10 @@
   "npm": {
     "@marcbachmann/cel-js@7.6.1": {
       "integrity": "sha512-YyY8yiDU07ByKb2rJUoNgMAkYeeDvkdrONBREV2MP9siAW7yNft0KfbIoonWTIMY0fGtv8og0EhzKx3Xsi1Nmg==",
+      "bin": true
+    },
+    "yaml@2.9.1": {
+      "integrity": "sha512-3NxN8+78OdzbT7C/WjGsyfPAtJaN3FNDsWxv7Y7mcDsT/oOmgW8BpyQQFFBnvZE3j9Y2Sdz1ULFLezL7Eb2yFw==",
       "bin": true
     },
     "zod@4.3.6": {

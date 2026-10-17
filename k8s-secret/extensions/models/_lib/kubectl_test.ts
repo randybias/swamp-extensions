@@ -4,7 +4,6 @@ import {
   b64ToBytes,
   buildManifest,
   classify,
-  clusterFingerprint,
   FIELD_MANAGER,
   hashData,
   hashObserved,
@@ -35,27 +34,29 @@ Deno.test("manifest carries base64 data and no plaintext", () => {
 Deno.test("hashData is stable and order independent", async () => {
   const a = await hashData({ a: "1", b: "2" });
   const b = await hashData({ b: "2", a: "1" });
-  assertEquals(a.total, b.total);
-  assertEquals((await hashData({ a: "1", b: "3" })).total === a.total, false);
+  assertEquals(a, b);
+  const c = await hashData({ a: "1", b: "3" });
+  assertEquals(c.a, a.a);
+  assertEquals(c.b === a.b, false);
 });
 
 Deno.test("hashObserved hashes raw bytes, not a lossy decode", async () => {
   // A UTF-8 value hashes the same as the desired value's UTF-8 bytes.
   assertEquals(
-    (await hashObserved({ k: b64("héllo") })).keys.k,
-    (await hashData({ k: "héllo" })).keys.k,
+    (await hashObserved({ k: b64("héllo") })).k,
+    (await hashData({ k: "héllo" })).k,
   );
   // 0xff cannot be decoded as UTF-8; hashing the stored bytes is correct.
   const raw = b64ToBytes("/w==");
   assertEquals(raw, Uint8Array.of(0xff));
   assertEquals(
-    (await hashObserved({ k: "/w==" })).keys.k,
+    (await hashObserved({ k: "/w==" })).k,
     await sha256HexBytes(raw),
   );
   // The lossy decode replaces 0xff with U+FFFD, a different digest.
   assertEquals(
-    (await hashObserved({ k: "/w==" })).keys.k ===
-      (await hashData({ k: unb64("/w==") })).keys.k,
+    (await hashObserved({ k: "/w==" })).k ===
+      (await hashData({ k: unb64("/w==") })).k,
     false,
   );
 });
@@ -70,19 +71,6 @@ Deno.test("grammars", () => {
   assertEquals(isDataKey("."), false);
   assertEquals(isContext("kind-test"), true);
   assertEquals(isContext("-x"), false);
-});
-
-Deno.test("clusterFingerprint is stable per server, differs across servers", async () => {
-  const a = "clusters:\n- cluster:\n    server: https://a.test:6443\n";
-  const b = "clusters:\n- cluster:\n    server: https://b.test:6443\n";
-  assertEquals(
-    await clusterFingerprint(a),
-    await clusterFingerprint(`${a}# rotated token, same server\n`),
-  );
-  assertEquals(
-    (await clusterFingerprint(a)) === (await clusterFingerprint(b)),
-    false,
-  );
 });
 
 Deno.test("ownedDataKeys reads only this manager's applied data keys", () => {

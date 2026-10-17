@@ -50,6 +50,23 @@ Not packaged. Notes for whoever maintains this extension.
   - MEDIUM-8: `apply`'s description now starts with DESTRUCTIVE and states that
     it prunes owned keys and force-overwrites conflicts.
   - LOW: the model gained a type description; README examples carry no `--json`.
+- 2026-10-17 (lane/d2): review round 3 (codex astra + terra on 56970c4).
+  Dispositions:
+  - HIGH-1 kubeconfig exec-auth local RCE: a new `_lib/kubeconfig.ts` parses the
+    kubeconfig with `npm:yaml` and `maxAliasCount: 100` (so alias-expansion
+    input is refused, not expanded) and rejects any `users[].user.exec` or
+    `auth-provider` credential plugin. The check runs inside the kubeconfig
+    field's schema, before any kubectl spawn, so a hostile kubeconfig cannot run
+    a local command. Only static credentials are accepted.
+  - MEDIUM-2: the state-id fingerprint now resolves the selected context (or
+    `current-context`) to its cluster and server from the parsed kubeconfig, so
+    two contexts that share a server no longer collide.
+  - MEDIUM-3: README no longer mentions `--json`; it states that kubeconfig and
+    data values are vault references or stdin only.
+  - REFUTED (held): rename `delete` to `remove`.
+  - LOW: removed `totalDigest`/`total`; hashes are plain per-key maps. Extracted
+    `persistState` for the shared state write. Dependency added:
+    `npm:yaml@2.9.1` (alias-safe parse).
 - Real-swamp check with a stub `kubectl` on PATH (not a live cell): vault
   expressions in `--input` (including inside `data:json=`) resolve; kubectl argv
   carries no value, stdin carries the base64 manifest, output and state hold key

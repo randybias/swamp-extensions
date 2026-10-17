@@ -406,21 +406,82 @@ Deno.test("data is bounded by key count and total bytes before kubectl", async (
   }
 });
 
+Deno.test("a kubeconfig with exec credentials is rejected before kubectl", async () => {
+  const h = harness(() => ({}));
+  try {
+    const { context } = createModelTestContext({ globalArgs: {} });
+    const execKc = [
+      "apiVersion: v1",
+      "kind: Config",
+      "users:",
+      "- name: u",
+      "  user:",
+      "    exec:",
+      "      apiVersion: client.authentication.k8s.io/v1",
+      "      command: /bin/sh",
+      '      args: ["-c", "id"]',
+      "",
+    ].join("\n");
+    await assertRejects(() =>
+      model.methods.apply.execute(
+        { ...APPLY, kubeconfig: execKc } as never,
+        context,
+      )
+    );
+    await assertRejects(() =>
+      model.methods.delete.execute(
+        { ...BASE, kubeconfig: execKc } as never,
+        context,
+      )
+    );
+    assertEquals(h.calls.length, 0);
+    assertEquals(h.written.length, 0);
+  } finally {
+    h.restore();
+  }
+});
+
 Deno.test("state ids are unique across clusters and separator-ambiguous names", async () => {
-  const kcA =
-    "apiVersion: v1\nkind: Config\nclusters:\n- cluster:\n    server: https://a.test\n";
-  const kcB =
-    "apiVersion: v1\nkind: Config\nclusters:\n- cluster:\n    server: https://b.test\n";
+  const kc = [
+    "apiVersion: v1",
+    "kind: Config",
+    "current-context: prod",
+    "clusters:",
+    "- name: c1",
+    "  cluster:",
+    "    server: https://a.test:6443",
+    "- name: c2",
+    "  cluster:",
+    "    server: https://b.test:6443",
+    "contexts:",
+    "- name: prod",
+    "  context:",
+    "    cluster: c1",
+    "    user: u",
+    "- name: staging",
+    "  context:",
+    "    cluster: c2",
+    "    user: u",
+    "users:",
+    "- name: u",
+    "  user:",
+    "    token: placeholder",
+    "",
+  ].join("\n");
   const base = { namespace: "app", name: "db" };
-  const a1 = await stateName({ ...base, context: "prod", kubeconfig: kcA });
-  const a2 = await stateName({ ...base, context: "prod", kubeconfig: kcA });
-  const across = await stateName({ ...base, context: "prod", kubeconfig: kcB });
-  const slash = await stateName({ ...base, context: "a/b", kubeconfig: kcA });
-  const under = await stateName({ ...base, context: "a_b", kubeconfig: kcA });
-  assertEquals(a1, a2);
-  assert(a1 !== across);
+  const prod = await stateName({ ...base, context: "prod", kubeconfig: kc });
+  const again = await stateName({ ...base, context: "prod", kubeconfig: kc });
+  const staging = await stateName({
+    ...base,
+    context: "staging",
+    kubeconfig: kc,
+  });
+  const slash = await stateName({ ...base, context: "a/b", kubeconfig: kc });
+  const under = await stateName({ ...base, context: "a_b", kubeconfig: kc });
+  assertEquals(prod, again);
+  assert(prod !== staging);
   assert(slash !== under);
-  for (const id of [a1, across, slash, under]) {
+  for (const id of [prod, staging, slash, under]) {
     assert(!id.includes("/") && !id.includes(".."));
     assert(id.length <= 200);
   }

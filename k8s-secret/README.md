@@ -64,8 +64,8 @@ swamp model method run db-secret delete \
   --input namespace=app --input name=db-creds
 ```
 
-Do not capture `--json` output of a run that carries these arguments: the swamp
-CLI echoes sensitive arguments there.
+Pass `kubeconfig` and every `data` value only as vault references (or over
+stdin); never as literal `--input` values.
 
 ## How it works
 
@@ -76,7 +76,9 @@ comparison hashes exist only inside an `apply` call. Failures are typed
 fixed message: remote kubectl text is never returned, because it can echo the
 manifest. Namespace, name, context, type and keys are validated against
 Kubernetes grammars before any process starts, and data is bounded by key count
-and total UTF-8 size.
+and total UTF-8 size. A kubeconfig that uses `exec` or `auth-provider`
+credentials is rejected before kubectl runs, because those plugins execute a
+local command.
 
 ## License
 

@@ -5,8 +5,10 @@
  * `kubectl apply -f -`; they never appear on a command line, in a file other
  * than the private temporary kubeconfig, in stored state, or in method output.
  * No value hash is returned or stored either, because a raw sha256 of a
- * low-entropy secret can be reversed by brute force. One definition serves any
- * cluster: the target is a method argument.
+ * low-entropy secret can be reversed by brute force. A kubeconfig that would
+ * make kubectl run a local credential command (exec or auth-provider) is
+ * rejected before it is used. One definition serves any cluster: the target is
+ * a method argument.
  *
  * @module
  */
@@ -15,7 +17,6 @@ import { z } from "npm:zod@4.3.6";
 import {
   buildManifest,
   classify,
-  clusterFingerprint,
   defaultDeps,
   type Deps,
   FIELD_MANAGER,
@@ -33,6 +34,7 @@ import {
   type Target,
   withKubectl,
 } from "./_lib/kubectl.ts";
+import { checkKubeconfig, clusterFingerprint } from "./_lib/kubeconfig.ts";
 
 /** Maximum number of keys in one Secret. */
 export const MAX_KEYS = 256;
@@ -50,9 +52,12 @@ function dataBytes(data: Record<string, string>): number {
 }
 
 const TargetShape = {
-  kubeconfig: z.string().min(1).max(262144).meta({ sensitive: true }).describe(
-    "Kubeconfig content. Wire with a vault.get(...) expression.",
-  ),
+  kubeconfig: z.string().min(1).max(262144).superRefine((value, ctx) => {
+    const check = checkKubeconfig(value);
+    if (!check.ok) ctx.addIssue({ code: "custom", message: check.reason });
+  }).describe(
+    "Kubeconfig content; only static credentials are allowed (no exec or auth-provider plugin). Wire with a vault.get(...) expression.",
+  ).meta({ sensitive: true }),
   context: z.string().refine(isContext, "invalid context name").optional()
     .describe("Kubeconfig context; defaults to the current context."),
   namespace: z.string().refine(isNamespace, "not a DNS-1123 label").describe(
@@ -123,12 +128,12 @@ function target(a: z.infer<typeof TargetArgs>): Target {
 
 /**
  * State instance name for a Secret. Includes the context, namespace and name
- * plus a digest of the cluster fingerprint and components, so a context whose
- * name contains `/` cannot collide with one that contains `_`, and the same
- * context name in two clusters keeps separate state.
+ * plus a digest of the selected cluster's server and the components, so a
+ * context whose name contains `/` cannot collide with one that contains `_`,
+ * and the same context name in two clusters keeps separate state.
  */
 export async function stateName(t: Target): Promise<string> {
-  const cluster = await clusterFingerprint(t.kubeconfig);
+  const cluster = await clusterFingerprint(t.kubeconfig, t.context);
   const readable = [t.context ?? "current-context", t.namespace, t.name]
     .join("_")
     .replace(/[^A-Za-z0-9._-]+/g, "-")
@@ -215,6 +220,11 @@ function summary(s: SecretState) {
   };
 }
 
+/** Writes the Secret's state under its instance name; returns the handle. */
+async function persistState(context: Ctx, t: Target, state: SecretState) {
+  return await context.writeResource("state", await stateName(t), state);
+}
+
 /**
  * True when applying `data` would change nothing: the type matches, every
  * desired key is owned by this field manager and has the same value, and the
@@ -232,7 +242,7 @@ async function unchanged(
   if (owned.size !== desiredKeys.length) return false;
   const have = await hashObserved(before.dataB64);
   for (const k of desiredKeys) {
-    if (!owned.has(k) || have.keys[k] !== want[k]) return false;
+    if (!owned.has(k) || have[k] !== want[k]) return false;
   }
   return true;
 }
@@ -262,12 +272,10 @@ export const model = {
         const a = ApplyArgs.parse(args);
         const t = target(a);
         const want = await hashData(a.data);
-        const desiredKeys = Object.keys(want.keys);
+        const desiredKeys = Object.keys(want);
         const state = await withKubectl(deps, t, async (kubectl) => {
           const before = await observe(kubectl, t);
-          if (
-            before && await unchanged(before, a.type, want.keys, desiredKeys)
-          ) {
+          if (before && await unchanged(before, a.type, want, desiredKeys)) {
             context.logger.info("Secret {name} unchanged", { name: t.name });
             return toState(t, before, "present", deps.now());
           }
@@ -289,11 +297,7 @@ export const model = {
           context.logger.info("Secret {name} applied", { name: t.name });
           return toState(t, after, "present", deps.now());
         });
-        const handle = await context.writeResource(
-          "state",
-          await stateName(t),
-          state,
-        );
+        const handle = await persistState(context, t, state);
         return { dataHandles: [handle], result: summary(state) };
       },
     },
@@ -315,11 +319,7 @@ export const model = {
           }
           return toState(t, o, "present", deps.now());
         });
-        const handle = await context.writeResource(
-          "state",
-          await stateName(t),
-          state,
-        );
+        const handle = await persistState(context, t, state);
         return { dataHandles: [handle], result: summary(state) };
       },
     },
@@ -339,11 +339,7 @@ export const model = {
           name: t.name,
           status: state.status,
         });
-        const handle = await context.writeResource(
-          "state",
-          await stateName(t),
-          state,
-        );
+        const handle = await persistState(context, t, state);
         return { dataHandles: [handle], result: summary(state) };
       },
     },
@@ -375,11 +371,7 @@ export const model = {
           status,
         });
         const state = toState(t, null, status, deps.now());
-        const handle = await context.writeResource(
-          "state",
-          await stateName(t),
-          state,
-        );
+        const handle = await persistState(context, t, state);
         return { dataHandles: [handle], result: { status } };
       },
     },

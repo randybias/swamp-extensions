@@ -193,24 +193,17 @@ export async function sha256Hex(s: string): Promise<string> {
   return await sha256HexBytes(new TextEncoder().encode(s));
 }
 
-/** One digest over the per-key hashes, independent of key order. */
-async function totalDigest(keys: Record<string, string>): Promise<string> {
-  return await sha256Hex(
-    Object.entries(keys).map(([k, h]) => `${k}=${h}`).join("\n"),
-  );
-}
-
 /**
- * Per-key sha256 of the desired values (their UTF-8 bytes), plus one digest
- * over the sorted pairs. Used only in-process to decide whether an apply is a
- * no-op; never written to state or returned.
+ * Per-key sha256 of the desired values (their UTF-8 bytes). Used only
+ * in-process to decide whether an apply is a no-op; never written to state or
+ * returned.
  */
 export async function hashData(
   data: Record<string, string>,
-): Promise<{ keys: Record<string, string>; total: string }> {
+): Promise<Record<string, string>> {
   const keys: Record<string, string> = {};
   for (const k of Object.keys(data).sort()) keys[k] = await sha256Hex(data[k]);
-  return { keys, total: await totalDigest(keys) };
+  return keys;
 }
 
 /**
@@ -220,12 +213,12 @@ export async function hashData(
  */
 export async function hashObserved(
   dataB64: Record<string, string>,
-): Promise<{ keys: Record<string, string>; total: string }> {
+): Promise<Record<string, string>> {
   const keys: Record<string, string> = {};
   for (const k of Object.keys(dataB64).sort()) {
     keys[k] = await sha256HexBytes(b64ToBytes(dataB64[k]));
   }
-  return { keys, total: await totalDigest(keys) };
+  return keys;
 }
 
 /** Standard base64 of a UTF-8 string. */
@@ -279,19 +272,6 @@ function baseArgs(t: Target): string[] {
     t.namespace,
     "--request-timeout=30s",
   ];
-}
-
-const SERVER_RE = /^\s*server:\s*["']?([^\s"']+)["']?\s*$/m;
-
-/**
- * Nonsecret fingerprint of the API server a kubeconfig talks to. The server
- * URL is stable across credential rotation, so a Secret's state id does not
- * change when its token does; it falls back to the kubeconfig content when
- * no server line is present. The raw URL is never put in an id or output.
- */
-export async function clusterFingerprint(kubeconfig: string): Promise<string> {
-  const m = SERVER_RE.exec(kubeconfig);
-  return (await sha256Hex(m ? m[1] : kubeconfig)).slice(0, 12);
 }
 
 /** One `metadata.managedFields` entry, narrowed to the fields we read. */

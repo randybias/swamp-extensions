@@ -1,0 +1,74 @@
+import { assert, assertEquals, assertRejects } from "jsr:@std/assert@1.0.19";
+import {
+  b64Utf8,
+  classifyFetch,
+  defaultDeps,
+  drain,
+  MAX_BODY_BYTES,
+  readBounded,
+  RedfishError,
+  sha256Hex,
+  statusError,
+} from "./http.ts";
+
+Deno.test("readBounded returns a body under the cap", async () => {
+  const text = await readBounded(new Response('{"a":1}'));
+  assertEquals(text, '{"a":1}');
+});
+
+Deno.test("readBounded refuses a body over the cap", async () => {
+  const big = "x".repeat(MAX_BODY_BYTES + 1);
+  const e = await assertRejects(() =>
+    readBounded(new Response(big))
+  ) as RedfishError;
+  assertEquals(e.code, "response_too_large");
+});
+
+Deno.test("readBounded on an empty body is an empty string", async () => {
+  assertEquals(await readBounded(new Response(null, { status: 204 })), "");
+});
+
+Deno.test("classifyFetch maps certificate failures to tls and the rest to unreachable", () => {
+  assertEquals(
+    classifyFetch(new Error("certificate verify failed")).code,
+    "tls",
+  );
+  assertEquals(
+    classifyFetch(new Error("x509: certificate signed by unknown authority"))
+      .code,
+    "tls",
+  );
+  const unreachable = classifyFetch(new TypeError("connection refused"));
+  assertEquals(unreachable.code, "unreachable");
+  assert(!unreachable.message.includes("connection refused"));
+});
+
+Deno.test("statusError maps status classes to fixed messages", () => {
+  assertEquals(statusError(401).code, "unauthorized");
+  assertEquals(statusError(403).code, "unauthorized");
+  assertEquals(statusError(404).code, "not_found");
+  const failed = statusError(500);
+  assertEquals(failed.code, "redfish_failed");
+  assertEquals(failed.message, "Redfish request failed (HTTP 500)");
+});
+
+Deno.test("b64Utf8 and sha256Hex", async () => {
+  assertEquals(b64Utf8("user:pass"), "dXNlcjpwYXNz");
+  assertEquals(
+    await sha256Hex("abc"),
+    "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
+  );
+});
+
+Deno.test("drain discards a body without throwing", async () => {
+  await drain(new Response("ignored"));
+  await drain(new Response(null, { status: 204 }));
+});
+
+Deno.test("defaultDeps exposes the injectable seams", () => {
+  const d = defaultDeps();
+  assertEquals(typeof d.fetch, "function");
+  assertEquals(typeof d.makeClient, "function");
+  assertEquals(typeof d.now, "function");
+  assertEquals(typeof d.sleep, "function");
+});

@@ -1,0 +1,90 @@
+{
+  "extension": "@randybias/kubevirt",
+  "version": "2026.10.17.1",
+  "reviewedAt": "2026-10-17T17:20:02Z",
+  "dimensions": [
+    {
+      "id": "credentials-secrets",
+      "verdict": "pass",
+      "note": "The kubeconfig is a sensitive-marked vault reference resolved through the plain-object context.vaultService. The vendored k8s-secret kubeconfig/kubectl/vault helpers (byte-identical blobs) validate it default-deny (no exec or auth-provider plugin), write it to a 0600 temporary file for one kubectl call and remove it in a finally; it never reaches argv, stored state, a log or output. Manifests travel on stdin. kubectl stderr is classified to fixed messages and never echoed. cloud_init_secret and ssh_public_key_secret are Secret names, not material (sensitive-field warning accepted with a comment). Live runs used a vault reference only."
+    },
+    {
+      "id": "logging-quality",
+      "verdict": "pass",
+      "note": "Each method logs the target and outcome once (version installed, VM status, uninstall status); no kubeconfig, manifest body or Secret content in log fields."
+    },
+    {
+      "id": "error-handling",
+      "verdict": "pass",
+      "note": "Typed KubevirtError codes (invalid_input, invalid_response, unreachable, unauthorized, not_found, crd_missing, manifest_fetch, manifest_mismatch, version_conflict, version_skew, uninstall_blocked, restart_halted, running_field, kubectl_failed). A parse failure inside a method body is invalid_response naming issue paths and codes only, never values, and is not flattened into kubectl_failed. A missing CRD on a read means not installed. Residual MEDIUM: an owned CDI whose CRD is gone but whose namespace remains fails uninstall at the CDI CR delete (documented)."
+    },
+    {
+      "id": "testing-completeness",
+      "verdict": "pass",
+      "note": "115 offline tests: grammars, golden CR/VM renders, the vendored helpers, schema and secret checks, the failure-mode table, a plain-object context, real condition shapes with lastProbeTime, swamp's data-name rule on every state key, and the re-run no-op. Live on <bm1> (single-node k0s v1.36.4, KubeVirt v1.9.1, CDI v1.66.1): 23/24 on 3966f44 with no patches (the failed cell, a CR generation bump on the first re-run, is fixed in bd22e15), then 9/9 on bd22e15. DataVolume cells were not run (no default StorageClass)."
+    },
+    {
+      "id": "idempotency-resilience",
+      "verdict": "pass",
+      "note": "install adopts a matching install and applies the CR only when a managed field differs from the live spec (crSpecSatisfied compares the live read-back, not the render); live: two immediate re-runs left the CR generation and every resourceVersion unchanged. VM delete and uninstall are clean no-ops when absent (live 5h, 7b, 3c). Uninstall fetches and verifies every manifest before the first delete, and CDI cleanup is independent of KubeVirt so a retry never orphans it."
+    },
+    {
+      "id": "api-contracts",
+      "verdict": "pass",
+      "note": "KubeVirt v1 (kubevirt.io/v1 KubeVirt, VirtualMachine, VirtualMachineInstance; subresources.kubevirt.io/v1 restart through kubectl replace --raw) and CDI v1beta1 (CDI CR, DataVolume templates) via kubectl only. Operator manifests are the GitHub release assets, SHA-256-pinned and refused on mismatch before any apply (live 4a, 4b). kvm_nodes reads status.allocatable devices.kubevirt.io/kvm (confirmed live). Observed objects are projected, never strictly parsed."
+    },
+    {
+      "id": "resource-management",
+      "verdict": "pass",
+      "note": "One temporary kubeconfig per kubectl call, removed in a finally. Waits are bounded by timeout_s (10-3600 s), including the CDI CR delete. Uninstall is refused unless confirm equals the cluster fingerprint (live 6, 3a) and, under the default strategy, while workloads exist; RemoveWorkloads is documented."
+    },
+    {
+      "id": "published-surface-hygiene",
+      "verdict": "pass",
+      "note": "Manifest @randybias/kubevirt 2026.10.17.1, two model types (kubevirt, kubevirt-vm), Apache-2.0, additionalFiles README.md and LICENSE.txt (LOGBOOK not packaged). README documents the live node prerequisites (/dev/kvm udev rule, k0s kubelet root, StorageClass). Leak scan, gitleaks and fixture guard pass; fixtures use RFC 5737 addresses; LOGBOOK receipts redact the host as <bm1>."
+    },
+    {
+      "id": "schema-strictness",
+      "verdict": "pass",
+      "note": "Every argument and the model's own records are strictObjects with grammars: release tags, lowercase SHA-256, DNS-1123 names, feature gates, bounded memory and DataVolume size, digest-pinned images only, HTTPS mirror base without userinfo or query, and a strict HTTP(S) DataVolume URL grammar that refuses ?, #, @, backslash and whitespace. External read-backs are projected, not strictly parsed (RULINGS)."
+    },
+    {
+      "id": "lifetime-gc",
+      "verdict": "pass",
+      "note": "state and rendered resources on both types: infinite/10."
+    },
+    {
+      "id": "crud-completeness",
+      "verdict": "pass",
+      "note": "Operator: render_cr, install, wait_ready, upgrade, get, sync, uninstall. VM: render_vm, define, start, stop, restart, wait_ready, get, sync, delete. Mutating verbs are actions; delete and uninstall are DESTRUCTIVE actions, so no method tombstones the definition."
+    },
+    {
+      "id": "preflight-checks",
+      "verdict": "pass",
+      "note": "Inputs are validated before any kubectl spawn; the kubeconfig is validated before use; manifests are SHA-verified before apply; a different installed version, a downgrade or a minor skip is refused before any fetch or apply; a DataVolume source requires the CDI CRD; adopting a VM that uses spec.running is refused; restart on a Halted VM is refused before the subresource call; CDI ownership is checked before apply and before delete."
+    },
+    {
+      "id": "instance-names",
+      "verdict": "pass",
+      "note": "State is keyed by the 16-hex fingerprint of the normalized server URL: <fp>_kubevirt and <fp>_<namespace>_<name> ('_' because swamp rejects '/'; '_' cannot occur in hex or DNS-1123, so the keys are injective). Residual: two clusters behind one server URL share a fingerprint (documented)."
+    },
+    {
+      "id": "data-access",
+      "verdict": "pass",
+      "note": "Targets, versions, pins and VM specs arrive as method arguments; the model reads back only its own state record (CDI ownership and pins) and the live cluster."
+    },
+    {
+      "id": "version-upgrades",
+      "verdict": "pass",
+      "note": "First publish: no prior stored attributes, so no upgrade entries are needed."
+    }
+  ],
+  "panel": {
+    "codex-astra": "codex gpt-6-astra conformance seat, d4 rounds r1 (base 471f4e9), r2 (7f04968) and r3 (c14f2fb), then b2's a2f86c0: earlier Highs (namespace override, CDI CR, uninstall order, CDI ownership/record match, URL grammar) were fixed in r1-r4; final round CLEAN after triage. Its mixed-ownership finding is recorded as the pending-owned marker residual.",
+    "codex-terra": "codex gpt-5.6-terra adversarial seat, same rounds: CLEAN after triage at a2f86c0; its CDI-CRD-missing uninstall MEDIUM is a documented LOGBOOK residual.",
+    "tightness-astra": "Its a2f86c0 TIGHTNESS note (CDI discovery duplicated between two helpers) is LOW and left. Merge-prep quality pass 82baba0 removed the duplicated grammar regexes in kubevirt.ts, the unused isRecord and the test-only wrappers.",
+    "merge-prep": "Self-review of the live-fix delta a2f86c0..bd22e15 (75b7dfe state keys, 3966f44 projected observations, bd22e15 re-run no-op) against TRIAGE 4b-4h: no Critical/High. get on a fresh cluster records not_found through the same plain-object writeResource path; crSpecSatisfied compares the live read-back, not the render (4e); no new parser differential (4c), no workflow (4d), no SSH (4f/4g), no hash on argv (4h). Code commits at merge-prep: 82baba0 quality pass and 359fba7 (gate 7: swamp-quality-ignore on the two Secret-name fields); 803bf55 is README only. Vendored kubeconfig/kubectl/vault files are byte-identical to k8s-secret on main. 115 tests pass.",
+    "live-e2e": "<bm1>, single-node k0s v1.36.4, KubeVirt v1.9.1, CDI v1.66.1: 23/24 on 3966f44 with no patches, then 9/9 on bd22e15 (immediate install re-runs are true no-ops; the udev rule verified; k0s --kubelet-root-dir present but untested). Earlier patched passes on a2f86c0 and 75b7dfe kept as history. DataVolume cells not run.",
+    "ocr-llm": "advisory adversarial-glm seat: no output in the kubevirt review directories; not blocking"
+  }
+}

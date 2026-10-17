@@ -1,0 +1,90 @@
+{
+  "extension": "@randybias/k0s-multinode",
+  "version": "2026.10.17.1",
+  "reviewedAt": "2026-10-17T20:20:00Z",
+  "dimensions": [
+    {
+      "id": "credentials-secrets",
+      "verdict": "pass",
+      "note": "Join tokens live only in memory and a caller-named vault key; state and output carry token ID, role and expiry only. mint_join_token refuses before any remote call without a vault service, takes the ID by decoding the create kubeconfig and corroborating it against the role-scoped token list, and invalidates on any doubt, list failure or vault failure; invalidate overwrites the key with a fixed tombstone. ClusterCommandError carries stderr only, never stdout. SSH key is a sensitive vault reference; strict host keys only (insecure_tofu dropped). Live: ps/argv scan on three nodes and locally across every join, drain, detach and failed join found 0 hits for any token value, bearer, secret half or their sha256, and 0 gzip-base64 strings; every minted token was invalidated (create workflow twice, bad-pin join). Residual MEDIUM: an unparseable create output or a failed final tokens-record write leaves that token live on the controller until token_expiry (default 1h), held nowhere else."
+    },
+    {
+      "id": "logging-quality",
+      "verdict": "pass",
+      "note": "One info line per mint (role, token ID, cluster, expiry); no token value, kubeconfig or host key in log fields or errors."
+    },
+    {
+      "id": "error-handling",
+      "verdict": "pass",
+      "note": "Typed errors: ClusterCommandError (argv head, exit, trimmed stderr), TokenError, VaultUnavailableError, DetachRefusedError, DrainBlockedError (PDB block, node stays cordoned; live cell 5), WaitTimeoutError. hasNonDaemonSetPods throws on a non-List and detach turns it into a refusal (fails closed). Canonical ssh.ts maps exit 255 to a typed transport error."
+    },
+    {
+      "id": "testing-completeness",
+      "verdict": "pass",
+      "note": "29 offline tests: planner (create, HA, even-count, duplicates, upgrade order, quorum and last-controller refusals), token decode and corroboration, argv builders, vault refusals, drain PDB block, detach refusals, sync drift persisted to status, worker role/version from the real k0s 1.36 worker Node shape, workflow structure. Round 3 ran 13 mock workflow cases, every token invalidated. Live: 11 of 12 on 3c8afc1 (3 nodes: one controller, two workers; published k0s-cluster 2026.10.17.3), the one FAIL (sync drift unobservable) and the role residual fixed in f94659f, then 5 of 5 on f94659f. Untested: HA with 3 controllers (quorum paths unit-tested only)."
+    },
+    {
+      "id": "idempotency-resilience",
+      "verdict": "pass",
+      "note": "invalidate by key is a no-op once every record is invalidated (live, no remote call); detach of an absent node is a no-op and an already-left etcd member is accepted; drain and uncordon are idempotent. The join-node child workflow pairs every mint with an invalidate (wait completed, or install failed). Workers are gated on the whole controllers job succeeding. Residuals: forEach has no early stop inside a job; an explicit invalidate of an already-invalidated token_id fails when k0s reports it unknown; a re-run mint creates another token."
+    },
+    {
+      "id": "api-contracts",
+      "verdict": "pass",
+      "note": "k0s v1.36.4 checked in a container and live: token create prints a base64 gzipped kubeconfig; token list requires a role; etcd member-list maps name to peer URL; worker Nodes carry no node.k0sproject.io role or version label, so role comes from etcd membership or a ControlNode and the version falls back to the kubelet string. kubectl drain honors PodDisruptionBudgets (never --disable-eviction)."
+    },
+    {
+      "id": "resource-management",
+      "verdict": "pass",
+      "note": "One SSH exec per command through a controller; no remote temp files; polling loops are bounded by timeout_s. Residual (k0s itself): reset leaves /opt/cni/bin, an empty /etc/cni/net.d and a stale kubelet device-plugin socket on workers."
+    },
+    {
+      "id": "published-surface-hygiene",
+      "verdict": "pass",
+      "note": "Manifest @randybias/k0s-multinode 2026.10.17.1, Apache-2.0, additionalFiles README.md and LICENSE.txt, two workflows (create-cluster, join-node) named <ext>-<verb>-<object>. Release stanza visibility public, audience general; the five naming answers are in the LOGBOOK, and the name disambiguates from the per-node k0s-cluster. detach_node is DESTRUCTIVE; get, sync, wait_joined, plan and plan_remove are READ-ONLY. Vendored _lib/ssh.ts (fe0139f0) and transport.ts are byte-identical to k0s-cluster. Leak scan, gitleaks and fixture guard pass; history carries only RFC 5737 addresses; live receipts in the LOGBOOK use redacted hosts. Prior art at merge: none for k0s multi-node (Talos and k3s packages are other distributions)."
+    },
+    {
+      "id": "schema-strictness",
+      "verdict": "pass",
+      "note": "Arguments and resource schemas are strict; node names use the DNS-1123 subdomain grammar before any remote call (live 7b: '-l x=y' refused with 0 remote calls); token IDs ^[a-z0-9]{6}$ (a leading-dash ID is refused); token expiry bounded 5m to 24h; external_lb/cplb_vip require external_address. Read-backs (nodes, etcd, token list) are projected, not strict-parsed. Residual MEDIUM: the workflows' control_plane_load_balancing input is an open object passed to k0s-cluster, which validates it; nested input defaults are not applied by swamp, so callers pass nested fields explicitly."
+    },
+    {
+      "id": "lifetime-gc",
+      "verdict": "pass",
+      "note": "plan, status and tokens: infinite/10."
+    },
+    {
+      "id": "crud-completeness",
+      "verdict": "pass",
+      "note": "plan/plan_remove (compute and record), mint/invalidate join tokens, wait_joined, drain/uncordon, detach_node (an action, never kind delete), get and sync. Deferred and recorded: render_config, the upgrade method, and the add-node, remove-node, upgrade-cluster and reset-cluster workflows; per-node install and reset are k0s-cluster's."
+    },
+    {
+      "id": "preflight-checks",
+      "verdict": "pass",
+      "note": "Mint refuses without a vault before any remote call. Detach refuses an undrained node or one with schedulable pods, the last controller (even with confirm; live 7a), a 3->2 or 2->1 controller removal without confirm, a peer_address that is not the member's, a worker that is an etcd member, and detaching through the leaving controller's own host. Each destructive method enforces its own preconditions, not only a workflow gate. Residual MEDIUM: the self-host check compares the etcd peer with the ssh.host string only, so a hostname or alternate interface is not caught (quorum and last-controller refusals still apply)."
+    },
+    {
+      "id": "instance-names",
+      "verdict": "pass",
+      "note": "<cluster> (plan), <cluster>-status, <cluster>-tokens; cluster_name is a label grammar, so no '/', '..', '\\' or NUL."
+    },
+    {
+      "id": "data-access",
+      "verdict": "pass",
+      "note": "Reads only this model's own plan and tokens records via readResource keyed by instance name; the SSH target, key and vault keys arrive as arguments; the vault is used through context.vaultService get/put (object shape, exercised by a plain-object test context)."
+    },
+    {
+      "id": "version-upgrades",
+      "verdict": "pass",
+      "note": "First release: upgrades[] is a literal empty array; no stored data to migrate."
+    }
+  ],
+  "panel": {
+    "codex-astra": "conformance seat, three rounds. Round 1 (8f531eb) 9 High and round 2 (4982ce9) 6 High fixed in the lane (token kubeconfig decode, per-role token list, etcd shape, DNS-1123 node names, etcd-based controller-ness, strict host keys, plan_remove parse, per-node join child workflow). Round 3 (6b8a0c0): triaged CLEAN; the private_address High was refuted live (create workflow succeeded twice), the stderr High refuted (token commands put nothing secret on stderr; stdout never reported), the self-host and mint-record Highs downgraded to MEDIUM residuals in the LOGBOOK.",
+    "codex-terra": "adversarial seat, round 3 (6b8a0c0): two orphaned-token paths (unparseable create output, failed tokens-record write) and the hostname self-detach bypass, downgraded to MEDIUM (a short-lived token held nowhere, expiring by token_expiry; quorum refusals still hold) and recorded as residuals; MEDIUMs on explicit re-invalidate, re-mint and open control_plane_load_balancing kept as residuals.",
+    "tightness-astra": "COULD-BE-TIGHTER, about 480 removable lines, about 440 of them in the vendored canonical ssh.ts/transport.ts (kept byte-identical by policy); the rest LOW (targetOf, duplicated fakeJoinToken and cordoned-node fixtures), left as is.",
+    "adversarial-glm": "Advisory GLM seat, round 3: the same orphaned-token and invalidate-idempotency points (residuals), controller_worker readiness in the verify assert and a fabricated ready:true for a dedicated controller (LOW), workflow passthrough strings validated by k0s-cluster downstream.",
+    "merge-prep": "Merged f94659f as 07149f0; diff scope k0s-multinode/ plus its release.yaml stanza; the rebased commits map tree-for-tree onto the reviewed 8f531eb, 4982ce9, 6b8a0c0 and 3c8afc1. Self-review of 6b8a0c0..f94659f: job split (verify is a read), metadata, sync drift persisted to status, role from etcd/ControlNode with tests on the real worker shape. Only gate-7 mechanics at merge prep (plain model export, swamp-quality-ignore on token_expiry, TOKEN_EXPIRY and TokensStateSchema): no behaviour change, so the published bytes are the live-tested code.",
+    "live-e2e": "Three throwaway VPS (one controller, two workers), published k0s-cluster 2026.10.17.3, k0s v1.36.4+k0s.1: 11 of 12 on 3c8afc1, then 5 of 5 on f94659f. HA with 3 controllers not live-tested; the channel stays beta."
+  }
+}

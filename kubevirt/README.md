@@ -73,30 +73,36 @@ Found on a live single-node k0s cluster; this extension does not change nodes.
 
 - **`/dev/kvm` permissions.** On stock Ubuntu with libvirt installed, `/dev/kvm`
   is `root:kvm 0660`, and `virt-launcher` (which does not run as that group)
-  crash-loops with "Unable to open /dev/kvm". Make the device world read-write
-  with a udev rule, for example in `/etc/udev/rules.d/99-kvm.rules`:
+  crash-loops with "Unable to open /dev/kvm: Permission denied". Make the device
+  world read-write with a udev rule, for example in
+  `/etc/udev/rules.d/99-kvm.rules`:
 
   ```
-  KERNEL=="kvm", GROUP="kvm", MODE="0666"
+  KERNEL=="kvm", MODE="0666"
   ```
 
-  then `udevadm control --reload && udevadm trigger --name-match=kvm` and check
-  `ls -l /dev/kvm`. Another package may reset the mode, so check it again after
-  a reboot. Without KVM at all, `use_emulation: true` runs VMs in software.
-- **Kubelet pod directory (k0s).** k0s keeps the kubelet's state under
-  `/var/lib/k0s/kubelet` (pods in `/var/lib/k0s/kubelet/pods`), while KubeVirt's
-  `virt-handler` mounts the upstream default `/var/lib/kubelet/pods`; VMIs then
-  fail with "Domain does not exist". KubeVirt's resource does not expose the
-  kubelet directory as a setting that this extension could pass through, so fix
-  the node. Either start the k0s worker with the kubelet root directory at the
-  upstream default (kubelet's `--root-dir`; k0s documents a worker option for
-  it, see `k0s worker --help` on your version), or make the upstream path point
-  at k0s's with a symlink or bind mount of `/var/lib/kubelet` onto
-  `/var/lib/k0s/kubelet`. This lane did not verify either option; test it on a
-  throwaway node first.
-- **Storage.** A VM with a `data_volume` source needs a default StorageClass (or
-  `storage_class`) and CDI. The live run had no default StorageClass, so the
-  DataVolume cell was not run; container-disk VMs need no storage class.
+  then run `udevadm control --reload` and
+  `udevadm trigger --name-match=kvm --action=change`, and check `ls -l /dev/kvm`
+  shows `crw-rw-rw-`. This rule was verified live. Without KVM at all,
+  `use_emulation: true` runs VMs in software.
+- **Kubelet root directory (k0s).** k0s keeps the kubelet root at
+  `/var/lib/k0s/kubelet`, but `virt-handler` expects `/var/lib/kubelet`; VMIs
+  then go to `Failed` with "Domain does not exist". k0s has a
+  `--kubelet-root-dir` flag on `k0s controller`, `k0s worker` and `k0s install`;
+  it exists, but it was not tested functionally. The verified workaround is to
+  bind the pod directory and make it shared, then restart `virt-handler`:
+
+  ```sh
+  mount --rbind /var/lib/k0s/kubelet/pods /var/lib/kubelet/pods
+  mount --make-rshared /var/lib/kubelet/pods
+  kubectl -n kubevirt delete pod -l kubevirt.io=virt-handler
+  ```
+
+  The mount is not persistent; add it to the node's boot configuration.
+- **Storage.** A VM with a `data_volume` source needs CDI and a default
+  StorageClass (or `storage_class`). The live cluster had no default
+  StorageClass, so the DataVolume cells were not run. Container-disk VMs need no
+  storage class.
 
 ## Install
 

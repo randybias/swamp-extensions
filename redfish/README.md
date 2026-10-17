@@ -74,31 +74,55 @@ Pass `username` and `password` only as vault references; never as literal
 
 `get` and `sync` read `PowerState`, the boot override and `Status`, and store an
 allowlist of metadata; no credential is ever written to state or output. By
-default a Redfish SessionService session is opened and deleted in a `finally`,
-falling back to Basic auth when the BMC has no SessionService; `auth_mode`
-forces one or the other. Over `insecure_skip_verify` no credential is sent at
-all — session or Basic — unless `allow_insecure_credentials` is set; the
-recommended path for a self-signed BMC is to put its certificate in `ca_pem` and
-keep `strict` verification. `power` validates the requested `ResetType` against
-the system's advertised allowables (only values this model knows are echoed
-back), is a no-op when the system is already in the target state, follows a
-returned Redfish task monitor, and accepts a restart once the system is back at
-the desired state. Only an explicit `TaskState` of `Completed` with an `OK` (or
-absent) `TaskStatus` is a confirmed task; a `404`/`204`/empty task read is
-unconfirmed and falls through to the power-state poll, and every action other
-than a restart must read back the desired state. A restart with no observed
-transition is accepted with a warning at the timeout; `Nmi` is fire-and-forget.
-`set_boot` patches the override, sending `If-Match` when the BMC provides an
-ETag, and reads it back to confirm.
+default (`auth_mode: auto`) the service root (`GET /redfish/v1`, sent without
+credentials) is read for `Links.Sessions`, or for the `SessionService`
+document's `Sessions` link; when one is found a session is opened and deleted in
+a `finally`. A BMC that advertises none, or whose root cannot be read without
+credentials, gets Basic auth over the same verified TLS connection. `session`
+requires a session and fails with a typed `no_session_service` error when there
+is none; `basic` always sends Basic. A BMC that advertises Sessions but refuses
+the credentials is `unauthorized`, never retried as Basic. `power` validates the
+requested `ResetType` against the system's advertised allowables (only values
+this model knows are echoed back), is a no-op when the system is already in the
+target state, follows a returned Redfish task monitor, and accepts a restart
+once the system is back at the desired state. Only an explicit `TaskState` of
+`Completed` with an `OK` (or absent) `TaskStatus` is a confirmed task; a
+`404`/`204`/empty task read is unconfirmed and falls through to the power-state
+poll, and every action other than a restart must read back the desired state. A
+restart with no observed transition is accepted with a warning at the timeout;
+`Nmi` is fire-and-forget. `set_boot` patches the override, sending `If-Match`
+when the BMC provides an ETag, and reads it back to confirm.
 
 The endpoint must be an https origin: no path, query, fragment or embedded
 credentials, and every `@odata.id` is resolved back onto that origin. The TLS
-policy is required — `strict` (system trust, plus an optional additional CA via
-`ca_pem`, which is not an exclusive pin) or the explicit `insecure_skip_verify`
-for the self-signed certificates BMCs commonly ship. Every request carries a
-timeout (clamped to the `power` deadline, and also applied to the body read and
-the session logout), response bodies are read with a hard byte cap, and every
-failure is a typed message that never echoes a response body, URL or credential.
+policy input is required and is always `tls_verify: strict`: the system trust
+store plus an optional additional CA via `ca_pem` (not an exclusive pin). There
+is no insecure mode, because Deno cannot disable certificate verification for a
+single client (`Deno.createHttpClient` takes `caCerts`, proxy and pool options
+only) and a process-wide switch would apply to every request. A TLS failure is
+reported as a typed `tls` error that names the class: an unknown issuer, a CA
+certificate used as the server certificate, an expired certificate, or a name
+mismatch.
+
+### Self-signed BMC certificates
+
+Put the BMC's certificate, or the CA that signed it, in `ca_pem`. The BMC's own
+certificate must be a leaf (`CA:FALSE`) whose subject alternative names include
+the host or IP you connect to. A self-signed certificate made with
+`openssl req -x509` is `CA:TRUE` by default and is rejected with
+`CaUsedAsEndEntity`; generate a leaf instead, for example:
+
+```sh
+openssl req -x509 -newkey rsa:2048 -nodes -days 365 -subj /CN=bmc \
+  -addext "subjectAltName=IP:192.0.2.10" -addext "basicConstraints=CA:FALSE" \
+  -keyout bmc.key -out bmc.pem
+```
+
+or create a small private CA, sign the BMC certificate with it, and pass the CA
+in `ca_pem`. Every request carries a timeout (clamped to the `power` deadline,
+and also applied to the body read and the session logout), response bodies are
+read with a hard byte cap, and every failure is a typed message that never
+echoes a response body, URL or credential.
 
 ## License
 

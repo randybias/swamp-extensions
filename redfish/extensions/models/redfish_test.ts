@@ -60,12 +60,43 @@ function makeBmc() {
   let restartStuck = false;
   let restartCounter = 0;
   let systemBodyOverride: unknown = undefined;
+  // How the service root advertises sessions: Links.Sessions, a SessionService
+  // link to a document, nothing, or a 401 to anonymous readers.
+  let rootMode: "links" | "service" | "none" | "401" = "links";
+  const rootCalls: Call[] = [];
   const fetchImpl: FetchFn = (url, init) => {
     const method = init?.method ?? "GET";
     const headers = headersOf(init);
     const body = init?.body !== undefined ? String(init.body) : undefined;
-    calls.push({ method, url, headers, body });
     const path = new URL(url).pathname;
+    if (
+      method === "GET" &&
+      (path === "/redfish/v1" || path === "/redfish/v1/SessionService")
+    ) {
+      rootCalls.push({ method, url, headers, body });
+      if (rootMode === "401") {
+        return Promise.resolve(new Response("x", { status: 401 }));
+      }
+      if (path === "/redfish/v1/SessionService") {
+        return Promise.resolve(
+          json({
+            Sessions: { "@odata.id": "/redfish/v1/SessionService/Sessions" },
+          }),
+        );
+      }
+      return Promise.resolve(json(
+        rootMode === "links"
+          ? {
+            Links: {
+              Sessions: { "@odata.id": "/redfish/v1/SessionService/Sessions" },
+            },
+          }
+          : rootMode === "service"
+          ? { SessionService: { "@odata.id": "/redfish/v1/SessionService" } }
+          : { Systems: { "@odata.id": "/redfish/v1/Systems" } },
+      ));
+    }
+    calls.push({ method, url, headers, body });
     if (method === "POST" && path === "/redfish/v1/SessionService/Sessions") {
       if (sessionStatus !== 201) {
         return Promise.resolve(new Response("x", { status: sessionStatus }));
@@ -179,6 +210,10 @@ function makeBmc() {
     system,
     systems,
     calls,
+    rootCalls,
+    setRootMode: (m: "links" | "service" | "none" | "401") => {
+      rootMode = m;
+    },
     fetch: fetchImpl,
     setSessionStatus: (s: number) => {
       sessionStatus = s;
@@ -292,9 +327,27 @@ Deno.test("schema: username and password are sensitive and tls_verify is require
   assertEquals(withTls.success, true);
   if (withTls.success) {
     assertEquals(
-      (withTls.data as { allow_insecure_credentials: boolean })
-        .allow_insecure_credentials,
+      (withTls.data as { auth_mode: string }).auth_mode,
+      "auto",
+    );
+  }
+  // Deno cannot skip certificate verification per client: no such mode exists.
+  for (
+    const extra of [
+      { tls_verify: "insecure_skip_verify" },
+      { allow_insecure_credentials: true },
+    ]
+  ) {
+    assertEquals(
+      model.methods.get.arguments.safeParse({
+        endpoint: ORIGIN,
+        username: USER,
+        password: PASS,
+        tls_verify: "strict",
+        ...extra,
+      }).success,
       false,
+      JSON.stringify(extra),
     );
   }
   const caDesc =
@@ -367,15 +420,6 @@ Deno.test("tls policy is passed to the client factory, with no default", async (
     const { context } = createModelTestContext(ctxOptions);
     await model.methods.get.execute(BASE, context);
     assertEquals(lastTls, { mode: "strict" });
-    await model.methods.get.execute(
-      {
-        ...BASE,
-        tls_verify: "insecure_skip_verify",
-        allow_insecure_credentials: true,
-      },
-      context,
-    );
-    assertEquals(lastTls, { mode: "insecure_skip_verify" });
     await model.methods.get.execute(
       { ...BASE, ca_pem: "placeholder-ca-pem" },
       context,
@@ -728,52 +772,100 @@ Deno.test("injection in endpoint and system_id is rejected before any request", 
   }
 });
 
-Deno.test("credentials over insecure TLS are refused unless explicitly allowed", async () => {
+Deno.test("auto uses the Sessions collection the service root advertises", async () => {
+  for (const mode of ["links", "service"] as const) {
+    const bmc = makeBmc();
+    bmc.setRootMode(mode);
+    const u = useBmc(bmc);
+    try {
+      const { context } = createModelTestContext(ctxOptions);
+      await model.methods.get.execute(BASE, context);
+      assert(
+        bmc.calls.some((c) =>
+          c.url.endsWith("/Sessions") && c.method === "POST"
+        ),
+        mode,
+      );
+      const read = bmc.calls.find((c) => c.method === "GET")!;
+      assertEquals(read.headers["X-Auth-Token"], TOKEN, mode);
+      assertEquals(read.headers["Authorization"], undefined, mode);
+      // Discovery sends no credential.
+      for (const c of bmc.rootCalls) {
+        assertEquals(c.headers["Authorization"], undefined);
+        assertEquals(c.body, undefined);
+      }
+    } finally {
+      u.restore();
+    }
+  }
+});
+
+Deno.test("auto falls back to Basic when the BMC advertises no SessionService, or hides the root", async () => {
+  for (const mode of ["none", "401"] as const) {
+    const bmc = makeBmc();
+    bmc.setRootMode(mode);
+    const u = useBmc(bmc);
+    try {
+      const { context } = createModelTestContext(ctxOptions);
+      await model.methods.get.execute(BASE, context);
+      assert(!bmc.calls.some((c) => c.method === "POST"), mode);
+      const read = bmc.calls.find((c) => c.method === "GET")!;
+      assert(read.headers["Authorization"]?.startsWith("Basic "), mode);
+    } finally {
+      u.restore();
+    }
+  }
+});
+
+Deno.test("auth_mode session with no SessionService is a typed error and sends no credential", async () => {
+  for (const mode of ["none", "401"] as const) {
+    const bmc = makeBmc();
+    bmc.setRootMode(mode);
+    const u = useBmc(bmc);
+    try {
+      const { context } = createModelTestContext(ctxOptions);
+      const e = await assertRejects(() =>
+        model.methods.get.execute({ ...BASE, auth_mode: "session" }, context)
+      ) as RedfishError;
+      assertEquals(e.code, "no_session_service", mode);
+      assertEquals(bmc.calls.length, 0);
+      for (const c of bmc.rootCalls) {
+        assertEquals(c.headers["Authorization"], undefined);
+      }
+    } finally {
+      u.restore();
+    }
+  }
+});
+
+Deno.test("an advertised SessionService that refuses the credentials is unauthorized, not a Basic fallback", async () => {
   const bmc = makeBmc();
+  bmc.setSessionStatus(401);
   const u = useBmc(bmc);
   try {
     const { context } = createModelTestContext(ctxOptions);
-    for (const auth_mode of ["session", "basic"] as const) {
+    for (const auth_mode of ["auto", "session"] as const) {
       const e = await assertRejects(() =>
-        model.methods.get.execute({
-          ...BASE,
-          auth_mode,
-          tls_verify: "insecure_skip_verify",
-        }, context)
+        model.methods.get.execute({ ...BASE, auth_mode }, context)
       ) as RedfishError;
-      assertEquals(e.code, "invalid_input", auth_mode);
+      assertEquals(e.code, "unauthorized", auth_mode);
     }
-    assertEquals(bmc.calls.length, 0);
-    await model.methods.get.execute({
-      ...BASE,
-      auth_mode: "session",
-      tls_verify: "insecure_skip_verify",
-      allow_insecure_credentials: true,
-    }, context);
-    assert(bmc.calls.some((c) => c.method === "GET"));
+    assert(!bmc.calls.some((c) => c.method === "GET"));
   } finally {
     u.restore();
   }
 });
 
-Deno.test("the SessionService fallback is refused over insecure TLS unless allowed", async () => {
+Deno.test("a 404 on the advertised Sessions falls back to Basic under auto only", async () => {
   const bmc = makeBmc();
   bmc.setSessionStatus(404);
   const u = useBmc(bmc);
   try {
     const { context } = createModelTestContext(ctxOptions);
     const e = await assertRejects(() =>
-      model.methods.get.execute(
-        { ...BASE, tls_verify: "insecure_skip_verify" },
-        context,
-      )
+      model.methods.get.execute({ ...BASE, auth_mode: "session" }, context)
     ) as RedfishError;
-    assertEquals(e.code, "invalid_input");
-    assert(!bmc.calls.some((c) => c.method === "GET"));
-    // Strict TLS allows the fallback.
-    await model.methods.get.execute(BASE, context);
-    const read = bmc.calls.find((c) => c.method === "GET")!;
-    assert(read.headers["Authorization"]?.startsWith("Basic "));
+    assertEquals(e.code, "no_session_service");
   } finally {
     u.restore();
   }
@@ -790,6 +882,10 @@ Deno.test("a stalled request times out and the session is still deleted", async 
         return baseFetch(url, init);
       }
       if (method === "DELETE") return baseFetch(url, init);
+      if (new URL(url).pathname.startsWith("/redfish/v1/SessionService")) {
+        return baseFetch(url, init);
+      }
+      if (new URL(url).pathname === "/redfish/v1") return baseFetch(url, init);
       return new Promise<Response>((_resolve, reject) => {
         const signal = (init as { signal?: AbortSignal } | undefined)?.signal;
         if (!signal) return;
@@ -907,17 +1003,25 @@ Deno.test("set_boot is described as destructive", () => {
   );
 });
 
-Deno.test("a restart already at desired on the immediate poll is accepted", async () => {
+Deno.test("a restart that shows no transition is accepted with a warning at the timeout", async () => {
   const bmc = makeBmc();
   bmc.setRestartTransition(false);
   const u = useBmc(bmc);
   try {
     const { context } = createModelTestContext(ctxOptions);
+    const warnings: string[] = [];
+    Object.assign(context.logger, {
+      warn: (m: string) => warnings.push(m),
+    });
     const out = await model.methods.power.execute(
       { ...BASE, action: "ForceRestart", timeout_seconds: 5 },
       context,
     ) as { result: Record<string, unknown> };
     assertEquals(out.result.power_state, "On");
+    assertEquals(
+      warnings.some((w) => w.includes("without an observed transition")),
+      true,
+    );
   } finally {
     u.restore();
   }

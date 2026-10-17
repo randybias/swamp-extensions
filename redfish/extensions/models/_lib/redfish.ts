@@ -332,9 +332,7 @@ export interface RedfishTarget {
   username: string;
   password: string;
   tls: TlsPolicy;
-  authMode: "session" | "basic";
-  /** Permit credentials to be sent over an unverified TLS connection. */
-  allowInsecureCredentials: boolean;
+  authMode: "auto" | "session" | "basic";
 }
 
 interface Auth {
@@ -357,22 +355,6 @@ function authHeader(
   return { Authorization: `Basic ${b64Utf8(`${username}:${password}`)}` };
 }
 
-/**
- * Refuses to send credentials over a TLS connection that is not verified
- * unless the caller explicitly allowed it. Both Basic auth and the session
- * POST hand the password to the (unverified) peer.
- */
-function assertCredentialsAllowed(
-  tls: TlsPolicy,
-  allowInsecureCredentials: boolean,
-): void {
-  if (tls.mode === "strict" || allowInsecureCredentials) return;
-  throw new RedfishError(
-    "invalid_input",
-    "credentials are not sent over a TLS connection with verification disabled; pin the BMC certificate with ca_pem (recommended) or set allow_insecure_credentials=true",
-  );
-}
-
 /** Per-request signal, clamped to a caller deadline when one is given. */
 function requestSignal(deps: Deps, deadline?: number): AbortSignal {
   const ms = deadline === undefined ? deps.requestTimeoutMs : Math.max(
@@ -382,10 +364,78 @@ function requestSignal(deps: Deps, deadline?: number): AbortSignal {
   return AbortSignal.timeout(ms);
 }
 
+/** GETs one unauthenticated JSON document; null on any non-2xx or bad body. */
+async function getAnonymous(
+  deps: Deps,
+  client: unknown,
+  url: string,
+  deadline?: number,
+): Promise<Record<string, unknown> | null> {
+  const signal = requestSignal(deps, deadline);
+  let resp: Response;
+  try {
+    resp = await deps.fetch(url, {
+      method: "GET",
+      redirect: "error",
+      headers: { "Accept": "application/json" },
+      signal,
+      client,
+    });
+  } catch (e) {
+    throw classifyFetch(e);
+  }
+  if (resp.status < 200 || resp.status > 299) {
+    await drain(resp);
+    return null;
+  }
+  try {
+    return asRecord(
+      JSON.parse(await readBounded(resp, MAX_BODY_BYTES, signal)),
+    ) ??
+      null;
+  } catch (e) {
+    if (e instanceof RedfishError) throw e;
+    return null;
+  }
+}
+
 /**
- * Opens a Redfish session and returns its header plus a logout. If the BMC
- * does not implement SessionService (404/405), Basic auth is used instead, but
- * only when the TLS policy (or the explicit override) allows it.
+ * Finds the Sessions collection from the service root: `Links.Sessions`, or the
+ * `Sessions` link of the document `SessionService` points at. Returns the
+ * absolute same-origin URL, or undefined when the BMC offers none (or the root
+ * cannot be read without credentials). No credential is sent.
+ */
+async function discoverSessions(
+  deps: Deps,
+  target: RedfishTarget,
+  client: unknown,
+  deadline?: number,
+): Promise<string | undefined> {
+  const root = await getAnonymous(
+    deps,
+    client,
+    resolveOdata(target.endpoint, "/redfish/v1"),
+    deadline,
+  );
+  if (!root) return undefined;
+  const direct = str(asRecord(asRecord(root.Links)?.Sessions)?.["@odata.id"]);
+  if (direct) return trySameOrigin(target.endpoint, direct);
+  const service = str(asRecord(root.SessionService)?.["@odata.id"]);
+  const serviceUrl = service
+    ? trySameOrigin(target.endpoint, service)
+    : undefined;
+  if (!serviceUrl) return undefined;
+  const doc = await getAnonymous(deps, client, serviceUrl, deadline);
+  const sessions = str(asRecord(doc?.Sessions)?.["@odata.id"]);
+  return sessions ? trySameOrigin(target.endpoint, sessions) : undefined;
+}
+
+/**
+ * Opens a Redfish session and returns its header plus a logout. The Sessions
+ * collection is discovered from the service root, never assumed. With
+ * auth_mode=auto a BMC that advertises none (or answers the session POST with
+ * 404/405) gets Basic auth over the same verified TLS connection; with
+ * auth_mode=session that is a typed `no_session_service` error.
  */
 async function openAuth(
   deps: Deps,
@@ -393,18 +443,26 @@ async function openAuth(
   client: unknown,
   deadline?: number,
 ): Promise<Auth> {
-  assertCredentialsAllowed(target.tls, target.allowInsecureCredentials);
-  if (target.authMode === "basic") {
-    return {
-      headers: authHeader(target.username, target.password),
-      logout: () => Promise.resolve(),
-    };
+  const basic = (): Auth => ({
+    headers: authHeader(target.username, target.password),
+    logout: () => Promise.resolve(),
+  });
+  if (target.authMode === "basic") return basic();
+  const noSessions = () =>
+    new RedfishError(
+      "no_session_service",
+      "the BMC does not offer a Redfish SessionService; use auth_mode auto or basic",
+    );
+  const sessionsUrl = await discoverSessions(deps, target, client, deadline);
+  if (!sessionsUrl) {
+    if (target.authMode === "auto") return basic();
+    throw noSessions();
   }
   const signal = requestSignal(deps, deadline);
   let resp: Response;
   try {
     resp = await deps.fetch(
-      resolveOdata(target.endpoint, "/redfish/v1/SessionService/Sessions"),
+      sessionsUrl,
       {
         method: "POST",
         redirect: "error",
@@ -425,10 +483,8 @@ async function openAuth(
   }
   if (resp.status === 404 || resp.status === 405) {
     await drain(resp);
-    return {
-      headers: authHeader(target.username, target.password),
-      logout: () => Promise.resolve(),
-    };
+    if (target.authMode === "auto") return basic();
+    throw noSessions();
   }
   if (resp.status !== 200 && resp.status !== 201) {
     await drain(resp);
@@ -647,10 +703,6 @@ export class RedfishApi {
     return { taskLocation };
   }
 
-  /**
-   * Waits for a Redfish task to reach a terminal state. A 204, an empty body
-   * after the 202, or a 404 (the task was purged once done) means completed.
-   */
   /** True when the caller's deadline has passed. */
   #expired(): boolean {
     return this.#deadline !== undefined &&

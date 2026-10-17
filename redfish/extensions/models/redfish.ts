@@ -58,17 +58,14 @@ const TargetShape = {
   password: z.string().min(1).max(1024).meta({ sensitive: true }).describe(
     "BMC password; wire with a vault.get(...) expression.",
   ),
-  tls_verify: z.enum(["strict", "insecure_skip_verify"]).describe(
-    "TLS policy. strict: verify against the system trust store or ca_pem. insecure_skip_verify: do not verify the certificate. Required; there is no default.",
+  tls_verify: z.literal("strict").describe(
+    "TLS policy; the only mode is strict: verify against the system trust store, plus ca_pem when given. Deno cannot skip certificate verification per client, so there is no insecure mode. Required.",
   ),
   ca_pem: z.string().max(65536).optional().describe(
-    "PEM-encoded CA to additionally trust when tls_verify=strict; the system trust store is still used, so this is not an exclusive pin.",
+    "PEM-encoded CA to additionally trust; the system trust store is still used, so this is not an exclusive pin. The BMC certificate must be a CA:FALSE leaf, or be signed by this CA.",
   ),
-  auth_mode: z.enum(["session", "basic"]).default("session").describe(
-    "session: open and delete a Redfish SessionService session; basic: send Basic auth. Falls back to basic when the BMC has no SessionService.",
-  ),
-  allow_insecure_credentials: z.boolean().default(false).describe(
-    "Permit credentials (session or Basic) to be sent when tls_verify=insecure_skip_verify. Default false; a self-signed BMC should use ca_pem with tls_verify=strict instead.",
+  auth_mode: z.enum(["auto", "session", "basic"]).default("auto").describe(
+    "auto (default): use a Redfish session when the service root advertises one, otherwise Basic auth. session: require a session; a BMC without a SessionService is a typed error. basic: always send Basic auth.",
   ),
 };
 
@@ -137,9 +134,10 @@ export function setDeps(d: Partial<Deps>): Deps {
 }
 
 function target(a: z.infer<typeof TargetArgs>) {
-  const tls: TlsPolicy = a.tls_verify === "insecure_skip_verify"
-    ? { mode: "insecure_skip_verify" }
-    : { mode: "strict", ...(a.ca_pem ? { caPem: a.ca_pem } : {}) };
+  const tls: TlsPolicy = {
+    mode: "strict",
+    ...(a.ca_pem ? { caPem: a.ca_pem } : {}),
+  };
   return {
     endpoint: normalizeEndpoint(a.endpoint),
     systemId: a.system_id,
@@ -147,7 +145,6 @@ function target(a: z.infer<typeof TargetArgs>) {
     password: a.password,
     tls,
     authMode: a.auth_mode,
-    allowInsecureCredentials: a.allow_insecure_credentials,
   };
 }
 
@@ -266,7 +263,7 @@ export const model = {
     power: {
       kind: "action" as const,
       description:
-        "DESTRUCTIVE. Power on, power off or restart the ComputerSystem, then wait until the resulting state is observed. On and the off actions are a no-op when already there. A restart is confirmed by a completed Redfish task or an observed state change; a restart that shows no transition is accepted with a warning at the timeout. Returns the observed state.",
+        "DESTRUCTIVE. Power on, power off or restart the ComputerSystem, then wait for the resulting state; On and the off actions are a no-op when already there. A restart that shows no transition is accepted with a warning at the timeout. Returns the observed state.",
       arguments: PowerArgs,
       execute: async (args: z.input<typeof PowerArgs>, context: Ctx) => {
         const a = PowerArgs.parse(args);

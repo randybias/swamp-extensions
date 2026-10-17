@@ -24,12 +24,15 @@ export interface HttpClientHandle {
   close(): void;
 }
 
-/** How the BMC's TLS certificate is validated. There is no default: the
- * caller must choose `strict` (system trust, or a pinned `caPem`) or the
- * explicit `insecure_skip_verify`. */
-export type TlsPolicy =
-  | { mode: "strict"; caPem?: string }
-  | { mode: "insecure_skip_verify" };
+/**
+ * How the BMC's TLS certificate is validated: always against the system trust
+ * store, or against a pinned `caPem` when one is given. There is no mode that
+ * skips verification: Deno has no per-client switch for it (see the README).
+ */
+export interface TlsPolicy {
+  mode: "strict";
+  caPem?: string;
+}
 
 /** Injectable dependencies. */
 export interface Deps {
@@ -49,10 +52,7 @@ const denoFetch: FetchFn = (url, init) => fetch(url, init as RequestInit);
 
 const denoMakeClient = (tls: TlsPolicy): HttpClientHandle => {
   const client = Deno.createHttpClient({
-    ...(tls.mode === "strict" && tls.caPem ? { caCerts: [tls.caPem] } : {}),
-    ...(tls.mode === "insecure_skip_verify"
-      ? { unsafelyDisableTlsVerification: true }
-      : {}),
+    ...(tls.caPem ? { caCerts: [tls.caPem] } : {}),
   });
   return { client, close: () => client.close() };
 };
@@ -76,6 +76,7 @@ export type RedfishErrorCode =
   | "unreachable"
   | "tls"
   | "unauthorized"
+  | "no_session_service"
   | "not_found"
   | "invalid_input"
   | "timeout"
@@ -175,9 +176,27 @@ export async function drain(resp: Response): Promise<void> {
   }
 }
 
+/** The message of an error and of every `cause` behind it (bounded). */
+function causeChain(e: unknown): string[] {
+  const out: string[] = [];
+  let cur: unknown = e;
+  for (let i = 0; i < 6 && cur !== undefined && cur !== null; i++) {
+    if (cur instanceof Error) {
+      out.push(`${cur.name} ${cur.message}`);
+      cur = (cur as Error & { cause?: unknown }).cause;
+    } else {
+      out.push(String(cur));
+      break;
+    }
+  }
+  return out;
+}
+
 /**
- * Maps a thrown fetch failure to a typed error. Certificate problems become
- * `tls`; anything else is `unreachable`. The thrown message is never included.
+ * Maps a thrown fetch failure to a typed error. Deno reports a TLS failure as
+ * a generic `fetch failed` whose `cause` carries the certificate error, so the
+ * whole cause chain is read. The message of the thrown error is never
+ * included; each TLS class gets a fixed hint instead.
  */
 export function classifyFetch(e: unknown): RedfishError {
   if (
@@ -186,12 +205,35 @@ export function classifyFetch(e: unknown): RedfishError {
   ) {
     return timeoutError();
   }
-  const text = e instanceof Error ? e.message : "";
-  if (/certificate|self.signed|x509|tls|ssl|verify/i.test(text)) {
-    return new RedfishError(
+  const text = causeChain(e).join(" | ");
+  const tls = (hint: string) =>
+    new RedfishError(
       "tls",
-      "TLS verification failed for the BMC endpoint",
+      `TLS verification failed for the BMC endpoint: ${hint}`,
     );
+  if (/CaUsedAsEndEntity/i.test(text)) {
+    return tls(
+      "the BMC certificate is a CA certificate (CA:TRUE) used as the server certificate; use a CA:FALSE leaf, or pin a separate CA that signed it, in ca_pem",
+    );
+  }
+  if (/UnknownIssuer|unknown ?ca|unable to get (local )?issuer/i.test(text)) {
+    return tls(
+      "the certificate was not issued by a trusted CA; pin the CA that signed it in ca_pem",
+    );
+  }
+  if (/Expired|NotValidYet|not yet valid/i.test(text)) {
+    return tls("the certificate is expired or not yet valid");
+  }
+  if (/NotValidForName|hostname|not valid for name|subject.?alt/i.test(text)) {
+    return tls(
+      "the certificate is not valid for the endpoint host name or address",
+    );
+  }
+  if (
+    /certificate|self.signed|x509|\btls\b|\bssl\b|handshake|verify|InvalidCertificate|invalid peer/i
+      .test(text)
+  ) {
+    return tls("the certificate could not be verified");
   }
   return new RedfishError("unreachable", "BMC endpoint unreachable");
 }

@@ -94,3 +94,29 @@ Deno.test("defaultDeps exposes the injectable seams", () => {
   assertEquals(typeof d.sleep, "function");
   assertEquals(typeof d.requestTimeoutMs, "number");
 });
+
+Deno.test("classifyFetch reads the cause chain: Deno puts the certificate error in cause", () => {
+  const wrap = (cause: string) =>
+    new TypeError("fetch failed", { cause: new Error(cause) });
+  const cases: [string, RegExp][] = [
+    ["invalid peer certificate: UnknownIssuer", /not issued by a trusted CA/],
+    ["invalid peer certificate: CaUsedAsEndEntity", /CA:FALSE/],
+    ["invalid peer certificate: Expired", /expired/],
+    ["invalid peer certificate: NotValidForName", /host name or address/],
+    ["invalid peer certificate: BadSignature", /could not be verified/],
+  ];
+  for (const [cause, hint] of cases) {
+    const e = classifyFetch(wrap(cause));
+    assertEquals(e.code, "tls", cause);
+    assertEquals(hint.test(e.message), true, `${cause}: ${e.message}`);
+    // Only fixed text: the cause string itself is never echoed.
+    assertEquals(e.message.includes("peer certificate"), false);
+  }
+  // A refused connection (no TLS word anywhere) stays unreachable.
+  const refused = classifyFetch(
+    new TypeError("fetch failed", {
+      cause: new Error("Connection refused (os error 111)"),
+    }),
+  );
+  assertEquals(refused.code, "unreachable");
+});

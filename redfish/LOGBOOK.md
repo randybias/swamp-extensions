@@ -79,3 +79,19 @@ Not packaged. Notes for whoever maintains this extension.
   - TEST: 404 task with the host still on times out; an empty 500 throws; a
     Completed task with a non-OK status throws; a confirmed task does not
     confirm a non-restart action that stays On.
+
+## Round 5 (live emulator findings)
+
+- HIGH: `insecure_skip_verify` could never work (`Deno.createHttpClient` has no
+  such option; it was silently ignored). Removed with
+  `allow_insecure_credentials`; `tls_verify` is the literal `strict`, `ca_pem`
+  the way to trust a private CA.
+- HIGH: `auth_mode` is now `auto` (default), `session` or `basic`. Sessions are
+  discovered from the service root (`Links.Sessions` or the SessionService
+  document); `auto` falls back to Basic when none is advertised, `session` fails
+  with a typed `no_session_service`. Discovery sends no credential.
+- MEDIUM: TLS failures are classified from the `cause` chain (UnknownIssuer,
+  CaUsedAsEndEntity, expired, name mismatch) instead of "unreachable".
+- MEDIUM: README documents the CA:FALSE leaf requirement.
+- LOW: power description shortened, a stale task doc comment removed, the
+  restart test renamed and its warning asserted.

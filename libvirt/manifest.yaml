@@ -1,0 +1,22 @@
+manifestVersion: 1
+name: "@randybias/libvirt"
+version: "2026.10.17.1"
+description: "Manage libvirt/KVM over SSH: define and undefine virtual networks including the default, clone a golden volume or zvol per node, define domains from a clone, control power, and capture the serial console. The SSH target, libvirt URI and every operand are method arguments, so one definition manages any hypervisor."
+license: Apache-2.0
+repository: https://github.com/randybias/swamp-extensions
+platforms: [darwin-aarch64, darwin-x86_64, linux-x86_64, linux-aarch64]
+labels: [
+  libvirt,
+  kvm,
+  qemu,
+  virsh,
+  virtualization,
+  ssh,
+  remote,
+  network,
+  storage,
+  console,
+]
+additionalFiles: [README.md, LICENSE.txt]
+models:
+  - libvirt.ts

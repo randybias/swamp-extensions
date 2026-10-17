@@ -485,6 +485,10 @@ Deno.test("trusted_interfaces: a good pattern passes, a bad one is refused befor
       "cali**",
       "*cali",
       "a{b}",
+      "e*",
+      "l*",
+      "lo",
+      "lo*",
     ]
   ) {
     assertThrows(

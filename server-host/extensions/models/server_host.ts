@@ -44,6 +44,7 @@ import {
   rulesetSha256,
 } from "./_lib/nftables.ts";
 import {
+  assertTrustedNotUplink,
   type EmittedStep,
   executePlan,
   HostOpsError,
@@ -440,6 +441,14 @@ export function createModel(overrides: Partial<HostDeps> = {}) {
     exposure: "management-only" | "anywhere",
   ) {
     const t = await openTarget(context, args);
+    // Read-only, before anything is armed: a trusted interface must not be the
+    // one carrying this session or the default route.
+    await assertTrustedNotUplink(
+      deps,
+      t,
+      args.sudo,
+      rules.trustedInterfaces ?? [],
+    );
     const ruleset = renderRuleset(rules);
     const ruleset_sha256 = await rulesetSha256(ruleset);
     const managed_sha256 = await expectedManagedSha256(rules);

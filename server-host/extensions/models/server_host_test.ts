@@ -1695,3 +1695,124 @@ Deno.test("observation: ssh_exposure is unknown when the host disagrees with the
   assertEquals(o.ssh_exposure, "unknown");
   assertEquals(o.pending_revoke, ["oldops"]);
 });
+
+const isRouteProbe = (c: string) => c.includes("ip -4 -j route show default");
+const ROUTES = [
+  '[{"dst":"default","gateway":"192.0.2.1","dev":"enp1s0"}]',
+  "---",
+  "[]",
+  "---",
+  '[{"dst":"198.51.100.100","dev":"wg0","prefsrc":"198.51.100.2"}]',
+].join("\n");
+
+function applyWithTrusted(
+  trusted: string[],
+  reply: { code: number; stdout?: string } = { code: 0, stdout: ROUTES },
+) {
+  const f = fakeTransport((c) =>
+    isRouteProbe(c) ? reply : c.includes("'nft' '-j' 'list' 'table'")
+      ? {
+        code: 0,
+        stdout: expectedListing({ ...FIREWALL, trustedInterfaces: trusted }),
+      }
+      : { code: 0 }
+  );
+  const m = modelWith(f);
+  const ctx = createModelTestContext({ globalArgs: {} });
+  const run = () =>
+    m.methods.apply_firewall.execute(
+      m.methods.apply_firewall.arguments.parse({
+        ...FIREWALL_ARGS,
+        trusted_interfaces: trusted,
+      }),
+      ctx.context,
+    );
+  return { f, run, ctx };
+}
+
+Deno.test("trusted_interfaces: the CNI bridge is accepted, with the uplink and session interfaces left out", async () => {
+  const { f, run } = applyWithTrusted(["kube-bridge", "cali*"]);
+  const out = await run();
+  assertEquals(out.result.changed, true);
+  assertEquals(f.commands.filter(isRouteProbe).length, 1);
+  // The probe is read-only and comes before anything is armed.
+  assertEquals(
+    f.commands.findIndex(isRouteProbe) < f.commands.findIndex(isArm),
+    true,
+  );
+});
+
+Deno.test("trusted_interfaces: an interface that carries the default route or the SSH session is refused before arming", async () => {
+  for (
+    const trusted of [["enp1s0"], ["enp*"], ["wg0"], ["wg*"], [
+      "kube-bridge",
+      "enp1s0",
+    ]]
+  ) {
+    const { f, run, ctx } = applyWithTrusted(trusted);
+    await assertRejects(
+      run,
+      Error,
+      "carries the SSH session or the default route",
+    );
+    assertEquals(f.commands.some(isArm), false, trusted.join());
+    assertEquals(f.commands.some(isGuardedApply), false, trusted.join());
+    assertEquals(ctx.getWrittenResources().length, 0, trusted.join());
+  }
+});
+
+Deno.test("trusted_interfaces: a route probe that fails or returns junk refuses rather than guessing", async () => {
+  for (
+    const reply of [
+      { code: 1 },
+      { code: 0, stdout: "not json" },
+      { code: 0, stdout: '{"dev":"eth0"}' },
+    ]
+  ) {
+    const { f, run } = applyWithTrusted(["kube-bridge"], reply);
+    await assertRejects(run, Error);
+    assertEquals(f.commands.some(isArm), false);
+  }
+});
+
+Deno.test("trusted_interfaces: with none set no route probe runs, so the command stream is the 17.1 one", async () => {
+  const { f, run } = applyWithTrusted([]);
+  await run();
+  assertEquals(f.commands.some(isRouteProbe), false);
+});
+
+Deno.test("trusted_interfaces: one-character prefixes and a leading dash are refused by the schema", () => {
+  const m = createModel();
+  const parse = (v: string) =>
+    m.methods.render_firewall.arguments.safeParse({
+      host: SSH.host,
+      management_cidrs: ["192.0.2.0/24"],
+      trusted_interfaces: [v],
+    }).success;
+  for (const bad of ["e*", "-x", "*", "l*"]) {
+    assertEquals(parse(bad), false, bad);
+  }
+  for (const ok of ["kube-bridge", "cali*", "tunl0", "lo0*"]) {
+    assertEquals(parse(ok), true, ok);
+  }
+});
+
+Deno.test("trusted_interfaces: render_firewall rejects patterns that match loopback", async () => {
+  const m = createModel();
+  const ctx = createModelTestContext({ globalArgs: {} });
+  for (const bad of ["lo", "lo*"]) {
+    await assertRejects(
+      () =>
+        m.methods.render_firewall.execute(
+          m.methods.render_firewall.arguments.parse({
+            host: SSH.host,
+            management_cidrs: ["192.0.2.0/24"],
+            trusted_interfaces: [bad],
+          }),
+          ctx.context,
+        ),
+      Error,
+      "loopback",
+    );
+  }
+});

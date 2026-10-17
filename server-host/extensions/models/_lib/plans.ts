@@ -33,7 +33,7 @@ import {
   withSudo,
 } from "./armed_revert.ts";
 import { listingSha256, managedSha256, normalizeListing } from "./nftables.ts";
-import { HostConfigError } from "./validate.ts";
+import { HostConfigError, ifacePatternMatches } from "./validate.ts";
 
 /** The risk class of a step, used to assert ordering. */
 export type StepKind =
@@ -674,3 +674,76 @@ export class HostOpsError extends Error {
 
 /** Re-exported so callers depend on one error family for host operations. */
 export { HostConfigError, STATE_DIR };
+
+/**
+ * A READ-ONLY script printing, separated by `---` lines, the JSON of the IPv4
+ * default routes, the IPv6 default routes, and the route to the address this SSH
+ * session comes from. The interfaces they name carry management or uplink
+ * traffic and must never be trusted wholesale.
+ */
+export const UPLINK_SCRIPT = `ip -4 -j route show default 2>/dev/null
+echo ---
+ip -6 -j route show default 2>/dev/null
+echo ---
+c="\${SSH_CLIENT%% *}"
+if [ -n "$c" ]; then ip -j route get "$c" 2>/dev/null; fi
+`;
+
+/** The argv of {@link UPLINK_SCRIPT}. */
+export function renderUplinkArgv(sudo: boolean): string[] {
+  return withSudo(sudo, ["sh", "-c", UPLINK_SCRIPT]);
+}
+
+/** Parses the output of {@link UPLINK_SCRIPT} into the interface names it names. */
+export function parseUplinkDevs(stdout: string): string[] {
+  const devs = new Set<string>();
+  for (const part of stdout.split(/^---$/m)) {
+    const text = part.trim();
+    if (text === "") continue;
+    let routes: unknown;
+    try {
+      routes = JSON.parse(text);
+    } catch {
+      throw new HostOpsError("The route probe did not return JSON");
+    }
+    if (!Array.isArray(routes)) {
+      throw new HostOpsError("The route probe did not return a list of routes");
+    }
+    for (const r of routes) {
+      const dev = (r as { dev?: unknown }).dev;
+      if (typeof dev === "string" && dev !== "") devs.add(dev);
+    }
+  }
+  return [...devs].sort();
+}
+
+/**
+ * Refuses trusted interfaces that carry the management session or the default
+ * route: trusting them would accept every port from the internet and bypass
+ * `management_cidrs`. READ-ONLY; runs before anything is armed.
+ */
+export async function assertTrustedNotUplink(
+  deps: SshDeps,
+  target: Target,
+  sudo: boolean,
+  trusted: readonly string[],
+): Promise<void> {
+  if (trusted.length === 0) return;
+  const res = await exec(deps, target, renderUplinkArgv(sudo), {
+    timeoutS: 30,
+  });
+  if (res.exit_code !== 0 || res.truncated) {
+    throw new HostOpsError(
+      `The route probe on ${target.host} failed (exit ${res.exit_code}); refusing trusted_interfaces it could not check`,
+    );
+  }
+  const devs = parseUplinkDevs(res.stdout);
+  for (const p of trusted) {
+    const hit = devs.find((d) => ifacePatternMatches(p, d));
+    if (hit !== undefined) {
+      throw new HostConfigError(
+        `trusted_interfaces entry ${p} matches ${hit}, which carries the SSH session or the default route; trusting it would accept every port from there`,
+      );
+    }
+  }
+}

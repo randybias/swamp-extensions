@@ -427,3 +427,19 @@ drop, so the table itself had to grow.
 - No forward_policy input: trusting the CNI interfaces in both directions covers
   pod to node and pod egress (checked live with the equivalent hand-added
   rules), so the forward policy stays `drop`.
+
+Review of 16f38c5:
+
+- HIGH `trusted_interfaces` accepted the uplink (`eth0`, `e*`, `wg*`): the
+  input-chain accept comes before the SSH rules, so it would have opened every
+  port and bypassed `management_cidrs`. Fixed: with any trusted interface set, a
+  read-only script reports the interfaces of the IPv4 and IPv6 default routes
+  and of the route to the SSH client (`$SSH_CLIENT`); an entry that matches one
+  (exact, or `x*` as a prefix) is refused with a `HostConfigError` before the
+  revert is armed, and a probe that fails or returns junk refuses too. `lo` and
+  patterns matching it, a leading `-`, and a `*` after fewer than two literal
+  characters are refused by the grammar. With none set no probe runs.
+- MEDIUM the real-nft test could apply the drop-policy table in the host's own
+  netns when run as root with nft installed. It now always uses the container,
+  with a `mktemp` file.
+- LOW the leading `-` rule is part of the schema regex.

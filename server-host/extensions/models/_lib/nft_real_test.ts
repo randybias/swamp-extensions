@@ -1,9 +1,8 @@
 // Feeds rendered rulesets to a REAL nft: `nft -c` must accept them, and applying
 // one twice (as a re-apply does) must leave a table whose own JSON read-back
-// matches the rendered rules. Runs `nft` directly when it is installed, else in
-// a container that has it (NFT_CHECK_IMAGE, default `nft-check:local`, built
+// matches the rendered rules. Runs in a throwaway container (NFT_CHECK_IMAGE, default `nft-check:local`, built
 // from ubuntu:24.04 with the nftables and netbase packages); skipped when
-// neither is available. The kernel only needs netlink access in its own netns.
+// the container is unavailable. The kernel only needs netlink in its own netns.
 import { assertEquals } from "jsr:@std/assert@1.0.19";
 import {
   assertListingMatches,
@@ -43,44 +42,19 @@ async function run(
   }
 }
 
-/** Runs a shell script that reads the ruleset from /tmp/r.nft (stdin). */
+/**
+ * Runs a shell script in the container with the ruleset in `$R` (a mktemp file).
+ * Always the container, never the host's own netns: applying the table here
+ * would drop the host's traffic.
+ */
 async function nftSh(script: string, ruleset: string) {
-  const body = `cat > /tmp/r.nft; ${script}`;
-  const direct = await run("nft", ["--version"], "");
-  if (direct && direct.code === 0 && Deno.uid() === 0) {
-    return await run("sh", ["-c", body], ruleset);
-  }
-  const probe = await run(
-    "docker",
-    [
-      "run",
-      "--rm",
-      "--cap-add",
-      "NET_ADMIN",
-      "--network",
-      "none",
-      IMAGE,
-      "nft",
-      "--version",
-    ],
-    "",
-  );
+  const body = `R=$(mktemp); cat > "$R"; ${script}`;
+  const args = ["run", "--rm", "--cap-add", "NET_ADMIN", "--network", "none"];
+  const probe = await run("docker", [...args, IMAGE, "nft", "--version"], "");
   if (!probe || probe.code !== 0) return null;
   return await run(
     "docker",
-    [
-      "run",
-      "--rm",
-      "-i",
-      "--cap-add",
-      "NET_ADMIN",
-      "--network",
-      "none",
-      IMAGE,
-      "sh",
-      "-c",
-      body,
-    ],
+    [...args.slice(0, 2), "-i", ...args.slice(2), IMAGE, "sh", "-c", body],
     ruleset,
   );
 }
@@ -132,11 +106,11 @@ for (const [name, rules] of Object.entries(CASES)) {
     sanitizeResources: false,
     fn: async () => {
       const text = renderRuleset(rules);
-      const checked = await nftSh("nft -c -f /tmp/r.nft", text);
+      const checked = await nftSh('nft -c -f "$R"', text);
       assertEquals(checked?.code, 0, checked?.stderr);
       // Applying twice mimics a re-apply over an existing table.
       const applied = await nftSh(
-        "nft -f /tmp/r.nft && nft -f /tmp/r.nft && nft -j list table inet server_host",
+        'nft -f "$R" && nft -f "$R" && nft -j list table inet server_host',
         text,
       );
       assertEquals(applied?.code, 0, applied?.stderr);
@@ -160,7 +134,7 @@ Deno.test({
       "ct state established,related accept",
       "ct state establishd accept",
     );
-    const r = await nftSh("nft -c -f /tmp/r.nft", bad);
+    const r = await nftSh('nft -c -f "$R"', bad);
     assertEquals(r !== null && r.code !== 0, true);
   },
 });

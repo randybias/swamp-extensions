@@ -56,4 +56,9 @@ sees the old code, builds from that spec and public documentation.
 | 2026-10-14 | Spec written | `docs/specs/cephadm/00-overview.md` … `08-workflows.md` (9 files) |
 | 2026-10-17 | Spec approved by Randy | sha256 of each file in `docs/specs/cephadm/SHA256SUMS` |
 | 2026-10-17 | Local clone deleted | scratchpad clone removed before any implementation work |
-| | Implementation started | |
+| 2026-10-17 | Implementation started | Fresh implementer lanes started after the spec was approved and the clone deleted; every implementer prompt carried the clean-room preamble (rules 3–4) |
+| 2026-10-17 | Implementer lane d6 | Groups 01–07 (transport, host prep, cluster lifecycle, pools/fs/CSI, verify, maintenance and teardown, RGW admin plane) and the handoff notes; clean-room preamble |
+| 2026-10-17 | Implementer lane d1 | Group 08 workflow catalog (22 workflows); clean-room preamble |
+| 2026-10-17 | Implementer lane d4 | RGW S3 plane (bucket inventory, inspect, ensure, policy, versioning); clean-room preamble |
+| 2026-10-17 | Implementer lane b2 | Disk-wipe guard, the shared protected-device module (`_lib/protected_devices.ts`) and integration of all lanes (`lane/cephadm-int`); clean-room preamble |
+| 2026-10-17 | Merged to main | `@randybias/cephadm` 2026.10.17.1 (beta), from `lane/cephadm-int` at `95517dc` |

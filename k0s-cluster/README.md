@@ -181,6 +181,11 @@ manifest where possible.
   there yourself (a `containerd.d` drop-in, registry credentials); on an adopted
   host, move those out first. If a cleanup step fails after `k0s reset` has run,
   the state keeps `cleanup_pending` and the next `reset` finishes the cleanup.
+  `reset` returns `binary_removed` and, when it did not remove the binary, a
+  `reason`; a binary at the path that is not the one `install` recorded is left
+  in place (the command still invokes the path's binary to stop and reset,
+  because that is what the unit runs). A unit that is already stopped is not
+  sent another `k0s stop`, so a reset after a crash or reboot works.
 - Every caller-supplied value that reaches the remote shell is validated against
   an allowlist grammar and quoted as a single argv element; remote exit codes
   are returned as data, except a local `ssh` failure (exit 255), which is raised

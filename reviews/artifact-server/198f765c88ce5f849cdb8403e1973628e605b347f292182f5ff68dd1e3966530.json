@@ -1,0 +1,90 @@
+{
+  "extension": "@randybias/artifact-server",
+  "version": "2026.10.17.1",
+  "reviewedAt": "2026-10-17T18:55:00Z",
+  "dimensions": [
+    {
+      "id": "credentials-secrets",
+      "verdict": "pass",
+      "note": "The basic-auth hash, the TLS key and certificate, and inline upload content are sensitive-marked inputs wired from the vault; they reach the host over stdin and land in root-only files (key 0600 root, htpasswd 0640 root:www-data). A private key goes into a short-lived ssh-agent over stdin and a password through an askpass helper, never argv. No content hash is put on any local argv or remote script text (compared locally). Live: 0 hits for the password, its hash or a TLS key line across three rounds of ps argv samples, the scratch repo's .swamp/ and its inputs. Literal-secret echo under --json is the platform limitation (ruling 3); README examples use vault references only. Strict host-key pins are required; insecure_tofu is not offered. Transport is the canonical vendored ssh.ts (fe0139f0)."
+    },
+    {
+      "id": "logging-quality",
+      "verdict": "pass",
+      "note": "One info line per install after the host is known good; errors name the failing step (nginx -t stderr excerpt, rollback failures listed by label). No secret or content is logged."
+    },
+    {
+      "id": "error-handling",
+      "verdict": "pass",
+      "note": "install snapshots the site, enabled link, default site, TLS files and htpasswd before any change; any failure after the snapshot (nginx -t, a credential write, enable/start, an unexpected wildcard listener) restores every one, removes a root the run created, re-runs nginx -t and reports each rollback failure; restore checks every rm/ln exit code and a failed snapshot read refuses before mutation. Persistence happens only after the host is good. Live: a failed credential write rolled /etc/nginx back byte-identical with no reload, and removed the created root (3cbf14d R5)."
+    },
+    {
+      "id": "testing-completeness",
+      "verdict": "pass",
+      "note": "Unit, regression and model tests over an in-memory fake remote that drives the real shell scripts' semantics: layout grammar, nginx rendering, TLS validation, observation parsing, newline and symlink smuggling, rollback paths, upload caps, default-site restore, wildcard-listener detection and the plain-object method context. Live on a throwaway Ubuntu 24.04 VPS: d8a643a 12/12 (found two Highs), 3cbf14d 5/6 (nginx left disabled), 7b9e4f1 5/5 including a real reboot (enabled, private address only, no wildcard listener in 860 samples)."
+    },
+    {
+      "id": "idempotency-resilience",
+      "verdict": "pass",
+      "note": "Re-install with the same inputs changes no file (same MainPID, live); a repeated pinned fetch returns changed: false; a second unref and a second uninstall are no-ops (live: identical stat listing, MainPID and reload count). The reload always runs on install so a retry after a failed reload picks up the config."
+    },
+    {
+      "id": "api-contracts",
+      "verdict": "pass",
+      "note": "The on-disk layout is the contract: sha256/<hex>/<name>, bundles/<tree-hash>/, refs/, SHA256SUMS and .layout-version; URLs derive from the recorded url_base. The tree hash is SHA-256 over sorted '<sha>  <name>' lines in C locale, and verify recomputes it on the host byte for byte (live: matched an independent local computation). Observed tool output (ss, systemctl, stat) is projected, never strictly parsed."
+    },
+    {
+      "id": "resource-management",
+      "verdict": "pass",
+      "note": "uninstall removes the site, enabled link, TLS files and htpasswd, restores the package default site install removed (only when absent), and removes the served root only with remove_data and only when it is a real directory holding the sentinel; it never removes the nginx package. Residuals (LOGBOOK): purging nginx leaves the enable link install created; the stored removed_default_site flag can restore a default site the operator removed after a first uninstall."
+    },
+    {
+      "id": "published-surface-hygiene",
+      "verdict": "pass",
+      "note": "Manifest @randybias/artifact-server 2026.10.17.1, one model, Apache-2.0, additionalFiles README.md and LICENSE.txt. Fixtures use documentation addresses and .test names; the LOGBOOK redacts every real address and hostname. Leak scan, gitleaks (including the branch history) and fixture guard pass. The model is a plain export const model = { ... } literal so the registry catalogs it (merge prep)."
+    },
+    {
+      "id": "schema-strictness",
+      "verdict": "pass",
+      "note": "Strict argument schemas: root needs two or more segments, no ./.. and no bare system directory (live: /etc refused at validation); file names, refs and hashes have grammars; the realm is restricted; fetch is https-only without userinfo or shell metacharacters. Inline content is capped at 128 MiB (base64 4*ceil(N/3)), because swamp holds payloads in memory before the method runs (live: 200 MiB crashed swamp); larger files use the host-side pinned fetch."
+    },
+    {
+      "id": "lifetime-gc",
+      "verdict": "pass",
+      "note": "config, server, artifact, listing and verification are infinite with garbage collection 5-10 versions; prune_plan lives 1d."
+    },
+    {
+      "id": "crud-completeness",
+      "verdict": "pass",
+      "note": "render_config, install, get, sync, uninstall; upload, fetch, publish_bundle, ref, unref, list; verify, plan_prune, prune. All live-exercised."
+    },
+    {
+      "id": "preflight-checks",
+      "verdict": "pass",
+      "note": "Every destructive method enforces its own preconditions against its actual arguments (ruling on workflow resume): install refuses a populated root without a regular sentinel, prune refuses when the recomputed plan hash differs from the approved one and refuses symlinked sha256/<hex> or bundles/<hex> entries, fetch refuses a pin mismatch and removes its temp. Residual (LOGBOOK): bundles/ itself as a symlink yields an empty plan rather than a refusal; nothing outside the root is touched (live)."
+    },
+    {
+      "id": "instance-names",
+      "verdict": "pass",
+      "note": "One generic definition; stored data is keyed by the canonical target plus root, never the definition name, and keys contain no '/', '..' or NUL."
+    },
+    {
+      "id": "data-access",
+      "verdict": "pass",
+      "note": "Reads only its own config resource (url_base, default-site snapshot) via context.readResource, proven in the live runtime (uninstall restored the default site from it). Every read-only method persists its observation as a resource."
+    },
+    {
+      "id": "version-upgrades",
+      "verdict": "pass",
+      "note": "First release; layout version 1 is recorded in .layout-version so a later layout change can detect and migrate."
+    }
+  ],
+  "panel": {
+    "codex-astra": "codex gpt-6-astra conformance seat: round 1 on 7192dd3 and round 2 on 1fe7dd1 routed (root safety, path grammar, refs, nginx, rollback; rollback scope for credential writes), fixed in 918a232 and 124d5a3. Round 3 on 124d5a3: four Highs (newline-named file injection, persist inside the rollback scope, snapLink null read, unchecked rollback exit codes) verified and triaged to MEDIUM, all fixed in the d8a643a polish. CLEAN.",
+    "codex-terra": "codex gpt-5.6-terra adversarial seat: round 3 on 124d5a3 the same rollback and snapshot items plus symlinked hash dirs and hashCmd masking, all fixed in d8a643a; the repeated-fetch SHA256SUMS rewrite is a LOW residual. CLEAN after triage.",
+    "tightness-astra": "COULD-BE-TIGHTER, about 7 removable lines (render.ts property comments restating names; an orphaned test JSDoc); the render.ts comments were removed in d8a643a.",
+    "adversarial-glm": "advisory GLM seat timed out on round 3 (rc=124, context cancelled); non-blocking.",
+    "live": "d8a643a 12/12 with two Highs (default-site wildcard listener during apt-get install; swamp OOM on inline uploads above about 150 MiB) fixed in 3cbf14d; 3cbf14d 5/6 (systemd mask left nginx disabled) fixed in 7b9e4f1; 7b9e4f1 5/5 including a real reboot.",
+    "merge-prep": "Self-review of 124d5a3..7b9e4f1 against TRIAGE 4b-4h: readResource and writeResource in the real runtime shape (live-proven), no remote command that can be killed at top level, systemctl is-enabled and ss read-backs rather than render comparisons, no content hash on argv. ssh.ts is canonical fe0139f0. Gate 7: plain model export (type annotation dropped). LOW residuals not changed after live: a stale duplicate JSDoc line above installNginx and a 'shasum - a 256' typo in the hashCmd comment."
+  }
+}

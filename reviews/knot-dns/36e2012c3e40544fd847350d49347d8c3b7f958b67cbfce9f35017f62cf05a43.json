@@ -1,0 +1,82 @@
+{
+  "extension": "@randybias/knot-dns",
+  "version": "2026.10.17.1",
+  "reviewedAt": "2026-10-17T18:17:52Z",
+  "dimensions": [
+    {
+      "id": "credentials-secrets",
+      "verdict": "pass",
+      "note": "The SSH key and every TSIG secret are vault references (ssh_key_ref, secret_ref) resolved in-model through context.vaultService as a plain {get, put} object, tested through a plain-object context. TSIG secrets reach the host only over stdin inside a root:knot 0640 fragment; render_zone returns no secret and nothing secret is stored. Canonical ssh.ts (blob fe0139f0) with strict host keys only; no insecure_tofu. No content hash on any argv. Live argv scan (local runner and remote ps every 50 ms): 0 hits for the TSIG secret or its sha256."
+    },
+    {
+      "id": "logging-quality",
+      "verdict": "pass",
+      "note": "The model writes no log lines; what an action did (changed, added/removed counts, serial, versions, removed, test name) is persisted as an outcome record because the CLI shows resources, not results. No secret, key or zone secret appears in any record or error message; script errors map stable markers to typed messages."
+    },
+    {
+      "id": "error-handling",
+      "verdict": "pass",
+      "note": "Typed KnotError codes (invalid_input, transport, tool_failed, tool_missing, reload_failed, rollback_failed, verify_failed, ...) mapped from script markers; exit 127 is tool_missing rather than a tool verdict. Rollback keeps the backup and reports RESTORE_RELOAD_FAILED if the restore reload fails. A failed apply_resolver removes its staged file (EXIT trap plus a best-effort remove when the script never ran)."
+    },
+    {
+      "id": "testing-completeness",
+      "verdict": "pass",
+      "note": "113 offline tests: grammars, golden zone files for every record type, wildcard, delegation with DS and glue, reverse zone, TXT escaping, golden fragments and resolver YAML, served-vs-declared diff, listen union, test-name choice, error mapping, sh -n of every host script, and a plain-object runtime context. host_test runs the scripts under dash with real knotd 3.3.4/3.6.1 and kresd/kresctl 6.5 in containers (knotc conf-check, kzonecheck, kresctl validate). Live on <vps1>: 11/13 on c7f35ea, then 13/13 on 37fa21e from a clean baseline, loopback only."
+    },
+    {
+      "id": "idempotency-resilience",
+      "verdict": "pass",
+      "note": "The zone file is a deterministic render and its sha256 is the identity: a re-apply is a no-op with no reload or restart (live cell 4). Listen changes restart knotd under the host lock after conf-check, are verified with kdig on every address, and restore + restart on failure. remove_zone and remove_resolver are clean no-ops when repeated. Residual MEDIUM: staging uploads happen outside the host lock (single-orchestrator ruling)."
+    },
+    {
+      "id": "api-contracts",
+      "verdict": "pass",
+      "note": "Knot DNS 3.x config (zonefile-sync -1, zonefile-load difference-no-serial, journal-content all, serial-policy unixtime) checked by knotc conf-check and kzonecheck; Knot Resolver 6 config.yaml checked by kresctl validate, forwards always render an explicit dnssec flag. install requires Knot 3.x and, with resolver, Knot Resolver 6.x from the CZ.NIC repository, whose key fingerprint 9C71D59CD4CE8BD2966A7A3EAB6A303124019B64 is pinned (independently confirmed) and whose packages are pinned at apt priority 100 so Knot DNS stays at the archive version (confirmed live)."
+    },
+    {
+      "id": "resource-management",
+      "verdict": "pass",
+      "note": "One ssh call per remote step through the canonical transport, output capped at 16 MiB; temp files on the host are mktemp'd and removed by the scripts; staged files are removed on every exit."
+    },
+    {
+      "id": "published-surface-hygiene",
+      "verdict": "pass",
+      "note": "Manifest @randybias/knot-dns 2026.10.17.1, one model type, Apache-2.0, additionalFiles README.md and LICENSE.txt (LOGBOOK not packaged). Leak scan, gitleaks (including the merged lane history) and the fixture guard pass; fixtures use RFC 5737 addresses and example.test; LOGBOOK receipts redact the host as <vps1>. Prior art re-checked at merge: nothing manages Knot DNS or Knot Resolver (Technitium and FreeIPA DNS packages are adjacent)."
+    },
+    {
+      "id": "schema-strictness",
+      "verdict": "pass",
+      "note": "Every argument, including each zone record branch, is a strictObject with grammars: FQDNs, owner labels, per-type RDATA, printable-ASCII TXT, ADDR[@port] listens and notify targets, CIDR allow_query_from and allow_transfer, TSIG algorithm allowlist, strict-only host keys, bounded arrays. Injection attempts (owner newline + $INCLUDE, allow_transfer quote/newline, notify, NS, TXT newline) are refused at argument validation before any contact (live cell 9). Observed read-backs (observation entries) are deliberately non-strict."
+    },
+    {
+      "id": "lifetime-gc",
+      "verdict": "pass",
+      "note": "zone, resolver, observation, outcome and ds resources: lifetime infinite, garbageCollection 10."
+    },
+    {
+      "id": "crud-completeness",
+      "verdict": "pass",
+      "note": "install, apply_zone, remove_zone, ksk_submitted, apply_resolver and remove_resolver are kind action; render_zone, render_resolver, get_ds, get and sync are read-only and persist their observations. No method tombstones the definition. Residuals in the LOGBOOK: KASP key purge left to keymgr; parent_ds_check accepted but not rendered."
+    },
+    {
+      "id": "preflight-checks",
+      "verdict": "pass",
+      "note": "Arguments and renders are fully validated before SSH; on the host kzonecheck and knotc conf-check (or kresctl validate) run on the staged candidate before the swap, a port precheck accepts only knotd-held sockets, unsigning needs dnssec_unsign_ack, a wildcard listen needs listen_any_ack and remove_resolver on a host it did not configure needs remove_ack."
+    },
+    {
+      "id": "instance-names",
+      "verdict": "pass",
+      "note": "Instance names are knot_<16 hex> from a sha256 of the kind plus identity parts (host, zone, action), so no '/', '..' or NUL can occur and kinds never collide."
+    },
+    {
+      "id": "data-access",
+      "verdict": "pass",
+      "note": "Inputs arrive as method arguments; the model reads back only its own zone/resolver records (listen union, remove guard) and the host files it manages under /etc/knot, /var/lib/knot and /etc/knot-resolver."
+    },
+    {
+      "id": "version-upgrades",
+      "verdict": "pass",
+      "note": "First publish: no prior stored attributes, so no upgrade entries are needed."
+    }
+  ]
+}

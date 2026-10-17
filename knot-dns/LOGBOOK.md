@@ -300,8 +300,10 @@ config, so there is nothing to file upstream.
 - Quality pass: the version, the fingerprint comments (now independently
   confirmed), and `systemctl reset-failed knot-resolver` after install disables
   the unit, so a package start that failed on a port knotd holds no longer
-  leaves the unit reading `failed`.
-- 112 offline tests, 0 failed.
+  leaves the unit reading `failed`. The zone record schemas are now
+  `z.strictObject` (they were `z.object`, which silently dropped a misspelt key
+  such as `TTL`, despite a comment calling them strict).
+- 113 offline tests, 0 failed.
 
 ## Live e2e (2026-10-17)
 

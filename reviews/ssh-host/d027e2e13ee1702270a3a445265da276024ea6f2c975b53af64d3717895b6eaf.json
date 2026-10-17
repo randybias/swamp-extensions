@@ -1,0 +1,89 @@
+{
+  "extension": "@randybias/ssh-host",
+  "version": "2026.10.17.3",
+  "reviewedAt": "2026-10-17T17:45:00Z",
+  "dimensions": [
+    {
+      "id": "credentials-secrets",
+      "verdict": "pass",
+      "note": "A private key reaches a short-lived ssh-agent over stdin; a password goes through a temporary askpass helper and an environment variable; neither appears in ssh argv (tested). Secret fields are sensitive-marked. 2026.10.17.2: upload no longer sends the expected content SHA-256 to the remote; the remote prints the destination's own SHA-256 and mode after the rename and the comparison runs locally, so no content-derived digest appears on any spawned argv or in remote script text for upload (probe and write), exec or execPipeline (new unit test asserts no 64-hex string on any argv). exec returns only exit code and SHA-256 of stdout/stderr; raw output is stored only in the sensitive execution resource when return_output is set. Residual MEDIUM (terra, carried from 2026.10.17.1; raised as HIGH in the delta round and refuted as a regression): the SHA-256 of low-entropy output or content returned in results and resources could be guessed; hashes in place of raw content is the design the run rulings require. Known external issue swamp-club lab 3555: the CLI prints literal sensitive arguments, so README examples use vault references only and never --json. 2026.10.17.3: exec gains an optional stdin that is streamed to ssh stdin and never placed on argv, so it may carry secrets; the no-options argv is byte-identical to the fe0139f0 transport (unit test and scripted comparison), and no content hash reaches argv."
+    },
+    {
+      "id": "logging-quality",
+      "verdict": "pass",
+      "note": "Each method logs once with structured placeholders (host, port, exit code, changed, key count); no secret, argv or output in log fields."
+    },
+    {
+      "id": "error-handling",
+      "verdict": "pass",
+      "note": "A remote non-zero exit is returned as data; every OpenSSH exit 255 maps to a typed SshError (host key, auth, unreachable, transport), live-verified. Typed SshConfigError for bad policy, pins that match nothing for the host, and a supplied pin that disagrees with the recorded pin. Output over max_output_bytes kills the child with a typed error. upload now fails with a typed 'did not converge' SshError when the post-rename hash or mode read back differs. Residual MEDIUM (terra, new in 2026.10.17.2): the post-rename check reads the first stdout token, so a target whose forced-command wrapper prints to stdout fails upload after the rename; it fails closed, never a false success. Residual MEDIUM (carried): a Linux target without sha256sum/shasum fails only after the rename. 2026.10.17.3: timeoutMs kills the local ssh and raises SshError kind timeout, never a partial success; maxOutputBytes caps stdout and sets truncated instead of throwing; stderr is bounded separately by max_output_bytes and throws over it, so ssh diagnostics stay whole and every exit 255 still classifies (live: 12/12 failure cells throw at caps 16/64/4096). Residual MEDIUM (terra): remote stderr is not cut to the caller's stdout cap, by design (documented). On timeout the remote command keeps running (documented)."
+    },
+    {
+      "id": "testing-completeness",
+      "verdict": "pass",
+      "note": "65 unit tests with an injected runner, clock and sleep (no process or socket), including a new test that no content-derived 64-hex string reaches any spawned argv or script text, and upload fakes that return the post-rename hash and mode. Live end-to-end matrix: 23/23 on 2026.10.17.1 (on stable). For 2026.10.17.2 the 17 non-upload cells carry over (code path byte-identical); the six upload cells (3, 3b, 10, X2, X3, X4) are pending re-run on 2026.10.17.2, which beta allows; they must pass before promotion to stable. 2026.10.17.3: 80 unit tests, including a byte-identical no-options argv test, real-sh runner tests for stdin, timeout, truncation and the separate stderr cap. Container sshd round trip (ubuntu:24.04, pinned key over ssh-agent) at 5cc589d: failure cells throw at caps 16/64/4096, insecure_tofu first use at cap 64 runs with the warning whole, yes truncation under 400 ms, NUL, 4 MiB and 64 MiB stdin match, a timeout mid-stdin raises kind timeout; receipts in the LOGBOOK."
+    },
+    {
+      "id": "idempotency-resilience",
+      "verdict": "pass",
+      "note": "upload probes the destination SHA-256 and mode and skips the write (no new resource version) when both match (probe unchanged from 2026.10.17.1, live-verified there); a mode-only change goes through the temp-file mv -T path, and the post-rename read-back now checks both hash and mode locally. insecure_tofu pins are committed only after the transport succeeds. Residual MEDIUM (carried, downgraded under the run rulings): two simultaneous first-use calls can race on the pin write."
+    },
+    {
+      "id": "api-contracts",
+      "verdict": "pass",
+      "note": "Built on the OpenSSH client, ssh-agent/ssh-add and ssh-keyscan with -F /dev/null and IdentityFile=none, so the operator's ssh config is never consulted. upload requires GNU mv -T and fails closed on non-Linux targets."
+    },
+    {
+      "id": "resource-management",
+      "verdict": "pass",
+      "note": "Temporary known_hosts, askpass helper and ssh-agent are removed or killed in finally (tested). Remote output is streamed with a cap (default 10 MiB, max 100 MiB). Residual MEDIUM (astra, terra): ssh-keyscan output is not capped; scan output is small and the cap is a follow-up. 2026.10.17.3: a truncated or timed-out exec kills ssh and stops reading instead of draining an endless writer; stdin and readers share one Promise.all and the abort listener is removed in finally."
+    },
+    {
+      "id": "published-surface-hygiene",
+      "verdict": "pass",
+      "note": "Manifest: @randybias/ssh-host 2026.10.17.2 (model version literals match), two-sentence description, Apache-2.0, additionalFiles README.md and LICENSE.txt. exec and upload descriptions start DESTRUCTIVE. Fixtures use RFC 5737 addresses and low-entropy synthetic host keys; leak scan, gitleaks and fixture guard pass. Residual LOW (astra, carried): the exec and upload descriptions describe return_output and mode-only changes inaccurately. LOW (astra, delta): a redundant exact-hash assertion in the new test. 2026.10.17.3: manifest and model version literals 2026.10.17.3; upgrades is a literal array on the exported model (dry run free of the version-bump warning). The model's own exec does not expose the new options."
+    },
+    {
+      "id": "schema-strictness",
+      "verdict": "pass",
+      "note": "Global arguments are an empty strictObject; host, user, port, remote path and mode carry grammars; argv rejects NUL and every word is POSIX-quoted, live-verified against injection. host_keys and argv are bounded. host_key_policy is required with no default; strict requires pins. Residual MEDIUM (astra): argv words have no allowlist grammar beyond NUL; quoting is the defence for a generic exec primitive."
+    },
+    {
+      "id": "lifetime-gc",
+      "verdict": "pass",
+      "note": "execution, upload and connection resources: lifetime infinite, garbageCollection 10."
+    },
+    {
+      "id": "crud-completeness",
+      "verdict": "pass",
+      "note": "Transport primitive with three action methods: exec, upload and wait_connection. It owns no remote resource lifecycle, so there is no create/delete; consumers (server-host, wireguard-mesh, k0s-cluster) own that."
+    },
+    {
+      "id": "preflight-checks",
+      "verdict": "pass",
+      "note": "Policy, pins and paths are validated before any spawn; strict without pins, pins for another host and a pin that disagrees with the record are refused before connecting. upload refuses a directory, symlink, trailing slash or dot component before writing and re-checks around the rename (mv -T, symlink and directory refusal unchanged in 2026.10.17.2)."
+    },
+    {
+      "id": "instance-names",
+      "verdict": "pass",
+      "note": "Length-prefixed components avoid collisions: the TOFU pin is connection-h<len>-<host>-p<port> (host+port, known_hosts semantics, so a second user is verified against the same pin); exec and upload evidence add u<len>-<user>."
+    },
+    {
+      "id": "data-access",
+      "verdict": "pass",
+      "note": "Methods read only this model's own connection resource for the pin; every target arrives as method arguments, so one generic definition serves any host."
+    },
+    {
+      "id": "version-upgrades",
+      "verdict": "pass",
+      "note": "2026.10.17.2 is a point release of 2026.10.17.1 with no schema, argument, resource or instance-name change; data written by 2026.10.17.1 is read unchanged. The vendored _lib/ssh.ts blob is now fe0139f08c42e3fdae0061b9688fb5c534174957; vendors resync to it. 2026.10.17.3 is additive: no model schema, argument, resource or instance-name change; an identity upgrade entry is declared. The vendored _lib/ssh.ts blob is now 8f132c4329c9e64bed686731cd5a0e02980194ea (one file, 1250 lines, so vendors copy it byte for byte); vendors re-vendor one by one."
+    }
+  ],
+  "panel": {
+    "codex-astra": "conformance seat, three rounds (2cef07a routed, 3cda9da routed, 5cc589d clean): final round 0 Critical/High, 2 Low (long-stderr test passed under the old shared cap; stale UPGRADES wording in the LOGBOOK), both fixed at merge prep.",
+    "codex-terra": "adversarial seat, final round on 5cc589d: 0 Critical/High, 1 Medium (maxOutputBytes does not cap remote stderr) carried as a documented residual; stderr stays bounded by max_output_bytes and throws over it, the round-2 fix that keeps ssh diagnostics whole.",
+    "tightness-astra": "COULD-BE-TIGHTER, about 5 removable test lines (unused calls bindings, duplicated stderr loop); applied at merge prep.",
+    "merge-prep": "Quality pass c5b59ff on lane/d2-ssh-host-3 (stdout-only cap documented in ExecOptions, README and release note; exec JSDoc spacing; test tightened; LOGBOOK receipts), merged as ea6c99c. Behaviour unchanged; 80 tests green.",
+    "ocr-llm": "advisory GLM seat ran on 5cc589d with no findings; OCR sonnet5 seat was not run"
+  }
+}

@@ -12,7 +12,6 @@
 export const HOSTNAME_RE = /^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?$/;
 /** Autoinstall identity user name. */
 export const USERNAME_RE = /^[a-z_][a-z0-9_-]{0,31}$/;
-
 /** A curtin storage action id. */
 export const ID_RE = /^[a-z][a-z0-9-]{0,31}$/;
 /** An APT package name with an optional version. */
@@ -27,6 +26,7 @@ export const MOUNT_PATH_RE = /^\/[A-Za-z0-9._/-]{0,255}$/;
 /** Printable text with no control characters. */
 // deno-lint-ignore no-control-regex
 export const PRINTABLE_RE = /^[^\x00-\x1f\x7f]+$/;
+
 const CRYPT_ALPHABET_RE = /^[./A-Za-z0-9$=,]+$/;
 const CRYPT_ROUNDS_RE = /^rounds=\d{1,7}$/;
 const BCRYPT_COST_RE = /^\d{2}$/;
@@ -46,8 +46,7 @@ export function isCryptHash(value: string): boolean {
   if (leading !== "" || id === undefined) return false;
   const fields = rest.filter((f) => f !== "");
   if (id === "y") {
-    return fields.length >= 2 && fields.every((f) => f !== "") &&
-      fields[fields.length - 1].length >= 40;
+    return fields.length >= 2 && fields[fields.length - 1].length >= 40;
   }
   if (id === "1" || id === "5" || id === "6") {
     let salt: string;

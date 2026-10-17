@@ -1,6 +1,6 @@
 import { assert, assertEquals, assertRejects } from "jsr:@std/assert@1.0.19";
 import { createModelTestContext } from "jsr:@swamp-club/swamp-testing@0.20261014.55";
-import { model, setDeps, stateName } from "./secret.ts";
+import { MAX_KEYS, model, setDeps, stateName } from "./secret.ts";
 import { b64, K8sSecretError, type KubectlResult } from "./_lib/kubectl.ts";
 
 const KC = "apiVersion: v1\nkind: Config\nclusters: []\n";
@@ -42,30 +42,59 @@ function harness(route: (c: Call) => Partial<KubectlResult>) {
   return { calls, written, removed, restore: () => setDeps(prev) };
 }
 
-const secretJson = (data: Record<string, string>, rv = "7", type = "Opaque") =>
+/**
+ * A `kubectl get -o json` body. `owned` defaults to every key, i.e. this
+ * field manager applied them all; pass `owned` to model keys written by
+ * another tool.
+ */
+const secretJson = (
+  data: Record<string, string>,
+  opts: { rv?: string; type?: string; owned?: string[] } = {},
+) =>
   JSON.stringify({
-    type,
-    metadata: { resourceVersion: rv },
-    data: Object.fromEntries(Object.entries(data).map(([k, v]) => [k, b64(v)])),
+    type: opts.type ?? "Opaque",
+    metadata: {
+      resourceVersion: opts.rv ?? "7",
+      managedFields: [
+        {
+          manager: "swamp-k8s-secret",
+          operation: "Apply",
+          fieldsV1: {
+            "f:data": Object.fromEntries(
+              (opts.owned ?? Object.keys(data)).map((k) => [`f:${k}`, {}]),
+            ),
+          },
+        },
+      ],
+    },
+    data: Object.fromEntries(
+      Object.entries(data).map(([k, v]) => [k, b64(v)]),
+    ),
   });
 
 const verb = (c: Call) => c.args[0];
 
-Deno.test("schema: kubeconfig and every data value are sensitive", () => {
+/** True when no output or state artifact contains a value or value hash. */
+function assertNoValueOrHash(blob: unknown, value: string) {
+  const dump = JSON.stringify(blob);
+  assert(!dump.includes(value));
+  assert(!dump.includes(b64(value)));
+  assert(!/sha256|[0-9a-f]{64}/.test(dump));
+}
+
+Deno.test("schema: kubeconfig, the data record and every value are sensitive", () => {
   const shape = (model.methods.apply.arguments as unknown as {
-    shape: Record<string, { meta(): unknown }>;
+    shape: Record<string, {
+      meta(): { sensitive?: boolean };
+      valueType?: { meta(): { sensitive?: boolean } };
+    }>;
   }).shape;
-  assertEquals(
-    (shape.kubeconfig.meta() as { sensitive: boolean }).sensitive,
-    true,
-  );
-  const valueType = (shape.data as unknown as {
-    valueType: { meta(): { sensitive?: boolean } };
-  }).valueType;
-  assertEquals(valueType.meta().sensitive, true);
+  assertEquals(shape.kubeconfig.meta().sensitive, true);
+  assertEquals(shape.data.meta().sensitive, true);
+  assertEquals(shape.data.valueType?.meta().sensitive, true);
 });
 
-Deno.test("apply creates: values on stdin only, never argv", async () => {
+Deno.test("apply creates: values on stdin only, output and state carry no value", async () => {
   let created = false;
   const h = harness((c) => {
     if (verb(c) === "get") {
@@ -83,25 +112,24 @@ Deno.test("apply creates: values on stdin only, never argv", async () => {
     };
     const ap = h.calls.find((c) => verb(c) === "apply")!;
     assert(ap.args.includes("-f") && ap.args.includes("-"));
+    assert(ap.args.some((a) => a.startsWith("--field-manager=")));
     assert(!ap.args.some((a) => a.includes("from-literal")));
     const all = h.calls.map((c) => c.args.join(" ")).join("\n");
     assert(!all.includes(VAL) && !all.includes(b64(VAL)));
     const m = JSON.parse(ap.stdin!);
     assertEquals(m.data.password, b64(VAL));
     assertEquals(m.type, "Opaque");
-    // output and stored state carry no value and no kubeconfig
-    const dump = JSON.stringify([out.result, getWrittenResources()]);
-    assert(!dump.includes(VAL) && !dump.includes(b64(VAL)));
-    assert(!dump.includes("kind: Config"));
+    assertNoValueOrHash([out.result, getWrittenResources()], VAL);
+    assert(!JSON.stringify(out.result).includes("kind: Config"));
     assertEquals(out.result.keys, ["password", "user"]);
-    assertEquals(typeof out.result.data_sha256, "string");
+    assertEquals(out.result.resource_version, "7");
     assertEquals(h.removed, h.written);
   } finally {
     h.restore();
   }
 });
 
-Deno.test("apply is a no-op when data and type are identical", async () => {
+Deno.test("apply is a no-op when desired keys, values and type are unchanged", async () => {
   const h = harness((c) =>
     verb(c) === "get" ? { stdout: secretJson(APPLY.data) } : {}
   );
@@ -117,12 +145,55 @@ Deno.test("apply is a no-op when data and type are identical", async () => {
   }
 });
 
-Deno.test("apply updates when one key changes", async () => {
+Deno.test("apply preserves a key owned by another manager (no-op)", async () => {
+  const live = { ...APPLY.data, "rotation-marker": "external" };
+  const h = harness((c) =>
+    verb(c) === "get"
+      ? { stdout: secretJson(live, { owned: Object.keys(APPLY.data) }) }
+      : {}
+  );
+  try {
+    const { context } = createModelTestContext({ globalArgs: {} });
+    await model.methods.apply.execute(APPLY, context);
+    // The external key is reported but never makes the apply mutate.
+    assertEquals(h.calls.some((c) => verb(c) === "apply"), false);
+  } finally {
+    h.restore();
+  }
+});
+
+Deno.test("apply re-applies when this manager owns a key no longer given", async () => {
+  let applied = false;
+  const h = harness((c) => {
+    if (verb(c) === "get") {
+      return {
+        stdout: applied ? secretJson(APPLY.data, { rv: "8" }) : secretJson(
+          { ...APPLY.data, stale: "old" },
+          { owned: ["password", "user", "stale"] },
+        ),
+      };
+    }
+    applied = true;
+    return { stdout: "secret/db-creds\n" };
+  });
+  try {
+    const { context } = createModelTestContext({ globalArgs: {} });
+    const out = await model.methods.apply.execute(APPLY, context) as {
+      result: { resource_version: string };
+    };
+    assertEquals(h.calls.filter((c) => verb(c) === "apply").length, 1);
+    assertEquals(out.result.resource_version, "8");
+  } finally {
+    h.restore();
+  }
+});
+
+Deno.test("apply updates when one value changes", async () => {
   let applied = false;
   const h = harness((c) => {
     if (verb(c) === "get") {
       return applied
-        ? { stdout: secretJson(APPLY.data, "8") }
+        ? { stdout: secretJson(APPLY.data, { rv: "8" }) }
         : { stdout: secretJson({ ...APPLY.data, user: "old" }) };
     }
     applied = true;
@@ -140,20 +211,19 @@ Deno.test("apply updates when one key changes", async () => {
   }
 });
 
-Deno.test("get returns hashes, never values", async () => {
+Deno.test("get returns key names and metadata, never values or hashes", async () => {
   const h = harness(() => ({ stdout: secretJson(APPLY.data) }));
   try {
     const { context, getWrittenResources } = createModelTestContext({
       globalArgs: {},
     });
     const out = await model.methods.get.execute(BASE, context);
-    const dump = JSON.stringify([out, getWrittenResources()]);
-    assert(!dump.includes(VAL) && !dump.includes(b64(VAL)));
-    assert(!dump.includes("kind: Config"));
-    const st = getWrittenResources()[0].data as {
-      key_sha256: Record<string, string>;
-    };
-    assertEquals(Object.keys(st.key_sha256), ["password", "user"]);
+    assertNoValueOrHash([out, getWrittenResources()], VAL);
+    assert(!JSON.stringify(out).includes("kind: Config"));
+    const st = getWrittenResources()[0].data as { keys: string[] };
+    assertEquals(st.keys, ["password", "user"]);
+    assertEquals("key_sha256" in st, false);
+    assertEquals("data_sha256" in st, false);
   } finally {
     h.restore();
   }
@@ -202,24 +272,28 @@ Deno.test("delete: deleted, then clean no-op when absent", async () => {
     );
     assertEquals(st, ["deleted", "not_found"]);
     assertEquals(model.methods.delete.kind, "action");
+    assertEquals(model.methods.apply.kind, "action");
   } finally {
     h.restore();
   }
 });
 
-Deno.test("failure modes are typed and scrubbed; kubeconfig removed", async () => {
+Deno.test("failure modes are typed and leak nothing; kubeconfig removed", async () => {
   const cases: [string, string][] = [
     [
       "Unable to connect to the server: dial tcp 192.0.2.1:6443: i/o timeout",
       "unreachable",
     ],
     ["Error from server (Forbidden): secrets is forbidden", "unauthorized"],
-    ["Error from server (Unauthorized)", "unauthorized"],
+    [
+      `Error from server (Unauthorized): data.password ${VAL} ${b64(VAL)}`,
+      "unauthorized",
+    ],
     [
       'Error from server (NotFound): namespaces "app" not found',
       "namespace_not_found",
     ],
-    [`boom ${VAL}`, "kubectl_failed"],
+    [`boom ${VAL} ${b64(VAL)}`, "kubectl_failed"],
   ];
   for (const [stderr, code] of cases) {
     const h = harness((c) =>
@@ -231,7 +305,8 @@ Deno.test("failure modes are typed and scrubbed; kubeconfig removed", async () =
         model.methods.apply.execute(APPLY, context)
       ) as K8sSecretError;
       assertEquals(e.code, code);
-      assert(!e.message.includes(VAL));
+      assert(!e.message.includes(VAL) && !e.message.includes(b64(VAL)));
+      assert(!e.message.includes(stderr));
       assertEquals(h.removed, h.written);
       assert(h.written.length > 0);
     } finally {
@@ -310,12 +385,45 @@ Deno.test("adversarial input is rejected before any kubectl call", async () => {
   }
 });
 
-Deno.test("state is keyed by context/namespace/name", () => {
-  assertEquals(
-    stateName({ ...BASE, context: "prod.test" }),
-    "prod.test_app_db-creds",
-  );
-  assertEquals(stateName(BASE), "current-context_app_db-creds");
+Deno.test("data is bounded by key count and total bytes before kubectl", async () => {
+  const h = harness(() => ({}));
+  try {
+    const { context } = createModelTestContext({ globalArgs: {} });
+    const tooMany: Record<string, string> = {};
+    for (let i = 0; i < MAX_KEYS + 1; i++) tooMany[`k${i}`] = "v";
+    await assertRejects(() =>
+      model.methods.apply.execute({ ...APPLY, data: tooMany } as never, context)
+    );
+    await assertRejects(() =>
+      model.methods.apply.execute(
+        { ...APPLY, data: { a: "x".repeat(600_000), b: "y".repeat(600_000) } },
+        context,
+      )
+    );
+    assertEquals(h.calls.length, 0);
+  } finally {
+    h.restore();
+  }
+});
+
+Deno.test("state ids are unique across clusters and separator-ambiguous names", async () => {
+  const kcA =
+    "apiVersion: v1\nkind: Config\nclusters:\n- cluster:\n    server: https://a.test\n";
+  const kcB =
+    "apiVersion: v1\nkind: Config\nclusters:\n- cluster:\n    server: https://b.test\n";
+  const base = { namespace: "app", name: "db" };
+  const a1 = await stateName({ ...base, context: "prod", kubeconfig: kcA });
+  const a2 = await stateName({ ...base, context: "prod", kubeconfig: kcA });
+  const across = await stateName({ ...base, context: "prod", kubeconfig: kcB });
+  const slash = await stateName({ ...base, context: "a/b", kubeconfig: kcA });
+  const under = await stateName({ ...base, context: "a_b", kubeconfig: kcA });
+  assertEquals(a1, a2);
+  assert(a1 !== across);
+  assert(slash !== under);
+  for (const id of [a1, across, slash, under]) {
+    assert(!id.includes("/") && !id.includes(".."));
+    assert(id.length <= 200);
+  }
 });
 
 Deno.test("no fixture, source or doc carries real-looking secret material", async () => {

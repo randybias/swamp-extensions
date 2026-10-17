@@ -11,18 +11,21 @@
 One Secret, addressed by method arguments (kubeconfig, context, namespace,
 name), so a single definition serves any cluster. Secret values go to kubectl on
 stdin as a server-side-apply manifest; they never appear on a command line, in
-stored state or in method output. The kubeconfig is written to a `0600`
-temporary file and removed after every call, even on error.
+stored state or in method output, and no value hash is returned either. The
+kubeconfig is written to a `0600` temporary file and removed after every call,
+even on error.
 
-| Method   | Description                                                                   |
-| -------- | ----------------------------------------------------------------------------- |
-| `apply`  | Create or update the Secret; identical data and type is a no-op by sha256     |
-| `get`    | Read metadata, key names and a sha256 per value, never the values (read-only) |
-| `sync`   | Refresh stored state; records `not_found` when gone (read-only)               |
-| `delete` | Delete the Secret; an absent Secret is a clean no-op                          |
+| Method   | Description                                                             |
+| -------- | ----------------------------------------------------------------------- |
+| `apply`  | Create or update the Secret; identical keys, values and type is a no-op |
+| `get`    | Read metadata and key names; never values or value hashes (read-only)   |
+| `sync`   | Refresh stored state; records `not_found` when gone (read-only)         |
+| `delete` | Delete the Secret; an absent Secret is a clean no-op                    |
 
-`apply` manages the keys you give it. Keys added by other tools are left alone
-and show up in `keys` and `data_sha256`.
+`apply` owns the keys you give it: keys added by other tools are left alone and
+still reported in `keys`, while a key this model previously owned and no longer
+receives is pruned. It uses `--force-conflicts`, so a conflicting value is
+overwritten. Failures are typed and carry no remote text.
 
 ## Dependencies
 
@@ -50,7 +53,7 @@ for ns in app app-staging; do
 done
 ```
 
-Read it back (hashes only) and delete it:
+Read it back (key names only) and delete it:
 
 ```sh
 swamp model method run db-secret get \
@@ -66,11 +69,14 @@ CLI echoes sensitive arguments there.
 
 ## How it works
 
-State is keyed by `{context}/{namespace}/{name}` and holds hashes only. Failures
-are typed (`unreachable`, `unauthorized`, `namespace_not_found`, `not_found`,
-`invalid_input`) and their messages are scrubbed of every supplied value.
-Namespace, name, context, type and keys are validated against Kubernetes
-grammars before any process starts.
+State is keyed by a nonsecret cluster fingerprint plus context, namespace and
+name, and holds key names and metadata, never values or value hashes. Value
+comparison hashes exist only inside an `apply` call. Failures are typed
+(`unreachable`, `unauthorized`, `namespace_not_found`, `not_found`) and carry a
+fixed message: remote kubectl text is never returned, because it can echo the
+manifest. Namespace, name, context, type and keys are validated against
+Kubernetes grammars before any process starts, and data is bounded by key count
+and total UTF-8 size.
 
 ## License
 

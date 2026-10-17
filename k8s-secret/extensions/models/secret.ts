@@ -4,7 +4,9 @@
  * Values reach kubectl only on stdin, as a manifest streamed to
  * `kubectl apply -f -`; they never appear on a command line, in a file other
  * than the private temporary kubeconfig, in stored state, or in method output.
- * One definition serves any cluster: the target is a method argument.
+ * No value hash is returned or stored either, because a raw sha256 of a
+ * low-entropy secret can be reversed by brute force. One definition serves any
+ * cluster: the target is a method argument.
  *
  * @module
  */
@@ -13,8 +15,10 @@ import { z } from "npm:zod@4.3.6";
 import {
   buildManifest,
   classify,
+  clusterFingerprint,
   defaultDeps,
   type Deps,
+  FIELD_MANAGER,
   hashData,
   hashObserved,
   isContext,
@@ -23,11 +27,27 @@ import {
   isSecretName,
   isSecretType,
   K8sSecretError,
+  type ManagedFieldEntry,
+  ownedDataKeys,
+  sha256Hex,
   type Target,
   withKubectl,
 } from "./_lib/kubectl.ts";
 
-const MAX_TOTAL_BYTES = 1024 * 1024;
+/** Maximum number of keys in one Secret. */
+export const MAX_KEYS = 256;
+/** Maximum combined UTF-8 size of all keys and values, in bytes. */
+export const MAX_TOTAL_BYTES = 1024 * 1024;
+
+const textEncoder = new TextEncoder();
+
+function dataBytes(data: Record<string, string>): number {
+  let n = 0;
+  for (const [k, v] of Object.entries(data)) {
+    n += textEncoder.encode(k).length + textEncoder.encode(v).length;
+  }
+  return n;
+}
 
 const TargetShape = {
   kubeconfig: z.string().min(1).max(262144).meta({ sensitive: true }).describe(
@@ -53,7 +73,13 @@ const ApplyArgs = z.strictObject({
   data: z.record(
     z.string().refine(isDataKey, "invalid Secret key"),
     z.string().max(MAX_TOTAL_BYTES).meta({ sensitive: true }),
-  ).refine((d) => Object.keys(d).length > 0, "data must not be empty").describe(
+  ).refine((d) => Object.keys(d).length > 0, "data must not be empty").refine(
+    (d) => Object.keys(d).length <= MAX_KEYS,
+    `data must have at most ${MAX_KEYS} keys`,
+  ).refine(
+    (d) => dataBytes(d) <= MAX_TOTAL_BYTES,
+    `data must be at most ${MAX_TOTAL_BYTES} UTF-8 bytes in total`,
+  ).meta({ sensitive: true }).describe(
     "Secret key to value. Wire each value with a vault.get(...) expression.",
   ),
 });
@@ -66,14 +92,12 @@ const StateSchema = z.strictObject({
   name: z.string(),
   type: z.string().optional(),
   keys: z.array(z.string()),
-  key_sha256: z.record(z.string(), z.string()),
-  data_sha256: z.string().optional(),
   resource_version: z.string().optional(),
   status: z.enum(["present", "not_found", "deleted"]),
   observed_at: z.string(),
 });
 
-/** Stored state of one Secret; holds hashes, never values. */
+/** Stored state of one Secret; holds names and metadata, never values. */
 export type SecretState = z.infer<typeof StateSchema>;
 
 // deno-lint-ignore no-explicit-any
@@ -97,21 +121,38 @@ function target(a: z.infer<typeof TargetArgs>): Target {
   };
 }
 
-/** State instance name for a Secret: `{context}/{namespace}/{name}`. */
-export function stateName(t: Target): string {
-  return `${t.context ?? "current-context"}/${t.namespace}/${t.name}`
-    .replace(/[\/\\]/g, "_").replace(/\.\./g, "_").replace(/\0/g, "");
+/**
+ * State instance name for a Secret. Includes the context, namespace and name
+ * plus a digest of the cluster fingerprint and components, so a context whose
+ * name contains `/` cannot collide with one that contains `_`, and the same
+ * context name in two clusters keeps separate state.
+ */
+export async function stateName(t: Target): Promise<string> {
+  const cluster = await clusterFingerprint(t.kubeconfig);
+  const readable = [t.context ?? "current-context", t.namespace, t.name]
+    .join("_")
+    .replace(/[^A-Za-z0-9._-]+/g, "-")
+    .replace(/^[.-]+|[.-]+$/g, "")
+    .slice(0, 120);
+  const digest = (await sha256Hex(
+    `${cluster}\0${t.context ?? ""}\0${t.namespace}\0${t.name}`,
+  )).slice(0, 16);
+  return `${readable === "" ? "secret" : readable}_${digest}`;
 }
 
 interface Observed {
   type: string;
   resource_version: string;
   dataB64: Record<string, string>;
+  ownedKeys: string[];
 }
 
 interface SecretJson {
   type?: string;
-  metadata?: { resourceVersion?: string };
+  metadata?: {
+    resourceVersion?: string;
+    managedFields?: ManagedFieldEntry[];
+  };
   data?: Record<string, string>;
 }
 
@@ -120,17 +161,17 @@ async function observe(
     { code: number; stdout: string; stderr: string }
   >,
   t: Target,
-  secrets: string[],
 ): Promise<Observed | null> {
   const r = await kubectl([
     "get",
     "secret",
     t.name,
+    "--show-managed-fields",
     "-o",
     "json",
     "--ignore-not-found",
   ]);
-  if (r.code !== 0) throw classify(r.stderr, t, secrets);
+  if (r.code !== 0) throw classify(r.stderr, t);
   if (!r.stdout.trim()) return null;
   let raw: SecretJson;
   try {
@@ -143,24 +184,22 @@ async function observe(
     type: raw.type ?? "Opaque",
     resource_version: raw.metadata?.resourceVersion ?? "",
     dataB64: raw.data ?? {},
+    ownedKeys: ownedDataKeys(raw.metadata?.managedFields, FIELD_MANAGER),
   };
 }
 
-async function toState(
+function toState(
   t: Target,
   o: Observed | null,
   status: SecretState["status"],
   now: Date,
-): Promise<SecretState> {
-  const h = o ? await hashObserved(o.dataB64) : { keys: {}, total: undefined };
+): SecretState {
   return StateSchema.parse({
     context: t.context ?? "current-context",
     namespace: t.namespace,
     name: t.name,
     ...(o ? { type: o.type, resource_version: o.resource_version } : {}),
-    keys: Object.keys(h.keys),
-    key_sha256: h.keys,
-    ...(h.total ? { data_sha256: h.total } : {}),
+    keys: o ? Object.keys(o.dataB64).sort() : [],
     status,
     observed_at: now.toISOString(),
   });
@@ -173,18 +212,41 @@ function summary(s: SecretState) {
     type: s.type,
     keys: s.keys,
     resource_version: s.resource_version,
-    data_sha256: s.data_sha256,
   };
+}
+
+/**
+ * True when applying `data` would change nothing: the type matches, every
+ * desired key is owned by this field manager and has the same value, and the
+ * manager owns no key that is no longer desired. Keys owned by other tools
+ * are ignored, so an externally-added key does not force a rewrite.
+ */
+async function unchanged(
+  before: Observed,
+  type: string,
+  want: Record<string, string>,
+  desiredKeys: string[],
+): Promise<boolean> {
+  if (before.type !== type) return false;
+  const owned = new Set(before.ownedKeys);
+  if (owned.size !== desiredKeys.length) return false;
+  const have = await hashObserved(before.dataB64);
+  for (const k of desiredKeys) {
+    if (!owned.has(k) || have.keys[k] !== want[k]) return false;
+  }
+  return true;
 }
 
 /** Model definition for `@randybias/k8s-secret`. */
 export const model = {
   type: "@randybias/k8s-secret",
   version: "2026.10.17.1",
+  description:
+    "Write a Kubernetes Secret from vault values delivered to kubectl on stdin, and read or delete it without ever exposing the values.",
   globalArguments: GlobalArgsSchema,
   resources: {
     state: {
-      description: "Secret metadata, key names and per-key sha256; no values",
+      description: "Secret metadata and key names; no values",
       schema: StateSchema,
       lifetime: "infinite" as const,
       garbageCollection: 10,
@@ -194,32 +256,27 @@ export const model = {
     apply: {
       kind: "action" as const,
       description:
-        "Create or update a Secret from vault values streamed to kubectl on stdin. Idempotent: identical data and type is a no-op by sha256. Returns metadata and hashes, never values.",
+        "DESTRUCTIVE. Create or update a Secret from vault values streamed to kubectl on stdin. Server-side apply prunes keys this model previously owned that are no longer given, and force-conflicts overwrites conflicting values. Idempotent when the desired keys, values and type already match. Returns key names and metadata, never values.",
       arguments: ApplyArgs,
       execute: async (args: z.input<typeof ApplyArgs>, context: Ctx) => {
         const a = ApplyArgs.parse(args);
         const t = target(a);
-        const secrets = [t.kubeconfig, ...Object.values(a.data)];
         const want = await hashData(a.data);
-        const state = await withKubectl(deps, t, secrets, async (kubectl) => {
-          const before = await observe(kubectl, t, secrets);
-          if (before) {
-            const have = await hashObserved(before.dataB64);
-            const same = before.type === a.type &&
-              JSON.stringify(Object.keys(want.keys)) ===
-                JSON.stringify(Object.keys(have.keys)) &&
-              have.total === want.total;
-            if (same) {
-              context.logger.info("Secret {name} unchanged", { name: t.name });
-              return toState(t, before, "present", deps.now());
-            }
+        const desiredKeys = Object.keys(want.keys);
+        const state = await withKubectl(deps, t, async (kubectl) => {
+          const before = await observe(kubectl, t);
+          if (
+            before && await unchanged(before, a.type, want.keys, desiredKeys)
+          ) {
+            context.logger.info("Secret {name} unchanged", { name: t.name });
+            return toState(t, before, "present", deps.now());
           }
           const r = await kubectl(
             [
               "apply",
               "--server-side",
               "--force-conflicts",
-              "--field-manager=swamp-k8s-secret",
+              `--field-manager=${FIELD_MANAGER}`,
               "-f",
               "-",
               "-o",
@@ -227,14 +284,14 @@ export const model = {
             ],
             buildManifest(t, a.type, a.data),
           );
-          if (r.code !== 0) throw classify(r.stderr, t, secrets);
-          const after = await observe(kubectl, t, secrets);
+          if (r.code !== 0) throw classify(r.stderr, t);
+          const after = await observe(kubectl, t);
           context.logger.info("Secret {name} applied", { name: t.name });
           return toState(t, after, "present", deps.now());
         });
         const handle = await context.writeResource(
           "state",
-          stateName(t),
+          await stateName(t),
           state,
         );
         return { dataHandles: [handle], result: summary(state) };
@@ -243,13 +300,13 @@ export const model = {
 
     get: {
       description:
-        "READ-ONLY. Read the Secret's metadata, key names and a sha256 per value. Never returns the values.",
+        "READ-ONLY. Read the Secret's metadata and key names. Never returns the values or a value hash.",
       arguments: TargetArgs,
       execute: async (args: z.infer<typeof TargetArgs>, context: Ctx) => {
         const a = TargetArgs.parse(args);
         const t = target(a);
-        const state = await withKubectl(deps, t, [t.kubeconfig], async (k) => {
-          const o = await observe(k, t, [t.kubeconfig]);
+        const state = await withKubectl(deps, t, async (k) => {
+          const o = await observe(k, t);
           if (!o) {
             throw new K8sSecretError(
               "not_found",
@@ -260,7 +317,7 @@ export const model = {
         });
         const handle = await context.writeResource(
           "state",
-          stateName(t),
+          await stateName(t),
           state,
         );
         return { dataHandles: [handle], result: summary(state) };
@@ -274,8 +331,8 @@ export const model = {
       execute: async (args: z.infer<typeof TargetArgs>, context: Ctx) => {
         const a = TargetArgs.parse(args);
         const t = target(a);
-        const state = await withKubectl(deps, t, [t.kubeconfig], async (k) => {
-          const o = await observe(k, t, [t.kubeconfig]);
+        const state = await withKubectl(deps, t, async (k) => {
+          const o = await observe(k, t);
           return toState(t, o, o ? "present" : "not_found", deps.now());
         });
         context.logger.info("Secret {name} status {status}", {
@@ -284,7 +341,7 @@ export const model = {
         });
         const handle = await context.writeResource(
           "state",
-          stateName(t),
+          await stateName(t),
           state,
         );
         return { dataHandles: [handle], result: summary(state) };
@@ -301,8 +358,7 @@ export const model = {
       execute: async (args: z.infer<typeof TargetArgs>, context: Ctx) => {
         const a = TargetArgs.parse(args);
         const t = target(a);
-        const secrets = [t.kubeconfig];
-        const status = await withKubectl(deps, t, secrets, async (kubectl) => {
+        const status = await withKubectl(deps, t, async (kubectl) => {
           const r = await kubectl([
             "delete",
             "secret",
@@ -311,17 +367,17 @@ export const model = {
             "-o",
             "name",
           ]);
-          if (r.code !== 0) throw classify(r.stderr, t, secrets);
+          if (r.code !== 0) throw classify(r.stderr, t);
           return r.stdout.trim() ? "deleted" as const : "not_found" as const;
         });
         context.logger.info("Secret {name} {status}", {
           name: t.name,
           status,
         });
-        const state = await toState(t, null, status, deps.now());
+        const state = toState(t, null, status, deps.now());
         const handle = await context.writeResource(
           "state",
-          stateName(t),
+          await stateName(t),
           state,
         );
         return { dataHandles: [handle], result: { status } };

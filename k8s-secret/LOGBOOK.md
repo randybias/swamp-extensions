@@ -18,13 +18,42 @@ Not packaged. Notes for whoever maintains this extension.
   `kubectl apply --server-side
   --force-conflicts -f -`, so removed keys owned
   by this field manager are pruned and keys added by others are kept. No-op
-  detection compares type and per-key sha256 of the live Secret, not an
-  annotation, so external drift is corrected. kubeconfig goes through a `0600`
-  temp file because stdin carries the manifest.
+  detection compares the desired keys and values against the keys this field
+  manager owns (read from `metadata.managedFields`), so an externally-added key
+  is preserved and a dropped owned key is pruned. kubeconfig goes through a
+  `0600` temp file because stdin carries the manifest.
+- 2026-10-17 (lane/d2): review ledger (codex astra + terra; ocr sonnet5/glm
+  timed out at the 10m wall, to rerun on this revision). Dispositions:
+  - REFUTED: rename `delete` to `remove`. Swamp tombstones the whole model only
+    for `kind: "delete"`, not for the method name; cherry-servers ships a method
+    named `delete` with `kind: "action"`, verified live. Kept as is.
+  - HIGH-1: remote `kubectl` stderr/exception text is no longer returned.
+    `classify` returns fixed typed messages and the spawn-failure path uses a
+    fixed message; `scrub` was removed. Base64 forms of a value can no longer
+    reach an error or `--json` output.
+  - MEDIUM-2: the whole `data` record is `.meta({ sensitive: true })`, not only
+    its values.
+  - MEDIUM-3: `writePrivateTempFile` removes the temp kubeconfig if `chmod` or
+    the write fails after creation; covered by an injected-IO test.
+  - MEDIUM-4: state ids now combine a nonsecret cluster fingerprint (sha256 of
+    the kubeconfig server URL) with the context/namespace/name and a 16-hex
+    digest, so `a/b` and `a_b`, or the same context name in two clusters, no
+    longer collide.
+  - MEDIUM-5: no-op compares only desired keys against this field manager's
+    owned keys; external keys are preserved and no longer force a rewrite, and
+    an owned key that is no longer given is pruned (tests for both).
+  - MEDIUM-6: a raw per-value sha256 is neither returned nor stored (it is
+    brute-forceable for low-entropy secrets). Comparison hashes live only
+    in-process. This intentionally supersedes the spec's `data_sha256` output.
+  - MEDIUM-7: `data` is bounded to 256 keys and 1 MiB total UTF-8 bytes before
+    kubectl is spawned.
+  - MEDIUM-8: `apply`'s description now starts with DESTRUCTIVE and states that
+    it prunes owned keys and force-overwrites conflicts.
+  - LOW: the model gained a type description; README examples carry no `--json`.
 - Real-swamp check with a stub `kubectl` on PATH (not a live cell): vault
   expressions in `--input` (including inside `data:json=`) resolve; kubectl argv
-  carries no value, stdin carries the base64 manifest, output and state hold
-  hashes only, no temp kubeconfig is left in the temp directory, and the value
+  carries no value, stdin carries the base64 manifest, output and state hold key
+  names only, no temp kubeconfig is left in the temp directory, and the value
   appears nowhere under the repo's `.swamp/`.
 - Live matrix (no cluster yet; waiting on a k0s target):
   - apply (create): blocked

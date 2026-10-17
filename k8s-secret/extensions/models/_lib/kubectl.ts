@@ -3,8 +3,10 @@
  *
  * Secret values never appear on a command line. The Secret manifest is built
  * in memory and streamed to `kubectl apply -f -` on stdin; the kubeconfig is
- * written to a `0600` temporary file that is removed in a `finally`. Error
- * text is scrubbed of every secret value before it leaves this module.
+ * written to a `0600` temporary file that is removed in a `finally`. Every
+ * failure is mapped to a fixed, typed message: remote `kubectl` output is
+ * never returned, so neither the kubeconfig nor the Secret values (or their
+ * base64 forms) can be read back out of an error.
  *
  * @module
  */
@@ -88,13 +90,51 @@ const denoRun: KubectlRunner = async (args, options) => {
   };
 };
 
-const denoFiles: KubeconfigFiles = {
-  async write(content) {
-    const path = await Deno.makeTempFile({ prefix: "kubeconfig-" });
-    await Deno.chmod(path, 0o600);
-    await Deno.writeTextFile(path, content);
+/** Low-level file operations; injectable so the failure path is testable. */
+export interface TempFileIo {
+  /** Creates a private temporary file. */
+  makeTempFile(options: { prefix: string }): Promise<string>;
+  /** Restricts the file mode. */
+  chmod(path: string, mode: number): Promise<void>;
+  /** Writes text to the file. */
+  writeText(path: string, content: string): Promise<void>;
+  /** Removes the file. */
+  remove(path: string): Promise<void>;
+}
+
+const denoTempIo: TempFileIo = {
+  makeTempFile: (options) => Deno.makeTempFile(options),
+  chmod: (path, mode) => Deno.chmod(path, mode),
+  writeText: (path, content) => Deno.writeTextFile(path, content),
+  remove: (path) => Deno.remove(path),
+};
+
+/**
+ * Writes `content` to a new `0600` temporary file. If any step after creation
+ * fails, the file is removed before the error is rethrown, so a partial
+ * kubeconfig is never left behind.
+ */
+export async function writePrivateTempFile(
+  content: string,
+  io: TempFileIo = denoTempIo,
+): Promise<string> {
+  const path = await io.makeTempFile({ prefix: "kubeconfig-" });
+  try {
+    await io.chmod(path, 0o600);
+    await io.writeText(path, content);
     return path;
-  },
+  } catch (e) {
+    try {
+      await io.remove(path);
+    } catch {
+      // The file is already gone; nothing to clean up.
+    }
+    throw e;
+  }
+}
+
+const denoFiles: KubeconfigFiles = {
+  write: (content) => writePrivateTempFile(content),
   async remove(path) {
     try {
       await Deno.remove(path);
@@ -108,6 +148,9 @@ const denoFiles: KubeconfigFiles = {
 export function defaultDeps(): Deps {
   return { run: denoRun, files: denoFiles, now: () => new Date() };
 }
+
+/** Field manager this extension uses for server-side apply. */
+export const FIELD_MANAGER = "swamp-k8s-secret";
 
 const DNS_LABEL = /^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?$/;
 const DNS_SUBDOMAIN =
@@ -159,7 +202,8 @@ async function totalDigest(keys: Record<string, string>): Promise<string> {
 
 /**
  * Per-key sha256 of the desired values (their UTF-8 bytes), plus one digest
- * over the sorted pairs.
+ * over the sorted pairs. Used only in-process to decide whether an apply is a
+ * no-op; never written to state or returned.
  */
 export async function hashData(
   data: Record<string, string>,
@@ -171,7 +215,8 @@ export async function hashData(
 
 /**
  * Per-key sha256 of a live Secret's `data`, hashing the stored bytes rather
- * than a decoded string, so a binary value hashes correctly.
+ * than a decoded string, so a binary value hashes correctly. Used only
+ * in-process to compare against the desired values.
  */
 export async function hashObserved(
   dataB64: Record<string, string>,
@@ -236,48 +281,83 @@ function baseArgs(t: Target): string[] {
   ];
 }
 
-/** Replaces every secret fragment in `text` with a marker. */
-export function scrub(text: string, secrets: string[]): string {
-  let out = text;
-  for (const s of secrets) {
-    if (s.length >= 3) out = out.split(s).join("[redacted]");
-  }
-  return out.slice(0, 1000);
+const SERVER_RE = /^\s*server:\s*["']?([^\s"']+)["']?\s*$/m;
+
+/**
+ * Nonsecret fingerprint of the API server a kubeconfig talks to. The server
+ * URL is stable across credential rotation, so a Secret's state id does not
+ * change when its token does; it falls back to the kubeconfig content when
+ * no server line is present. The raw URL is never put in an id or output.
+ */
+export async function clusterFingerprint(kubeconfig: string): Promise<string> {
+  const m = SERVER_RE.exec(kubeconfig);
+  return (await sha256Hex(m ? m[1] : kubeconfig)).slice(0, 12);
 }
 
-/** Maps kubectl stderr to a typed error. */
-export function classify(
-  stderr: string,
-  t: Target,
-  secrets: string[],
-): K8sSecretError {
-  const text = scrub(stderr.trim(), secrets);
-  if (/namespaces? "[^"]*" not found/i.test(text)) {
+/** One `metadata.managedFields` entry, narrowed to the fields we read. */
+export interface ManagedFieldEntry {
+  /** Who wrote the fields. */
+  manager?: string;
+  /** `Apply` for server-side apply, `Update` otherwise. */
+  operation?: string;
+  /** The applied field set. */
+  fieldsV1?: { "f:data"?: Record<string, unknown> };
+}
+
+/**
+ * The `data` keys a given field manager owns through server-side apply. Used
+ * to ignore keys owned by other tools when deciding whether an apply is a
+ * no-op, and to detect a key this manager must prune.
+ */
+export function ownedDataKeys(
+  entries: ManagedFieldEntry[] | undefined,
+  manager: string,
+): string[] {
+  const keys = new Set<string>();
+  for (const e of entries ?? []) {
+    if (e.manager !== manager || e.operation !== "Apply") continue;
+    for (const k of Object.keys(e.fieldsV1?.["f:data"] ?? {})) {
+      if (k.startsWith("f:")) keys.add(k.slice(2));
+    }
+  }
+  return [...keys].sort();
+}
+
+/**
+ * Maps kubectl stderr to a typed error with a fixed message. The stderr is
+ * matched but never included: it can echo the manifest, including base64
+ * values, which `scrub` cannot reliably remove.
+ */
+export function classify(stderr: string, t: Target): K8sSecretError {
+  if (/namespaces? "[^"]*" not found/i.test(stderr)) {
     return new K8sSecretError(
       "namespace_not_found",
       `Namespace ${t.namespace} does not exist`,
     );
   }
-  if (/unauthorized|forbidden|must be logged in|credentials/i.test(text)) {
-    return new K8sSecretError("unauthorized", `Not authorized: ${text}`);
+  if (/unauthorized|forbidden|must be logged in|credentials/i.test(stderr)) {
+    return new K8sSecretError(
+      "unauthorized",
+      "Not authorized to access the API server",
+    );
   }
   if (
     /unable to connect|connection refused|no such host|i\/o timeout|timed out|dial tcp|tls: |context deadline|no route to host/i
-      .test(text)
+      .test(stderr)
   ) {
-    return new K8sSecretError("unreachable", `API server unreachable: ${text}`);
+    return new K8sSecretError("unreachable", "API server unreachable");
   }
-  return new K8sSecretError("kubectl_failed", `kubectl failed: ${text}`);
+  return new K8sSecretError("kubectl_failed", "kubectl failed");
 }
 
 /**
  * Runs `fn` with a kubectl runner bound to a temporary kubeconfig, removing
- * the file in a `finally`, even when `fn` throws.
+ * the file in a `finally`, even when `fn` throws. A failure to launch kubectl
+ * is reported without its exception text.
  */
 export async function withKubectl<T>(
   deps: Deps,
   t: Target,
-  secrets: string[],
   fn: (
     kubectl: (args: string[], stdin?: string) => Promise<KubectlResult>,
   ) => Promise<T>,
@@ -290,16 +370,14 @@ export async function withKubectl<T>(
       HOME: Deno.env.get("HOME") ?? "/tmp",
     };
     return await fn(async (args, stdin) => {
-      let r: KubectlResult;
       try {
-        r = await deps.run([...args, ...baseArgs(t)], { stdin, env });
-      } catch (e) {
+        return await deps.run([...args, ...baseArgs(t)], { stdin, env });
+      } catch {
         throw new K8sSecretError(
           "kubectl_failed",
-          `Could not run kubectl: ${scrub(String(e), secrets)}`,
+          "Could not run kubectl",
         );
       }
-      return r;
     });
   } finally {
     await deps.files.remove(path);

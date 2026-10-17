@@ -165,55 +165,55 @@ const TXT_CHUNK = z.string().min(1).max(255).regex(
 const Owner = z.string().min(1).max(253);
 const Ttl = z.number().int().min(1).max(604800);
 
-const ARecord = z.object({
+const ARecord = z.strictObject({
   name: Owner,
   ttl: Ttl.optional(),
   type: z.literal("A"),
   data: z.string().refine(isIpv4, "not an IPv4 address"),
 });
-const AaaaRecord = z.object({
+const AaaaRecord = z.strictObject({
   name: Owner,
   ttl: Ttl.optional(),
   type: z.literal("AAAA"),
   data: z.string().refine(isIpv6, "not an IPv6 address"),
 });
-const CnameRecord = z.object({
+const CnameRecord = z.strictObject({
   name: Owner,
   ttl: Ttl.optional(),
   type: z.literal("CNAME"),
   data: FqdnSchema,
 });
-const MxRecord = z.object({
+const MxRecord = z.strictObject({
   name: Owner,
   ttl: Ttl.optional(),
   type: z.literal("MX"),
-  data: z.object({
+  data: z.strictObject({
     preference: z.number().int().min(0).max(65535),
     exchange: FqdnSchema,
   }),
 });
-const TxtRecord = z.object({
+const TxtRecord = z.strictObject({
   name: Owner,
   ttl: Ttl.optional(),
   type: z.literal("TXT"),
   data: z.array(TXT_CHUNK).min(1).max(255),
 });
-const SrvRecord = z.object({
+const SrvRecord = z.strictObject({
   name: Owner,
   ttl: Ttl.optional(),
   type: z.literal("SRV"),
-  data: z.object({
+  data: z.strictObject({
     priority: z.number().int().min(0).max(65535),
     weight: z.number().int().min(0).max(65535),
     port: z.number().int().min(0).max(65535),
     target: FqdnSchema,
   }),
 });
-const CaaRecord = z.object({
+const CaaRecord = z.strictObject({
   name: Owner,
   ttl: Ttl.optional(),
   type: z.literal("CAA"),
-  data: z.object({
+  data: z.strictObject({
     flags: z.number().int().min(0).max(255),
     tag: z.enum(["issue", "issuewild", "iodef"]),
     value: z.string().min(1).max(255).regex(
@@ -222,34 +222,34 @@ const CaaRecord = z.object({
     ),
   }),
 });
-const NsRecord = z.object({
+const NsRecord = z.strictObject({
   name: Owner,
   ttl: Ttl.optional(),
   type: z.literal("NS"),
   data: FqdnSchema,
 });
-const DsRecord = z.object({
+const DsRecord = z.strictObject({
   name: Owner,
   ttl: Ttl.optional(),
   type: z.literal("DS"),
-  data: z.object({
+  data: z.strictObject({
     key_tag: z.number().int().min(0).max(65535),
     algorithm: z.number().int().min(0).max(255),
     digest_type: z.number().int().min(0).max(255),
     digest: z.string().regex(/^[0-9a-fA-F]{40,96}$/, "invalid DS digest"),
   }).refine((d) => d.digest.length % 2 === 0, "digest must be even-length hex"),
 });
-const PtrRecord = z.object({
+const PtrRecord = z.strictObject({
   name: Owner,
   ttl: Ttl.optional(),
   type: z.literal("PTR"),
   data: FqdnSchema,
 });
-const SshfpRecord = z.object({
+const SshfpRecord = z.strictObject({
   name: Owner,
   ttl: Ttl.optional(),
   type: z.literal("SSHFP"),
-  data: z.object({
+  data: z.strictObject({
     algorithm: z.number().int().min(0).max(255),
     fp_type: z.number().int().min(0).max(255),
     fingerprint: z.string().min(8).max(128).regex(
@@ -258,11 +258,11 @@ const SshfpRecord = z.object({
     ),
   }),
 });
-const TlsaRecord = z.object({
+const TlsaRecord = z.strictObject({
   name: Owner,
   ttl: Ttl.optional(),
   type: z.literal("TLSA"),
-  data: z.object({
+  data: z.strictObject({
     usage: z.number().int().min(0).max(3),
     selector: z.number().int().min(0).max(1),
     matching_type: z.number().int().min(0).max(2),

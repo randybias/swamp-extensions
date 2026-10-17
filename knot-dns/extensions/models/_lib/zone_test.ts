@@ -361,3 +361,15 @@ Deno.test("served-vs-declared diff", () => {
     { name: "old.example.com.", type: "A", data: "192.0.2.99" },
   ]);
 });
+
+Deno.test("a record with an unknown key is refused, not silently stripped", () => {
+  // A misspelt `ttl` must not fall back to the default TTL unnoticed.
+  const r = { name: "www", type: "A", data: "192.0.2.1", TTL: 60 };
+  assertEquals(RecordSchema.safeParse(r).success, false);
+  const mx = {
+    name: "@",
+    type: "MX",
+    data: { preference: 10, exchange: "mx.example.com.", weight: 1 },
+  };
+  assertEquals(RecordSchema.safeParse(mx).success, false);
+});

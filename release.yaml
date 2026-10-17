@@ -55,3 +55,8 @@ wireguard-mesh:
     2026.10.17.4: f74daacaa223888d33da7a3018ca6d2beb22520f2d04f1e44a50913882eb7957
   notes:
     2026.10.17.4: 'First release, beta. Render one node''s WireGuard config from mesh inputs (peers allowlist, relay exclusion) and push it over SSH under a strict or persisted trust-on-first-use host-key policy. Every apply arms a host-side rollback before any live change, confirms over a fresh management connection, and disarms only its own generation under a host lock; Address or routed AllowedIPs changes recreate the interface. Live end to end on two throwaway VPS: 19 of 21 cells pass, 0 fail; a delete that severs its own management path and that delete''s rollback firing were not exercised, so it stays on beta.'
+
+k8s-secret:
+  channel: beta
+  ci: false
+  published: {}

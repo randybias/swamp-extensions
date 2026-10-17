@@ -1,0 +1,11 @@
+manifestVersion: 1
+name: "@randybias/k8s-secret"
+version: "2026.10.17.1"
+description: "Create, read, sync and delete a Kubernetes Secret from vault values. Values reach kubectl only on stdin and are never returned: output and stored state carry metadata and key names only."
+license: Apache-2.0
+repository: https://github.com/randybias/swamp-extensions
+platforms: [darwin-aarch64, darwin-x86_64, linux-x86_64, linux-aarch64]
+labels: [kubernetes, k8s, secret, kubectl, vault, security]
+additionalFiles: [README.md, LICENSE.txt]
+models:
+  - secret.ts

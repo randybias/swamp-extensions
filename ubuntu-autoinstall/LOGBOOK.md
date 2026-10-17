@@ -47,16 +47,20 @@ builder and no `build_seed` action. The HTTP path (`publish_http`) is ours.
    `SHA256SUMS`) directly over SSH, as the spec drafted; it reads
    `<root>/.layout-version` and refuses a mismatch, but an absent marker is
    allowed so a fresh root works.
-5. **Schemas pinned.** `autoinstall-schema.json` from `canonical/subiquity` tag
-   `24.04.5` and cloud-init's `schema-cloud-config-v1.json` from
-   `cloud-init 26.1` (Ubuntu 24.04 archive) are vendored under `_lib/schemas/`
-   and compiled with `ajv` / `ajv-draft-04` / `ajv-formats`. Unknown
-   `autoinstall` keys are rejected separately because the subiquity schema sets
-   `additionalProperties: true`.
-6. **Late commands.** The spec allows a shell string with `shell:true` plus
-   `late_commands_shell_ack`; it is rendered as the argv `["sh","-c", cmd]`
-   (prefixed with `curtin in-target --` when asked), so the rendered document
-   only ever contains argv lists and nothing is interpolated into a string.
+5. **License ruling: the subiquity schema is not shipped.** Subiquity's
+   `autoinstall-schema.json` is AGPL-3.0, so only cloud-init's
+   `schema-cloud-config-v1.json` from `cloud-init 26.1` (Apache-2.0 / GPL-3.0)
+   is vendored under `_lib/schemas/` and compiled with `ajv` / `ajv-draft-04` /
+   `ajv-formats`. `autoinstall` itself is checked by our own structural code
+   (unknown keys refused), and a dev-only test (`AUTOINSTALL_SUBIQUITY=1`)
+   fetches the upstream schema into a temp dir to cross-check the renders. The
+   lane branch's early history carried the AGPL file, so it was squash-merged
+   and never pushed. See "License ruling" below.
+6. **Late commands (shell ack).** The spec allows a shell string with
+   `shell:true` only together with `late_commands_shell_ack: true`; it is
+   rendered as the argv `["sh","-c", cmd]` (prefixed with `curtin in-target --`
+   when asked), so the rendered document only ever contains argv lists and
+   nothing is interpolated into a string.
 7. **Storage `match`.** The spec wrote `size:"largest"|"smallest"|ssd`; `size`
    is the enum and `ssd` is a separate boolean selector.
 
@@ -68,13 +72,12 @@ subiquity schema validation runs offline in the unit tests via `ajv`.
 
 ## Live testing
 
-Not run: booting the installer needs a nested-KVM target. Every live cell in the
-spec's matrix is **blocked**, so the version is published to `beta`
-(`release.yaml`, `ci: false`).
+Run on bare metal with KVM (see "Live e2e (2026-10-17)" below): 11 of 11 cells
+on 61147ba. Published to `beta`.
 
 ## Test count
 
-103 tests (0 failed, 2 ignored: the gated container and subiquity cross-check
+104 tests (0 failed, 2 ignored: the gated container and subiquity cross-check
 tests, both run green manually).
 
 ## Vendor note
@@ -174,7 +177,7 @@ packages are cloud-init seed helpers.
 - The user-data goldens are built from shared blocks (identity, ssh, version,
   network, per-profile storage) instead of eight full copies.
 
-## Live fixes on bm1 (fc6e664)
+## Live fixes on <bm1> (fc6e664)
 
 - **Duplicate data instance name.** `render` wrote the `render` and `seed_files`
   resources under the SAME instance name, which swamp rejects within one method
@@ -188,3 +191,66 @@ packages are cloud-init seed helpers.
   module graph. Proven by copying the packaged extension into a fresh swamp repo
   without deno.json/deno.lock: `swamp extension quality` bundles and `render`
   runs (the seed files land in the repo vault).
+
+## Merge prep (2026-10-17)
+
+- Squash-merged from `lane/d4-ubuntu-autoinstall` at 61147ba as one commit; the
+  lane history (which once carried the AGPL subiquity schema) is not on main and
+  the lane branch is not pushed.
+- Quality pass: removed a redundant empty-field check in `isCryptHash` and
+  tidied the grammar constants.
+- Final self-review of e13edd7..61147ba (round 3 was CLEAN): crypt-hash grammar,
+  `stat`-based existence probe, 64 KiB `first_boot_user_data` bound, shared
+  golden blocks, distinct resource names per kind, pinned `ajv` import. No
+  Critical/High.
+
+## Live e2e (2026-10-17)
+
+Source: 61147ba from `git archive` into a scratch directory, no local patches,
+and without the extension's deno.json/deno.lock: it bundles in a fresh swamp
+repo (type found, no loader warning). Target `<bm1>` (bare metal, Ubuntu 24.04,
+KVM), libvirt default NAT network `<guest-net>` (started for the test, stopped
+afterwards); the seed was served by a transient HTTP server on the bridge
+address. ISO `ubuntu-24.04.5-live-server-amd64.iso`, verified against the
+published SHA256SUMS. The key and password hash were throwaway vault entries,
+deleted afterwards.
+
+| Cell                                                                         | Result | Receipt          |
+| ---------------------------------------------------------------------------- | ------ | ---------------- |
+| 2 render: no secret in results; `seed_files` values are vault references     | PASS   | c616c49d921877fc |
+| 1 validate on the rendered seed                                              | PASS   | fbada93bab00926b |
+| 6 publish_http with a plaintext password refused; seed root unchanged        | PASS   | 4d1c0af945d28a75 |
+| 6b render also refuses the plaintext                                         | PASS   | 0938c5953391e70d |
+| 4a publish_http writes the bundle and the ref                                | PASS   | c23e13eb66b7c98a |
+| 4b get: present and matching                                                 | PASS   | 9f3b1335ec2e8a0f |
+| 4c sync: present and matching                                                | PASS   | 3426b81703bc4877 |
+| 3 unattended install, reboot into disk, SSH with seed key, hostname + lvm ok | PASS   | 3feac6a95e1bfbde |
+| 5a unpublish removes the bundle and the ref                                  | PASS   | 091aadceee333788 |
+| 5b unpublish again: clean no-op                                              | PASS   | 017cd5295ada04e8 |
+| 5c get after unpublish: not_found                                            | PASS   | 9730a8a160ce1296 |
+
+Cell 3 was a real unattended install of the official 24.04.5 live-server ISO in
+a KVM guest with the `lvm` profile (about 6 minutes), booted by kernel/initrd
+with `autoinstall ds=nocloud-net;s=<seed url>`; after reboot the guest ran from
+disk with the LVM root mounted at `/` and reported Ubuntu 24.04.5 LTS. The guest
+was created with `virt-install`, not `@randybias/libvirt`, which has no
+direct-kernel or install-media boot option. The seed went through
+`publish_http`; the CIDATA path was not used. An earlier pass on fc6e664 found
+the two live fixes recorded above.
+
+## Known residuals
+
+- **CIDATA path not live-tested** (the `@evrardjp/cloud-init-nocloud` workflow
+  wiring); only `publish_http` ran live.
+- MEDIUM: `unpublish` without a ref treats a bundle with no `meta-data` as
+  absent, so stray files in that bundle directory are left and reported
+  `not_found`.
+- LOW: absence is detected from `stat`'s English stderr; a remote with a non-C
+  locale turns absence into a transport error (fails closed).
+- LOW: the rendered `user-data` (including `first_boot_user_data`) is stored in
+  the sensitive `seed_files` resource (vault-backed live), by design, so the
+  CIDATA workflow can consume it.
+- LOW (tightness): `render_test.ts` keeps a fixture-count test and a separate
+  RAID10 validation that the matrix already covers; one unpublish test repeats
+  its argument object.
+- The advisory GLM seat timed out in round 3.

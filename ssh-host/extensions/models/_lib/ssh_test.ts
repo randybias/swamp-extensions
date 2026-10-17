@@ -419,12 +419,16 @@ Deno.test("exec enforces the output capture cap with a typed error", async () =>
   );
 });
 
-Deno.test("exec returns an unexplained 255 as data", async () => {
+Deno.test("exec treats any ssh exit 255 as a transport error, not data", async () => {
   const calls: Call[] = [];
   const deps = fakeDeps(fakeRun(calls, {
     ssh: () => ({ code: 255, stdout: "", stderr: "remote said no\n" }),
   }));
-  assertEquals((await exec(deps, STRICT_TARGET, ["./script"])).exit_code, 255);
+  await assertRejects(
+    () => exec(deps, STRICT_TARGET, ["./script"]),
+    SshError,
+    "transport failed",
+  );
 });
 
 Deno.test("strict needs pinned keys and rejects two credentials at once", async () => {
@@ -697,6 +701,36 @@ Deno.test("waitConnection insecure_tofu accepts the first keys observed", async 
     host_key_policy: "insecure_tofu",
   });
   assertEquals(result.host_keys[0].key, OTHER.key);
+});
+
+Deno.test("a supplied pin that matches no host refuses instead of accept-new", async () => {
+  const deps = fakeDeps(fakeRun([]));
+  await assertRejects(
+    () =>
+      exec(deps, {
+        ...STRICT_TARGET,
+        host_key_policy: "insecure_tofu",
+        host_keys: [
+          `other.example.com ${KEY.type} ${KEY.key}`,
+        ],
+      }, ["true"]),
+    SshConfigError,
+    "none apply",
+  );
+  // The same supplied set also refuses in waitConnection.
+  const waitDeps = fakeDeps(fakeRun([]));
+  await assertRejects(
+    () =>
+      waitConnection(waitDeps, {
+        host: HOST,
+        port: 22,
+        user: "root",
+        host_key_policy: "strict",
+        host_keys: [`other.example.com ${KEY.type} ${KEY.key}`],
+      }, { timeout_s: 1 }),
+    SshConfigError,
+    "none apply",
+  );
 });
 
 Deno.test("waitConnection verifies a recorded tofu pin and refuses a change", async () => {

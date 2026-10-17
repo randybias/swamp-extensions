@@ -457,7 +457,7 @@ export function createModel(deps: SshDeps = denoDeps): SshHostModel {
       exec: {
         kind: "action",
         description:
-          "DESTRUCTIVE. Run one argv vector on the host over SSH and return the exit code plus output hashes; each element is a literal argv word, never interpolated into a shell string, but argv can change or break the host and exec cannot roll that back. A non-zero remote exit is data while an unreachable host, rejected credential or host-key mismatch is an error. Never put a secret in argv; stdout and stderr are persisted sensitive-marked and returned only when return_output is set.",
+          "DESTRUCTIVE. Run one argv vector on the host over SSH and return the exit code plus output hashes; each element is a literal argv word, never interpolated into a shell string, but argv can change or break the host and exec cannot roll that back. A non-zero remote exit is data, except 255, which ssh reserves for its own failures and is always reported as a transport error. Never put a secret in argv; stdout and stderr are persisted sensitive-marked and returned only when return_output is set.",
         arguments: ExecArgsSchema,
         execute: async (
           rawArgs: unknown,

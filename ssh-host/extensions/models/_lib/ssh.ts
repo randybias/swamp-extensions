@@ -375,9 +375,25 @@ function applicableKeys(target: NormalizedTarget): HostKey[] {
   return keysForHost(parsed, target.host, target.port);
 }
 
+/**
+ * The pinned keys that apply to `target`, refusing a supplied set that matches
+ * nothing. A caller that hands over `host_keys` means it, so a set that does
+ * not apply to this host/port is a configuration error, never a silent
+ * fallback to trust-on-first-use.
+ */
+function pinnedKeys(target: NormalizedTarget): HostKey[] {
+  const applicable = applicableKeys(target);
+  if ((target.host_keys?.length ?? 0) > 0 && applicable.length === 0) {
+    throw new SshConfigError(
+      `host_keys were supplied but none apply to ${target.host}:${target.port}`,
+    );
+  }
+  return applicable;
+}
+
 /** Resolves the pinned keys for `target`, refusing an empty or inapplicable set. */
 function expectedKeys(target: NormalizedTarget): HostKey[] {
-  const applicable = applicableKeys(target);
+  const applicable = pinnedKeys(target);
   if (applicable.length === 0) {
     throw new SshConfigError(
       `host_key_policy strict requires pinned host keys for ${target.host}:${target.port}`,
@@ -695,12 +711,12 @@ function transportFailure(
   ) {
     return new SshError(`could not connect to ${target.host}:${target.port}`);
   }
-  if (/^(?:ssh|ssh-agent): /m.test(e)) {
-    return new SshError(
-      `ssh transport failed for ${target.host}:${target.port} (exit 255)`,
-    );
-  }
-  return null;
+  // OpenSSH reserves exit 255 for its own failures, so any unrecognized 255
+  // is a transport failure, not a remote exit code. A remote command that
+  // itself exits 255 is therefore reported as a transport error.
+  return new SshError(
+    `ssh transport failed for ${target.host}:${target.port} (exit 255)`,
+  );
 }
 
 /**
@@ -729,11 +745,16 @@ async function runRemote(
   const env: Record<string, string> = {};
   const args: string[] = ["-F", "/dev/null", "-o", "IdentityFile=none"];
   try {
-    const pinned = applicableKeys(t);
+    const pinned = pinnedKeys(t);
     if (t.host_key_policy === "strict") {
+      if (pinned.length === 0) {
+        throw new SshConfigError(
+          `host_key_policy strict requires pinned host keys for ${t.host}:${t.port}`,
+        );
+      }
       await Deno.writeTextFile(
         knownHosts,
-        buildKnownHosts(t.host, t.port, expectedKeys(t)),
+        buildKnownHosts(t.host, t.port, pinned),
       );
       args.push("-o", "StrictHostKeyChecking=yes");
     } else if (pinned.length > 0) {
@@ -958,7 +979,7 @@ export async function waitConnection(
   // in which case this poll verifies against it instead of trusting anew.
   const expected = t.host_key_policy === "strict"
     ? expectedKeys(t)
-    : applicableKeys(t);
+    : pinnedKeys(t);
   const deadline = deps.now() + timeoutS * 1000;
   const scanTimeout = Math.min(Math.max(t.connect_timeout_s, 1), 10);
   while (true) {

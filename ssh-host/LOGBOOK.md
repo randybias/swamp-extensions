@@ -163,3 +163,15 @@ for this round.
   `SshError` at the cap (killing the child); `runRemote` re-checks the returned
   strings with a non-allocating UTF-8 length so an injected runner is bounded
   too. Tests cover the typed overflow error.
+
+## Review ledger: round 7 (k0s review of the vendored helper)
+
+- HIGH-1 (unrecognized exit 255 became data): `transportFailure` now maps every
+  ssh exit 255 to a typed `SshError`; OpenSSH reserves 255 for its own failures,
+  so a remote command that exits 255 is reported as a transport error. The test
+  expects the error, and the README and `exec` description say so.
+- HIGH-2 (non-applicable pins fell back to accept-new): a supplied `host_keys`
+  set that matches nothing for the host/port now throws `SshConfigError` in both
+  `runRemote` and `waitConnection`; only a run with no `host_keys` at all may
+  take the first-use accept-new path. Tests cover the refusal in both paths.
+  This is the canonical `_lib/ssh.ts` sha for k0s/zfs/libvirt to resync.

@@ -87,21 +87,23 @@ swamp CLI echoes method arguments, sensitive ones included, in `--json` output
   it sees, keyed by host, port and user, and pins exactly those on every later
   run: a changed key is refused. Each line is `ssh-keyscan` format, either bare
   `type key` or with a host field naming this target (port 22 as `host`,
-  otherwise `[host]:port`).
+  otherwise `[host]:port`); a supplied set that matches no host/port is refused,
+  never silently downgraded to trust-on-first-use.
 - `exec` takes a command and its arguments as an array. Each element is quoted
   as one literal word before it is sent, so `;`, `$()`, backticks and newlines
   inside an element can never become a second command. `argv` can still run a
   destructive command on the host, and `exec` cannot roll back what it changed;
   reachability protection (locking down a host, reverting a config) belongs in
   the extension that owns that workflow. A non-zero remote exit code is returned
-  as data; an unreachable host, rejected credential or host-key mismatch is an
-  error that names the host. The result carries only `exit_code` and the
-  `stdout_sha256`/`stderr_sha256` hashes, never the raw bytes. Set
-  `return_output` to store the captured output in the sensitive-marked
-  `execution` resource; the result then also names that resource, and a model
-  read resolves its vault reference. Captured output is capped by
-  `max_output_bytes` (default 10 MiB); exceeding it is a typed error rather than
-  unbounded memory use.
+  as data, except exit 255, which ssh reserves for its own failures and which is
+  always reported as a transport error. An unreachable host, rejected credential
+  or host-key mismatch is an error that names the host. The result carries only
+  `exit_code` and the `stdout_sha256`/`stderr_sha256` hashes, never the raw
+  bytes. Set `return_output` to store the captured output in the
+  sensitive-marked `execution` resource; the result then also names that
+  resource, and a model read resolves its vault reference. Captured output is
+  capped by `max_output_bytes` (default 10 MiB); exceeding it is a typed error
+  rather than unbounded memory use.
 - `upload` writes a temporary file in the destination directory from stdin,
   applies `mode`, then renames it over the destination, so the destination is
   never half-written and an unwritable path or a destination that is a directory

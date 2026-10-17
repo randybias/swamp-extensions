@@ -1,0 +1,88 @@
+{
+  "extension": "@randybias/ssh-host",
+  "version": "2026.10.17.1",
+  "reviewedAt": "2026-10-17T12:18:53Z",
+  "dimensions": [
+    {
+      "id": "credentials-secrets",
+      "verdict": "pass",
+      "note": "A private key reaches a short-lived ssh-agent over stdin; a password goes through a temporary askpass helper and an environment variable; neither appears in ssh argv (tested). Secret fields are sensitive-marked. exec returns only exit code and SHA-256 of stdout/stderr; raw output is stored only in the sensitive execution resource when return_output is set (swamp has no sensitive result schema). wait_connection takes a scan-only target with no credential fields. Residual MEDIUM (terra): the SHA-256 of a low-entropy secret in output or content could be guessed; documented, not blocking beta. Known external issue swamp-club lab 3555: the CLI prints literal sensitive arguments, so README examples use vault references only and never --json."
+    },
+    {
+      "id": "logging-quality",
+      "verdict": "pass",
+      "note": "Each method logs once with structured placeholders (host, port, exit code, changed, key count); no secret, argv or output in log fields."
+    },
+    {
+      "id": "error-handling",
+      "verdict": "pass",
+      "note": "A remote non-zero exit is returned as data; every OpenSSH exit 255 maps to a typed SshError (host key, auth, unreachable, transport), live-verified. Typed SshConfigError for bad policy, pins that match nothing for the host, and a supplied pin that disagrees with the recorded pin (6773984, live X5b/X7b). Output over max_output_bytes kills the child with a typed error. Residual MEDIUM (terra): a Linux target without sha256sum/shasum fails only after the rename, so the error is raised after the write; documented."
+    },
+    {
+      "id": "testing-completeness",
+      "verdict": "pass",
+      "note": "64 unit tests with an injected runner, clock and sleep (no process or socket). Live end-to-end matrix against a scratch VPS through swamp model method run: exec success/non-zero/exit 255, upload, read-back, idempotent re-run, wait_connection, strict match and mismatch, unreachable host, auth failure, argv injection ($(), backtick, newline, quote break), output cap, upload onto symlink/directory/unwritable path, pins for another host under strict and insecure_tofu, TOFU first contact, wrong pin and recorded pin. X5b and X7b failed on 70b698f and pass on 6773984."
+    },
+    {
+      "id": "idempotency-resilience",
+      "verdict": "pass",
+      "note": "upload probes the destination SHA-256 and mode and skips the write (no new resource version) when both match, live-verified; a mode-only change goes through the temp-file mv -T path. insecure_tofu pins are committed only after the transport succeeds. Residual MEDIUM (terra, downgraded from HIGH under the run rulings as distributed locking for a single-orchestrator op): two simultaneous first-use calls can race on the pin write; first use is inherently trust-on-first-use."
+    },
+    {
+      "id": "api-contracts",
+      "verdict": "pass",
+      "note": "Built on the OpenSSH client, ssh-agent/ssh-add and ssh-keyscan with -F /dev/null and IdentityFile=none, so the operator's ssh config is never consulted. upload requires GNU mv -T and fails closed on non-Linux targets."
+    },
+    {
+      "id": "resource-management",
+      "verdict": "pass",
+      "note": "Temporary known_hosts, askpass helper and ssh-agent are removed or killed in finally (tested). Remote output is streamed with a cap (default 10 MiB, max 100 MiB). Residual MEDIUM (astra, terra): ssh-keyscan output is not capped; scan output is small and the cap is a follow-up."
+    },
+    {
+      "id": "published-surface-hygiene",
+      "verdict": "pass",
+      "note": "Manifest: @randybias/ssh-host, two-sentence description, Apache-2.0, additionalFiles README.md and LICENSE.txt. exec and upload descriptions start DESTRUCTIVE. Fixtures use RFC 5737 addresses and low-entropy synthetic host keys; leak scan, gitleaks and fixture guard pass. Residual LOW (astra): the exec and upload descriptions describe return_output and mode-only changes inaccurately; fix in the next version."
+    },
+    {
+      "id": "schema-strictness",
+      "verdict": "pass",
+      "note": "Global arguments are an empty strictObject; host, user, port, remote path and mode carry grammars; argv rejects NUL and every word is POSIX-quoted, live-verified against injection. host_keys and argv are bounded. host_key_policy is required with no default; strict requires pins. Residual MEDIUM (astra): argv words have no allowlist grammar beyond NUL; quoting is the defence for a generic exec primitive."
+    },
+    {
+      "id": "lifetime-gc",
+      "verdict": "pass",
+      "note": "execution, upload and connection resources: lifetime infinite, garbageCollection 10."
+    },
+    {
+      "id": "crud-completeness",
+      "verdict": "pass",
+      "note": "Transport primitive with three action methods: exec, upload and wait_connection. It owns no remote resource lifecycle, so there is no create/delete; consumers (server-host, wireguard-mesh, k0s-cluster) own that."
+    },
+    {
+      "id": "preflight-checks",
+      "verdict": "pass",
+      "note": "Policy, pins and paths are validated before any spawn; strict without pins, pins for another host and a pin that disagrees with the record are refused before connecting. upload refuses a directory, symlink, trailing slash or dot component before writing and re-checks around the rename."
+    },
+    {
+      "id": "instance-names",
+      "verdict": "pass",
+      "note": "Length-prefixed components avoid collisions: the TOFU pin is connection-h<len>-<host>-p<port> (host+port, known_hosts semantics, so a second user is verified against the same pin); exec and upload evidence add u<len>-<user>."
+    },
+    {
+      "id": "data-access",
+      "verdict": "pass",
+      "note": "Methods read only this model's own connection resource for the pin; every target arrives as method arguments, so one generic definition serves any host."
+    },
+    {
+      "id": "version-upgrades",
+      "verdict": "pass",
+      "note": "First release (2026.10.17.1): no earlier version or stored data to upgrade."
+    }
+  ],
+  "panel": {
+    "codex-astra": "codex gpt-6-astra conformance seat over the lane/d1 diff at 6773984: 0 Critical/High, 2 Medium (argv allowlist grammar, uncapped keyscan), 4 Low (two descriptions, two duplication); residuals recorded in LOGBOOK.",
+    "codex-terra": "codex gpt-5.6-terra adversarial seat at 6773984: 1 High (concurrent first-use TOFU pin race) downgraded to Medium under the run rulings, 2 Medium (upload without a hash tool, uncapped keyscan). Earlier rounds 1 to 7 and the round-6 verify are dispositioned in LOGBOOK.",
+    "merge-prep": "Post-review change 9e94c5a: plain model export so the registry catalogs the model type (dry-run uncatalogued-model); no behaviour change, 64 tests and gates 0 to 6 pass.",
+    "ocr-llm": "OCR sonnet5 and glm seats were not run in the final rounds"
+  }
+}

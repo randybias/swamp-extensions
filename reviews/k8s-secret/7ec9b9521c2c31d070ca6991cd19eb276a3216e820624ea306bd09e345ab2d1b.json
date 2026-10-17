@@ -1,0 +1,88 @@
+{
+  "extension": "@randybias/k8s-secret",
+  "version": "2026.10.17.1",
+  "reviewedAt": "2026-10-17T13:46:09Z",
+  "dimensions": [
+    {
+      "id": "credentials-secrets",
+      "verdict": "pass",
+      "note": "Values reach kubectl only as a base64 manifest on stdin, never on argv; kubeconfig and values are vault references (data is sensitive-marked) or are resolved by the model itself from data_from_vault through the runtime context.vaultService {get,put} object, tested through a plain-object context. Output and state carry metadata and key names only; per-key comparison hashes live in-process and are never returned or stored. kubectl stderr is never returned (fixed typed messages). Kubeconfig is default-deny: merge keys and tags refused up front, then canonicalized by kubectl config view --raw -o json and the canonical form validated (no exec/auth-provider plugins, no file-path credentials such as tokenFile or client-key) and written 0600 as the only kubeconfig kubectl uses. Live: value text in console output 0 across 22 cells. Residual MEDIUM (terra): if the selected cluster has no explicit server, the state-id fingerprint digests the whole kubeconfig (48 bits in the id). Residual MEDIUM (astra, delta): the optional() wrapper on data is not itself sensitive-marked (the inner record is). Known external issue swamp-club lab 3555: README uses vault references only and never --json."
+    },
+    {
+      "id": "logging-quality",
+      "verdict": "pass",
+      "note": "Each method logs once with name/status placeholders; no value, kubeconfig or kubectl output in log fields."
+    },
+    {
+      "id": "error-handling",
+      "verdict": "pass",
+      "note": "Typed K8sSecretError with fixed messages: API server unreachable, not authorized, namespace absent, kubectl failed, invalid input; vault lookup failures name the vault and key only. All live-verified (cells 8-13, V3-V4). Residual MEDIUM (terra): if the Secret is deleted between apply and the follow-up observe, state records present with no keys."
+    },
+    {
+      "id": "testing-completeness",
+      "verdict": "pass",
+      "note": "60 unit tests (secret 29, kubectl 12, kubeconfig 14, vault 5) with an injected runner, files and clock, including leak-regression tests, injected-IO temp-file cleanup, merge-key smuggles and a run against the real kubectl (tests need --allow-run=kubectl). data_from_vault is driven through a plain-object {get,put} context. Live end-to-end on a k0s single node: 14/14 on 073f868 plus 8/8 data_from_vault cells on 7dfcd38 (22/22)."
+    },
+    {
+      "id": "idempotency-resilience",
+      "verdict": "pass",
+      "note": "Server-side apply with a per-definition field manager; no-op detection compares desired keys and values with the keys this field manager owns (managedFields), so external keys are preserved and dropped owned keys are pruned. Live: idempotent re-apply leaves resourceVersion unchanged (cells 3, V2); delete of an absent Secret is a clean no-op (cell 7). Residual MEDIUM (terra, raised HIGH and downgraded): two independent swamp repositories that give a definition the same name and target the same Secret share a field manager; that is an operator naming collision, not a single-orchestrator defect."
+    },
+    {
+      "id": "api-contracts",
+      "verdict": "pass",
+      "note": "Built on kubectl apply --server-side --force-conflicts -f - and kubectl get -o json with clearEnv and an explicit KUBECONFIG; requires kubectl on PATH (README Install). The Deno.Command spawn of kubectl is accepted with an inline swamp-quality-ignore (every argument validated, documented)."
+    },
+    {
+      "id": "resource-management",
+      "verdict": "pass",
+      "note": "Raw and canonical kubeconfigs are 0600 temp files removed in finally; a write/chmod failure removes the partial file (tested). Live: temp kubeconfigs left 0 after unreachable and bad-credential cells. data is bounded to 256 keys and 1 MiB total. Residual MEDIUM (astra, raised HIGH and downgraded): the cleanup loop stops if the first remove throws a non-NotFound error, which can leave the second 0600 temp file; the error surfaces, nothing is silent. Residual MEDIUM (terra, delta): data_from_vault values are all resolved before the total-byte check."
+    },
+    {
+      "id": "published-surface-hygiene",
+      "verdict": "pass",
+      "note": "Manifest @randybias/k8s-secret 2026.10.17.1 (model version literal matches), Apache-2.0, additionalFiles README.md and LICENSE.txt, LOGBOOK not packaged. apply description starts DESTRUCTIVE. Leak scan, gitleaks and fixture guard pass. Residual LOW (astra): apply description runs four sentences; digestHex duplicates sha256Hex."
+    },
+    {
+      "id": "schema-strictness",
+      "verdict": "pass",
+      "note": "Global arguments are an empty strictObject. name/namespace are DNS-1123, context and type carry grammars, Secret keys follow the Kubernetes key rule and reject ., .. and __proto__ (null-prototype maps); exactly one of data or data_from_vault; vault and key names grammar-validated. Live: invalid key and 5 hostile name/namespace values each rejected before kubectl (cells 11, 12, V5-V7). Residual MEDIUM (astra): cluster server, proxy-url and tls-server-name accept any scalar (kubectl parses them)."
+    },
+    {
+      "id": "lifetime-gc",
+      "verdict": "pass",
+      "note": "state resource: lifetime infinite, garbageCollection 10."
+    },
+    {
+      "id": "crud-completeness",
+      "verdict": "pass",
+      "note": "apply (create/update), get, sync and delete; delete is kind action (run ruling 1: tombstoning follows kind delete, not the method name), live-verified including delete-again."
+    },
+    {
+      "id": "preflight-checks",
+      "verdict": "pass",
+      "note": "Arguments, kubeconfig shape and canonical kubeconfig are validated before any API call; namespace existence is reported with a typed error (cell 10)."
+    },
+    {
+      "id": "instance-names",
+      "verdict": "pass",
+      "note": "State name combines a readable context_namespace_name with a 16-hex digest of a nonsecret cluster fingerprint (selected context's server) and the components, so a/b vs a_b and the same context in two clusters do not collide."
+    },
+    {
+      "id": "data-access",
+      "verdict": "pass",
+      "note": "Methods read only this model's own state; kubeconfig and values arrive as method arguments or vault names, so one definition serves any cluster."
+    },
+    {
+      "id": "version-upgrades",
+      "verdict": "pass",
+      "note": "First release; no prior data to migrate."
+    }
+  ],
+  "panel": {
+    "codex-astra": "codex gpt-6-astra conformance seat over the full extension (073f868 lineage, base 74010f3): 2 High (rename delete to remove, refuted by run ruling 1; kubeconfig cleanup loop stops on a non-NotFound remove error, downgraded to MEDIUM since it fails loudly on a 0600 private temp file), 1 Medium, 2 Low. Delta seat over 7dfcd38 (base 073f868): 0 Critical/High; 2 Medium (optional data wrapper not sensitive-marked, carried; __proto__ key loss in the vault resolver, refuted because isDataKey rejects __proto__), 1 Low.",
+    "codex-terra": "codex gpt-5.6-terra adversarial seat over the full extension: 1 High (same definition name in two independent repositories shares a field manager) downgraded to MEDIUM as an operator naming collision; 2 Medium (whole-kubeconfig fingerprint when no server is set; post-apply delete race). Delta seat over 7dfcd38: 0 Critical/High; 1 Medium (data_from_vault byte budget checked after resolution).",
+    "merge-prep": "Merged as 156bf90; triage confirmed head 7dfcd38 unchanged and diff scope k8s-secret/ plus its release.yaml stanza. One comment-only change for gate 7 (swamp-quality-ignore deno-command on the kubectl spawn), no behaviour change.",
+    "ocr-llm": "OCR sonnet5 and glm seats timed out in an earlier round and were not rerun"
+  }
+}

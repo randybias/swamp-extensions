@@ -159,3 +159,30 @@ unchanged from `073f868`).
 | V8 delete and residue                | PASS   | Secret removed; value text anywhere in receipts 0                                 | `7dfcd38` | 611496f412cac947 |
 
 22/22 pass. Released on the beta channel.
+
+## 2026-10-17: merge prep and known residuals (2026.10.17.1)
+
+Review-clean (no unrefuted Critical/High). Gate 7 needed one comment-only
+change: `swamp-quality-ignore deno-command` on the kubectl spawn in
+`_lib/kubectl.ts`. Gate-8 report: `reviews/k8s-secret/7ec9b952….json`.
+Dispositions: rename `delete` refuted (run ruling 1); `__proto__` loss in the
+vault resolver refuted (`isDataKey` rejects `__proto__`). Residuals, all MEDIUM
+unless noted, for a later release:
+
+- Cleanup loop in `withKubectl` stops if the first temp-file remove throws a
+  non-NotFound error (raised HIGH, downgraded: it fails loudly on a `0600`
+  private file). Attempt every removal, then report.
+- Field manager derives from the definition name, so two independent repos with
+  the same definition name on the same Secret share it (raised HIGH, downgraded:
+  operator naming collision).
+- With no explicit `server` on the selected cluster, the state-id fingerprint
+  digests the whole kubeconfig. Require and fingerprint an explicit server.
+- A delete between apply and the follow-up observe records `present` with no
+  keys.
+- `data_from_vault` values are all resolved before the total-byte check; enforce
+  the budget during resolution.
+- The `.optional()` wrapper on `data` is not itself sensitive-marked (the inner
+  record is).
+- Cluster `server`, `proxy-url`, `tls-server-name` accept any scalar.
+- LOW: `apply` description is four sentences; `digestHex` duplicates
+  `sha256Hex`; `isVaultName`/`isVaultKey` are identical.

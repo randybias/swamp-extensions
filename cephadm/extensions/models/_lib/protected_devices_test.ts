@@ -1470,3 +1470,49 @@ Deno.test("21 any /dev-sourced mount is seeded, whatever its filesystem type", (
   });
   refused(input, ["/dev/sdb"], "protected");
 });
+
+Deno.test("22 a mounted non-root filesystem outside fstab also needs a known type", () => {
+  const rows = (fstype?: string): CommandProbe =>
+    lsblk(
+      {
+        name: "sda",
+        type: "disk",
+        children: [
+          {
+            name: "sda1",
+            type: "part",
+            fstype: "vfat",
+            uuid: "ABCD-1234",
+            mounts: ["/boot/efi"],
+          },
+          {
+            name: "sda2",
+            type: "part",
+            fstype: "ext4",
+            uuid: "11111111-2222-3333-4444-555555555555",
+            mounts: ["/"],
+          },
+        ],
+      },
+      {
+        name: "sdb",
+        type: "disk",
+        children: [{ name: "sdb1", type: "part", fstype, mounts: ["/srv"] }],
+      },
+      { name: "sdc", type: "disk" },
+    );
+  const mounted = {
+    findmnt: findmnt(
+      { target: "/", source: "/dev/sda2", fstype: "ext4" },
+      { target: "/boot/efi", source: "/dev/sda1", fstype: "vfat" },
+      { target: "/srv", source: "/dev/sdb1", fstype: "xfs" },
+    ),
+  };
+  refused(
+    plain({ ...mounted, lsblk: rows(undefined) }),
+    ["/dev/sdc"],
+    "unverifiable",
+  );
+  refused(plain({ ...mounted, lsblk: rows("xfs") }), ["/dev/sdb"], "protected");
+  safe(plain({ ...mounted, lsblk: rows("xfs") }), ["/dev/sdc"]);
+});

@@ -738,3 +738,38 @@ Deno.test("mdadm's not-a-member answer is read from stderr", async () => {
     ),
   }, "wipe.boot-unverifiable");
 });
+
+Deno.test("a failed mdadm --examine before --stop refuses and nothing is stopped", async () => {
+  let examines = 0;
+  const probes: Probes = {
+    // Reads 1 and 2 are the two guard passes; read 3 is the belt check.
+    "examine:/dev/nvme0n1": () => {
+      examines++;
+      return examines <= 2 ? NO_SUPERBLOCK : done("", 2, "mdadm: error\n");
+    },
+  };
+  const { session, calls } = routedSession(
+    (opts) => {
+      if (opts.command.startsWith("mdadm --examine --scan")) {
+        return done("ARRAY /dev/md9 metadata=1.2 name=host:9 UUID=abc\n");
+      }
+      if (opts.command === "test -e /etc/mdadm/mdadm.conf") return done("", 1);
+      if (opts.command.startsWith("mdadm --detail --scan")) return done("");
+      if (opts.command === "cat /etc/fstab") return done("");
+      return discover(opts, DIRTY_TREE);
+    },
+    "192.0.2.10",
+    probes,
+  );
+  await assertRejects(
+    () =>
+      wipeDiskToRaw({ ...deps, session }, {
+        dataDevices: [{ serial: "SN0001" }],
+        excludeDevices: [],
+      }),
+    PhaseError,
+    "wipe.boot-unverifiable",
+  );
+  assertEquals(examines, 3);
+  assertEquals(calls.some((c) => c.command.startsWith("mdadm --stop")), false);
+});

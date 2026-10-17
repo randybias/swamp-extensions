@@ -405,15 +405,22 @@ async function assertArrayNotProtected(
   const r = await root(session, mdExamineCommand(device), {
     allowNonZero: true,
   });
-  const uuid = r.code === 0 ? parseExamineUuid(r.stdout) : null;
-  if (r.code === 0 && !uuid) {
+  if (r.code !== 0) {
+    fail(
+      "wipe.boot-unverifiable",
+      "the array about to be stopped could not be examined",
+      { host, array: arrayPath, exit: r.code },
+    );
+  }
+  const uuid = parseExamineUuid(r.stdout);
+  if (!uuid) {
     fail(
       "wipe.boot-unverifiable",
       "the array about to be stopped cannot be identified",
       { host, array: arrayPath },
     );
   }
-  if (uuid && protectedSet.arrayUuids.includes(uuid)) {
+  if (protectedSet.arrayUuids.includes(uuid)) {
     fail("wipe.boot-protected", what, { host, array: arrayPath });
   }
 }

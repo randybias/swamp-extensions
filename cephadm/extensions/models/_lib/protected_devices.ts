@@ -714,7 +714,8 @@ function compute(input: ProbeInputs): ProtectedSet {
     if (m.source.startsWith("/dev/")) {
       seedDevice(m.source, `mounted at ${m.target}`);
       const path = resolver.resolve(m.source);
-      if (strict && path) mustHaveFs.add(path);
+      // A mounted filesystem always has a type, strict mount or not.
+      if (path) mustHaveFs.add(path);
       continue;
     }
     if (strict) {

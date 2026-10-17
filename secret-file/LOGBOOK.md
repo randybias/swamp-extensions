@@ -2,6 +2,28 @@
 
 Not packaged. Notes for whoever maintains this extension.
 
+## Naming and visibility
+
+Answers to the five naming questions (naming and visibility convention, §3):
+
+visibility: public
+
+audience: general
+
+1. Private or public? Public: published to swamp-club with public visibility,
+   source in this repo.
+2. Individual or general? General: any operator who needs a secret file on a
+   host over SSH; no environment, host or deployment is baked in.
+3. Does the name clearly describe and disambiguate while staying short? Not
+   fully: it names no system, and the run sp-20261017 naming audit judged
+   "rename". A rename to `ssh-secret-file` is proposed and pending Randy, so
+   2026.10.17.2 ships as `secret-file` for now.
+4. Private purpose check: not applicable (public).
+5. Would a stranger guess roughly right and wrong about nothing? Partly: a
+   stranger could guess a swamp vault backend that reads secrets from a file,
+   which is wrong. It writes a secret file onto a remote host over SSH, which
+   the proposed `ssh-secret-file` would make plain.
+
 ## Registry evaluation (before building)
 
 Searched the registry for a generic secret-file/dotenv writer over SSH:
@@ -159,3 +181,47 @@ Every non-secret external command that remains external is byte-identical
 (`test`, `stat`, `sha256sum`, `rm`); only the pre-rename `test -L`/`test -d`
 pair moved inside the write script, and the upload/chown/mv argv are now in it.
 The value is on stdin in both, never on argv, and never in state.
+
+## 2026-10-17 live e2e (2026.10.17.2)
+
+Run sp-20261017 on lane/d1-secret-file-stdin ec4cbd5 (`git archive` into a
+scratch repo), swamp 20261013.025835.0, model typeVersion 2026.10.17.2. One
+throwaway VPS `<vps5>`, user root, strict host-key pins only. Every secret input
+was a vault reference and no run used `--json`. Values: two 32-character base64
+values and three 1,000,000-character base64 values (the `content` cap is 1 MiB).
+Content was checked by comparing sha256 of the vault value with sha256 on the
+host, MATCH or MISMATCH only.
+
+| Cell                               | Result | Detail                                                                                                                                                                                                  |
+| ---------------------------------- | ------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 1 normal write                     | PASS   | `changed=true`, `600 root root`, 32 bytes, sha256 MATCH (negative control MISMATCH)                                                                                                                     |
+| 2 idempotent re-write              | PASS   | `changed=false`; inode and mtime identical, no stray file                                                                                                                                               |
+| 3 symlink destination              | PASS   | refused (`is a symlink; refusing to replace it`), exit 1; link and target unchanged; a dangling link is refused the same way                                                                            |
+| 4 directory destination            | PASS   | non-empty and empty directories refused (`is a directory`), exit 1; both intact, no stage file                                                                                                          |
+| 5 atomic publish of a changed file | PASS   | a host poller hashed the destination about every 30 ms over two 1 MB switches: 2730 samples, each pass one transition from old to new, 0 missing, 0 partial; the stage file was removed after publish   |
+| 6 short stdin (killed local ssh)   | PASS   | local ssh `kill -9` mid-stream (three runs): `write ... failed (exit 137)`, exit 1; the partial stage was removed by the trap, destination still the old value (MATCH), inode and mtime unchanged       |
+| 7 argv and transport temp scan     | PASS   | `ps -efww` every 50 ms on control and target across six writes, 22 patterns (substrings, sha256): 0 hits, no 64-hex string on the target; no `.ssh-host-upload*` file ever appeared, 0 stage files left |
+| 8 remove                           | PASS   | `Removed secret file`, then `already absent`; remove on a symlink removed only the link                                                                                                                 |
+
+Result 8/8 PASS, 0 FAIL, 0 BLOCKED. The test paths on `<vps5>` were removed and
+the scratch vault emptied afterwards; no provider resource changed.
+
+- 2026-10-17 (merge-prep, main): review at b34692d routed one Critical
+  (`set -o
+  pipefail` rejected by dash, so every changed write failed) and one
+  High (a short stdin published a truncated file); ec4cbd5 fixed both
+  (`set -eu`, a staged byte-count check before the rename,
+  `trap 'exit 1' HUP INT TERM`) and added a test that runs the generated script
+  under a real dash for the normal, short-read, symlink and directory cases.
+  Live above is on ec4cbd5, and the published bytes are that code. The staged
+  length on the remote script is a byte count, not a content-derived hash.
+  Residuals:
+  - LOW (open): the remote write keeps running after a local timeout until its
+    stdin closes; it then fails the length check and keeps the old file.
+  - LOW (open): `deno.json` grants `--allow-run=sh,dash` to the whole test task,
+    not only the runner tests.
+  - LOW (open, tightness COULD-BE-TIGHTER): the single-use `f` local in
+    `stageWriteScript` could be inlined.
+  - Refuted: a relative destination path (the schema requires an absolute path);
+    findings located only in the canonical `_lib/ssh.ts` (reviewed in ssh-host).
+  - Pending Randy: rename to `ssh-secret-file` (see Naming and visibility).

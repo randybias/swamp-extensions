@@ -14,7 +14,6 @@ import {
   type CommandRunner,
   denoDeps,
   exec as sshExec,
-  sha256Hex,
   SshConfigError,
   SshError,
   type SshTarget,
@@ -71,38 +70,6 @@ export class SyncthingError extends Error {
   }
 }
 
-/** A short, secret-free message from a Syncthing error body. */
-export function errorText(body: unknown): string {
-  if (typeof body === "string" && body !== "") return body.slice(0, 300);
-  if (body && typeof body === "object") {
-    const record = body as Record<string, unknown>;
-    const message = record.error ?? record.message;
-    if (typeof message === "string" && message !== "") {
-      return message.slice(0, 300);
-    }
-  }
-  return "no response body";
-}
-
-/** Throws when `result` is not 2xx; returns its body otherwise. */
-export function checkResult(
-  result: SyncthingResult,
-  what: string,
-): unknown {
-  if (result.status < 200 || result.status > 299) {
-    throw new SyncthingError(
-      `${what} returned ${result.status}: ${errorText(result.body)}`,
-      result.status,
-    );
-  }
-  return result.body;
-}
-
-/** True when `error` is a Syncthing 404. */
-export function isNotFound(error: unknown): boolean {
-  return error instanceof SyncthingError && error.status === 404;
-}
-
 /** The REST client. */
 export interface SyncthingClient {
   /** Sends one request; never throws on a non-2xx. */
@@ -116,7 +83,7 @@ export interface SyncthingClient {
 const LOOPBACK = /^(?:localhost|127(?:\.\d{1,3}){3}|\[::1\]|::1)$/i;
 const API_KEY_RE = /^[A-Za-z0-9_-]{8,128}$/;
 const DEVICE_ID_RE = /^[A-Z2-7]{7}(?:-[A-Z2-7]{7}){7}$/;
-const FOLDER_ID_RE = /^[A-Za-z0-9._-]{1,255}$/;
+const FOLDER_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,254}$/;
 
 /** Throws unless `value` is a Syncthing device id. */
 export function assertDeviceId(value: string): void {
@@ -155,6 +122,22 @@ export function assertApiKey(value: string): void {
       "api_key must be 8-128 letters, digits, underscore or hyphen",
     );
   }
+}
+
+/** A device address: exactly `dynamic`, or a tcp/quic/relay host:port URL. */
+export function isDeviceAddress(value: string): boolean {
+  if (value === "dynamic") return true;
+  return /^(?:tcp|quic|relay):\/\/[^\s/]+:\d{1,5}$/.test(value);
+}
+
+/** True when `value` has no control characters and is not blank. */
+export function isSafeLabel(value: string): boolean {
+  if (typeof value !== "string" || value.trim() === "") return false;
+  for (const ch of value) {
+    const code = ch.codePointAt(0) ?? 0;
+    if (code < 0x20 || code === 0x7f) return false;
+  }
+  return true;
 }
 
 /**
@@ -273,7 +256,14 @@ export function createClient(
         method,
         headers,
         body: body === undefined ? undefined : JSON.stringify(body),
+        redirect: "manual",
       });
+      if (res.status >= 300 && res.status <= 399) {
+        throw new SyncthingError(
+          `refusing a redirect (${res.status}); the API key would be re-sent`,
+          res.status,
+        );
+      }
       const text = await res.text();
       return { status: res.status, body: parseBody(text) };
     }
@@ -282,20 +272,38 @@ export function createClient(
     }
     const url = `${base}${path}`;
     const config = curlRequestConfig(method, url, api.apiKey, body);
-    // The config holds the key, so it goes to the host over stdin as a mode-0600
-    // temp file, curl reads it by path, and the file is removed afterwards. Key
-    // material never reaches an argv.
-    const stamp = await sha256Hex(`${method}\n${url}\n${config}`);
-    const tempPath = `/tmp/.syncthing-peer-${stamp.slice(0, 16)}.curlrc`;
-    await sshUpload(deps, sshTarget, {
-      path: tempPath,
-      content: config,
-      mode: "0600",
-    });
+    // One shell resolves a 0700 per-user cache directory and sweeps configs left
+    // by an earlier interrupted call; the config is uploaded there over stdin
+    // under a random name; curl and its trap-based cleanup then run in one
+    // remote shell, so a dropped session cannot strand the key file for long.
+    const prepared = await sshExec(deps, sshTarget, [
+      "sh",
+      "-c",
+      'd="$HOME/.cache/syncthing-peer"; mkdir -p -m 700 "$d" && ' +
+      'find "$d" -maxdepth 1 -name "*.curlrc" -type f -mmin +5 -delete ' +
+      '2>/dev/null; printf %s "$d"',
+    ]);
+    if (prepared.exit_code !== 0) {
+      throw new SshError(
+        `could not prepare the remote config directory (exit ${prepared.exit_code})`,
+      );
+    }
+    const dir = prepared.stdout.trim();
+    if (!dir.endsWith("/.cache/syncthing-peer")) {
+      throw new SshError("could not resolve the remote config directory");
+    }
+    const tempPath = `${dir}/${crypto.randomUUID()}.curlrc`;
     try {
+      await sshUpload(deps, sshTarget, {
+        path: tempPath,
+        content: config,
+        mode: "0600",
+      });
       const result = await sshExec(deps, sshTarget, [
-        "curl",
-        "--config",
+        "sh",
+        "-c",
+        'trap \'rm -f "$1"\' EXIT HUP INT TERM; curl --config "$1"',
+        "sh",
         tempPath,
       ]);
       if (result.exit_code !== 0) {
@@ -306,10 +314,11 @@ export function createClient(
         );
       }
       return parseCurlOutput(result.stdout);
-    } finally {
+    } catch (error) {
       await sshExec(deps, sshTarget, ["rm", "-f", tempPath]).catch(
         () => undefined,
       );
+      throw error;
     }
   };
   return { request };
@@ -323,7 +332,6 @@ export const denoSyncthingDeps: SyncthingDeps = {
   sleep: denoDeps.sleep,
 };
 
-const DEVICE_TYPES = new Set(["dynamic", "tcp", "quic", "relay"]);
 const FOLDER_TYPES = new Set(["sendreceive", "sendonly", "receiveonly"]);
 
 /** A desired device config, already validated. */
@@ -365,15 +373,16 @@ export function buildDeviceSpec(input: {
   paused?: boolean | null;
 }): DeviceSpec {
   assertDeviceId(input.deviceId);
-  if (input.name.trim() === "") {
-    throw new SshConfigError("device name must not be empty");
+  if (!isSafeLabel(input.name)) {
+    throw new SshConfigError(
+      "device name must be non-blank with no control characters",
+    );
   }
   const addresses = input.addresses ?? ["dynamic"];
   for (const address of addresses) {
-    const scheme = address.split("://")[0];
-    if (address !== "dynamic" && !DEVICE_TYPES.has(scheme)) {
+    if (!isDeviceAddress(address)) {
       throw new SshConfigError(
-        `device address must be dynamic or a tcp/quic/relay URL: ${address}`,
+        `device address must be exactly 'dynamic' or a tcp/quic/relay host:port URL: ${address}`,
       );
     }
   }
@@ -397,8 +406,10 @@ export function buildFolderSpec(input: {
 }): FolderSpec {
   assertFolderId(input.folderId);
   assertRemoteFolderPath(input.path);
-  if (input.label.trim() === "") {
-    throw new SshConfigError("folder label must not be empty");
+  if (!isSafeLabel(input.label)) {
+    throw new SshConfigError(
+      "folder label must be non-blank with no control characters",
+    );
   }
   const type = input.type ?? "sendreceive";
   if (!FOLDER_TYPES.has(type)) {
@@ -470,15 +481,46 @@ export function deviceMatches(existing: unknown, spec: DeviceSpec): boolean {
     JSON.stringify([...spec.addresses].sort());
 }
 
-/** Compares a live folder config with the desired one. */
-export function folderMatches(existing: unknown, spec: FolderSpec): boolean {
+/**
+ * Compares a live folder config with the desired one. Syncthing always adds
+ * the node's own device id to a folder's devices, so `ownDeviceId` is removed
+ * from both sides before comparing.
+ */
+export function folderMatches(
+  existing: unknown,
+  spec: FolderSpec,
+  ownDeviceId?: string,
+): boolean {
   if (!existing || typeof existing !== "object") return false;
   const current = existing as Record<string, unknown>;
   if (current.label !== spec.label) return false;
   if (current.path !== spec.path) return false;
   if (current.type !== spec.type) return false;
   if (current.paused !== spec.paused) return false;
-  const devices = folderDevices(existing);
+  const devices = folderDevices(existing).filter((id) => id !== ownDeviceId);
+  const declared = spec.devices.filter((id) => id !== ownDeviceId);
   return JSON.stringify([...devices].sort()) ===
-    JSON.stringify([...spec.devices].sort());
+    JSON.stringify([...declared].sort());
+}
+
+/**
+ * Derives a folder spec from a live read-back, so stored state reflects what
+ * Syncthing normalized rather than what was requested. The node's own device id
+ * is dropped from the recorded device list.
+ */
+export function folderSpecOf(
+  body: unknown,
+  fallback: FolderSpec,
+  ownDeviceId?: string,
+): FolderSpec {
+  if (!body || typeof body !== "object") return fallback;
+  const record = body as Record<string, unknown>;
+  return {
+    folderId: typeof record.id === "string" ? record.id : fallback.folderId,
+    label: typeof record.label === "string" ? record.label : fallback.label,
+    path: typeof record.path === "string" ? record.path : fallback.path,
+    type: typeof record.type === "string" ? record.type : fallback.type,
+    devices: folderDevices(body).filter((id) => id !== ownDeviceId),
+    paused: record.paused === true,
+  };
 }

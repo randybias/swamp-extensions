@@ -1,4 +1,9 @@
-import { assert, assertEquals, assertThrows } from "jsr:@std/assert@1.0.19";
+import {
+  assert,
+  assertEquals,
+  assertRejects,
+  assertThrows,
+} from "jsr:@std/assert@1.0.19";
 import {
   assertApiKey,
   assertApiUrl,
@@ -7,7 +12,6 @@ import {
   assertRemoteFolderPath,
   buildDeviceSpec,
   buildFolderSpec,
-  checkResult,
   createClient,
   curlConfigValue,
   curlRequestConfig,
@@ -17,7 +21,9 @@ import {
   folderBody,
   folderDevices,
   folderMatches,
-  isNotFound,
+  folderSpecOf,
+  isDeviceAddress,
+  isSafeLabel,
   parseCurlOutput,
   type SyncthingDeps,
   SyncthingError,
@@ -69,13 +75,26 @@ Deno.test("api key, device id, folder id and path grammars", () => {
   }
   assertFolderId("media");
   assertFolderId("photos-2026");
-  for (const bad of ["a/b", "", "a".repeat(256)]) {
+  for (const bad of [".", "..", ".hidden", "a/b", "", "a".repeat(256)]) {
     assertThrows(() => assertFolderId(bad), Error, undefined, bad);
   }
   assertRemoteFolderPath("/srv/data");
   for (const bad of ["relative", "/a/../b", "/a/./b", ""]) {
     assertThrows(() => assertRemoteFolderPath(bad), Error, undefined, bad);
   }
+  for (
+    const good of ["dynamic", "tcp://192.0.2.10:22000", "quic://[::1]:22000"]
+  ) {
+    assertEquals(isDeviceAddress(good), true, good);
+  }
+  for (
+    const bad of ["tcp", "dynamic://x", "tcp://host", "ftp://h:1", "tcp://h:p"]
+  ) {
+    assertEquals(isDeviceAddress(bad), false, bad);
+  }
+  assert(isSafeLabel("edge-2"));
+  assert(!isSafeLabel("  "));
+  assert(!isSafeLabel("bad\u0007name"));
 });
 
 Deno.test("curl config carries the key over stdin and escapes quotes", () => {
@@ -95,10 +114,10 @@ Deno.test("curl config carries the key over stdin and escapes quotes", () => {
 });
 
 Deno.test("parseCurlOutput splits body and status", () => {
-  assertEquals(
-    parseCurlOutput('{"ok":true}\n__SYNCTHING_STATUS__200\n'),
-    { status: 200, body: { ok: true } },
-  );
+  assertEquals(parseCurlOutput('{"ok":true}\n__SYNCTHING_STATUS__200\n'), {
+    status: 200,
+    body: { ok: true },
+  });
   assertEquals(parseCurlOutput("nope\n__SYNCTHING_STATUS__500\n"), {
     status: 500,
     body: "nope",
@@ -106,17 +125,17 @@ Deno.test("parseCurlOutput splits body and status", () => {
   assertThrows(() => parseCurlOutput("no marker"), Error, "status");
 });
 
-Deno.test("the local client sends the key only as a header", async () => {
+Deno.test("the local client sends the key only as a header and refuses redirects", async () => {
   const calls: {
     url: string;
     headers: Record<string, string>;
-    method: string;
+    redirect?: string;
   }[] = [];
   const fetch: FetchFn = (input, init) => {
     calls.push({
       url: String(input),
       headers: (init?.headers ?? {}) as Record<string, string>,
-      method: init?.method ?? "GET",
+      redirect: init?.redirect,
     });
     return Promise.resolve(
       new Response(JSON.stringify({ myID: "NODE" }), { status: 200 }),
@@ -130,14 +149,31 @@ Deno.test("the local client sends the key only as a header", async () => {
   assertEquals(result.status, 200);
   assertEquals((result.body as { myID: string }).myID, "NODE");
   assertEquals(calls[0].headers["X-API-Key"], HEADER_VALUE);
-  assertEquals(
-    calls[0].url.includes(HEADER_VALUE),
-    false,
-    "key must not be in the URL",
+  assertEquals(calls[0].url.includes(HEADER_VALUE), false, "key in URL");
+  assertEquals(calls[0].redirect, "manual");
+
+  const redirecting = createClient(
+    {
+      ...DEPS,
+      fetch: () =>
+        Promise.resolve(
+          new Response("", {
+            status: 302,
+            headers: { location: "https://evil" },
+          }),
+        ),
+    },
+    "local",
+    { apiUrl: "http://127.0.0.1:8384", apiKey: HEADER_VALUE },
+  );
+  await assertRejects(
+    () => redirecting.request("GET", "/rest/system/status"),
+    SyncthingError,
+    "redirect",
   );
 });
 
-Deno.test("the ssh client uploads the curl config over stdin and keeps the key off argv", async () => {
+Deno.test("the ssh client keeps the key off argv and runs curl with its cleanup", async () => {
   const calls: { args: string[]; stdin?: string }[] = [];
   const run: CommandRunner = async (
     cmd: string,
@@ -145,30 +181,26 @@ Deno.test("the ssh client uploads the curl config over stdin and keeps the key o
     options: RunOptions = {},
   ): Promise<CommandResult> => {
     const remote = args.at(-1) ?? "";
-    calls.push({
-      args: [cmd, ...args],
-      stdin: typeof options.stdin === "string"
-        ? options.stdin
-        : options.stdin
-        ? new TextDecoder().decode(options.stdin)
-        : undefined,
-    });
+    const stdin = typeof options.stdin === "string"
+      ? options.stdin
+      : options.stdin
+      ? new TextDecoder().decode(options.stdin)
+      : undefined;
+    calls.push({ args: [cmd, ...args], stdin });
+    if (remote.includes("mmin +5")) {
+      return { code: 0, stdout: "/root/.cache/syncthing-peer", stderr: "" };
+    }
     if (remote.includes("mktemp")) {
-      const config = typeof options.stdin === "string"
-        ? options.stdin
-        : options.stdin
-        ? new TextDecoder().decode(options.stdin)
-        : "";
       return {
         code: 0,
-        stdout: `${await sha256Hex(config)} 600\n`,
+        stdout: `${await sha256Hex(stdin ?? "")} 600\n`,
         stderr: "",
       };
     }
-    if (remote.startsWith("'curl'")) {
+    if (remote.includes("trap") && remote.includes("curl")) {
       return {
         code: 0,
-        stdout: '{"ok":true}\n__SYNCTHING_STATUS__201\n',
+        stdout: '{"ok":true}__SYNCTHING_STATUS__201',
         stderr: "",
       };
     }
@@ -181,7 +213,8 @@ Deno.test("the ssh client uploads the curl config over stdin and keeps the key o
     host: "192.0.2.10",
     port: 22,
     user: "root",
-    host_key_policy: "insecure_tofu",
+    host_key_policy: "strict",
+    host_keys: ["192.0.2.10 ssh-ed25519 AAAA"],
     connect_timeout_s: 15,
   });
   const result = await client.request("PUT", "/rest/config/devices/x", {
@@ -199,12 +232,18 @@ Deno.test("the ssh client uploads the curl config over stdin and keeps the key o
     call.stdin?.includes(`header = "X-API-Key: ${HEADER_VALUE}"`)
   );
   assert(uploaded, "the curl config must be uploaded over stdin");
-  const curl = calls.find((call) =>
-    (call.args.at(-1) ?? "").startsWith("'curl'")
+  const prepare = calls.find((call) =>
+    (call.args.at(-1) ?? "").includes("printf")
   );
-  assert(curl, "curl must run");
-  assert(curl.args.join(" ").includes("/tmp/.syncthing-peer-"));
-  assert(calls.some((call) => (call.args.at(-1) ?? "").includes("'rm'")));
+  assert(prepare, "prepare shell must run");
+  assert((prepare.args.at(-1) ?? "").includes("-mmin +5"), "stale sweep");
+  const curl = calls.find((call) => (call.args.at(-1) ?? "").includes("trap"));
+  assert(curl, "curl must run with its trap cleanup");
+  assert((curl.args.at(-1) ?? "").includes(".cache/syncthing-peer"));
+  assert(
+    (curl.args.at(-1) ?? "").includes("trap 'rm -f"),
+    "the cleanup must run in the same shell",
+  );
 });
 
 Deno.test("device and folder specs validate and match", () => {
@@ -229,8 +268,11 @@ Deno.test("device and folder specs validate and match", () => {
   );
   assert(!deviceMatches({ name: "other" }, device));
   assertThrows(
-    () =>
-      buildDeviceSpec({ deviceId: DEVICE, name: "x", addresses: ["ftp://y"] }),
+    () => buildDeviceSpec({ deviceId: DEVICE, name: "x", addresses: ["tcp"] }),
+    Error,
+  );
+  assertThrows(
+    () => buildDeviceSpec({ deviceId: DEVICE, name: "bad\u0007" }),
     Error,
   );
 
@@ -249,38 +291,27 @@ Deno.test("device and folder specs validate and match", () => {
     folderDevices({ devices: [{ deviceID: DEVICE }, "PLAINID"] }),
     [DEVICE, "PLAINID"],
   );
-  assert(
-    folderMatches(
-      {
-        id: "media",
-        label: "Media",
-        path: "/srv/media",
-        type: "sendreceive",
-        paused: false,
-        devices: [{ deviceID: DEVICE }],
-      },
-      folder,
-    ),
-  );
-  assert(!folderMatches({ label: "Media" }, folder));
+  // Syncthing adds the node's own device and extra fields to the read-back.
+  const live = {
+    id: "media",
+    label: "Media",
+    path: "/srv/media",
+    type: "sendreceive",
+    paused: false,
+    devices: [
+      { deviceID: "OWN-ID", encryptionPassword: "" },
+      { deviceID: DEVICE, introducedBy: "" },
+    ],
+  };
+  assert(folderMatches(live, folder, "OWN-ID"));
+  assert(!folderMatches(live, folder), "own device is part of the raw list");
+  assertEquals(folderSpecOf(live, folder, "OWN-ID").devices, [DEVICE]);
   assertThrows(
     () => buildFolderSpec({ folderId: "media", label: "M", path: "/a/../b" }),
     Error,
   );
-});
-
-Deno.test("checkResult and isNotFound are typed", () => {
-  assertEquals(checkResult({ status: 200, body: { ok: true } }, "x"), {
-    ok: true,
-  });
-  const error = (() => {
-    try {
-      checkResult({ status: 404, body: { error: "not found" } }, "x");
-      return null;
-    } catch (e) {
-      return e;
-    }
-  })();
-  assert(error instanceof SyncthingError);
-  assertEquals(isNotFound(error), true);
+  assertThrows(
+    () => buildFolderSpec({ folderId: "..", label: "M", path: "/a" }),
+    Error,
+  );
 });

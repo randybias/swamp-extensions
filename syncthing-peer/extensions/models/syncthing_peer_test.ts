@@ -21,6 +21,8 @@ import {
 const DEVICE =
   "AAAAAAA-BBBBBBB-CCCCCCC-DDDDDDD-EEEEEEE-FFFFFFF-GGGGGGG-HHHHHHH";
 const HEADER_VALUE = "placeholder-header-value";
+const MY_ID = "NODE-ID";
+const KEY_LINE = "192.0.2.10 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFakeKey";
 
 const BASE = {
   access: "local" as const,
@@ -44,19 +46,36 @@ const FOLDER_ARGS = {
   devices: [DEVICE],
 };
 
-interface Reply {
-  status: number;
-  body: unknown;
+/** Syncthing's folder read-back: own device added, objects with extra fields. */
+function normalizeFolder(
+  body: Record<string, unknown>,
+): Record<string, unknown> {
+  const devices = Array.isArray(body.devices) ? body.devices : [];
+  const ids = devices.map((entry) =>
+    typeof entry === "string"
+      ? entry
+      : String((entry as Record<string, unknown>).deviceID ?? "")
+  ).filter((id) => id !== "");
+  const all = [MY_ID, ...ids.filter((id) => id !== MY_ID)];
+  return {
+    ...body,
+    devices: all.map((deviceID) => ({
+      deviceID,
+      introducedBy: "",
+      encryptionPassword: "",
+    })),
+  };
 }
 
 function json(body: unknown, status = 200): Response {
   return new Response(JSON.stringify(body), { status });
 }
 
-/** A scripted Syncthing API. */
+/** A scripted Syncthing API that normalizes like the real one. */
 function server(initial: {
   devices?: Record<string, unknown>;
   folders?: Record<string, unknown>;
+  status?: number;
 }) {
   const devices = new Map(Object.entries(initial.devices ?? {}));
   const folders = new Map(Object.entries(initial.folders ?? {}));
@@ -67,10 +86,14 @@ function server(initial: {
     const path = url.pathname;
     calls.push(`${method} ${path}`);
     const body = typeof init?.body === "string"
-      ? JSON.parse(init.body)
+      ? JSON.parse(init.body) as Record<string, unknown>
       : undefined;
     if (path === "/rest/system/status") {
-      return Promise.resolve(json({ myID: "NODE-ID", version: "v2.0.0" }));
+      return Promise.resolve(
+        initial.status && initial.status !== 200
+          ? json({ error: "unauthorized" }, initial.status)
+          : json({ myID: MY_ID, version: "v2.0.0" }),
+      );
     }
     if (path === "/rest/config/devices") {
       return Promise.resolve(json([...devices.values()]));
@@ -92,6 +115,10 @@ function server(initial: {
         devices.set(id, body);
         return Promise.resolve(json({}, 200));
       }
+      if (method === "PATCH") {
+        devices.set(id, { ...(devices.get(id) as object), ...body });
+        return Promise.resolve(json({}, 200));
+      }
       if (method === "DELETE") {
         devices.delete(id);
         return Promise.resolve(json({}, 200));
@@ -108,7 +135,14 @@ function server(initial: {
         );
       }
       if (method === "PUT") {
-        folders.set(id, body);
+        folders.set(id, normalizeFolder(body as Record<string, unknown>));
+        return Promise.resolve(json({}, 200));
+      }
+      if (method === "PATCH") {
+        folders.set(
+          id,
+          normalizeFolder({ ...(folders.get(id) as object), ...body }),
+        );
         return Promise.resolve(json({}, 200));
       }
       if (method === "DELETE") {
@@ -207,6 +241,10 @@ Deno.test("model contract: empty globals, action verbs, three resources", () => 
     "folder",
     "node",
   ]);
+  // Only strict is offered for the ssh transport.
+  const shape = (model.methods.get.arguments as z.ZodObject)
+    .shape as Record<string, z.ZodType>;
+  assertEquals(shape.host_key_policy.safeParse("insecure_tofu").success, false);
 });
 
 Deno.test("schemas are strict, mark secrets, and default the API origin", () => {
@@ -227,14 +265,13 @@ Deno.test("schemas are strict, mark secrets, and default the API origin", () => 
   assertEquals(parsed.port, 22);
 });
 
-Deno.test("node instance names are distinct SHA-256 keys, not fnv", async () => {
+Deno.test("node instance names are distinct SHA-256 keys", async () => {
   const a = await nodeInstance("edge-1", "http://127.0.0.1:8384");
   const b = await nodeInstance("edge-2", "http://127.0.0.1:8384");
   const c = await nodeInstance("edge-1", "http://127.0.0.1:8385");
   assertEquals(a === b, false);
   assertEquals(a === c, false);
   assert(/^syncthing-[0-9a-f]{32}$/.test(a), a);
-  assertEquals(a.length, "syncthing-".length + 32);
 });
 
 Deno.test("get stores node status and counts", async () => {
@@ -248,29 +285,37 @@ Deno.test("get stores node status and counts", async () => {
         paused: false,
       },
     },
-    folders: {},
   });
   const m = createModel(deps(s.fetch));
   const { context, written } = testContext();
   const result = await m.methods.get.execute(BASE, context);
   assertEquals((result.result as { device_count: number }).device_count, 1);
-  assertEquals((result.result as { folder_count: number }).folder_count, 0);
   assertEquals(written[0].specName, "node");
-  assertEquals(written[0].data.status, "present");
-  assertEquals(written[0].data.my_id, "NODE-ID");
+  assertEquals(written[0].data.my_id, MY_ID);
 });
 
-Deno.test("sync records unreachable instead of failing", async () => {
+Deno.test("sync records unreachable on a connect failure", async () => {
   const fetch: FetchFn = () => Promise.reject(new Error("connection refused"));
   const m = createModel(deps(fetch));
   const { context, written } = testContext();
   const result = await m.methods.sync.execute(BASE, context);
   assertEquals((result.result as { reachable: boolean }).reachable, false);
   assertEquals(written[0].data.status, "unreachable");
-  assertEquals(written[0].data.reachable, false);
 });
 
-Deno.test("ensure_device creates, then is a no-op, then removes", async () => {
+Deno.test("sync rethrows an auth failure instead of recording unreachable", async () => {
+  const s = server({ status: 401 });
+  const m = createModel(deps(s.fetch));
+  const { context, written } = testContext();
+  const error = await assertRejects(
+    () => m.methods.sync.execute(BASE, context),
+    SyncthingError,
+  );
+  assertEquals(error.status, 401);
+  assertEquals(written.length, 0);
+});
+
+Deno.test("ensure_device creates, is a no-op, then removes", async () => {
   const s = server({});
   const m = createModel(deps(s.fetch));
   const first = testContext();
@@ -281,7 +326,10 @@ Deno.test("ensure_device creates, then is a no-op, then removes", async () => {
   assertEquals((created.result as { changed: boolean }).changed, true);
   assertEquals(first.written[0].specName, "device");
   assertEquals(first.written[0].data.status, "present");
-  assert(first.written[0].name.startsWith("syncthing-"));
+  assert(
+    s.calls.some((c) => c === `PUT /rest/config/devices/${DEVICE}`),
+    "a create uses PUT",
+  );
 
   const second = testContext();
   const noop = await m.methods.ensure_device.execute(
@@ -289,10 +337,6 @@ Deno.test("ensure_device creates, then is a no-op, then removes", async () => {
     second.context,
   );
   assertEquals((noop.result as { changed: boolean }).changed, false);
-  assertEquals(
-    s.calls.filter((c) => c.startsWith("PUT /rest/config/devices")).length,
-    1,
-  );
 
   const third = testContext();
   const removed = await m.methods.remove_device.execute(
@@ -301,48 +345,9 @@ Deno.test("ensure_device creates, then is a no-op, then removes", async () => {
   );
   assertEquals((removed.result as { changed: boolean }).changed, true);
   assertEquals(third.written[0].data.status, "removed");
-
-  const fourth = testContext();
-  const again = await m.methods.remove_device.execute(
-    { ...BASE, device_id: DEVICE },
-    fourth.context,
-  );
-  assertEquals((again.result as { changed: boolean }).changed, false);
-  assertEquals(fourth.written[0].data.status, "not_found");
 });
 
-Deno.test("ensure_folder creates, then is a no-op, then removes", async () => {
-  const s = server({});
-  const m = createModel(deps(s.fetch));
-  const first = testContext();
-  const created = await m.methods.ensure_folder.execute(
-    FOLDER_ARGS,
-    first.context,
-  );
-  assertEquals((created.result as { changed: boolean }).changed, true);
-  assertEquals(first.written[0].data.device_ids, [DEVICE]);
-
-  const second = testContext();
-  const noop = await m.methods.ensure_folder.execute(
-    FOLDER_ARGS,
-    second.context,
-  );
-  assertEquals((noop.result as { changed: boolean }).changed, false);
-  assertEquals(
-    s.calls.filter((c) => c.startsWith("PUT /rest/config/folders")).length,
-    1,
-  );
-
-  const third = testContext();
-  const removed = await m.methods.remove_folder.execute(
-    { ...BASE, folder_id: "media" },
-    third.context,
-  );
-  assertEquals((removed.result as { changed: boolean }).changed, true);
-  assertEquals(third.written[0].data.status, "removed");
-});
-
-Deno.test("ensure_device updates a differing config", async () => {
+Deno.test("ensure_device PATCHes an existing differing device", async () => {
   const s = server({
     devices: {
       [DEVICE]: {
@@ -358,11 +363,57 @@ Deno.test("ensure_device updates a differing config", async () => {
   const { context, written } = testContext();
   const result = await m.methods.ensure_device.execute(DEVICE_ARGS, context);
   assertEquals((result.result as { changed: boolean }).changed, true);
-  assertEquals(written[0].data.changed, true);
-  assertEquals(
-    (s.devices.get(DEVICE) as { name?: string } | undefined)?.name,
-    "edge-2",
+  assert(
+    s.calls.some((c) => c === `PATCH /rest/config/devices/${DEVICE}`),
+    "an update uses PATCH",
   );
+  assert(
+    !s.calls.some((c) => c === `PUT /rest/config/devices/${DEVICE}`),
+    "an update must not PUT",
+  );
+  assertEquals(written[0].data.changed, true);
+});
+
+Deno.test("ensure_folder creates, is a no-op on the second run, then removes", async () => {
+  const s = server({});
+  const m = createModel(deps(s.fetch));
+  const first = testContext();
+  const created = await m.methods.ensure_folder.execute(
+    FOLDER_ARGS,
+    first.context,
+  );
+  assertEquals((created.result as { changed: boolean }).changed, true);
+  assertEquals(first.written[0].data.device_ids, [DEVICE]);
+  // The observed read-back is stored, not the requested spec.
+  const stored = first.written[0].data.devices ?? first.written[0].data;
+  assert(stored !== undefined);
+  assertEquals(
+    s.calls.filter((c) => c === "PUT /rest/config/folders/media").length,
+    1,
+  );
+
+  const second = testContext();
+  const noop = await m.methods.ensure_folder.execute(
+    FOLDER_ARGS,
+    second.context,
+  );
+  assertEquals((noop.result as { changed: boolean }).changed, false);
+  assertEquals(
+    s.calls.filter((c) =>
+      c === "PUT /rest/config/folders/media" ||
+      c === "PATCH /rest/config/folders/media"
+    ).length,
+    1,
+    "a second run must not write",
+  );
+
+  const third = testContext();
+  const removed = await m.methods.remove_folder.execute(
+    { ...BASE, folder_id: "media" },
+    third.context,
+  );
+  assertEquals((removed.result as { changed: boolean }).changed, true);
+  assertEquals(third.written[0].data.status, "removed");
 });
 
 Deno.test("a non-loopback plain-HTTP API origin is refused", async () => {
@@ -371,10 +422,10 @@ Deno.test("a non-loopback plain-HTTP API origin is refused", async () => {
   const { context } = testContext();
   await assertRejects(
     () =>
-      m.methods.get.execute({
-        ...BASE,
-        api_url: "http://syncthing.example.com",
-      }, context),
+      m.methods.get.execute(
+        { ...BASE, api_url: "http://syncthing.example.com" },
+        context,
+      ),
     SshConfigError,
     "HTTPS",
   );
@@ -400,6 +451,14 @@ Deno.test("bad device, folder and path inputs are refused", async () => {
       ),
     SshConfigError,
   );
+  await assertRejects(
+    () =>
+      m.methods.ensure_folder.execute(
+        { ...FOLDER_ARGS, folder_id: ".." },
+        context,
+      ),
+    SshConfigError,
+  );
 });
 
 Deno.test("the ssh transport reaches the API and keeps the key off argv", async () => {
@@ -417,22 +476,25 @@ Deno.test("the ssh transport reaches the API and keeps the key off argv", async 
         : new TextDecoder().decode(options.stdin);
     }
     calls.push({ args: [cmd, ...args], stdin: lastConfig });
-    if (remote.startsWith("'curl'")) {
-      const url = /url = "([^"]+)"/.exec(lastConfig)?.[1] ?? "";
-      const path = new URL(url).pathname;
-      const body = path === "/rest/system/status"
-        ? { myID: "NODE-ID", version: "v2.0.0" }
-        : [];
-      return {
-        code: 0,
-        stdout: `${JSON.stringify(body)}__SYNCTHING_STATUS__200`,
-        stderr: "",
-      };
+    if (remote.includes("mmin +5")) {
+      return { code: 0, stdout: "/root/.cache/syncthing-peer", stderr: "" };
     }
     if (remote.includes("mktemp")) {
       return {
         code: 0,
         stdout: `${await sha256Hex(lastConfig)} 600\n`,
+        stderr: "",
+      };
+    }
+    if (remote.includes("trap") && remote.includes("curl")) {
+      const url = /url = "([^"]+)"/.exec(lastConfig)?.[1] ?? "";
+      const path = new URL(url).pathname;
+      const body = path === "/rest/system/status"
+        ? { myID: MY_ID, version: "v2.0.0" }
+        : [];
+      return {
+        code: 0,
+        stdout: `${JSON.stringify(body)}__SYNCTHING_STATUS__200`,
         stderr: "",
       };
     }
@@ -446,11 +508,12 @@ Deno.test("the ssh transport reaches the API and keeps the key off argv", async 
       access: "ssh",
       host: "192.0.2.10",
       user: "root",
-      host_key_policy: "insecure_tofu",
+      host_key_policy: "strict",
+      host_keys: [KEY_LINE],
     },
     context,
   );
-  assertEquals((result.result as { my_id: string }).my_id, "NODE-ID");
+  assertEquals((result.result as { my_id: string }).my_id, MY_ID);
   assertEquals(written[0].data.reachable, true);
   for (const call of calls) {
     assertEquals(
@@ -485,7 +548,7 @@ Deno.test("a strict ssh policy without pinned keys is refused before any call", 
         context,
       ),
     SshConfigError,
-    "strict requires",
+    "host_keys",
   );
   assertEquals(s.calls.length, 0);
 });

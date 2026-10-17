@@ -74,13 +74,20 @@ Read the change flag with
 
 - The API key travels only in the `X-API-Key` header. A local call sets it as an
   in-memory request header; a remote call uploads a mode-0600 `curl --config`
-  file over stdin, runs `curl --config <file>`, and removes it, so the key never
+  file over stdin to a random name in a 0700 `~/.cache/syncthing-peer/`
+  directory, runs `curl` and its trap-based cleanup in **one** remote shell, and
+  sweeps any config older than a few minutes before each upload. The key never
   reaches a URL, a process argument, a log or stored state.
 - Plain HTTP is accepted only on a loopback address; any other origin must use
-  HTTPS.
-- `ensure_device` and `ensure_folder` create what is missing and update what
-  differs, then re-read the config and refuse if it did not converge. An
-  identical config is a no-op with `changed false`.
+  HTTPS. A redirect is refused rather than re-sending the key.
+- The SSH transport is strict-only: `host_key_policy=strict` and a non-empty
+  `host_keys` are required, so the host is verified on every run.
+- `ensure_device` and `ensure_folder` create what is missing with `PUT` and
+  update what differs with `PATCH`, so fields this model does not declare are
+  left alone; they re-read the config and refuse if it did not converge. An
+  identical config is a no-op with `changed false`. Syncthing always adds the
+  node's own device to a folder, so the comparison ignores it and stored state
+  keeps the observed read-back.
 - `remove_device` and `remove_folder` delete and prove the config is gone; an
   already-absent config is a clean no-op.
 - State is keyed by `sha256(node, api_url)`, with device and folder records

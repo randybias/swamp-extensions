@@ -23,6 +23,7 @@ import {
   folderBody,
   folderMatches,
   type FolderSpec,
+  folderSpecOf,
   type SyncthingAccess,
   type SyncthingClient,
   type SyncthingDeps,
@@ -33,6 +34,7 @@ import {
   type HostKeyPolicy,
   sha256Hex,
   SshConfigError,
+  SshError,
   type SshTarget,
   USER_RE,
 } from "./_lib/ssh.ts";
@@ -126,11 +128,11 @@ const SSH_FIELDS = {
   user: z.string().regex(USER_RE).nullish().describe(
     "SSH user; required for the ssh transport.",
   ),
-  host_key_policy: z.enum(["strict", "insecure_tofu"]).nullish().describe(
-    "Required for the ssh transport. strict verifies against host_keys.",
+  host_key_policy: z.enum(["strict"]).nullish().describe(
+    "Required for the ssh transport, and only strict is offered: the host is verified against host_keys on every run.",
   ),
-  host_keys: z.array(z.string().max(8192)).max(64).nullish().describe(
-    "ssh-keyscan-format lines, required for strict.",
+  host_keys: z.array(z.string().max(8192)).min(1).max(64).nullish().describe(
+    "ssh-keyscan-format lines; required for the ssh transport, and the only accepted host keys.",
   ),
   private_key: z.string().max(65536).meta({ sensitive: true }).nullish()
     .describe("Private key text; delivered over stdin to a short-lived agent."),
@@ -293,17 +295,20 @@ interface EnsureFolderArgs extends AccessArgs {
 /** Validates the target and builds an SSH target for the ssh transport. */
 function sshTargetOf(args: AccessArgs): SshTarget | undefined {
   if (args.access !== "ssh") return undefined;
-  if (!args.host || !args.user || !args.host_key_policy) {
+  if (!args.host || !args.user) {
     throw new SshConfigError(
-      "the ssh transport requires host, user and host_key_policy",
+      "the ssh transport requires host and user",
+    );
+  }
+  if (args.host_key_policy !== "strict") {
+    throw new SshConfigError(
+      "the ssh transport only offers host_key_policy strict",
     );
   }
   const hostKeys = args.host_keys ?? undefined;
-  if (
-    args.host_key_policy === "strict" && (!hostKeys || hostKeys.length === 0)
-  ) {
+  if (!hostKeys || hostKeys.length === 0) {
     throw new SshConfigError(
-      "host_key_policy strict requires a non-empty host_keys list",
+      "the ssh transport requires a non-empty host_keys list",
     );
   }
   if (args.private_key && args.password) {
@@ -313,12 +318,26 @@ function sshTargetOf(args: AccessArgs): SshTarget | undefined {
     host: args.host,
     port: args.port ?? 22,
     user: args.user,
-    host_key_policy: args.host_key_policy,
+    host_key_policy: "strict",
     host_keys: hostKeys,
     private_key: args.private_key ?? undefined,
     password: args.password ?? undefined,
     connect_timeout_s: args.connect_timeout_s ?? 15,
   };
+}
+
+/** A configuration, host-key or auth failure that must never be "unreachable". */
+function isFatalObservationError(error: unknown): boolean {
+  if (error instanceof SshConfigError) return true;
+  if (error instanceof SyncthingError) {
+    return error.status === 401 || error.status === 403;
+  }
+  if (error instanceof SshError) {
+    return /host key verification failed|authentication failed/i.test(
+      error.message,
+    );
+  }
+  return false;
 }
 
 /** Builds the client for one call. */
@@ -396,6 +415,30 @@ async function listFolders(client: SyncthingClient): Promise<unknown[]> {
     `folder list returned ${result.status}`,
     result.status,
   );
+}
+
+/** One observation of a node: status, device list, folder list and own id. */
+interface Observation {
+  status: Record<string, unknown>;
+  devices: unknown[];
+  folders: unknown[];
+  myId?: string;
+}
+
+/** Reads status, devices and folders as one observation. */
+async function observe(client: SyncthingClient): Promise<Observation> {
+  const raw = await readStatus(client);
+  const status = raw && typeof raw === "object"
+    ? raw as Record<string, unknown>
+    : {};
+  const devices = await listDevices(client);
+  const folders = await listFolders(client);
+  return {
+    status,
+    devices,
+    folders,
+    myId: typeof status.myID === "string" ? status.myID : undefined,
+  };
 }
 
 /** Reads one device config; null on 404. */
@@ -569,35 +612,29 @@ export function createModel(
           const args = rawArgs as AccessArgs;
           const client = clientOf(deps, args);
           const instance = await nodeInstance(args.node, args.api_url);
-          const status = await readStatus(client);
-          const devices = await listDevices(client);
-          const folders = await listFolders(client);
-          const statusRecord = status && typeof status === "object"
-            ? status as Record<string, unknown>
-            : {};
+          const observation = await observe(client);
+          const version = typeof observation.status.version === "string"
+            ? observation.status.version
+            : undefined;
           const handle = await writeNode(context, args, instance, {
-            my_id: typeof statusRecord.myID === "string"
-              ? statusRecord.myID
-              : undefined,
-            version: typeof statusRecord.version === "string"
-              ? statusRecord.version
-              : undefined,
+            my_id: observation.myId,
+            version,
             reachable: true,
-            device_count: devices.length,
-            folder_count: folders.length,
+            device_count: observation.devices.length,
+            folder_count: observation.folders.length,
             status: "present",
           }, new Date(deps.now()).toISOString());
           context.logger.info("Syncthing node {node} has {devices} devices", {
             node: args.node,
-            devices: devices.length,
+            devices: observation.devices.length,
           });
           return {
             dataHandles: [handle],
             result: {
-              my_id: statusRecord.myID,
-              version: statusRecord.version,
-              device_count: devices.length,
-              folder_count: folders.length,
+              my_id: observation.myId,
+              version,
+              device_count: observation.devices.length,
+              folder_count: observation.folders.length,
             },
           };
         },
@@ -615,29 +652,29 @@ export function createModel(
           const client = clientOf(deps, args);
           const instance = await nodeInstance(args.node, args.api_url);
           try {
-            const status = await readStatus(client);
-            const devices = await listDevices(client);
-            const folders = await listFolders(client);
-            const statusRecord = status && typeof status === "object"
-              ? status as Record<string, unknown>
-              : {};
+            const observation = await observe(client);
+            const version = typeof observation.status.version === "string"
+              ? observation.status.version
+              : undefined;
             const handle = await writeNode(context, args, instance, {
-              my_id: typeof statusRecord.myID === "string"
-                ? statusRecord.myID
-                : undefined,
-              version: typeof statusRecord.version === "string"
-                ? statusRecord.version
-                : undefined,
+              my_id: observation.myId,
+              version,
               reachable: true,
-              device_count: devices.length,
-              folder_count: folders.length,
+              device_count: observation.devices.length,
+              folder_count: observation.folders.length,
               status: "present",
             }, new Date(deps.now()).toISOString());
             return {
               dataHandles: [handle],
-              result: { reachable: true, device_count: devices.length },
+              result: {
+                reachable: true,
+                device_count: observation.devices.length,
+              },
             };
           } catch (error) {
+            // A configuration, host-key or auth failure is not "unreachable";
+            // only a connect or timeout failure is recorded as down.
+            if (isFatalObservationError(error)) throw error;
             const message = error instanceof Error
               ? error.message
               : String(error);
@@ -691,8 +728,11 @@ export function createModel(
               result: { changed: false, device_id: spec.deviceId },
             };
           }
+          // PATCH an existing device so fields this model does not declare are
+          // left alone; PUT only creates.
+          const method = existing === null ? "PUT" : "PATCH";
           const put = await client.request(
-            "PUT",
+            method,
             `/rest/config/devices/${encodeURIComponent(spec.deviceId)}`,
             deviceBody(spec),
           );
@@ -708,10 +748,14 @@ export function createModel(
               `device ${spec.deviceId} did not converge`,
             );
           }
-          const handle = await writeDevice(context, args, instance, spec, {
-            changed: true,
-            status: "present",
-          }, observedAt);
+          const handle = await writeDevice(
+            context,
+            args,
+            instance,
+            specOfDevice(after, spec),
+            { changed: true, status: "present" },
+            observedAt,
+          );
           context.logger.info("Ensured device {device}", {
             device: spec.deviceId,
           });
@@ -807,19 +851,31 @@ export function createModel(
           const nodeHash = await nodeInstance(args.node, args.api_url);
           const instance = childInstance(nodeHash, "f", spec.folderId);
           const observedAt = new Date(deps.now()).toISOString();
+          // Syncthing always adds the node's own device to a folder, so the
+          // comparison ignores it on both sides.
+          const status = await readStatus(client);
+          const myId = status && typeof status === "object"
+            ? (status as Record<string, unknown>).myID
+            : undefined;
+          const ownId = typeof myId === "string" ? myId : undefined;
           const existing = await readFolder(client, spec.folderId);
-          if (existing !== null && folderMatches(existing, spec)) {
-            const handle = await writeFolder(context, args, instance, spec, {
-              changed: false,
-              status: "present",
-            }, observedAt);
+          if (existing !== null && folderMatches(existing, spec, ownId)) {
+            const handle = await writeFolder(
+              context,
+              args,
+              instance,
+              folderSpecOf(existing, spec, ownId),
+              { changed: false, status: "present" },
+              observedAt,
+            );
             return {
               dataHandles: [handle],
               result: { changed: false, folder_id: spec.folderId },
             };
           }
+          const method = existing === null ? "PUT" : "PATCH";
           const put = await client.request(
-            "PUT",
+            method,
             `/rest/config/folders/${encodeURIComponent(spec.folderId)}`,
             folderBody(spec),
           );
@@ -830,15 +886,19 @@ export function createModel(
             );
           }
           const after = await readFolder(client, spec.folderId);
-          if (after === null || !folderMatches(after, spec)) {
+          if (after === null || !folderMatches(after, spec, ownId)) {
             throw new SyncthingError(
               `folder ${spec.folderId} did not converge`,
             );
           }
-          const handle = await writeFolder(context, args, instance, spec, {
-            changed: true,
-            status: "present",
-          }, observedAt);
+          const handle = await writeFolder(
+            context,
+            args,
+            instance,
+            folderSpecOf(after, spec, ownId),
+            { changed: true, status: "present" },
+            observedAt,
+          );
           context.logger.info("Ensured folder {folder}", {
             folder: spec.folderId,
           });
@@ -894,10 +954,14 @@ export function createModel(
               `folder ${args.folder_id} is still present`,
             );
           }
-          const handle = await writeFolder(context, args, instance, spec, {
-            changed: true,
-            status: "removed",
-          }, observedAt);
+          const handle = await writeFolder(
+            context,
+            args,
+            instance,
+            folderSpecOf(existing, spec),
+            { changed: true, status: "removed" },
+            observedAt,
+          );
           context.logger.info("Removed folder {folder}", {
             folder: args.folder_id,
           });

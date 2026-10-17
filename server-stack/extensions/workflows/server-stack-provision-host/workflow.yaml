@@ -1,0 +1,867 @@
+id: 81b1bccb-23ec-4703-8e09-e97a8591e1b2
+name: "@randybias/server-stack-provision-host"
+version: 1
+description: Build a hardened k0s host running NATS on the mesh, then publish its DNS
+vaults:
+  - server-stack
+  - default
+inputs:
+  type: object
+  additionalProperties: false
+  required:
+    - hostname
+    - ownership_tag
+    - server_model
+    - project_id
+    - plan
+    - region
+    - image
+    - cycle
+    - ssh_private_key_key
+    - user_data_key
+    - cloudflare_token_key
+    - wg_private_key_key
+    - kubeconfig_key
+    - ssh_user
+    - host_key_policy
+    - admin_user
+    - mesh_node
+    - mesh_peers
+    - mesh_peers_allowlist
+    - management_cidrs
+    - verify_timeout_s
+    - k0s_version
+    - k0s_binary_sha256
+    - k0s_api_sans
+    - k0s_pod_cidr
+    - k0s_service_cidr
+    - nats_chart
+    - cloudflare_zone_id
+    - dns_record_name
+    - dns_record_target
+  properties:
+    hostname:
+      type: string
+      description: Server hostname; keys every model's state
+      maxLength: 253
+      pattern: '^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)*$'
+    adopt:
+      type: boolean
+      description: Allow an existing owned server and record
+      default: false
+    ownership_tag:
+      type: string
+      description: Server ownership tag, key=value
+      pattern: "^[A-Za-z0-9_.:/-]{1,128}=[A-Za-z0-9_.:/-]{1,256}$"
+    server_model:
+      type: string
+      description: Name of a generic servers definition
+      pattern: "^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$"
+    project_id:
+      type: integer
+      description: Cherry Servers project ID
+      minimum: 1
+    plan:
+      type: string
+      description: Cherry Servers plan slug
+      pattern: "^[A-Za-z0-9][A-Za-z0-9_.:/-]{0,127}$"
+    region:
+      type: string
+      description: Cherry Servers region slug
+      pattern: "^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$"
+    image:
+      type: string
+      description: Cherry Servers image slug
+      pattern: "^[A-Za-z0-9][A-Za-z0-9_.:/ -]{0,255}$"
+    cycle:
+      type: string
+      description: Cherry Servers billing cycle
+      enum: [hourly, monthly, annually]
+    ssh_keys:
+      type: array
+      description: Cherry Servers SSH key IDs
+      default: []
+      uniqueItems: true
+      items:
+        type: integer
+        minimum: 1
+    tags:
+      type: object
+      description: Server tag key and value pairs
+      default: {}
+      propertyNames:
+        pattern: "^[A-Za-z0-9_.:/-]{1,128}$"
+      additionalProperties:
+        type: string
+        pattern: '^[^\r\n\x00]{0,256}$'
+    os_partition_size:
+      type: integer
+      description: OS partition size in GB, for bare metal
+      minimum: 1
+    ssh_private_key_key:
+      type: string
+      description: Vault key of the admin SSH private key
+      pattern: "^[A-Za-z0-9][A-Za-z0-9_./-]{0,255}$"
+    user_data_key:
+      type: string
+      description: Vault key of cloud-init user data with the pinned host keys
+      pattern: "^[A-Za-z0-9][A-Za-z0-9_./-]{0,255}$"
+    cloudflare_token_key:
+      type: string
+      description: Vault key of a Cloudflare DNS edit token
+      pattern: "^[A-Za-z0-9][A-Za-z0-9_./-]{0,255}$"
+    wg_private_key_key:
+      type: string
+      description: Vault key of the node WireGuard private key
+      pattern: "^[A-Za-z0-9][A-Za-z0-9_./-]{0,255}$"
+    kubeconfig_key:
+      type: string
+      description: Vault key the admin kubeconfig is written to
+      pattern: "^[A-Za-z0-9][A-Za-z0-9_./-]{0,255}$"
+    ssh_user:
+      type: string
+      description: Remote SSH user
+      pattern: "^[a-z_][a-z0-9_-]{0,31}$"
+    ssh_port:
+      type: integer
+      description: Remote SSH port, 1-65535
+      minimum: 1
+      maximum: 65535
+      default: 22
+    host_key_policy:
+      type: string
+      description: SSH host-key policy
+      enum: [strict, accept-new]
+    known_hosts:
+      type: array
+      description: Expected host keys in ssh-keyscan format
+      default: []
+      items:
+        type: string
+        maxLength: 4096
+    ready_timeout_s:
+      type: integer
+      description: Cherry readiness timeout in seconds
+      minimum: 10
+      maximum: 7200
+      default: 2700
+    base_packages:
+      type: array
+      description: Debian package names to install
+      default: []
+      items:
+        type: string
+        maxLength: 64
+    admin_user:
+      type: string
+      description: Administrative account to create
+      pattern: "^[a-z_][a-z0-9_-]{0,31}$"
+    authorized_keys:
+      type: array
+      description: Public keys authorized for the admin account
+      default: []
+      items:
+        type: string
+        maxLength: 4096
+    sysctl:
+      type: object
+      description: Sysctl keys and values
+      default: {}
+      additionalProperties:
+        type: string
+        maxLength: 128
+    timezone:
+      type: string
+      description: Time zone, for example UTC
+      default: UTC
+      maxLength: 64
+    mesh_node:
+      type: object
+      description: This node's mesh record
+      additionalProperties: false
+      required: [name, address, listen_port]
+      properties:
+        name:
+          type: string
+          maxLength: 63
+        address:
+          type: string
+          maxLength: 64
+        listen_port:
+          type: integer
+          minimum: 1
+          maximum: 65535
+        endpoint:
+          type: string
+          maxLength: 255
+    mesh_peers:
+      type: array
+      description: Mesh peers visible to this node
+      items:
+        type: object
+    mesh_peers_allowlist:
+      type: array
+      description: Peer names or public keys allowed in the mesh
+      items:
+        type: string
+        maxLength: 64
+    mesh_relay_exclusion:
+      type: array
+      description: Relay exclusion rules
+      default: []
+      items:
+        type: object
+    mesh_handshake_max_age_s:
+      type: integer
+      description: A handshake older than this many seconds fails verification
+      minimum: 10
+      maximum: 3600
+      default: 180
+    management_cidrs:
+      type: array
+      description: CIDRs allowed to reach SSH and admin ports
+      minItems: 1
+      items:
+        type: string
+        maxLength: 64
+    allow_tcp:
+      type: array
+      description: Public TCP ports
+      default: []
+      items:
+        type: integer
+        minimum: 1
+        maximum: 65535
+    allow_udp:
+      type: array
+      description: Public UDP ports; must include the mesh listen port
+      default: []
+      items:
+        type: integer
+        minimum: 1
+        maximum: 65535
+    revert_after_s:
+      type: integer
+      description: Seconds before an uncommitted change reverts, 60-1800
+      minimum: 60
+      maximum: 1800
+      default: 300
+    verify_timeout_s:
+      type: integer
+      description: Seconds to prove reachability after a change
+      minimum: 10
+      maximum: 1740
+    k0s_version:
+      type: string
+      description: Pinned k0s version, for example v1.31.2+k0s.0
+      pattern: "^[A-Za-z0-9][A-Za-z0-9.+-]{0,63}$"
+    k0s_binary_sha256:
+      type: string
+      description: SHA-256 of the k0s binary, 64 hex characters
+      pattern: "^[0-9a-f]{64}$"
+    k0s_download_url:
+      type: string
+      description: Optional k0s binary URL override
+      maxLength: 512
+    k0s_api_sans:
+      type: array
+      description: API server certificate SANs; must include the mesh address
+      items:
+        type: string
+        maxLength: 253
+    k0s_pod_cidr:
+      type: string
+      description: Pod network CIDR
+      maxLength: 64
+    k0s_service_cidr:
+      type: string
+      description: Service network CIDR
+      maxLength: 64
+    cluster_namespaces:
+      type: array
+      description: DNS-1123 namespaces created before secrets
+      default: []
+      items:
+        type: string
+        pattern: "^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$"
+    cluster_secrets:
+      type: array
+      description: Secrets to write, each with vault-key values
+      default: []
+      items:
+        type: object
+    nats_chart:
+      type: object
+      description: NATS Helm chart, with values exposing the client port on the mesh
+      required: [chart, repo, version, namespace]
+      properties:
+        chart:
+          type: string
+          maxLength: 128
+        repo:
+          type: string
+          maxLength: 512
+        version:
+          type: string
+          maxLength: 64
+        namespace:
+          type: string
+          maxLength: 63
+        values:
+          type: object
+    nats_probe_port:
+      type: integer
+      description: NATS client port reached over the mesh
+      minimum: 1
+      maximum: 65535
+      default: 4222
+    nats_expect_server_name:
+      type: string
+      description: Expected INFO server_name, if any
+      maxLength: 253
+    cloudflare_zone_id:
+      type: string
+      description: Cloudflare zone ID
+      maxLength: 64
+    dns_record_name:
+      type: string
+      description: Fully qualified A record name
+      maxLength: 253
+    dns_record_target:
+      type: string
+      description: Which address the A record points at
+      enum: [public, mesh]
+    dns_ttl:
+      type: integer
+      description: A record TTL in seconds, 60-86400
+      minimum: 60
+      maximum: 86400
+      default: 300
+jobs:
+  - name: preflight
+    description: Check inputs and probe Cherry and Cloudflare before anything is created
+    steps:
+      - name: check-inputs
+        description: Check cross-input invariants before any remote call
+        task:
+          type: assert
+          expr: >-
+            inputs.verify_timeout_s + 60 <= inputs.revert_after_s &&
+                inputs.allow_udp.exists(p, p == inputs.mesh_node.listen_port) &&
+                (inputs.host_key_policy != "strict" || size(inputs.known_hosts) > 0) &&
+                size(inputs.management_cidrs) > 0
+          message: Cross-input invariants failed
+          severity: high
+      - name: probe-server
+        description: List the project's servers via the Cherry Servers API
+        task:
+          type: model_method
+          modelIdOrName: ${{ inputs.server_model }}
+          methodName: list
+      - name: check-cloudflare-token
+        description: Read the zone via the Cloudflare API to prove the token works
+        task:
+          type: model_method
+          modelType: "@webframp/cloudflare/zone"
+          modelName: cloudflare-zone
+          methodName: get
+          globalArgs:
+            apiToken: ${{ vault.get("server-stack", inputs.cloudflare_token_key) }}
+          inputs:
+            zoneId: ${{ inputs.cloudflare_zone_id }}
+      - name: probe-record
+        description: Look up the target A record via the Cloudflare API
+        allowFailure: true
+        task:
+          type: model_method
+          modelType: "@swamp/cloudflare/dns/dns-records"
+          modelName: host-dns
+          methodName: lookup
+          globalArgs:
+            zone_id: ${{ inputs.cloudflare_zone_id }}
+            name: ${{ inputs.dns_record_name }}
+            type: A
+            apiToken: ${{ vault.get("server-stack", inputs.cloudflare_token_key) }}
+      - name: refuse-existing
+        description: Refuse an existing server or record unless adopt is set
+        task:
+          type: assert
+          expr: >-
+            inputs.adopt ||
+                (steps["probe-record"].status == "failed" &&
+                 steps["probe-server"].outputs.count == 0)
+          message: A server or record already exists; set adopt to true to own it
+          severity: high
+  - name: host
+    description: Order the server, wait for SSH, and join it to the mesh
+    dependsOn:
+      - job: preflight
+        condition:
+          type: succeeded
+    steps:
+      - name: create
+        description: Order or adopt the server via the Cherry Servers API
+        task:
+          type: model_method
+          modelIdOrName: ${{ inputs.server_model }}
+          methodName: create
+          inputs:
+            hostname: ${{ inputs.hostname }}
+            project_id: ${{ inputs.project_id }}
+            plan: ${{ inputs.plan }}
+            region: ${{ inputs.region }}
+            image: ${{ inputs.image }}
+            cycle: ${{ inputs.cycle }}
+            ssh_keys: ${{ inputs.ssh_keys }}
+            tags: ${{ inputs.tags }}
+            user_data: ${{ vault.get("server-stack", inputs.user_data_key) }}
+      - name: wait-ready
+        description: Wait for SSH with pinned host keys via the Cherry Servers model
+        guard: inputs.adopt
+        task:
+          type: model_method
+          modelIdOrName: ${{ inputs.server_model }}
+          methodName: wait_ready
+          inputs:
+            hostname: ${{ inputs.hostname }}
+            host_key_policy: ${{ inputs.host_key_policy }}
+            known_hosts: ${{ inputs.known_hosts.join("\n") }}
+            ssh_user: ${{ inputs.ssh_user }}
+            ssh_private_key: ${{ vault.get("server-stack", inputs.ssh_private_key_key) }}
+            timeout_seconds: ${{ inputs.ready_timeout_s }}
+      - name: apply-base
+        description: Apply base packages, admin user and sysctl via SSH
+        dependsOn:
+          - step: wait-ready
+            condition:
+              type: completed
+        task:
+          type: model_method
+          modelType: "@randybias/server-host"
+          modelName: server-host
+          methodName: apply_base
+          inputs:
+            host: >-
+              ${{ inputs.adopt ? inputs.mesh_node.address.split("/")[0] : steps["wait-ready"].outputs.public_ipv4 }}
+            port: ${{ inputs.ssh_port }}
+            user: ${{ inputs.ssh_user }}
+            host_key_policy: strict
+            host_keys: ${{ inputs.known_hosts }}
+            ssh_key_ref:
+              vault: server-stack
+              key: ${{ inputs.ssh_private_key_key }}
+            sudo: true
+            packages: ${{ inputs.base_packages }}
+            admin_user: ${{ inputs.admin_user }}
+            authorized_keys: ${{ inputs.authorized_keys }}
+            sysctl: ${{ inputs.sysctl }}
+            timezone: ${{ inputs.timezone }}
+      - name: join-mesh
+        description: Render and push the node's WireGuard config via SSH
+        task:
+          type: model_method
+          modelType: "@randybias/wireguard-mesh"
+          modelName: wireguard-mesh
+          methodName: apply
+          inputs:
+            node: ${{ inputs.mesh_node }}
+            peers: ${{ inputs.mesh_peers }}
+            peers_allowlist: ${{ inputs.mesh_peers_allowlist }}
+            relay_exclusion: ${{ inputs.mesh_relay_exclusion }}
+            interface: wg0
+            private_key: ${{ vault.get("server-stack", inputs.wg_private_key_key) }}
+            ssh:
+              host: >-
+                ${{ inputs.adopt ? inputs.mesh_node.address.split("/")[0] : steps["wait-ready"].outputs.public_ipv4 }}
+              port: ${{ inputs.ssh_port }}
+              user: ${{ inputs.ssh_user }}
+              host_key_policy: strict
+              host_keys: ${{ inputs.known_hosts }}
+              private_key: ${{ vault.get("server-stack", inputs.ssh_private_key_key) }}
+      - name: verify-mesh
+        description: Read the node's WireGuard peers and handshakes via SSH
+        task:
+          type: model_method
+          modelType: "@randybias/wireguard-mesh"
+          modelName: wireguard-mesh
+          methodName: get
+          inputs:
+            node: ${{ inputs.mesh_node.name }}
+            interface: wg0
+            ssh:
+              host: >-
+                ${{ inputs.adopt ? inputs.mesh_node.address.split("/")[0] : steps["wait-ready"].outputs.public_ipv4 }}
+              port: ${{ inputs.ssh_port }}
+              user: ${{ inputs.ssh_user }}
+              host_key_policy: strict
+              host_keys: ${{ inputs.known_hosts }}
+              private_key: ${{ vault.get("server-stack", inputs.ssh_private_key_key) }}
+      - name: check-mesh
+        description: Check a recent mesh handshake exists before any firewall change
+        task:
+          type: assert
+          expr: >-
+            data.latest("wireguard-mesh", inputs.mesh_node.name)
+                  .attributes.peers.size() > 0
+          message: No mesh peer handshake was recorded
+          severity: high
+  - name: harden
+    description: Apply the firewall and lockdown, committing only after fresh reachability
+    dependsOn:
+      - job: host
+        condition:
+          type: succeeded
+    steps:
+      - name: apply-firewall
+        description: Apply the nftables ruleset with a revert armed first
+        task:
+          type: model_method
+          modelType: "@randybias/server-host"
+          modelName: server-host
+          methodName: apply_firewall
+          inputs:
+            host: ${{ inputs.mesh_node.address.split("/")[0] }}
+            port: ${{ inputs.ssh_port }}
+            user: ${{ inputs.ssh_user }}
+            host_key_policy: strict
+            host_keys: ${{ inputs.known_hosts }}
+            ssh_key_ref:
+              vault: server-stack
+              key: ${{ inputs.ssh_private_key_key }}
+            management_cidrs: ${{ inputs.management_cidrs }}
+            allow_tcp: ${{ inputs.allow_tcp }}
+            allow_udp: ${{ inputs.allow_udp }}
+            ssh_port: ${{ inputs.ssh_port }}
+            revert_after_s: ${{ inputs.revert_after_s }}
+      - name: verify-firewall
+        description: Verify SSH answers over the mesh after the firewall
+        task:
+          type: model_method
+          modelType: "@randybias/ssh-host"
+          modelName: ssh-host
+          methodName: wait_connection
+          inputs:
+            host: ${{ inputs.mesh_node.address.split("/")[0] }}
+            port: ${{ inputs.ssh_port }}
+            user: ${{ inputs.ssh_user }}
+            host_key_policy: strict
+            host_keys: ${{ inputs.known_hosts }}
+            timeout_s: ${{ inputs.verify_timeout_s }}
+      - name: commit-firewall
+        description: Commit the firewall by cancelling its armed revert
+        guard: steps["apply-firewall"].outputs.revert_token != null
+        task:
+          type: model_method
+          modelType: "@randybias/server-host"
+          modelName: server-host
+          methodName: commit
+          inputs:
+            host: ${{ inputs.mesh_node.address.split("/")[0] }}
+            port: ${{ inputs.ssh_port }}
+            user: ${{ inputs.ssh_user }}
+            host_key_policy: strict
+            host_keys: ${{ inputs.known_hosts }}
+            ssh_key_ref:
+              vault: server-stack
+              key: ${{ inputs.ssh_private_key_key }}
+            revert_token: ${{ steps["apply-firewall"].outputs.revert_token }}
+      - name: lockdown
+        description: Close public SSH to the management CIDRs with a revert armed
+        task:
+          type: model_method
+          modelType: "@randybias/server-host"
+          modelName: server-host
+          methodName: lockdown
+          inputs:
+            host: ${{ inputs.mesh_node.address.split("/")[0] }}
+            port: ${{ inputs.ssh_port }}
+            user: ${{ inputs.ssh_user }}
+            host_key_policy: strict
+            host_keys: ${{ inputs.known_hosts }}
+            ssh_key_ref:
+              vault: server-stack
+              key: ${{ inputs.ssh_private_key_key }}
+            management_cidrs: ${{ inputs.management_cidrs }}
+            allow_tcp: ${{ inputs.allow_tcp }}
+            allow_udp: ${{ inputs.allow_udp }}
+            ssh_port: ${{ inputs.ssh_port }}
+            revert_after_s: ${{ inputs.revert_after_s }}
+      - name: verify-lockdown
+        description: Verify SSH answers over the mesh after the lockdown
+        task:
+          type: model_method
+          modelType: "@randybias/ssh-host"
+          modelName: ssh-host
+          methodName: wait_connection
+          inputs:
+            host: ${{ inputs.mesh_node.address.split("/")[0] }}
+            port: ${{ inputs.ssh_port }}
+            user: ${{ inputs.ssh_user }}
+            host_key_policy: strict
+            host_keys: ${{ inputs.known_hosts }}
+            timeout_s: ${{ inputs.verify_timeout_s }}
+      - name: inspect-lockdown
+        description: Read the recorded firewall and exposure state via SSH
+        task:
+          type: model_method
+          modelType: "@randybias/server-host"
+          modelName: server-host
+          methodName: get
+          inputs:
+            host: ${{ inputs.mesh_node.address.split("/")[0] }}
+            port: ${{ inputs.ssh_port }}
+            user: ${{ inputs.ssh_user }}
+            host_key_policy: strict
+            host_keys: ${{ inputs.known_hosts }}
+            ssh_key_ref:
+              vault: server-stack
+              key: ${{ inputs.ssh_private_key_key }}
+      - name: check-lockdown
+        description: Check SSH exposure is management-only before committing
+        task:
+          type: assert
+          expr: >-
+            data.latest("server-host", "state-" +
+                  inputs.mesh_node.address.split("/")[0])
+                  .attributes.firewall.ssh_exposure == "management-only"
+          message: SSH exposure is not management-only after lockdown
+          severity: high
+      - name: commit-lockdown
+        description: Commit the lockdown by cancelling its armed revert
+        guard: steps["lockdown"].outputs.revert_token != null
+        task:
+          type: model_method
+          modelType: "@randybias/server-host"
+          modelName: server-host
+          methodName: commit
+          inputs:
+            host: ${{ inputs.mesh_node.address.split("/")[0] }}
+            port: ${{ inputs.ssh_port }}
+            user: ${{ inputs.ssh_user }}
+            host_key_policy: strict
+            host_keys: ${{ inputs.known_hosts }}
+            ssh_key_ref:
+              vault: server-stack
+              key: ${{ inputs.ssh_private_key_key }}
+            revert_token: ${{ steps["lockdown"].outputs.revert_token }}
+  - name: cluster
+    description: Install k0s, write the kubeconfig, and run the secrets and NATS chart
+    dependsOn:
+      - job: harden
+        condition:
+          type: succeeded
+    steps:
+      - name: install-k0s
+        description: Install the SHA-pinned k0s binary and start the node via SSH
+        task:
+          type: model_method
+          modelType: "@randybias/k0s-cluster"
+          modelName: k0s-cluster
+          methodName: install
+          inputs:
+            ssh:
+              host: ${{ inputs.mesh_node.address.split("/")[0] }}
+              port: ${{ inputs.ssh_port }}
+              user: ${{ inputs.ssh_user }}
+              host_key_policy: strict
+              host_keys: ${{ inputs.known_hosts }}
+              private_key: ${{ vault.get("server-stack", inputs.ssh_private_key_key) }}
+            k0s_version: ${{ inputs.k0s_version }}
+            k0s_binary_sha256: ${{ inputs.k0s_binary_sha256 }}
+            k0s_download_url: ${{ inputs.k0s_download_url }}
+            role: single
+            cluster_name: ${{ inputs.hostname }}
+            api_sans: ${{ inputs.k0s_api_sans }}
+            pod_cidr: ${{ inputs.k0s_pod_cidr }}
+            service_cidr: ${{ inputs.k0s_service_cidr }}
+            helm:
+              - ${{ inputs.nats_chart }}
+      - name: wait-k0s
+        description: Wait for the node and system pods to be Ready
+        task:
+          type: model_method
+          modelType: "@randybias/k0s-cluster"
+          modelName: k0s-cluster
+          methodName: wait_ready
+          inputs:
+            ssh:
+              host: ${{ inputs.mesh_node.address.split("/")[0] }}
+              port: ${{ inputs.ssh_port }}
+              user: ${{ inputs.ssh_user }}
+              host_key_policy: strict
+              host_keys: ${{ inputs.known_hosts }}
+              private_key: ${{ vault.get("server-stack", inputs.ssh_private_key_key) }}
+            ready_timeout_s: ${{ inputs.ready_timeout_s }}
+            require_system_pods: true
+      - name: check-k0s
+        description: Check the node and system pods are Ready
+        task:
+          type: assert
+          expr: steps["wait-k0s"].outputs.ready == true
+          message: k0s node or system pods are not Ready
+          severity: high
+      - name: kubeconfig
+        description: Write the admin kubeconfig to the vault via k0s
+        task:
+          type: model_method
+          modelType: "@randybias/k0s-cluster"
+          modelName: k0s-cluster
+          methodName: kubeconfig
+          inputs:
+            ssh:
+              host: ${{ inputs.mesh_node.address.split("/")[0] }}
+              port: ${{ inputs.ssh_port }}
+              user: ${{ inputs.ssh_user }}
+              host_key_policy: strict
+              host_keys: ${{ inputs.known_hosts }}
+              private_key: ${{ vault.get("server-stack", inputs.ssh_private_key_key) }}
+            store_in_vault:
+              vault: server-stack
+              key: ${{ inputs.kubeconfig_key }}
+      - name: check-kubeconfig
+        description: Check the kubeconfig server host equals the mesh address
+        task:
+          type: assert
+          expr: >-
+            steps["kubeconfig"].outputs.server.split("//")[1].split(":")[0]
+                == inputs.mesh_node.address.split("/")[0]
+          message: The kubeconfig server URL does not match the mesh address
+          severity: high
+      - name: apply-namespaces
+        description: Create the cluster namespaces via the k0s manifest deployer
+        guard: size(inputs.cluster_namespaces) > 0
+        task:
+          type: model_method
+          modelType: "@randybias/k0s-cluster"
+          modelName: k0s-cluster
+          methodName: apply_manifests
+          inputs:
+            ssh:
+              host: ${{ inputs.mesh_node.address.split("/")[0] }}
+              port: ${{ inputs.ssh_port }}
+              user: ${{ inputs.ssh_user }}
+              host_key_policy: strict
+              host_keys: ${{ inputs.known_hosts }}
+              private_key: ${{ vault.get("server-stack", inputs.ssh_private_key_key) }}
+            stack:
+              name: server-stack-namespaces
+              files:
+                - path: namespaces.yaml
+                  content: >-
+                    ${{ inputs.cluster_namespaces.map(n, "apiVersion: v1\nkind: Namespace\nmetadata:\n  name: " + n + "\n").join("---\n") }}
+      - name: apply-secrets
+        description: Write each cluster Secret from vault values via kubectl stdin
+        guard: size(inputs.cluster_secrets) > 0
+        forEach:
+          item: secret
+          in: ${{ inputs.cluster_secrets }}
+        task:
+          type: model_method
+          modelType: "@randybias/k8s-secret"
+          modelName: k8s-secret
+          methodName: apply
+          inputs:
+            kubeconfig: ${{ vault.get("server-stack", inputs.kubeconfig_key) }}
+            namespace: ${{ self.secret.namespace }}
+            name: ${{ self.secret.name }}
+            type: ${{ self.secret.type }}
+            data: '${{ self.secret.data.map(k, v, {k: vault.get("server-stack", v)}) }}'
+      - name: apply-nats
+        description: Reconcile the NATS chart via the k0s Helm extension
+        task:
+          type: model_method
+          modelType: "@randybias/k0s-cluster"
+          modelName: k0s-cluster
+          methodName: apply_helm
+          inputs:
+            ssh:
+              host: ${{ inputs.mesh_node.address.split("/")[0] }}
+              port: ${{ inputs.ssh_port }}
+              user: ${{ inputs.ssh_user }}
+              host_key_policy: strict
+              host_keys: ${{ inputs.known_hosts }}
+              private_key: ${{ vault.get("server-stack", inputs.ssh_private_key_key) }}
+            cluster_name: ${{ inputs.hostname }}
+            api_sans: ${{ inputs.k0s_api_sans }}
+            pod_cidr: ${{ inputs.k0s_pod_cidr }}
+            service_cidr: ${{ inputs.k0s_service_cidr }}
+            helm:
+              - ${{ inputs.nats_chart }}
+  - name: verify
+    description: Prove NATS answers over the mesh before any DNS is published
+    dependsOn:
+      - job: cluster
+        condition:
+          type: succeeded
+    steps:
+      - name: probe-nats
+        description: Read the NATS INFO banner over the mesh via a TCP probe
+        task:
+          type: model_method
+          modelType: command/shell
+          modelName: nats-probe
+          methodName: execute
+          inputs:
+            run: |
+              bash -c '
+                exec 3<>/dev/tcp/"$NATS_HOST"/"$NATS_PORT" || exit 1
+                IFS= read -r info <&3
+                printf "%s\n" "$info"
+                printf "CONNECT {}\r\nPING\r\n" >&3
+                IFS= read -r pong <&3
+                printf "%s\n" "$pong"
+              '
+            env:
+              NATS_HOST: ${{ inputs.mesh_node.address.split("/")[0] }}
+              NATS_PORT: ${{ inputs.nats_probe_port }}
+            timeout: ${{ inputs.verify_timeout_s }}
+            ignoreExitCode: false
+      - name: check-nats
+        description: Check the banner is NATS INFO with the expected server name
+        task:
+          type: assert
+          expr: >-
+            steps["probe-nats"].outputs.stdout.contains("INFO {") &&
+                steps["probe-nats"].outputs.stdout.contains("server_id") &&
+                (inputs.nats_expect_server_name == null ||
+                 steps["probe-nats"].outputs.stdout.contains(
+                   "\"server_name\":\"" + inputs.nats_expect_server_name + "\""))
+          message: The NATS INFO banner was not as expected
+          severity: high
+  - name: publish
+    description: Create and verify the host's A record only after NATS answers
+    dependsOn:
+      - job: verify
+        condition:
+          type: succeeded
+    steps:
+      - name: create-record
+        description: Create the host's A record via the Cloudflare API
+        guard: steps["probe-record"].status == "failed"
+        task:
+          type: model_method
+          modelType: "@swamp/cloudflare/dns/dns-records"
+          modelName: host-dns
+          methodName: create
+          globalArgs:
+            zone_id: ${{ inputs.cloudflare_zone_id }}
+            name: ${{ inputs.dns_record_name }}
+            type: A
+            content: >-
+              ${{ inputs.dns_record_target == "mesh" ? inputs.mesh_node.address.split("/")[0] : steps["wait-ready"].outputs.public_ipv4 }}
+            ttl: ${{ inputs.dns_ttl }}
+            proxied: false
+            comment: ${{ "managed-by=provision-server-host host=" + inputs.hostname }}
+            apiToken: ${{ vault.get("server-stack", inputs.cloudflare_token_key) }}
+      - name: check-record
+        description: Re-read the record and check it points at the host
+        task:
+          type: assert
+          expr: >-
+            data.latest("host-dns", inputs.dns_record_name)
+                  .attributes.content ==
+                (inputs.dns_record_target == "mesh"
+                  ? inputs.mesh_node.address.split("/")[0]
+                  : steps["wait-ready"].outputs.public_ipv4)
+          message: The A record does not point at the host
+          severity: high

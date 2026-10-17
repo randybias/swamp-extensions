@@ -1,0 +1,214 @@
+id: 6c053a9b-a13b-4f48-bf92-76e1f049e5df
+name: "@randybias/server-stack-teardown-host"
+version: 1
+description: Remove a provisioned host's DNS record, k0s cluster and server
+vaults:
+  - server-stack
+  - default
+inputs:
+  type: object
+  additionalProperties: false
+  required:
+    - hostname
+    - confirm_hostname
+    - server_model
+    - project_id
+    - ownership_tag
+    - ssh_private_key_key
+    - ssh_user
+    - host_key_policy
+    - mesh_address
+    - cloudflare_zone_id
+    - dns_record_name
+    - cloudflare_token_key
+  properties:
+    hostname:
+      type: string
+      description: Server hostname; keys every model's state
+      maxLength: 253
+    confirm_hostname:
+      type: string
+      description: Must equal hostname, as a guard
+      maxLength: 253
+    server_model:
+      type: string
+      description: Name of a generic servers definition
+      maxLength: 128
+    project_id:
+      type: integer
+      description: Cherry Servers project ID
+      minimum: 1
+    ownership_tag:
+      type: string
+      description: Server ownership tag, key=value
+      maxLength: 385
+    ssh_private_key_key:
+      type: string
+      description: Vault key of the admin SSH private key
+      maxLength: 256
+    ssh_user:
+      type: string
+      description: Remote SSH user
+      maxLength: 32
+    ssh_port:
+      type: integer
+      description: Remote SSH port, 1-65535
+      minimum: 1
+      maximum: 65535
+      default: 22
+    host_key_policy:
+      type: string
+      description: SSH host-key policy
+      enum: [strict, accept-new]
+    known_hosts:
+      type: array
+      description: Expected host keys in ssh-keyscan format
+      default: []
+      items:
+        type: string
+        maxLength: 4096
+    mesh_address:
+      type: string
+      description: The host's mesh address, CIDR or bare
+      maxLength: 64
+    cloudflare_zone_id:
+      type: string
+      description: Cloudflare zone ID
+      maxLength: 64
+    dns_record_name:
+      type: string
+      description: Fully qualified A record name
+      maxLength: 253
+    cloudflare_token_key:
+      type: string
+      description: Vault key of a Cloudflare DNS edit token
+      maxLength: 256
+jobs:
+  - name: teardown
+    description: Remove DNS, reset k0s, delete the server, and verify both APIs
+    steps:
+      - name: check-inputs
+        description: Check the hostname confirmation before any change
+        task:
+          type: assert
+          expr: inputs.confirm_hostname == inputs.hostname
+          message: confirm_hostname must equal hostname
+          severity: high
+      - name: sync-server
+        description: Refresh the recorded server via the Cherry Servers API
+        task:
+          type: model_method
+          modelIdOrName: ${{ inputs.server_model }}
+          methodName: sync
+          inputs:
+            hostname: ${{ inputs.hostname }}
+      - name: check-ownership
+        description: Refuse a server that lacks the ownership tag
+        task:
+          type: assert
+          expr: >-
+            data.latest(inputs.server_model, inputs.hostname).attributes.status
+                  == "not_found" ||
+                data.latest(inputs.server_model, inputs.hostname).attributes.tags
+                  .contains(inputs.ownership_tag)
+          message: The server exists but lacks the ownership tag; refusing to delete
+          severity: high
+      - name: find-record
+        description: Look up the host's A record via the Cloudflare API
+        allowFailure: true
+        task:
+          type: model_method
+          modelType: "@swamp/cloudflare/dns/dns-records"
+          modelName: host-dns
+          methodName: lookup
+          globalArgs:
+            zone_id: ${{ inputs.cloudflare_zone_id }}
+            name: ${{ inputs.dns_record_name }}
+            type: A
+            apiToken: ${{ vault.get("server-stack", inputs.cloudflare_token_key) }}
+      - name: check-record
+        description: Refuse a record without this host's ownership marker
+        task:
+          type: assert
+          expr: >-
+            steps["find-record"].status == "failed" ||
+                data.latest("host-dns", inputs.dns_record_name).attributes.comment
+                  .contains("managed-by=provision-server-host host=" + inputs.hostname)
+          message: The record exists without this host's ownership marker; refusing
+          severity: high
+      - name: delete-record
+        description: Delete the host's A record via the Cloudflare API
+        guard: steps["find-record"].status != "succeeded"
+        task:
+          type: model_method
+          modelType: "@swamp/cloudflare/dns/dns-records"
+          modelName: host-dns
+          methodName: delete
+          globalArgs:
+            zone_id: ${{ inputs.cloudflare_zone_id }}
+            apiToken: ${{ vault.get("server-stack", inputs.cloudflare_token_key) }}
+          inputs:
+            id: ${{ data.latest("host-dns", inputs.dns_record_name).attributes.id }}
+      - name: reset-k0s
+        description: Stop and reset k0s over the mesh via SSH
+        allowFailure: true
+        guard: >-
+          data.latest(inputs.server_model, inputs.hostname).attributes.status
+              == "not_found"
+        task:
+          type: model_method
+          modelType: "@randybias/k0s-cluster"
+          modelName: k0s-cluster
+          methodName: reset
+          inputs:
+            confirm_host: ${{ inputs.mesh_address.split("/")[0] }}
+            ssh:
+              host: ${{ inputs.mesh_address.split("/")[0] }}
+              port: ${{ inputs.ssh_port }}
+              user: ${{ inputs.ssh_user }}
+              host_key_policy: strict
+              host_keys: ${{ inputs.known_hosts }}
+              private_key: ${{ vault.get("server-stack", inputs.ssh_private_key_key) }}
+      - name: delete-server
+        description: Delete the server after hostname and project checks
+        task:
+          type: model_method
+          modelIdOrName: ${{ inputs.server_model }}
+          methodName: delete
+          inputs:
+            confirm_hostname: ${{ inputs.confirm_hostname }}
+      - name: verify-cherry
+        description: Verify no server with this hostname remains in the project
+        task:
+          type: model_method
+          modelIdOrName: ${{ inputs.server_model }}
+          methodName: list
+      - name: check-cherry
+        description: Check no server with this hostname remains in the project
+        task:
+          type: assert
+          expr: >-
+            data.latest(inputs.server_model, inputs.hostname).attributes.status
+                  == "not_found"
+          message: A server with this hostname still exists in the project
+          severity: high
+      - name: verify-dns
+        description: Verify no record with this name remains in the zone
+        allowFailure: true
+        task:
+          type: model_method
+          modelType: "@swamp/cloudflare/dns/dns-records"
+          modelName: host-dns
+          methodName: lookup
+          globalArgs:
+            zone_id: ${{ inputs.cloudflare_zone_id }}
+            name: ${{ inputs.dns_record_name }}
+            type: A
+            apiToken: ${{ vault.get("server-stack", inputs.cloudflare_token_key) }}
+      - name: check-dns
+        description: Check no record with this name remains in the zone
+        task:
+          type: assert
+          expr: steps["verify-dns"].status == "failed"
+          message: A DNS record with this name still exists in the zone
+          severity: high

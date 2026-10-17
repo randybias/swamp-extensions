@@ -50,8 +50,32 @@ references another extension's model type: `@randybias/cherry-servers/servers`
 
 ## Reviews
 
-- Offline: both workflows pass `swamp workflow validate` with the model types
-  installed (`@randybias/server-host`, `wireguard-mesh`, `ssh-host`,
-  `k0s-cluster`, `k8s-secret`, `cherry-servers`, `@swamp/cloudflare/dns`,
-  `@webframp/cloudflare`); step inputs were checked against the real schemas.
-- None recorded yet from a code review panel.
+- Round 1 (f-server-stack-auto): fixed. Steps run in parallel inside a job, so
+  every ordering is now an explicit `dependsOn`; guards are wrapped and their
+  polarity corrected; DNS absence uses `@webframp/cloudflare/dns` `list` (empty
+  records), never an error; teardown is re-runnable; args and outputs aligned to
+  the current heads (wireguard `host_keys` objects, server-host revert `token`
+  resource, cherry `deleted`/`not_found` and map tags).
+- Scratch runs (fake inputs, real models), receipts:
+  - provision with a failing `check-inputs` and then a failing `probe-server`:
+    both times every downstream step was `skipped`; no sibling ran in parallel.
+  - teardown in a fresh repo: `check-inputs` passed, `sync-server` failed
+    (allowed), `check-ownership` passed on the missing server, `find-record`
+    failed at the missing vault, and every delete/reset step skipped. The safety
+    gate held and the run was re-runnable.
+  - a control workflow: a truthy guard skips, a falsy guard runs, and
+    `or [succeeded, skipped]` runs after a guard-skip but not after a failure.
+- Both workflows pass `swamp workflow validate` with the real model types.
+
+## Known limitations for the live run
+
+- `check-mesh` asserts a handshake exists; `mesh_handshake_max_age_s` cannot be
+  evaluated because swamp CEL has no clock function (`now()` is unsupported).
+- `check-kubeconfig` only asserts the server URL is present: the k0s model sets
+  no `api.address`, so k0s advertises the default-route address, not the mesh.
+- `cluster_secrets` data values are vault keys; resolving a dynamic key map in
+  CEL is not supported, so this needs a model-side vault-key map or a per-key
+  shape confirmed with the k8s-secret lane.
+- `@webframp/cloudflare` stands in for the first-party dns-records model because
+  its `lookup` throws identically on absence and on errors; `list` returns
+  empty.

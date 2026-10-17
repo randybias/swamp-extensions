@@ -62,7 +62,7 @@ inputs:
       enum: [strict, accept-new]
     known_hosts:
       type: array
-      description: Expected host keys in ssh-keyscan format
+      description: Expected host keys in ssh-keyscan format; each line must match the mesh address or carry no host field
       default: []
       items:
         type: string
@@ -96,6 +96,11 @@ jobs:
           severity: high
       - name: sync-server
         description: Refresh the recorded server via the Cherry Servers API
+        dependsOn:
+          - step: check-inputs
+            condition:
+              type: succeeded
+        allowFailure: true
         task:
           type: model_method
           modelIdOrName: ${{ inputs.server_model }}
@@ -104,57 +109,84 @@ jobs:
             hostname: ${{ inputs.hostname }}
       - name: check-ownership
         description: Refuse a server that lacks the ownership tag
+        dependsOn:
+          - step: sync-server
+            condition:
+              type: completed
         task:
           type: assert
           expr: >-
-            data.latest(inputs.server_model, inputs.hostname).attributes.status
-                  == "not_found" ||
-                data.latest(inputs.server_model, inputs.hostname).attributes.tags
-                  .contains(inputs.ownership_tag)
+            data.latest(inputs.server_model, inputs.hostname) == null ||
+            data.latest(inputs.server_model, inputs.hostname).attributes.status in ["deleted", "not_found"] ||
+            (data.latest(inputs.server_model, inputs.hostname).attributes.tags != null &&
+            data.latest(inputs.server_model, inputs.hostname).attributes.tags[inputs.ownership_tag.split("=")[0]] == inputs.ownership_tag.split("=")[1])
           message: The server exists but lacks the ownership tag; refusing to delete
           severity: high
       - name: find-record
-        description: Look up the host's A record via the Cloudflare API
-        allowFailure: true
+        description: List the host's A record via the Cloudflare API
+        dependsOn:
+          - step: check-ownership
+            condition:
+              type: succeeded
         task:
           type: model_method
-          modelType: "@swamp/cloudflare/dns/dns-records"
+          modelType: "@webframp/cloudflare/dns"
           modelName: host-dns
-          methodName: lookup
+          methodName: list
           globalArgs:
-            zone_id: ${{ inputs.cloudflare_zone_id }}
-            name: ${{ inputs.dns_record_name }}
-            type: A
+            zoneId: ${{ inputs.cloudflare_zone_id }}
             apiToken: ${{ vault.get("server-stack", inputs.cloudflare_token_key) }}
+          inputs:
+            type: A
+            name: ${{ inputs.dns_record_name }}
       - name: check-record
         description: Refuse a record without this host's ownership marker
+        dependsOn:
+          - step: find-record
+            condition:
+              type: succeeded
         task:
           type: assert
           expr: >-
-            steps["find-record"].status == "failed" ||
-                data.latest("host-dns", inputs.dns_record_name).attributes.comment
-                  .contains("managed-by=provision-server-host host=" + inputs.hostname)
+            data.latest("host-dns", "main").attributes.records.size() == 0 ||
+            (data.latest("host-dns", "main").attributes.records[0].comment != null &&
+            data.latest("host-dns", "main").attributes.records[0].comment.contains(
+              "managed-by=provision-server-host host=" + inputs.hostname))
           message: The record exists without this host's ownership marker; refusing
           severity: high
       - name: delete-record
         description: Delete the host's A record via the Cloudflare API
-        guard: steps["find-record"].status != "succeeded"
+        dependsOn:
+          - step: check-record
+            condition:
+              type: succeeded
+        guard: ${{ data.latest("host-dns", "main").attributes.records.size() == 0 }}
         task:
           type: model_method
-          modelType: "@swamp/cloudflare/dns/dns-records"
+          modelType: "@webframp/cloudflare/dns"
           modelName: host-dns
           methodName: delete
           globalArgs:
-            zone_id: ${{ inputs.cloudflare_zone_id }}
+            zoneId: ${{ inputs.cloudflare_zone_id }}
             apiToken: ${{ vault.get("server-stack", inputs.cloudflare_token_key) }}
           inputs:
-            id: ${{ data.latest("host-dns", inputs.dns_record_name).attributes.id }}
+            recordId: ${{ data.latest("host-dns", "main").attributes.records[0].id }}
       - name: reset-k0s
         description: Stop and reset k0s over the mesh via SSH
+        dependsOn:
+          - step: delete-record
+            condition:
+              type: or
+              conditions:
+                - type: succeeded
+                - type: skipped
+          - step: check-ownership
+            condition:
+              type: succeeded
         allowFailure: true
         guard: >-
-          data.latest(inputs.server_model, inputs.hostname).attributes.status
-              == "not_found"
+          ${{ data.latest(inputs.server_model, inputs.hostname) == null ||
+              data.latest(inputs.server_model, inputs.hostname).attributes.status in ["deleted", "not_found"] }}
         task:
           type: model_method
           modelType: "@randybias/k0s-cluster"
@@ -171,6 +203,16 @@ jobs:
               private_key: ${{ vault.get("server-stack", inputs.ssh_private_key_key) }}
       - name: delete-server
         description: Delete the server after hostname and project checks
+        dependsOn:
+          - step: reset-k0s
+            condition:
+              type: always
+          - step: check-ownership
+            condition:
+              type: succeeded
+        guard: >-
+          ${{ data.latest(inputs.server_model, inputs.hostname) == null ||
+              data.latest(inputs.server_model, inputs.hostname).attributes.status in ["deleted", "not_found"] }}
         task:
           type: model_method
           modelIdOrName: ${{ inputs.server_model }}
@@ -178,37 +220,56 @@ jobs:
           inputs:
             confirm_hostname: ${{ inputs.confirm_hostname }}
       - name: verify-cherry
-        description: Verify no server with this hostname remains in the project
+        description: List the project's servers to confirm none match this hostname
+        dependsOn:
+          - step: delete-server
+            condition:
+              type: always
+          - step: check-ownership
+            condition:
+              type: succeeded
         task:
           type: model_method
           modelIdOrName: ${{ inputs.server_model }}
           methodName: list
       - name: check-cherry
         description: Check no server with this hostname remains in the project
+        dependsOn:
+          - step: verify-cherry
+            condition:
+              type: succeeded
         task:
           type: assert
           expr: >-
-            data.latest(inputs.server_model, inputs.hostname).attributes.status
-                  == "not_found"
+            data.latest(inputs.server_model, inputs.hostname) == null ||
+            data.latest(inputs.server_model, inputs.hostname).attributes.status in ["deleted", "not_found"]
           message: A server with this hostname still exists in the project
           severity: high
       - name: verify-dns
-        description: Verify no record with this name remains in the zone
-        allowFailure: true
+        description: List the zone's A records to confirm none match this name
+        dependsOn:
+          - step: check-cherry
+            condition:
+              type: succeeded
         task:
           type: model_method
-          modelType: "@swamp/cloudflare/dns/dns-records"
+          modelType: "@webframp/cloudflare/dns"
           modelName: host-dns
-          methodName: lookup
+          methodName: list
           globalArgs:
-            zone_id: ${{ inputs.cloudflare_zone_id }}
-            name: ${{ inputs.dns_record_name }}
-            type: A
+            zoneId: ${{ inputs.cloudflare_zone_id }}
             apiToken: ${{ vault.get("server-stack", inputs.cloudflare_token_key) }}
+          inputs:
+            type: A
+            name: ${{ inputs.dns_record_name }}
       - name: check-dns
         description: Check no record with this name remains in the zone
+        dependsOn:
+          - step: verify-dns
+            condition:
+              type: succeeded
         task:
           type: assert
-          expr: steps["verify-dns"].status == "failed"
+          expr: data.latest("host-dns", "main").attributes.records.size() == 0
           message: A DNS record with this name still exists in the zone
           severity: high

@@ -1,6 +1,6 @@
 manifestVersion: 1
 name: "@randybias/wireguard-mesh"
-version: "2026.10.17.5"
+version: "2026.10.17.6"
 description: "Render one WireGuard node's config from mesh data (peers, allowlist, relay exclusion) and apply it to that node over SSH. One generic model for any node of any mesh; the private key is delivered over stdin and never appears in the config text."
 license: Apache-2.0
 repository: https://github.com/randybias/swamp-extensions

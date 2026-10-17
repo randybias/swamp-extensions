@@ -140,9 +140,14 @@ echoes method arguments, so pass the key as a vault reference only.
   re-learn: delete it to re-learn. The transport is the canonical vendored
   `_lib/ssh.ts`: an ssh exit 255 is a typed error, supplied pins that apply to
   no host are refused, and no config, key or digest is ever placed on `argv`.
-  The key and config are written to a private `mktemp -d` directory and the
-  script unlinks the file as soon as it opens it, so they are unlinked before
-  the script runs and removed by a checked cleanup.
+  The private key and config are streamed straight into the remote command over
+  ssh stdin, never on `argv` and never written to the node by the transport; the
+  key file WireGuard reads is staged by the script itself, at mode 0600, under
+  its own trap. Each remote command runs under a remote deadline
+  (`ssh.command_timeout_s`, default 300 s, capped at 110 s) as well as a local
+  one: the remote process group is killed at the deadline, so a hung `wg-quick`
+  cannot keep the node lock past it, and a not-yet-confirmed change is reverted
+  by the retrying rollback. A hang is reported as a transport error.
 - Upgrading from 2026.10.17.4: `host_key_policy: accept-new` now maps to
   `insecure_tofu` and `insecure` is refused (the transport cannot honour it
   safely); `ssh.host_keys` entries that are `{type, key}` objects are accepted

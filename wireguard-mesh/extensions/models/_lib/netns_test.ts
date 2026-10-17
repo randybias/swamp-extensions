@@ -386,3 +386,85 @@ Deno.test({
     }
   },
 });
+
+Deno.test({
+  name:
+    "netns: a session killed mid-apply with a hung wg-quick is restored by the armed rollback",
+  ignore: !enabled,
+  sanitizeOps: false,
+  sanitizeResources: false,
+  fn: async () => {
+    const dir = await Deno.makeTempDir({ prefix: "wgmesh-hang-" });
+    const applyFile = `${dir}/apply.sh`;
+    const confirmFile = `${dir}/confirm.sh`;
+    const window = 5;
+    await Deno.writeTextFile(applyFile, applyScript(IFACE, window));
+    const key = (await sh(["wg", "genkey"])).stdout.trim();
+    const hub = "H".repeat(42) + "A=";
+    const stdin = (addr: string) =>
+      `${key}\n[Interface]\nAddress = ${addr}\nListenPort = 51996\n` +
+      `PostUp = wg set '%i' private-key '/etc/wireguard/%i.key'\n` +
+      `[Peer]\nPublicKey = ${hub}\nAllowedIPs = 198.51.100.0/24\n`;
+    const confirm = async (stdout: string) => {
+      const rb = parseRollbackDir(stdout, IFACE);
+      assertExists(rb, `no rollback dir in: ${stdout}`);
+      await Deno.writeTextFile(confirmFile, confirmScript(IFACE, rb));
+      const c = await inNs(["sh", confirmFile]);
+      assertEquals(c.code, 0, c.stderr);
+    };
+    const cleanupSystem = async () => {
+      await sudo(["ip", "netns", "del", NS]).catch(() => undefined);
+      await sudo([
+        "rm",
+        "-f",
+        `/etc/wireguard/${IFACE}.conf`,
+        `/etc/wireguard/${IFACE}.key`,
+      ]);
+      await sudo(["sh", "-c", `rm -rf /etc/wireguard/.${IFACE}.*`]);
+    };
+    await cleanupSystem();
+    await sudo(["ip", "netns", "add", NS]);
+    try {
+      // Baseline good config, confirmed so no rollback is left armed.
+      const r = await inNs(["sh", applyFile], stdin("192.0.2.1/24"));
+      assertEquals(r.code, 0, r.stderr);
+      await confirm(r.stdout);
+
+      // A fake wg-quick that hangs on `up`, shadowing the real one on PATH.
+      const real = (await sh(["sh", "-c", "command -v wg-quick"])).stdout
+        .trim();
+      const bin = `${dir}/bin`;
+      await Deno.mkdir(bin, { recursive: true });
+      await Deno.writeTextFile(
+        `${bin}/wg-quick`,
+        `#!/bin/sh\nif [ "$1" = "up" ]; then sleep 60; exit 0; fi\nexec ${real} "$@"\n`,
+        { mode: 0o755 },
+      );
+      const path = (await sh(["sh", "-c", 'printf %s "$PATH"'])).stdout.trim();
+
+      // Run the apply under the transport's remote deadline (5 s). The hung
+      // wg-quick makes it hang; `timeout` kills the whole group, releasing the
+      // lock, and the armed rollback (5 s window) restores the baseline.
+      const bounded = await inNs([
+        "env",
+        `PATH=${bin}:${path}`,
+        "timeout",
+        "-k",
+        "5",
+        "5",
+        "sh",
+        applyFile,
+      ], stdin("192.0.2.9/24"));
+      assertEquals(bounded.code, 124, bounded.stderr);
+
+      // Wait past the rollback window, then the baseline must be back.
+      await new Promise((resolve) => setTimeout(resolve, 9000));
+      const addr = (await inNs(["ip", "-4", "addr", "show", IFACE])).stdout;
+      assertStringIncludes(addr, "192.0.2.1/24");
+      assertEquals(addr.includes("192.0.2.9/24"), false);
+    } finally {
+      await cleanupSystem();
+      await Deno.remove(dir, { recursive: true }).catch(() => {});
+    }
+  },
+});

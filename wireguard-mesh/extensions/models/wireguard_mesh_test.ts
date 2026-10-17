@@ -1,4 +1,5 @@
 import {
+  assert,
   assertEquals,
   assertExists,
   assertRejects,
@@ -8,14 +9,14 @@ import { createModelTestContext } from "jsr:@swamp-club/swamp-testing@0.20261014
 import { z } from "npm:zod@4.3.6";
 import { fullMesh, hubSelf, hubSpoke, key } from "./_lib/fixtures.ts";
 import {
-  sha256Hex,
+  applyScript,
   type SshTarget,
   sshTransport,
   type Transport,
   TransportError,
   type TransportResult,
 } from "./_lib/push.ts";
-import type { CommandRunner, SshDeps } from "./_lib/ssh.ts";
+import { type CommandRunner, type SshDeps } from "./_lib/ssh.ts";
 import { MeshSchema } from "./_lib/render.ts";
 import { createModel, model, type as modelType } from "./wireguard_mesh.ts";
 
@@ -396,7 +397,7 @@ Deno.test("methods carry the documented description prefixes", () => {
   assertStringIncludes(model.methods.get.description, "READ-ONLY.");
   assertStringIncludes(model.methods.delete.description, "DESTRUCTIVE.");
   assertStringIncludes(model.description, "WireGuard");
-  assertEquals(model.version, "2026.10.17.5");
+  assertEquals(model.version, "2026.10.17.6");
   assertEquals(model.type, modelType);
 });
 
@@ -406,7 +407,7 @@ Deno.test("packaging: the manifest and license describe this extension", async (
   );
   assertStringIncludes(manifest, 'name: "@randybias/wireguard-mesh"');
   assertStringIncludes(manifest, "license: Apache-2.0");
-  assertStringIncludes(manifest, 'version: "2026.10.17.5"');
+  assertStringIncludes(manifest, 'version: "2026.10.17.6"');
   assertStringIncludes(manifest, "README.md");
   assertStringIncludes(manifest, "LICENSE.txt");
   const license = await Deno.readTextFile(
@@ -418,16 +419,21 @@ Deno.test("packaging: the manifest and license describe this extension", async (
 /** Records ssh invocations and answers the canonical upload/exec probes. */
 function recordSsh(): {
   deps: SshDeps;
-  calls: { cmd: string; args: string[]; stdin?: string }[];
+  calls: { cmd: string; args: string[]; stdin?: string; timeoutMs?: number }[];
 } {
-  const calls: { cmd: string; args: string[]; stdin?: string }[] = [];
+  const calls: {
+    cmd: string;
+    args: string[];
+    stdin?: string;
+    timeoutMs?: number;
+  }[] = [];
   const run: CommandRunner = (cmd, args, _o = {}) => {
     const stdin = typeof _o.stdin === "string"
       ? _o.stdin
       : _o.stdin instanceof Uint8Array
       ? new TextDecoder().decode(_o.stdin)
       : undefined;
-    calls.push({ cmd, args, stdin });
+    calls.push({ cmd, args, stdin, timeoutMs: _o.timeoutMs });
     if (cmd === "ssh-agent") {
       return Promise.resolve(
         args[0] === "-s"
@@ -445,25 +451,6 @@ function recordSsh(): {
     }
     if (cmd !== "ssh") {
       return Promise.resolve({ code: 0, stdout: "", stderr: "" });
-    }
-    const remote = args[args.length - 1] ?? "";
-    if (remote.includes("'mktemp'")) {
-      return Promise.resolve({
-        code: 0,
-        stdout: "/tmp/wgmesh.AbC123XY\n",
-        stderr: "",
-      });
-    }
-    if (remote.includes("echo MISSING")) {
-      return Promise.resolve({ code: 0, stdout: "MISSING\n", stderr: "" });
-    }
-    if (remote.includes(".ssh-host-upload")) {
-      const mode = /chmod '([0-7]{3,4})'/.exec(remote)?.[1] ?? "0600";
-      return sha256Hex(stdin ?? "").then((h) => ({
-        code: 0,
-        stdout: `${h} ${mode}\n`,
-        stderr: "",
-      }));
     }
     return Promise.resolve({
       code: 0,
@@ -487,28 +474,29 @@ const STRICT_TARGET: SshTarget = {
   ],
 };
 
-Deno.test("sshTransport: stdin is uploaded, never on argv; non-applicable pins are refused", async () => {
+Deno.test("sshTransport streams stdin into the remote command, never on argv", async () => {
   const rec = recordSsh();
   const t = sshTransport(STRICT_TARGET, rec.deps);
   const res = await t("echo hi", "TOPSECRET\n");
   assertEquals(res.code, 0);
+  const ssh = rec.calls.find((c) => c.cmd === "ssh")!;
+  // The secret is on the ssh process's stdin, never on any argv, and no
+  // remote temp file is ever named.
+  assertEquals(ssh.stdin, "TOPSECRET\n");
   for (const c of rec.calls) {
-    assertEquals(c.args.join(" ").includes("TOPSECRET"), false, c.cmd);
+    const line = c.args.join(" ");
+    assert(!line.includes("TOPSECRET"), c.cmd);
+    assert(!line.includes("ssh-host-upload"), c.cmd);
+    assert(!line.includes("mktemp"), c.cmd);
+    assert(!line.includes("exec 3<"), c.cmd);
   }
-  const upload = rec.calls.find((c) =>
-    c.args.at(-1)?.includes(".ssh-host-upload")
-  );
-  assertEquals(upload?.stdin?.includes("TOPSECRET"), true);
-  // The script unlinks the temp file before it runs, so the key is never at
-  // rest even if the script cuts the SSH path.
-  const body = rec.calls.map((c) => c.args.at(-1) ?? "").find((c) =>
-    c.includes("exec 3<")
-  )!;
-  assertEquals(body.includes("umask 077"), true);
-  assertEquals(body.includes("exec 3<"), true);
-  assertEquals(body.includes("/tmp/wgmesh.AbC123XY/stdin"), true);
-  assertEquals(body.includes("rm -f --"), true);
-  assertEquals(body.indexOf("rm -f --") < body.indexOf("echo hi"), true);
+  // The remote command is the unchanged script under a remote deadline; no
+  // temp file.
+  const remote = ssh.args.at(-1) ?? "";
+  assert(remote.includes("timeout -k 5"));
+  assert(remote.includes("echo hi"));
+  // A per-command deadline is set so a hung session is killed.
+  assert((ssh.timeoutMs ?? 0) > 0);
   // A supplied pin that applies to no host is refused, not silently accepted.
   const bad = sshTransport(
     { ...STRICT_TARGET, host_keys: ["203.0.113.9 ssh-ed25519 AAAA"] },
@@ -718,55 +706,34 @@ Deno.test("insecure_tofu on a non-22 port pins [host]:port and reuses it strictl
   assertEquals(runs.every((r) => !r.includes("AAAASCAN")), true);
 });
 
-Deno.test("an upload failure still triggers the temp-file cleanup", async () => {
-  const calls: string[] = [];
-  const run: CommandRunner = (cmd, args, _o = {}) => {
-    if (cmd === "ssh-agent") {
-      return Promise.resolve(
-        args[0] === "-s"
-          ? {
-            code: 0,
-            stdout:
-              "SSH_AUTH_SOCK=/tmp/a.sock;\nexport SSH_AUTH_SOCK;\nSSH_AGENT_PID=1;\nexport SSH_AGENT_PID;\n",
-            stderr: "",
-          }
-          : { code: 0, stdout: "", stderr: "" },
-      );
-    }
-    if (cmd === "ssh-add") {
-      return Promise.resolve({ code: 0, stdout: "", stderr: "" });
-    }
-    if (cmd !== "ssh") {
-      return Promise.resolve({ code: 0, stdout: "", stderr: "" });
-    }
-    const remote = args[args.length - 1] ?? "";
-    calls.push(remote);
-    if (remote.includes("'mktemp'")) {
-      return Promise.resolve({
-        code: 0,
-        stdout: "/tmp/wgmesh.AbC123XY\n",
-        stderr: "",
-      });
-    }
-    if (remote.includes("echo MISSING")) {
-      return Promise.resolve({ code: 0, stdout: "MISSING\n", stderr: "" });
-    }
-    if (remote.includes(".ssh-host-upload")) {
-      // A mismatched hash makes upload() throw after the temp file was written.
-      return Promise.resolve({
-        code: 0,
-        stdout: `${"0".repeat(64)} 0600\n`,
-        stderr: "",
-      });
-    }
-    return Promise.resolve({ code: 0, stdout: "", stderr: "" });
-  };
-  const deps: SshDeps = { run, now: () => 0, sleep: () => Promise.resolve() };
-  await assertRejects(
-    () => sshTransport(STRICT_TARGET, deps)("echo hi", "SECRET\n"),
-    TransportError,
+Deno.test("transport command diff: a secret never reaches a remote temp file (old vs new)", async () => {
+  const rec = recordSsh();
+  const script = applyScript("wg0");
+  await sshTransport(STRICT_TARGET, rec.deps)(
+    script,
+    "PRIVATEKEY\n[Interface]\n",
   );
-  assertEquals(calls.some((c) => c.includes("rmdir")), true);
+  const commands = rec.calls.filter((c) => c.cmd === "ssh")
+    .map((c) => c.args.at(-1) ?? "");
+  // The transport this replaced issued these; none may appear now.
+  const OLD_TEMP_FILE_COMMANDS = [
+    "'mktemp' '-d' '-p' '/tmp' 'wgmesh.XXXXXXXX'",
+    ".ssh-host-upload",
+    "exec 3<'",
+    "rm -f -- '/tmp/wgmesh.",
+  ];
+  for (const marker of OLD_TEMP_FILE_COMMANDS) {
+    assertEquals(commands.some((c) => c.includes(marker)), false, marker);
+  }
+  // New: exactly one remote command, the unchanged script under a remote
+  // deadline, and the secret on the ssh process's stdin.
+  assertEquals(commands.length, 1);
+  assert(commands[0].includes("timeout -k 5"));
+  // A distinctive line of the script survives quoting verbatim.
+  assert(commands[0].includes("IFS= read -r key"));
+  const ssh = rec.calls.find((c) => c.cmd === "ssh")!;
+  assertEquals(ssh.stdin, "PRIVATEKEY\n[Interface]\n");
+  assert((ssh.timeoutMs ?? 0) > 0);
 });
 
 Deno.test("legacy ssh inputs are migrated: object host_keys, accept-new, insecure", () => {
@@ -875,55 +842,23 @@ Deno.test("a legacy {type,key} hostkeys record is migrated to a port-aware line"
   assertEquals((rewritten.data as { host_keys: string[] }).host_keys, [line]);
 });
 
-Deno.test("a failed cleanup surfaces that the temp file may still hold the key", async () => {
-  const run: CommandRunner = (cmd, args, _o = {}) => {
-    if (cmd === "ssh-agent") {
-      return Promise.resolve(
-        args[0] === "-s"
-          ? {
-            code: 0,
-            stdout:
-              "SSH_AUTH_SOCK=/tmp/a.sock;\nexport SSH_AUTH_SOCK;\nSSH_AGENT_PID=1;\nexport SSH_AGENT_PID;\n",
-            stderr: "",
-          }
-          : { code: 0, stdout: "", stderr: "" },
-      );
-    }
-    if (cmd === "ssh-add") {
-      return Promise.resolve({ code: 0, stdout: "", stderr: "" });
-    }
+Deno.test("a failed remote command is typed and leaves no remote temp file", async () => {
+  const calls: string[] = [];
+  const run: CommandRunner = (cmd, args) => {
     if (cmd !== "ssh") {
       return Promise.resolve({ code: 0, stdout: "", stderr: "" });
     }
     const remote = args[args.length - 1] ?? "";
-    if (remote.includes("'mktemp'")) {
-      return Promise.resolve({
-        code: 0,
-        stdout: "/tmp/wgmesh.AbC123XY\n",
-        stderr: "",
-      });
-    }
-    if (remote.includes("echo MISSING")) {
-      return Promise.resolve({ code: 0, stdout: "MISSING\n", stderr: "" });
-    }
-    if (remote.includes(".ssh-host-upload")) {
-      // The cleanup command is the one with rmdir and without umask 077.
-      return sha256Hex("SECRET\n").then((h) => ({
-        code: 0,
-        stdout: `${h} 0600\n`,
-        stderr: "",
-      }));
-    }
-    if (remote.includes("rmdir") && !remote.includes("umask 077")) {
-      return Promise.resolve({ code: 1, stdout: "", stderr: "rm failed" });
-    }
-    return Promise.resolve({ code: 0, stdout: "", stderr: "" });
+    calls.push(remote);
+    return Promise.resolve({ code: 3, stdout: "", stderr: "wg failed" });
   };
   const deps: SshDeps = { run, now: () => 0, sleep: () => Promise.resolve() };
-  await assertRejects(
-    () => sshTransport(STRICT_TARGET, deps)("echo hi", "SECRET\n"),
-    TransportError,
-    "may still hold the key",
+  const res = await sshTransport(STRICT_TARGET, deps)("echo hi", "SECRET\n");
+  assertEquals(res.code, 3);
+  assertEquals(calls.length, 1);
+  assertEquals(
+    calls.some((c) => c.includes("mktemp") || c.includes("rm -f")),
+    false,
   );
 });
 
@@ -1131,78 +1066,4 @@ Deno.test("legacy host key objects must be exactly {type, key} strings", () => {
     false,
   );
   assertEquals(parse([{ type: "ssh-ed25519" }]), false);
-});
-
-Deno.test("under dash a TERM, HUP or INT stops the script, exits non-zero and cleans up", async () => {
-  const ok = await new Deno.Command("sh", {
-    args: ["-c", "true"],
-    stdout: "null",
-    stderr: "null",
-  }).output().then((o) => o.success, () => false);
-  if (!ok) return;
-  for (
-    const [sig, code] of [["TERM", 143], ["HUP", 129], ["INT", 130]] as const
-  ) {
-    const dir = await Deno.makeTempDir({ prefix: "wgmesh." });
-    // The transport only accepts /tmp/wgmesh.<alnum> directories.
-    const real = `/tmp/wgmesh.${sig}${crypto.randomUUID().slice(0, 6)}`;
-    await Deno.rename(dir, real).catch(async () => {
-      await Deno.mkdir(real);
-    });
-    await Deno.writeTextFile(`${real}/stdin`, "SECRET\n");
-    let body: { code: number; stdout: string } | undefined;
-    const run: CommandRunner = async (cmd, args, _o = {}) => {
-      if (cmd === "ssh-agent") {
-        return {
-          code: 0,
-          stdout: args[0] === "-s"
-            ? "SSH_AUTH_SOCK=/tmp/a.sock;\nSSH_AGENT_PID=1;\n"
-            : "",
-          stderr: "",
-        };
-      }
-      if (cmd !== "ssh") return { code: 0, stdout: "", stderr: "" };
-      const remote = args[args.length - 1] ?? "";
-      if (remote.includes("'mktemp'")) {
-        return { code: 0, stdout: `${real}\n`, stderr: "" };
-      }
-      if (remote.includes("echo MISSING")) {
-        return { code: 0, stdout: "MISSING\n", stderr: "" };
-      }
-      if (remote.includes(".ssh-host-upload")) {
-        return {
-          code: 0,
-          stdout: `${await sha256Hex("SECRET\n")} 0600\n`,
-          stderr: "",
-        };
-      }
-      if (remote.includes("exec 3<")) {
-        // The real script body, run under the system sh (dash).
-        const o = await new Deno.Command("sh", {
-          args: ["-c", remote.replace(/^'sh' '-c' /, "sh -c ")],
-          stdout: "piped",
-          stderr: "piped",
-        }).output();
-        body = {
-          code: o.code,
-          stdout: new TextDecoder().decode(o.stdout),
-        };
-        return { code: o.code, stdout: body.stdout, stderr: "" };
-      }
-      return { code: 0, stdout: "", stderr: "" };
-    };
-    const deps: SshDeps = { run, now: () => 0, sleep: () => Promise.resolve() };
-    await sshTransport(STRICT_TARGET, deps)(
-      `kill -${sig} $$; echo SHOULD-NOT-RUN`,
-      "SECRET\n",
-    ).catch(() => undefined);
-    assertEquals(body?.code, code, sig);
-    assertEquals(body?.stdout.includes("SHOULD-NOT-RUN"), false, sig);
-    // The EXIT trap removed the directory (the stdin file was unlinked first).
-    assertEquals(
-      await Deno.stat(real).then(() => true, () => false),
-      false,
-      `${sig}: temp dir removed`,
-    );
-  }
 });

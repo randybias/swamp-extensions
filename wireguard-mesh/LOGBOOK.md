@@ -422,3 +422,51 @@ Residuals (follow-ups, not failures):
   capitalization is reported unreadable instead of reused (astra, Medium).
 - Different spellings of one IPv6 address, and a name with a trailing dot, get
   separate pins (Low).
+
+## 2026.10.17.6 — canonical transport re-vendor; secrets over stdin
+
+- Re-vendored `_lib/ssh.ts` byte-identical from `ssh-host` on `origin/main`
+  (blob `8f132c4329c9e64bed686731cd5a0e02980194ea`, `ssh_test.ts`
+  `4e8ac15fcd6bce797c523a221fe58fe9a8d9b386`). The new transport adds
+  `exec(argv, {stdin, timeoutMs, maxOutputBytes})`, a typed `SshErrorKind`
+  `"timeout"`, and `truncated`/`duration_ms` on `ExecResult`.
+- **Dropped the remote temp-file workaround.** `sshTransport` used to
+  `mktemp
+  -d` a directory on the node, `upload` the private key and config
+  into it, and open that file on fd 3 for the script. It now calls
+  `exec(["sh","-c",script], { stdin })`, so the bytes stream through ssh
+  straight into the consuming command and the transport never writes a secret to
+  remote disk. The remote script text is unchanged (`applyScript` still reads
+  the key line then the config from stdin).
+- **Files a tool must read by path** (the WireGuard key and config) are still
+  staged by the script itself under a private `mktemp -d` at mode 0600 with an
+  `EXIT` trap, then committed with a guarded `mv`; that is the only remote write
+  of the secret and it is the file WireGuard requires.
+- **Bounded remote steps.** `sshTransport` now wraps every script as
+  `timeout -k 5 <N> sh -c <script>` inside a surviving `sh -c`, so the REMOTE
+  process group is killed at the deadline (N = `ssh.command_timeout_s`, default
+  300 s, capped at `APPLY_ROLLBACK_SECONDS - 10` = 110 s) and not just the local
+  ssh. The detached rollback redirects its stdin from `/dev/null`, so it
+  survives. Adds the `ssh.command_timeout_s` input; no stored-attribute changes;
+  a literal no-op `upgrades[]` entry is added.
+
+## 2026.10.17.6 review fixes
+
+- **HIGH — rollback could be lost to a held lock.** A hung `wg-quick` orphaned
+  by the local-ssh kill kept fd 9, so the rollback's `flock -w 60 9` gave up at
+  t+60 and the node stayed on the new config with no revert. Now the remote body
+  runs under `timeout -k 5 N sh -c ...` (kills the whole process group, so the
+  lock is released) and the rollback waits the holder out (`rollbackLockLines`
+  retries `flock -w 5` until it acquires, with a 900 s cap) instead of
+  abandoning the generation. `applyScript` takes an optional rollback window so
+  a test can exercise it quickly. New: a netns cell kills a session mid-apply
+  with a hung `wg-quick` and asserts the rollback restores the baseline, a shell
+  test that the rollback waits out a held lock, and transport tests asserting
+  the `timeout -k 5` wrapper and a local deadline that outlives it.
+- **MEDIUM — claims.** The README/release/LOGBOOK now say what actually happens:
+  the remote process group is killed at the deadline, and
+  `ssh.command_timeout_s` is documented (default 300 s, capped at 110 s).
+- **MEDIUM — staging cleanup on a signal.** `applyScript` sets
+  `trap 'exit 129' HUP`, 130 INT, 143 TERM and 141 PIPE after the `EXIT` trap,
+  so a signalled run still removes the staging directory and its 0600 key copy.
+  The signal test is restored (`signalTrapLines`, run under `sh`).

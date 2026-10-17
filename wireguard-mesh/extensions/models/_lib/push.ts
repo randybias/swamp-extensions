@@ -2,8 +2,9 @@
  * Push half: applies a rendered config to one node through the canonical
  * vendored SSH transport (`_lib/ssh.ts`). Every value that reaches the remote
  * shell is validated against a grammar and quoted, and each script is a fixed
- * template; the private key and the config travel in an uploaded temp file
- * piped into the script, never on argv. An ssh exit 255 is the transport's
+ * template; the private key and the config are streamed to the script over
+ * ssh stdin, never on argv and never written to the node by the transport (a
+ * tool that reads a path gets the script's own private staging). An ssh exit 255 is the transport's
  * typed `SshError`, and supplied host-key pins that do not apply to the host
  * are refused rather than silently accepted.
  *
@@ -16,11 +17,11 @@ import {
   exec,
   type ExecResult,
   type HostKeyInfo,
+  quoteArgv,
   SshConfigError,
   type SshDeps,
   SshError,
   type SshTarget as CanonicalTarget,
-  upload,
   waitConnection,
 } from "./ssh.ts";
 
@@ -66,9 +67,14 @@ export interface SshTarget {
   private_key?: string;
   /** Connection timeout in seconds. */
   connect_timeout_s?: number;
+  /** Deadline in seconds for one remote command; a hung session is killed. */
+  command_timeout_s?: number;
   /** Cap in bytes on captured output. */
   max_output_bytes?: number;
 }
+
+/** Default deadline for one remote command, in seconds. */
+export const DEFAULT_COMMAND_TIMEOUT_S = 300;
 
 /** A transport failure: unreachable host, rejected auth or host key. */
 export class TransportError extends Error {
@@ -128,13 +134,24 @@ function knownHostsLines(
  * Builds the ssh-backed transport on the canonical `_lib/ssh.ts`. A first
  * `insecure_tofu` call with no pins learns the host keys (returned in
  * `known_hosts`, `[host]:port` for a non-default port) and pins them for the
- * rest of the operation; `stdin` is written to a private `mktemp -d` directory
- * and the script unlinks it as soon as it is opened on fd 3, so the key and
- * config are unlinked before the script runs (removed by a checked cleanup) and never on argv. An ssh exit 255 is the canonical
- * typed `SshError`, rethrown here as a `TransportError`.
+ * rest of the operation. `stdin` is streamed straight into the remote command
+ * through ssh, so the private key and config never touch remote disk and never
+ * appear on argv. Any file a tool must read by path (the WireGuard key and the
+ * config) is staged by the script itself under a private `mktemp -d` and
+ * committed with a guarded `mv`. An ssh exit 255 is the canonical typed
+ * `SshError`, rethrown here as a `TransportError`, and a per-command
+ * `timeoutMs` kills a hung session and is typed the same way.
  */
 export function sshTransport(t: SshTarget, deps: SshDeps): Transport {
   const target = canonicalTarget(t);
+  // The remote deadline is capped below the apply rollback window so the lock a
+  // hung body holds is always released before the rollback fires; the local ssh
+  // outlives it so the remote `timeout` reports first.
+  const deadlineS = Math.min(
+    t.command_timeout_s ?? DEFAULT_COMMAND_TIMEOUT_S,
+    APPLY_ROLLBACK_SECONDS - 10,
+  );
+  const timeoutMs = (deadlineS + 15) * 1000;
   return async (script, stdin) => {
     let learnedLines: string | undefined;
     if (
@@ -155,105 +172,29 @@ export function sshTransport(t: SshTarget, deps: SshDeps): Transport {
       learnedLines = knownHostsLines(t.host, t.port, waited.host_keys);
       target.host_keys = learnedLines.split("\n").filter((l) => l !== "");
     }
-    let dir: string | undefined;
-    let tmp: string | undefined;
-    let result: TransportResult | undefined;
-    let failure: TransportError | undefined;
+    // Bound the REMOTE side too: `timeout` runs the script in its own process
+    // group and kills that group at the deadline, so a hung wg-quick cannot
+    // hold the node lock past it and an armed rollback can still acquire the
+    // lock and restore. The outer `sh -c` survives the kill and reports the
+    // code (124 = TERM, 137 = KILL).
+    const bounded = `timeout -k 5 ${deadlineS} ${
+      quoteArgv(["sh", "-c", script])
+    }; exit $?`;
+    let res: ExecResult;
     try {
-      if (stdin !== undefined) {
-        let made: ExecResult;
-        try {
-          made = await exec(deps, target, [
-            "mktemp",
-            "-d",
-            "-p",
-            "/tmp",
-            "wgmesh.XXXXXXXX",
-          ]);
-        } catch (e) {
-          throw toTransportError(e);
-        }
-        if (made.exit_code !== 0) {
-          throw new TransportError(
-            "remote",
-            "could not create a private temp directory on the node",
-          );
-        }
-        dir = made.stdout.trim();
-        if (!/^\/tmp\/wgmesh\.[A-Za-z0-9]{6,}$/.test(dir)) {
-          throw new TransportError(
-            "remote",
-            "mktemp returned an unexpected path",
-          );
-        }
-        tmp = `${dir}/stdin`;
-        try {
-          await upload(deps, target, {
-            path: tmp,
-            content: stdin,
-            mode: "0600",
-          });
-        } catch (e) {
-          throw toTransportError(e);
-        }
-      }
-      const body = tmp === undefined || dir === undefined ? script : [
-        "umask 077",
-        // Open the file, then unlink it before the script body runs. Each step
-        // is checked, so a failed open or unlink stops before the script can
-        // touch the host.
-        `exec 3<'${tmp}' || exit 70`,
-        `rm -f -- '${tmp}' || exit 70`,
-        `[ ! -e '${tmp}' ] || exit 70`,
-        // The EXIT trap does the cleanup; a signal makes the shell exit (with
-        // the conventional status) so the trap runs and the script stops.
-        `trap 'rm -f -- "${tmp}"; rmdir -- "${dir}" 2>/dev/null || true' EXIT`,
-        "trap 'exit 129' HUP",
-        "trap 'exit 130' INT",
-        "trap 'exit 143' TERM",
-        "{",
-        script,
-        "} <&3",
-      ].join("\n");
-      let res: ExecResult;
-      try {
-        res = await exec(deps, target, ["sh", "-c", body]);
-      } catch (e) {
-        throw toTransportError(e);
-      }
-      result = {
-        code: res.exit_code,
-        stdout: res.stdout,
-        stderr: res.stderr,
-        ...(learnedLines !== undefined ? { known_hosts: learnedLines } : {}),
-      };
+      res = await exec(deps, target, ["sh", "-c", bounded], {
+        ...(stdin !== undefined ? { stdin } : {}),
+        timeoutMs,
+      });
     } catch (e) {
-      failure = e instanceof TransportError ? e : toTransportError(e);
+      throw toTransportError(e);
     }
-    let cleanupFailure: TransportError | undefined;
-    if (tmp !== undefined) {
-      let cleaned: ExecResult | undefined;
-      try {
-        cleaned = await exec(deps, target, [
-          "sh",
-          "-c",
-          // Only a failed rm of the key file is an error; an absent directory
-          // (or one still holding the file) is handled by the trailing test.
-          `rm -f -- '${tmp}' && { rmdir -- '${dir}' 2>/dev/null || [ ! -e '${dir}/stdin' ]; }`,
-        ]);
-      } catch {
-        cleaned = undefined;
-      }
-      if (cleaned === undefined || cleaned.exit_code !== 0) {
-        cleanupFailure = new TransportError(
-          "remote",
-          `the remote temp file ${tmp} may still hold the key; remove it by hand`,
-        );
-      }
-    }
-    if (cleanupFailure !== undefined) throw cleanupFailure;
-    if (failure !== undefined) throw failure;
-    return result!;
+    return {
+      code: res.exit_code,
+      stdout: res.stdout,
+      stderr: res.stderr,
+      ...(learnedLines !== undefined ? { known_hosts: learnedLines } : {}),
+    };
   };
 }
 
@@ -360,10 +301,7 @@ function launchRollbackLines(windowSeconds: number): string[] {
     'sleep "$1"',
     "shift",
     "rb=$1; d=$2; i=$3; up=$4; epoch=$5",
-    "if command -v flock >/dev/null 2>&1; then",
-    '  exec 9>"$d/.$i.lock"',
-    "  flock -w 60 9 || exit 1",
-    "fi",
+    ...rollbackLockLines(),
     'if [ ! -e "$rb/epoch" ]; then exit 0; fi',
     'if [ -e "$rb/disarm" ]; then rm -rf "$rb"; exit 0; fi',
     'if [ "$(cat "$d/.$i.epoch" 2>/dev/null || echo stale)" != "$epoch" ]; then rm -rf "$rb"; exit 0; fi',
@@ -473,6 +411,38 @@ function addrCheckLines(): string[] {
   ];
 }
 
+/**
+ * Traps that turn a signal into a normal exit so the `EXIT` trap (which removes
+ * the staging directory and its 0600 key copy) still runs.
+ */
+export function signalTrapLines(): string[] {
+  return [
+    "trap 'exit 129' HUP",
+    "trap 'exit 130' INT",
+    "trap 'exit 143' TERM",
+    "trap 'exit 141' PIPE",
+  ];
+}
+
+/**
+ * Rollback lock lines: the holder is a bounded apply/delete, so wait it out
+ * rather than abandon the generation. `timeout` frees the lock when it kills a
+ * hung body, so the rollback still reverts; a 900 s cap stops a truly stuck
+ * holder pinning the rollback forever.
+ */
+export function rollbackLockLines(): string[] {
+  return [
+    "if command -v flock >/dev/null 2>&1; then",
+    '  exec 9>"$d/.$i.lock"',
+    "  waited=0",
+    "  while ! flock -w 5 9; do",
+    "    waited=$((waited + 5))",
+    '    if [ "$waited" -ge 900 ]; then exit 1; fi',
+    "  done",
+    "fi",
+  ];
+}
+
 /** Seconds the remote rollback waits before restoring a changed interface. */
 export const APPLY_ROLLBACK_SECONDS = 120;
 
@@ -486,8 +456,14 @@ export const APPLY_ROLLBACK_SECONDS = 120;
  * success it leaves a detached rollback armed and prints `rb=<dir>` for a fresh
  * connection to disarm; prints `changed=0|1`.
  */
-export function applyScript(iface: string): string {
+export function applyScript(
+  iface: string,
+  rollbackSeconds: number = APPLY_ROLLBACK_SECONDS,
+): string {
   assertIface(iface);
+  if (!Number.isInteger(rollbackSeconds) || rollbackSeconds < 1) {
+    throw new Error(`Invalid rollback window: ${rollbackSeconds}`);
+  }
   return [
     "set -eu",
     "umask 077",
@@ -500,6 +476,7 @@ export function applyScript(iface: string): string {
     'stage=$(mktemp -d "$d/.$i.stage.XXXXXX")',
     'cleanup() { rm -rf "$stage"; }',
     "trap cleanup EXIT",
+    ...signalTrapLines(),
     'cfg="$stage/$i.conf"',
     'kf="$stage/$i.key"',
     'cat > "$cfg"',
@@ -523,7 +500,7 @@ export function applyScript(iface: string): string {
     '  epoch=$(cat "$d/.$i.epoch" 2>/dev/null || echo 0)',
     '  if [ "$1" = 1 ]; then epoch=$((epoch + 1)); echo "$epoch" > "$d/.$i.epoch"; fi',
     ...backupLines(),
-    ...launchRollbackLines(APPLY_ROLLBACK_SECONDS),
+    ...launchRollbackLines(rollbackSeconds),
     "}",
     // Peers, endpoints, allowed IPs, keepalive and listen port; no counters.
     "live_sig() {",

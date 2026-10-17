@@ -340,18 +340,23 @@ export async function clusterFingerprint16(
 
 /**
  * State instance name for the operator record: the cluster fingerprint and the
- * fixed `kubevirt` suffix. Two contexts on one server share the fingerprint.
+ * fixed `kubevirt` suffix, joined by `_`. Two contexts on one server share the
+ * fingerprint. swamp rejects `/` in a data name, so the spec's `fp/kubevirt`
+ * form is not usable; `_` cannot appear in a hex fingerprint or in a DNS-1123
+ * namespace or name, so the keys stay injective.
  */
 export async function operatorStateKey(
   kubeconfig: string,
   context?: string,
 ): Promise<string> {
-  return `${await clusterFingerprint16(kubeconfig, context)}/kubevirt`;
+  return `${await clusterFingerprint16(kubeconfig, context)}_kubevirt`;
 }
 
 /**
- * State instance name for one VM: the cluster fingerprint, namespace and name.
- * Namespace and name are DNS-1123 labels, so the key cannot collide.
+ * State instance name for one VM: the cluster fingerprint, namespace and name
+ * joined by `_` (swamp rejects `/`). Namespace and name are DNS-1123 labels and
+ * cannot contain `_`, so the key cannot collide with another VM or with the
+ * operator record (which has one part fewer).
  */
 export async function vmStateKey(
   kubeconfig: string,
@@ -360,7 +365,7 @@ export async function vmStateKey(
   name: string,
 ): Promise<string> {
   const fp = await clusterFingerprint16(kubeconfig, context);
-  return `${fp}/${namespace}/${name}`;
+  return `${fp}_${namespace}_${name}`;
 }
 
 /** The `kubeconfig` and `context` fields every method takes. */

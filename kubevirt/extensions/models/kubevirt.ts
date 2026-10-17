@@ -991,7 +991,22 @@ export const model = {
           async (kubectl) => {
             const cr = await readCr(kubectl);
             if (!cr) {
-              throw new KubevirtError("not_found", "KubeVirt is not installed");
+              // Not installed is an answer, not an error: record it.
+              return stateOf(
+                a,
+                fp,
+                null,
+                { schedulable: [], kvm: [] },
+                "not_found",
+                d.now(),
+                {
+                  cdi_version: prior?.cdi_version,
+                  cdi_installed_by_model: prior?.cdi_installed_by_model,
+                  ...(prior?.cdi_operator_sha256
+                    ? { cdi_operator_sha256: prior.cdi_operator_sha256 }
+                    : {}),
+                },
+              );
             }
             const nodes = await readNodes(kubectl);
             const cdi = await readCdi(kubectl);

@@ -132,8 +132,8 @@ Deno.test("clusterFingerprint16 follows the selected server, not the text", asyn
 
 Deno.test("state keys are the cluster fingerprint plus the operands", async () => {
   const fp = await clusterFingerprint16(KC, "c");
-  assertEquals(await operatorStateKey(KC, "c"), `${fp}/kubevirt`);
-  assertEquals(await vmStateKey(KC, "c", "app", "vm-1"), `${fp}/app/vm-1`);
+  assertEquals(await operatorStateKey(KC, "c"), `${fp}_kubevirt`);
+  assertEquals(await vmStateKey(KC, "c", "app", "vm-1"), `${fp}_app_vm-1`);
 });
 
 Deno.test("version guards refuse a downgrade and a multi-minor jump", () => {

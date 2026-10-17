@@ -198,3 +198,16 @@ schema/secret checks, and the failure-mode table above.
   refused.
 - LOW: uninstall description shortened; `.test` host names in URL fixtures; the
   recorded flag is false after an uninstall.
+
+## Round 5 (live blockers on a real swamp)
+
+- HIGH: state keys contained `/` (`<fp>/kubevirt`, `<fp>/<ns>/<name>`), which
+  swamp rejects in a data name, so every state write failed. DEVIATION FROM THE
+  SPEC key format, forced by the platform: the keys are now `<fp>_kubevirt` and
+  `<fp>_<ns>_<name>`. `_` cannot occur in a hex fingerprint or in a DNS-1123
+  namespace or name, so the mapping stays injective; the operator record has one
+  part fewer than a VM record. A test checks every written name against swamp's
+  rule (no `..`, `/`, `\` or NUL).
+- HIGH: `get` on a cluster without KubeVirt returned an error. It now records
+  and returns `status: not_found` (the spec's only absent status; the spec has
+  no `not_installed`), like `sync`.

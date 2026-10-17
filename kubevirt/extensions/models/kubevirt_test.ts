@@ -8,6 +8,7 @@ import {
   KubevirtError,
   operatorStateKey,
   setDeps,
+  vmStateKey,
 } from "./_lib/k8s.ts";
 
 const KC = `apiVersion: v1
@@ -558,22 +559,23 @@ Deno.test("get reports the install and its node facts", async () => {
   }
 });
 
-Deno.test("get refuses when KubeVirt is absent; sync records not_found", async () => {
+Deno.test("get and sync on a fresh cluster record not_found, without an error", async () => {
   const h = harness(getRoute(null));
   try {
     const ctx = testCtx();
-    const e = await assertRejects(
-      () => model.methods.get.execute({ kubeconfig: KC }, ctx.context),
-      KubevirtError,
+    for (const method of ["get", "sync"] as const) {
+      const out = await model.methods[method].execute(
+        { kubeconfig: KC },
+        ctx.context,
+      ) as { result: { status: string } };
+      assertEquals(out.result.status, "not_found", method);
+    }
+    const written = ctx.getWrittenResources();
+    assertEquals(written.length, 2);
+    assertEquals(
+      (written[0].data as { status: string }).status,
+      "not_found",
     );
-    assertEquals((e as KubevirtError).code, "not_found");
-    const out = await model.methods.sync.execute(
-      { kubeconfig: KC },
-      ctx.context,
-    ) as {
-      result: { status: string };
-    };
-    assertEquals(out.result.status, "not_found");
   } finally {
     h.restore();
   }
@@ -926,7 +928,7 @@ async function fingerprint(): Promise<string> {
 
 // The operator state key is derived from the fingerprint; assert the shape.
 Deno.test("the uninstall state key is the fingerprint plus kubevirt", async () => {
-  assertEquals(await operatorStateKey(KC), `${await fingerprint()}/kubevirt`);
+  assertEquals(await operatorStateKey(KC), `${await fingerprint()}_kubevirt`);
 });
 
 // --- A cluster that serves a kind only once its CRD exists -------------------
@@ -1085,21 +1087,18 @@ Deno.test("get and sync on a cluster with KubeVirt but no CDI CRD work", async (
   }
 });
 
-Deno.test("get is not_found and sync records not_found when the KubeVirt CRD is absent", async () => {
+Deno.test("get and sync report not_found when the KubeVirt CRD is absent", async () => {
   const k = crdCluster();
   const h = harness(k.route);
   try {
     const ctx = testCtx();
-    const e = await assertRejects(
-      () => model.methods.get.execute({ kubeconfig: KC }, ctx.context),
-      KubevirtError,
-    );
-    assertEquals((e as KubevirtError).code, "not_found");
-    const synced = await model.methods.sync.execute(
-      { kubeconfig: KC },
-      ctx.context,
-    ) as { result: { status: string } };
-    assertEquals(synced.result.status, "not_found");
+    for (const method of ["get", "sync"] as const) {
+      const out = await model.methods[method].execute(
+        { kubeconfig: KC },
+        ctx.context,
+      ) as { result: { status: string } };
+      assertEquals(out.result.status, "not_found", method);
+    }
   } finally {
     h.restore();
   }
@@ -1306,4 +1305,45 @@ Deno.test("a CDI namespace or CRD that someone else owns, with no CDI resource, 
   } finally {
     h.restore();
   }
+});
+
+// swamp's data-name rule: no "..", "/", "\\" or NUL.
+const BAD_NAME = /\.\.|[/\\\0]/;
+
+Deno.test("every resource name the models write passes swamp's data-name rule", async () => {
+  const k = crdCluster();
+  const h = harness(k.route, { fetch: kvFetch() });
+  try {
+    const ctx = testCtx();
+    await model.methods.sync.execute({ kubeconfig: KC }, ctx.context);
+    await model.methods.install.execute(INSTALL, ctx.context);
+    await model.methods.get.execute({ kubeconfig: KC }, ctx.context);
+    const names = ctx.getWrittenResources().map((r) => r.name);
+    assert(names.length >= 3);
+    for (const n of names) {
+      assertEquals(BAD_NAME.test(n), false, `data name ${n}`);
+    }
+  } finally {
+    h.restore();
+  }
+  // The key builders, including a VM key with a dotted name.
+  const fp = await fingerprint();
+  for (
+    const key of [
+      await operatorStateKey(KC),
+      await vmStateKey(KC, undefined, "app-ns", "vm-1"),
+      await vmStateKey(KC, "c", "app-ns", "vm.1"),
+    ]
+  ) {
+    assertEquals(BAD_NAME.test(key), false, key);
+    assert(key.startsWith(fp));
+  }
+  // Injective: distinct VMs, and the operator record, never share a key.
+  const keys = new Set([
+    await operatorStateKey(KC),
+    await vmStateKey(KC, undefined, "a-b", "c"),
+    await vmStateKey(KC, undefined, "a", "b-c"),
+    await vmStateKey(KC, undefined, "a", "b"),
+  ]);
+  assertEquals(keys.size, 4);
 });

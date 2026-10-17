@@ -1,0 +1,89 @@
+{
+  "extension": "@randybias/wireguard-mesh",
+  "version": "2026.10.17.4",
+  "reviewedAt": "2026-10-17T13:12:50Z",
+  "dimensions": [
+    {
+      "id": "credentials-secrets",
+      "verdict": "pass",
+      "note": "The WireGuard private key and the SSH private key are sensitive-marked and taken as vault references; the WireGuard key is delivered to the node over stdin into a 0600 key file and PostUp reads that file, so it never appears in the rendered config, on remote argv, or in any resource. Live cell 19: zero private-key occurrences in any run's output. Known external issue swamp-club lab 3555 (CLI prints literal sensitive arguments) is handled by vault-reference-only README examples."
+    },
+    {
+      "id": "logging-quality",
+      "verdict": "pass",
+      "note": "Each method logs once with the node name and outcome (changed / no change); no key material, config text or host keys in log fields."
+    },
+    {
+      "id": "error-handling",
+      "verdict": "pass",
+      "note": "SSH exit 255 is a typed TransportError (reason unreachable / host-key); the remote script exits with distinct codes (75 missing flock, 3 confirm after rollback, 4 superseded) mapped to typed errors; a failed reload, route check or interface check runs fail_restore before returning. Residual MEDIUM: if both wg-quick down and ip link delete fail, delete removes the files before detecting the interface is still up (the armed rollback restores them)."
+    },
+    {
+      "id": "testing-completeness",
+      "verdict": "pass",
+      "note": "63 unit/contract tests pass (render golden files for full mesh and hub-spoke, push script behaviour, allowlist, host-key policy, real plain-object context through createModelTestContext), plus an opt-in netns suite (WG_MESH_NETNS=1) against real WireGuard: apply, no-op, recreation, drift repair, double confirm, confirm after rollback, retry superseding. Live e2e on two throwaway VPS: 19 pass, 0 fail, 2 untested (delete over the wg path that severs itself, and delete's own rollback firing); those two block stable, not beta."
+    },
+    {
+      "id": "idempotency-resilience",
+      "verdict": "pass",
+      "note": "apply is a no-op when files, addresses and live peers match (live cell 7, no new generation); delete again is a no-op (cells 16, 17); every live change arms a detached generation-checked rollback before mutating and is disarmed only by a fresh-connection confirmation; an unconfirmed change rolls back (cell 12) and a retry inside the window supersedes the old rollback (cell 13). Residual MEDIUMs: extra routes through wg0 are not detected; a failed retry restores to the retry's own backup, not the original pre-change state (reachable by construction)."
+    },
+    {
+      "id": "api-contracts",
+      "verdict": "pass",
+      "note": "wg-quick / wg syncconf / wg set / ip, wireguard-tools 1.0.20210914 on Ubuntu 24.04 (live). Address or route changes recreate the interface; peer-only changes use syncconf. Drift is compared on the tool's own read-back (wg showconf peers, ip addr), not on the render text."
+    },
+    {
+      "id": "resource-management",
+      "verdict": "pass",
+      "note": "Each operation holds one flock on the node and one SSH connection per step; each converged re-apply leaves one sleeping, already-disarmed rollback process for the 120 s window, which then removes its directory (live cleanup: no rollback processes left)."
+    },
+    {
+      "id": "published-surface-hygiene",
+      "verdict": "pass",
+      "note": "Manifest @randybias/wireguard-mesh, two-sentence description, Apache-2.0, additionalFiles README.md and LICENSE.txt. apply and delete are actions marked DESTRUCTIVE, delete requires acknowledge_reachability_risk=true; render and get are read-only. Leak scan, gitleaks and fixture guard pass; live receipts in LOGBOOK use redacted hosts and addresses. Residual LOW: README says flock is used when available but mutations require it."
+    },
+    {
+      "id": "schema-strictness",
+      "verdict": "pass",
+      "note": "Global arguments are an empty strictObject; every argument and resource schema is strict; keys, CIDRs, interface names, endpoints and host keys carry grammars and bounds; peers must be on peers_allowlist (live cell 8). Residual LOW: EndpointSchema has no total length bound."
+    },
+    {
+      "id": "lifetime-gc",
+      "verdict": "pass",
+      "note": "state infinite/10, rendered infinite/5, live infinite/5, hostkeys infinite/10."
+    },
+    {
+      "id": "crud-completeness",
+      "verdict": "pass",
+      "note": "render, apply (create or converge), get (live read-back) and delete (an action; deleting an absent interface is a no-op). No method uses kind delete, so no verb tombstones the definition."
+    },
+    {
+      "id": "preflight-checks",
+      "verdict": "pass",
+      "note": "Inputs, allowlist, relay exclusion and the delete acknowledgement are validated before any connection (cells 8, 14); the remote script refuses up front without flock (exit 75); host keys are strict-pinned, and under accept-new the first accepted key is pinned for the rest of the operation."
+    },
+    {
+      "id": "instance-names",
+      "verdict": "pass",
+      "note": "state, rendered and live are keyed by node name; host keys by <node>-hostkeys, so one definition serves every node of a mesh without collision."
+    },
+    {
+      "id": "data-access",
+      "verdict": "pass",
+      "note": "Mesh data, SSH target and keys arrive as method arguments; the only data read back is this model's own hostkeys resource for pinning."
+    },
+    {
+      "id": "version-upgrades",
+      "verdict": "pass",
+      "note": "Upgrade entries for 2026.10.17.2, .3 and .4 declare no stored-attribute changes; the hostkeys resource added in .2 is a new resource, absent data means no pin yet."
+    }
+  ],
+  "panel": {
+    "codex-astra": "codex gpt-6-astra conformance seat at 588a882 (round 6): 2 High downgraded under the run rulings (retry backs up already-mutated files -> MEDIUM, reachable by construction; drift probe disarms before confirmation -> LOW, its rollback would restore identical files), 1 Medium (route check after the no-op exit), 3 Low (unquoted numeric window, netns test duplication, README flock wording); residuals recorded in LOGBOOK.",
+    "codex-terra": "codex gpt-5.6-terra adversarial seat at 588a882 (round 6): 0 Critical/High, 2 Medium (delete removes files before detecting a failed teardown; extra routes through wg0 not detected), 1 Low (endpoint length bound); no argv/shell injection or literal-secret persistence found. Rounds 1 to 5 are dispositioned in LOGBOOK.",
+    "merge-prep": "Post-review change: plain model export so the registry catalogs the model type (dry-run uncatalogued-model); no behaviour change, 63 tests and gates 0 to 6 pass. Lane keeps its own SSH push transport rather than vendored _lib/ssh.ts (accepted by the lead).",
+    "live-e2e": "Two throwaway VPS at 588a882: 19 pass, 0 fail, 2 untested (self-severing delete over the wg path; delete's own rollback firing). Channel beta until those run.",
+    "ocr-llm": "OCR sonnet5 and glm seats were not run in the final rounds"
+  }
+}

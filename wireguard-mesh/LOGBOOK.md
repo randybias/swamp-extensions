@@ -224,7 +224,7 @@ appeared in any run's console output.
 | 6 confirm over a fresh connection                   | pass     | after each apply the matching rollback directory holds `disarm`                                                                                    |
 | 7 apply idempotent                                  | pass     | "No change" on both; generation counter unchanged; the probe's disarmed rollback directory is removed after its window                             |
 | 8 allowlist rejection                               | pass     | `peer node-b is not on peers_allowlist`; nothing contacted                                                                                         |
-| 9 AllowedIPs change recreates                       | pass     | ifindex 4 -> 5; `10.99.0.0/24` route and allowed-ips present                                                                                       |
+| 9 AllowedIPs change recreates                       | pass     | ifindex 4 -> 5; `<extra-net>/24` route and allowed-ips present                                                                                     |
 | 10 Address change recreates                         | pass     | ifindex 5 -> 6; address <wg-a2>/32                                                                                                                 |
 | 11 restore to desired                               | pass     | <wg-a>/32, route to <wg-b>, ping OK                                                                                                                |
 | 12 apply rollback fires when not confirmed (manual) | pass     | unconfirmed ListenPort 51821; after the 120 s window port back to 51820, config restored, peer kept, ping OK                                       |
@@ -243,3 +243,31 @@ processes; the SSH agent was killed and the vault copies of the keys deleted.
 The VPS are left for deletion by the live lane.
 
 Cells 20 and 21 block promotion to stable; they do not block beta.
+
+## Review ledger: final verify and merge prep (round 6 at 588a882)
+
+Round 6 (codex astra conformance, codex terra adversarial) found no unrefuted
+Critical/High; the lane head was unchanged at merge prep and the merged diff is
+byte-identical to the one reviewed.
+
+- astra HIGH, retry inside the window backs up already-mutated files: downgraded
+  to MEDIUM. A retry only runs if the node is reachable over the mutated state,
+  and a failed retry restores to exactly that state, so no path leaves the host
+  unreachable. Residual: the original pre-change backup is not carried across a
+  retry.
+- astra HIGH, drift probe disarms before a fresh-connection confirmation:
+  downgraded to LOW. The probe runs only when the files on disk already equal
+  the desired config, so its rollback would restore identical files; disarming
+  it loses no recovery. Live cell 7 exercised this path.
+- Residual MEDIUMs for the next version: extra routes through wg0 are not
+  detected (only missing ones); route verification comes after the no-op exit;
+  if both `wg-quick down` and `ip link delete` fail, delete removes the files
+  before it detects the interface is still up (the armed rollback restores
+  them).
+- Residual LOWs: `EndpointSchema` has no total length bound; the rollback window
+  is interpolated unquoted (validated integer); the netns tests duplicate setup;
+  README says `flock` is used "when available" but mutations require it.
+- Merge prep: plain model export so the registry catalogs the model type
+  (dry-run uncatalogued-model); no behaviour change.
+- Transport: this extension keeps its own SSH push transport rather than the
+  vendored `_lib/ssh.ts`; accepted by the lead.

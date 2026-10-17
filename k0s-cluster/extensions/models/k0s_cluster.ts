@@ -300,6 +300,8 @@ const StateSchema = z.strictObject({
   installed: z.boolean(),
   adopted: z.boolean(),
   cleanup_pending: z.boolean().optional(),
+  binary_removed: z.boolean().optional(),
+  binary_removal_reason: z.string().optional(),
   observed_at: z.string(),
 });
 
@@ -824,6 +826,15 @@ async function readLive(
       : [],
     observed_at: iso(now),
   });
+}
+
+/** `systemctl is-active` reported a state that is neither running nor stopped. */
+export class ResetStateError extends Error {
+  /** Creates a typed error for an indeterminate unit state. */
+  constructor(message: string) {
+    super(message);
+    this.name = "ResetStateError";
+  }
 }
 
 /** A reset cleanup step failed after k0s was already reset. */
@@ -1871,6 +1882,8 @@ function buildK0sModel(deps: K0sDeps) {
             extra: {
               binary_sha256?: string | null;
               cleanup_pending?: boolean;
+              binary_removed?: boolean;
+              binary_removal_reason?: string;
             },
           ) =>
             context.writeResource(
@@ -1928,7 +1941,12 @@ function buildK0sModel(deps: K0sDeps) {
             context.logger.info("Finished reset cleanup on {host}", {
               host: target.host,
             });
-            const handle = await writeState({});
+            const handle = await writeState({
+              binary_removed: cleanup.binary_removed,
+              ...(cleanup.reason
+                ? { binary_removal_reason: cleanup.reason }
+                : {}),
+            });
             return {
               dataHandles: [...handles, handle],
               result: { reset: true, ...cleanup },
@@ -1942,7 +1960,9 @@ function buildK0sModel(deps: K0sDeps) {
             "is-active",
             unit,
           ]);
-          if (active.stdout.trim() === "active") {
+          const unitState = active.stdout.trim();
+          const stoppedStates = ["inactive", "failed"];
+          if (unitState === "active") {
             const stopped = await deps.ssh.exec(target, [
               K0S_BINARY_PATH,
               "stop",
@@ -1953,16 +1973,30 @@ function buildK0sModel(deps: K0sDeps) {
                 "is-active",
                 unit,
               ]);
-              if (after.stdout.trim() === "active") {
+              const afterState = after.stdout.trim();
+              if (afterState === "active") {
                 throw new Error(
                   `k0s stop failed on ${target.host} (exit ${stopped.exit_code}) and ${unit} is still active`,
                 );
               }
+              if (!stoppedStates.includes(afterState)) {
+                throw new ResetStateError(
+                  `k0s stop failed on ${target.host} and ${unit} is ${
+                    afterState || "in an unknown state"
+                  } (systemctl is-active exit ${after.exit_code})`,
+                );
+              }
               context.logger.info(
-                "k0s stop reported {code} but {unit} is inactive; continuing",
-                { code: stopped.exit_code, unit },
+                "k0s stop reported {code} but {unit} is {state}; continuing",
+                { code: stopped.exit_code, unit, state: afterState },
               );
             }
+          } else if (!stoppedStates.includes(unitState)) {
+            throw new ResetStateError(
+              `could not tell whether ${unit} is running on ${target.host}: systemctl is-active reported ${
+                unitState || "no output"
+              } (exit ${active.exit_code})`,
+            );
           }
           const result = await deps.ssh.exec(target, [
             K0S_BINARY_PATH,
@@ -1995,7 +2029,12 @@ function buildK0sModel(deps: K0sDeps) {
             throw e;
           }
           context.logger.info("Reset k0s on {host}", { host: target.host });
-          const handle = await writeState({});
+          const handle = await writeState({
+            binary_removed: cleanup.binary_removed,
+            ...(cleanup.reason
+              ? { binary_removal_reason: cleanup.reason }
+              : {}),
+          });
           return {
             dataHandles: [...handles, handle],
             result: { reset: true, ...cleanup },

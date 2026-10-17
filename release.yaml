@@ -244,6 +244,8 @@ ubuntu-autoinstall:
 k0s-multinode:
   channel: beta
   ci: false
+  visibility: public
+  audience: general
   published: {}
 
 knot-dns:

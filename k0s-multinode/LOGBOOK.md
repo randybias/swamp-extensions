@@ -1,6 +1,26 @@
 # Maintainer logbook
 
+visibility: public
+
+audience: general
+
 Not packaged. Notes for whoever maintains this extension.
+
+## Naming rubric (shared-docs 2026-10-17, section 3)
+
+1. **Public or private:** public.
+2. **Individual or general:** general.
+3. **Public and general — does the name describe and disambiguate while staying
+   short:** `k0s-multinode` names the system (`k0s`) and the kind (`multinode`),
+   disambiguating the multi-node orchestrator from the single-node `k0s-cluster`
+   in two segments.
+4. **Private and specific:** not applicable (this is public and general).
+5. **Would a stranger guess roughly right, and wrong about nothing:** yes — it
+   drives multi-node k0s clusters and is not a node-level installer
+   (`k0s-cluster`), a CLI tool or a provider service.
+
+Workflows follow `<ext>-<verb>-<object>` with a verb from the convention list:
+`k0s-multinode-create-cluster` (create) and `k0s-multinode-join-node` (join).
 
 ## Scope
 

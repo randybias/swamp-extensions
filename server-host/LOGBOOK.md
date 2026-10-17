@@ -216,3 +216,12 @@ later restore would have destroyed the managed table instead of restoring it.
 Fixed: the listing is captured on its own (`tables=$(nft list tables)`) under
 `set -e`, so a failure aborts the arm step before the marker or the timer exist.
 Tested under `sh` with an `nft` stub whose listing fails.
+
+Round 8: live blocker found on a871a24. `resolvePrivateKey` treated
+`context.vaultService` as a factory function, but swamp 20261013 passes an
+object with `get` and `put`, so every real run failed at `ssh_key_ref`
+resolution; the unit tests only passed because they inject `deps.resolveSecret`.
+Fixed to use the object directly. New tests drive the method with a context
+whose `vaultService` is a plain `{get, put}` object and no injected resolver,
+and reject the old factory shape, a missing service, a service without `get` and
+an empty secret without echoing any secret.

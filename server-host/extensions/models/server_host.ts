@@ -261,7 +261,7 @@ type Ctx = {
     name: string,
     version?: number,
   ) => Promise<Record<string, unknown> | null>;
-  vaultService?: () => Promise<VaultReader>;
+  vaultService?: VaultReader;
 };
 
 /** Converts a host into a safe swamp data instance suffix. */
@@ -315,15 +315,11 @@ async function resolvePrivateKey(
     }
     return value;
   }
-  const factory = context.vaultService;
-  if (typeof factory !== "function") {
+  const service = context.vaultService;
+  if (!service || typeof service.get !== "function") {
     throw new HostConfigError(
       "No vault service is available to resolve ssh_key_ref; run with a vault",
     );
-  }
-  const service = await factory();
-  if (!service || typeof service.get !== "function") {
-    throw new HostConfigError("The vault service cannot read secrets");
   }
   const value = await service.get(ref.vault, ref.key);
   if (typeof value !== "string" || value.length === 0) {

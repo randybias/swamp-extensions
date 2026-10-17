@@ -1237,3 +1237,61 @@ Deno.test("lockdown: a re-run with identical inputs after commit is a no-op, wit
   );
   assertEquals(getWrittenResources().length, 0);
 });
+
+/** A model whose only secret source is the runtime's vault service. */
+function vaultOnly(f: Fake) {
+  return createModel({ ...f.deps, resolveSecret: undefined });
+}
+
+Deno.test("vault: the real runtime shape (a plain {get, put} object, no injected resolver) resolves the key", async () => {
+  const f = fakeTransport();
+  const m = vaultOnly(f);
+  const asked: [string, string][] = [];
+  const { context } = createModelTestContext({ globalArgs: {} });
+  const withVault = {
+    ...context,
+    vaultService: {
+      get: (v: string, k: string) => {
+        asked.push([v, k]);
+        return Promise.resolve(PEM);
+      },
+      put: () => Promise.resolve(),
+    },
+  };
+  const out = await m.methods.get.execute(
+    m.methods.get.arguments.parse({ ...SSH }),
+    withVault as never,
+  );
+  assertEquals(asked, [["prod", "ssh-key"]]);
+  assertEquals(out.result.host, SSH.host);
+  // The key reached ssh-add over stdin and nowhere else.
+  assertEquals(f.stdins.some((s) => s.includes("PRIVATE KEY")), true);
+  assertEquals(f.commands.some((c) => c.includes("PRIVATE KEY")), false);
+});
+
+Deno.test("vault: a missing, malformed or empty vault service is a clear error that never echoes a secret", async () => {
+  const f = fakeTransport();
+  const m = vaultOnly(f);
+  const base = createModelTestContext({ globalArgs: {} }).context;
+  const args = m.methods.get.arguments.parse({ ...SSH });
+  const cases: [string, unknown, string][] = [
+    ["absent", undefined, "No vault service"],
+    [
+      "factory function (the old shape)",
+      () => ({ get: () => PEM }),
+      "No vault service",
+    ],
+    ["no get", { put: () => Promise.resolve() }, "No vault service"],
+    ["empty secret", { get: () => Promise.resolve("") }, "returned no secret"],
+  ];
+  for (const [name, vaultService, text] of cases) {
+    const e = await assertRejects(
+      () => m.methods.get.execute(args, { ...base, vaultService } as never),
+      Error,
+      text,
+      name,
+    );
+    assertEquals(e.message.includes("PRIVATE KEY"), false, name);
+  }
+  assertEquals(f.commands.length, 0);
+});

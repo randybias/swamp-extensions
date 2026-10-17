@@ -340,8 +340,8 @@ commits as deletions and was discarded):
   strict pins — 6/6 pass (upload + read-back sha/mode; identical re-upload is a
   no-op with inode, mtime and data version unchanged; mode-only change through
   the temp-file path; symlink, directory and unwritable destinations refused,
-  nothing left behind). Security property of this release verified live: while
-  a random secret was uploaded three times, process listings sampled on the
+  nothing left behind). Security property of this release verified live: while a
+  random secret was uploaded three times, process listings sampled on the
   control host (4,502 samples) and the target (1,798 samples, plus execsnoop)
   never showed the secret, its SHA-256 or its base64. Every live cell of the
   matrix now passes on 2026.10.17.2, so it was promoted from beta to stable.

@@ -1285,6 +1285,8 @@ function systemPoolRoute(
     devices?: Record<string, string>;
     swaps?: string[];
     readlinkCode?: number;
+    lsblkCode?: number;
+    ancestors?: Record<string, string[]>;
   } = {},
 ): Route {
   const mounts = Array.isArray(mount) ? mount : [mount];
@@ -1316,6 +1318,18 @@ function systemPoolRoute(
       const link = /'readlink' '-f' '([^']+)'/.exec(remote)?.[1] ?? "";
       const name = link.replace("/dev/zvol/", "");
       return { code: 0, stdout: `${opts.devices?.[name] ?? link}\n` };
+    }
+    if (has(remote, "'lsblk' '-s'")) {
+      if (opts.lsblkCode !== undefined) {
+        return { code: opts.lsblkCode, stdout: "", stderr: "lsblk error" };
+      }
+      const dev =
+        /'lsblk' '-s' '-n' '-o' 'PATH,TYPE' '([^']+)'/.exec(remote)?.[1] ?? "";
+      const ancestors = opts.ancestors?.[dev] ?? [dev];
+      return {
+        code: 0,
+        stdout: ancestors.map((p) => `${p} disk`).join("\n") + "\n",
+      };
     }
     if (has(remote, P.poolDescendants)) {
       return { code: 0, stdout: "tank\ntank/data\n" };
@@ -1353,6 +1367,15 @@ Deno.test("destroy_pool refuses a system pool regardless of recursive", async ()
       devices: { "tank/swap": "/dev/zd16" },
       swaps: ["/dev/zd16"],
     }),
+    // dm-crypt on a zvol: the mount source is /dev/dm-0, whose ancestry
+    // includes /dev/zd0.
+    systemPoolRoute({ target: "/", source: "/dev/dm-0" }, {
+      zvols: ["tank/root"],
+      devices: { "tank/root": "/dev/zd0" },
+      ancestors: { "/dev/dm-0": ["/dev/dm-0", "/dev/zd0"] },
+    }),
+    // A nested bind-mount suffix is stripped from the first '['.
+    systemPoolRoute({ target: "/var", source: "tank[/a[b]]" }),
   ];
   for (const route of cases) {
     const m = model(route);
@@ -1406,7 +1429,7 @@ Deno.test("a failing system-pool probe fails closed", async () => {
         createModelTestContext().context,
       ),
     SystemPoolError,
-    "could not resolve zvol",
+    "did not resolve to a /dev/zdN device",
   );
 });
 
@@ -1440,5 +1463,42 @@ Deno.test("destroy_pool refuses without recursive when system checks pass", asyn
       ),
     Error,
     "set recursive",
+  );
+});
+
+Deno.test("a failing ancestry probe fails closed; a stacked swap is refused", async () => {
+  const failing = model(
+    systemPoolRoute({ target: "/", source: "/dev/dm-0" }, {
+      zvols: ["tank/root"],
+      devices: { "tank/root": "/dev/zd0" },
+      lsblkCode: 1,
+    }),
+  );
+  await assertRejects(
+    () =>
+      failing.methods.export_pool.execute(
+        failing.methods.export_pool.arguments.parse({ ssh: SSH, pool: "tank" }),
+        createModelTestContext().context,
+      ),
+    SystemPoolError,
+    "ancestry",
+  );
+
+  const swap = model(
+    systemPoolRoute({ target: "/", source: "/dev/sda1" }, {
+      zvols: ["tank/swap"],
+      devices: { "tank/swap": "/dev/zd16" },
+      swaps: ["/dev/dm-1"],
+      ancestors: { "/dev/dm-1": ["/dev/dm-1", "/dev/zd16"] },
+    }),
+  );
+  await assertRejects(
+    () =>
+      swap.methods.export_pool.execute(
+        swap.methods.export_pool.arguments.parse({ ssh: SSH, pool: "tank" }),
+        createModelTestContext().context,
+      ),
+    SystemPoolError,
+    "stacked on zvol",
   );
 });

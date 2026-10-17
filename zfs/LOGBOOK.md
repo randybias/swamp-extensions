@@ -234,3 +234,14 @@ and only the probe-running code kept. The guard was NOT rewritten here.
   skipping it — a malformed probe can no longer read as "no system mounts".
 - **Wider system-mount set (MEDIUM).** `/var/lib` and `/var/log` are refused
   too; the remaining `/var/*` gap is documented in the README as a known limit.
+
+## Pool-review final polish
+
+- **dm/LVM/dm on a zvol (MEDIUM).** For every system mount source and every swap
+  device, `assertNoZvolAncestor` walks `lsblk -s -n -o PATH,TYPE <dev>` and
+  refuses when any ancestor is a `/dev/zdN` of the pool (so encrypted swap on a
+  zvol is refused). A failed `lsblk` fails closed.
+- **Strict readlink (MEDIUM).** A zvol's `readlink -f /dev/zvol/<name>` must be
+  exactly `/dev/zd<digits>`; anything else refuses.
+- **Nested bind suffix (MEDIUM).** The findmnt `[...]` suffix is stripped from
+  the first `[` (dataset names cannot contain one), so `tank[/a[b]]` is refused.

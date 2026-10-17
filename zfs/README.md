@@ -34,9 +34,12 @@ plus the pool or dataset name.
 `/var/lib`, `/var/log`) sourced from a dataset or zvol of the pool, or a zvol of
 the pool active as swap. Zvol-backed mounts are matched by their canonical
 `/dev/zdN` (or `/dev/zdNpM`) device, because `mount(8)` reports that, not the
-`/dev/zvol/...` link. Every probe must succeed; an unreadable host refuses. A
-system mount under a _different_ `/var/*` path (for example `/var/lib/docker`)
-is a known limit — a pool dedicated to it is a legitimate target.
+`/dev/zvol/...` link, and a mount or swap stacked on a zvol through dm-crypt,
+LVM or dm is caught by walking its `lsblk -s` ancestry. Every probe must
+succeed; an unreadable host, a zvol that does not resolve to `/dev/zdN`, or a
+failed `lsblk` refuses. A system mount under a _different_ `/var/*` path (for
+example `/var/lib/docker`) is a known limit — a pool dedicated to it is a
+legitimate target.
 
 ## Dependencies
 

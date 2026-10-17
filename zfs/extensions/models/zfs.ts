@@ -346,9 +346,10 @@ const SYSTEM_MOUNTS: ReadonlySet<string> = new Set([
   "/var/log",
 ]);
 
-/** Strips the `[...]` suffix findmnt appends to a bind mount's source. */
+/** Strips findmnt's bind-mount `[...]` suffix; dataset names cannot contain `[`. */
 function canonicalMountSource(source: string): string {
-  return source.replace(/\[[^\]]*\]$/, "");
+  const bracket = source.indexOf("[");
+  return bracket >= 0 ? source.slice(0, bracket) : source;
 }
 
 /** True when `source` is a partition of the zvol device `dev`. */
@@ -409,9 +410,11 @@ async function resolvePoolZvolDevices(
     devices.add(link);
     const resolved = await exec(deps.ssh, target, ["readlink", "-f", link]);
     const canonical = resolved.stdout.trim();
-    if (resolved.exit_code !== 0 || canonical === "") {
+    if (resolved.exit_code !== 0 || !/^\/dev\/zd\d+$/.test(canonical)) {
       throw new SystemPoolError(
-        `refusing to touch pool ${pool}: could not resolve zvol ${name} to its device (exit ${resolved.exit_code})`,
+        `refusing to touch pool ${pool}: zvol ${name} did not resolve to a /dev/zdN device (got ${
+          canonical || `exit ${resolved.exit_code}`
+        })`,
       );
     }
     devices.add(canonical);
@@ -427,6 +430,45 @@ async function resolvePoolZvolDevices(
  * overrides this. A `/var/*` mount outside the listed targets is a known limit
  * (a pool dedicated to /var/lib/docker is a legitimate target).
  */
+/**
+ * Refuses when `device` is stacked on a zvol of the pool through dm-crypt,
+ * LVM or dm: `lsblk -s` prints the device and every ancestor, and any ancestor
+ * that is one of the pool's zvols is a match. A failed lsblk fails closed.
+ */
+async function assertNoZvolAncestor(
+  deps: ZfsDeps,
+  target: SshTarget,
+  pool: string,
+  device: string,
+  zvolDevices: ReadonlySet<string>,
+): Promise<void> {
+  const res = await exec(deps.ssh, target, [
+    "lsblk",
+    "-s",
+    "-n",
+    "-o",
+    "PATH,TYPE",
+    device,
+  ]);
+  if (res.exit_code !== 0) {
+    throw new SystemPoolError(
+      `refusing to touch pool ${pool}: could not resolve the ancestry of ${device} (exit ${res.exit_code})`,
+    );
+  }
+  for (const line of nonEmptyLines(res.stdout)) {
+    const path = line.split(/\s+/)[0];
+    if (path === undefined || path === "") continue;
+    if (
+      isZvolDevice(path, zvolDevices) ||
+      path.startsWith(`/dev/zvol/${pool}/`)
+    ) {
+      throw new SystemPoolError(
+        `refusing to touch pool ${pool}: ${device} is stacked on zvol ${path}`,
+      );
+    }
+  }
+}
+
 async function assertNotSystemPool(
   deps: ZfsDeps,
   target: SshTarget,
@@ -470,6 +512,10 @@ async function assertNotSystemPool(
         `refusing to touch pool ${pool}: ${mount.target} is mounted from ${mount.source}`,
       );
     }
+    const source = canonicalMountSource(mount.source);
+    if (source.startsWith("/dev/")) {
+      await assertNoZvolAncestor(deps, target, pool, source, zvolDevices);
+    }
   }
   const swaps = await exec(deps.ssh, target, ["cat", "--", "/proc/swaps"]);
   if (swaps.exit_code !== 0) {
@@ -486,6 +532,7 @@ async function assertNotSystemPool(
         `refusing to touch pool ${pool}: ${device} is active swap backed by this pool`,
       );
     }
+    await assertNoZvolAncestor(deps, target, pool, device, zvolDevices);
   }
 }
 

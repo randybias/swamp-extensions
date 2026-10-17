@@ -20,6 +20,7 @@ One host, described per call by its SSH target and the phase inputs.
 | `lockdown`        | Restrict the SSH port to management CIDRs, armed before the change and reverted unless committed      |
 | `commit`          | Cancel the armed revert for good after confirming the host is still reachable                         |
 | `get`             | Probe the host and record the observation: revert timer and expiry, ruleset hash, drift, SSH exposure |
+| `forget`          | Delete the record kept for a host that no longer exists (no remote call)                              |
 | `sync`            | Same probe, recorded as the observation, with drift against the recorded state                        |
 
 ### Armed revert
@@ -37,6 +38,17 @@ The firewall owns one nftables table, `inet server_host`, and never flushes or
 reads other tables: the snapshot and the restore cover only that table, so rules
 added by other software (a Kubernetes distribution, Docker) survive both an
 apply and a revert.
+
+The table drops everything it does not allow, including traffic from and through
+a container network. A host that runs Kubernetes or Docker therefore needs
+`trusted_interfaces`: names or `prefix*` patterns (for example `kube-bridge`,
+`cali*`) whose traffic is accepted into the host and through it in both
+directions. Each name renders as `iifname` in the input chain and as `iifname`
+plus `oifname` in the forward chain; the default policies stay `drop`. The
+masquerade for pod egress is the cluster's own. Leave it empty and the ruleset
+is byte-for-byte what earlier versions rendered, so an existing host sees no
+drift. Trust only interfaces you control: everything arriving on one is
+accepted.
 
 The host is the source of truth. The apply runs under the same lock as the
 restore and is refused once its revert has expired, fired or been superseded, so
@@ -62,6 +74,18 @@ sudo membership cannot be removed. The account is not deleted; root is never
 touched, a `~/.ssh` that is a symlink or not the account's own is left alone,
 and the account the run logs in with is kept on a `pending_revoke` list (shown
 in the observation) until a run logs in as another account.
+
+### Exposure and identity
+
+- `apply_firewall` with `allow_ssh_from_anywhere` refuses to replace a live
+  management-only SSH rule, whatever the workflow did, unless
+  `allow_widening_ssh_exposure` is set: a re-run can never reopen public SSH by
+  accident. `lockdown` never widens.
+- The optional `identity` input (for example the provider's server id) is stored
+  with the records. A record made for another identity is refused by every
+  method, so a rebuilt host that receives a deleted host's address does not
+  inherit its state. `forget` empties a host's records after the machine is
+  gone.
 
 ## Install
 

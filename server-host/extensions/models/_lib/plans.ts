@@ -33,7 +33,7 @@ import {
   withSudo,
 } from "./armed_revert.ts";
 import { listingSha256, managedSha256, normalizeListing } from "./nftables.ts";
-import { HostConfigError } from "./validate.ts";
+import { HostConfigError, ifacePatternMatches } from "./validate.ts";
 
 /** The risk class of a step, used to assert ordering. */
 export type StepKind =
@@ -514,6 +514,8 @@ export interface ProbeResult {
   managed_sha256: string;
   /** True when the managed table is present. */
   managed_table: boolean;
+  /** The managed input chain's rules, normalized; empty when the table is absent. */
+  managed_input_rules: string[];
   /** True when the revert timer (the recorded one, else the host's) is active. */
   armed: boolean;
   /** Token of the revert the host itself records as current, if any. */
@@ -605,6 +607,8 @@ export async function probeState(
   return {
     ruleset_sha256: await listingSha256(listed.stdout),
     managed_sha256: await managedSha256(table),
+    managed_input_rules: table?.chains.find((c) => c.name === "input")?.rules ??
+      [],
     managed_table: managed,
     armed,
     ...(marker
@@ -674,3 +678,111 @@ export class HostOpsError extends Error {
 
 /** Re-exported so callers depend on one error family for host operations. */
 export { HostConfigError, STATE_DIR };
+
+/**
+ * A READ-ONLY script printing, separated by `---` lines, the JSON of the IPv4
+ * default routes, the IPv6 default routes, and the route to the address this SSH
+ * session comes from. It fails closed: a missing `ip`, any failing `ip`
+ * command, or an empty `SSH_CLIENT` is a non-zero exit. It must NOT run under
+ * sudo, whose env_reset strips `SSH_CLIENT`; `ip route` needs no privilege.
+ */
+export const UPLINK_SCRIPT = `set -e
+c="\${SSH_CLIENT%% *}"
+if [ -z "$c" ]; then echo "SSH_CLIENT is empty" >&2; exit 3; fi
+command -v ip >/dev/null
+ip -4 -j route show default
+echo ---
+ip -6 -j route show default
+echo ---
+ip -j route get "$c"
+`;
+
+/** The argv of {@link UPLINK_SCRIPT}; deliberately not wrapped in sudo. */
+export function renderUplinkArgv(): string[] {
+  return ["sh", "-c", UPLINK_SCRIPT];
+}
+
+/** The interfaces the probe found, by role. */
+export interface UplinkDevs {
+  /** Interfaces of the IPv4 and IPv6 default routes, including ECMP next hops. */
+  defaults: string[];
+  /** Interfaces of the route to the SSH client. */
+  session: string[];
+}
+
+function devsOf(routes: unknown[]): string[] {
+  const out: string[] = [];
+  for (const r of routes) {
+    const o = r as { dev?: unknown; nexthops?: { dev?: unknown }[] };
+    if (typeof o.dev === "string" && o.dev !== "") out.push(o.dev);
+    for (const n of o.nexthops ?? []) {
+      if (typeof n.dev === "string" && n.dev !== "") out.push(n.dev);
+    }
+  }
+  return out;
+}
+
+/** Parses the output of {@link UPLINK_SCRIPT}. */
+export function parseUplinkDevs(stdout: string): UplinkDevs {
+  const parts = stdout.split(/^---$/m).map((p) => p.trim());
+  if (parts.length !== 3) {
+    throw new HostOpsError("The route probe output was not in three parts");
+  }
+  const lists = parts.map((text) => {
+    if (text === "") return [] as unknown[];
+    let routes: unknown;
+    try {
+      routes = JSON.parse(text);
+    } catch {
+      throw new HostOpsError("The route probe did not return JSON");
+    }
+    if (!Array.isArray(routes)) {
+      throw new HostOpsError("The route probe did not return a list of routes");
+    }
+    return routes;
+  });
+  return {
+    defaults: [...new Set([...devsOf(lists[0]), ...devsOf(lists[1])])].sort(),
+    session: [...new Set(devsOf(lists[2]))].sort(),
+  };
+}
+
+/**
+ * Refuses trusted interfaces that carry the management session or the default
+ * route: trusting them would accept every port from the internet and bypass
+ * `management_cidrs`. READ-ONLY; runs before anything is armed. It checks once,
+ * in TypeScript: the apply script does not repeat it, so an interface that
+ * starts carrying the session between the check and the apply is not caught.
+ */
+export async function assertTrustedNotUplink(
+  deps: SshDeps,
+  target: Target,
+  trusted: readonly string[],
+): Promise<void> {
+  if (trusted.length === 0) return;
+  const res = await exec(deps, target, renderUplinkArgv(), { timeoutS: 30 });
+  if (res.exit_code !== 0 || res.truncated) {
+    throw new HostOpsError(
+      `The route probe on ${target.host} failed (exit ${res.exit_code}); refusing trusted_interfaces it could not check`,
+    );
+  }
+  const { defaults, session } = parseUplinkDevs(res.stdout);
+  // A host that shows neither a default route nor a session route cannot be
+  // checked, and an unchecked trust of an interface is refused.
+  if (defaults.length === 0 || session.length === 0) {
+    throw new HostOpsError(
+      `The route probe on ${target.host} found no ${
+        defaults.length === 0 ? "default route" : "route to the SSH client"
+      }; refusing trusted_interfaces it could not check`,
+    );
+  }
+  const devs = [...new Set([...defaults, ...session])];
+  for (const p of trusted) {
+    const hit = devs.find((d) => ifacePatternMatches(p, d));
+    if (hit !== undefined) {
+      throw new HostConfigError(
+        `trusted_interfaces entry ${p} matches ${hit}, which carries the SSH session or the default route; trusting it would accept every port from there`,
+      );
+    }
+  }
+}

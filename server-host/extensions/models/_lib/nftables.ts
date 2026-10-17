@@ -11,6 +11,7 @@
  */
 
 import {
+  assertIfacePattern,
   HostConfigError,
   isEffectivelyAnywhere,
   parseCidr,
@@ -30,6 +31,12 @@ export interface FirewallRules {
   sshPort: number;
   /** When true, allow the SSH port from any source and ignore the CIDR list. */
   allowSshFromAnywhere: boolean;
+  /**
+   * Interfaces whose traffic is trusted: accepted into the host (input) and
+   * through it (forward, both directions). Names or `prefix*` patterns. Unset or
+   * empty renders exactly the ruleset of earlier versions.
+   */
+  trustedInterfaces?: string[];
 }
 
 const HEADER =
@@ -77,6 +84,8 @@ export function renderRuleset(rules: FirewallRules): string {
   );
   lines.push(`\t\tct state established,related accept`);
   lines.push(`\t\tiifname "lo" accept`);
+  const trusted = [...new Set(rules.trustedInterfaces ?? [])].sort();
+  for (const i of trusted) lines.push(`\t\tiifname "${i}" accept`);
   lines.push(`\t\tip protocol icmp accept`);
   lines.push(`\t\tip6 nexthdr ipv6-icmp accept`);
   const { v4, v6 } = splitCidrs(rules.managementCidrs);
@@ -103,6 +112,10 @@ export function renderRuleset(rules: FirewallRules): string {
   lines.push(`\t}`);
   lines.push(`\tchain forward {`);
   lines.push(`\t\ttype filter hook forward priority filter; policy drop;`);
+  for (const i of trusted) {
+    lines.push(`\t\tiifname "${i}" accept`);
+    lines.push(`\t\toifname "${i}" accept`);
+  }
   lines.push(`\t}`);
   lines.push(`\tchain output {`);
   lines.push(`\t\ttype filter hook output priority filter; policy accept;`);
@@ -364,8 +377,9 @@ export function expectedListing(rules: FirewallRules): string {
         policy,
       },
     });
-  const rule = (...expr: Json[]) =>
-    out.push({ rule: { family: "inet", table: TABLE, chain: "input", expr } });
+  const ruleIn = (chain: string, ...expr: Json[]) =>
+    out.push({ rule: { family: "inet", table: TABLE, chain, expr } });
+  const rule = (...expr: Json[]) => ruleIn("input", ...expr);
   chain("input", "input", rules.defaultPolicy);
   chain("forward", "forward", "drop");
   chain("output", "output", "accept");
@@ -374,6 +388,12 @@ export function expectedListing(rules: FirewallRules): string {
     { accept: null },
   );
   rule(match({ meta: { key: "iifname" } }, "lo"), { accept: null });
+  const trusted = [...new Set(rules.trustedInterfaces ?? [])].sort();
+  for (const i of trusted) {
+    rule(match({ meta: { key: "iifname" } }, i), { accept: null });
+    ruleIn("forward", match({ meta: { key: "iifname" } }, i), { accept: null });
+    ruleIn("forward", match({ meta: { key: "oifname" } }, i), { accept: null });
+  }
   rule(match(payload("ip", "protocol"), "icmp"), { accept: null });
   rule(match(payload("ip6", "nexthdr"), "ipv6-icmp"), { accept: null });
   const ssh = match(payload("tcp", "dport"), rules.sshPort);
@@ -494,6 +514,7 @@ export function assertListingMatches(
  * unacknowledged rule set leaves SSH reachable from somewhere.
  */
 export function assertFirewallRules(rules: FirewallRules): void {
+  for (const i of rules.trustedInterfaces ?? []) assertIfacePattern(i);
   if (
     !rules.allowSshFromAnywhere && rules.managementCidrs.length > 0 &&
     isEffectivelyAnywhere(rules.managementCidrs)

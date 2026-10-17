@@ -36,6 +36,14 @@ const KEY_TYPE =
 export const AUTHORIZED_KEY_RE = new RegExp(
   `^${KEY_TYPE} [A-Za-z0-9+/]{16,}={0,3}(?: [^\\r\\n]{0,255})?$`,
 );
+/**
+ * Grammar for a trusted interface pattern: an interface name of 1-15 characters
+ * that does not start with `-`, or a prefix of 2-14 literal characters followed
+ * by one `*` wildcard (nft's `iifname "cali*"`). Fewer than two literal
+ * characters before the wildcard is refused: `e*` would also trust `eth0`.
+ */
+export const IFACE_PATTERN_RE =
+  /^(?!-)[A-Za-z0-9_.-]{2,14}\*$|^(?!-)[A-Za-z0-9_.-]{1,15}$/;
 const MAX_TEXT = 4096;
 
 /** A parsed CIDR: family, prefix length and the masked network address. */
@@ -209,4 +217,24 @@ export function dedupeSorted(values: readonly string[]): string[] {
 /** Returns `values` with duplicates removed and a stable numeric sort applied. */
 export function dedupeSortedNumbers(values: readonly number[]): number[] {
   return [...new Set(values)].sort((a, b) => a - b);
+}
+
+/** True when the trusted interface pattern `p` matches the interface `dev`. */
+export function ifacePatternMatches(p: string, dev: string): boolean {
+  return p.endsWith("*") ? dev.startsWith(p.slice(0, -1)) : p === dev;
+}
+
+/**
+ * Throws unless `s` is a valid trusted interface pattern. `lo` (which the table
+ * already accepts) and any pattern that would match it are refused.
+ */
+export function assertIfacePattern(s: string): void {
+  if (!IFACE_PATTERN_RE.test(s)) {
+    throw new HostConfigError(`Not an interface name or pattern: ${s}`);
+  }
+  if (ifacePatternMatches(s, "lo")) {
+    throw new HostConfigError(
+      `Interface pattern ${s} matches the loopback interface, which is already accepted`,
+    );
+  }
 }

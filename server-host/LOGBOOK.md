@@ -401,3 +401,72 @@ blocking beta:
   lookup and the marker removal keeps a sudo membership with no marker.
   Downgraded under the run rulings: concurrent account management on the target
   is outside the single-orchestrator model.
+
+2026.10.17.2: found by the first end-to-end run of the server stack on a fresh
+host. With the table's `input` and `forward` policies at `drop`, a k0s node came
+up Ready but its pods never did: a trace showed pod traffic from `kube-bridge`
+to the node (apiserver, konnectivity) dropped by `inet server_host input` and
+pod egress dropped by `inet server_host forward`, although kube-router's own
+`ip filter FORWARD` accepted it. An accept in another table cannot override a
+drop, so the table itself had to grow.
+
+- New optional input `trusted_interfaces` (up to 16 names or `prefix*` patterns,
+  one wildcard at the end, at least one literal character, 15 characters at
+  most). Each renders as `iifname` in input and `iifname` plus `oifname` in
+  forward; sorted and deduplicated. Unset or empty renders byte-identically to
+  17.1, so the hash and the goldens are unchanged.
+- The expected structure, the verify read-back and the drift hash include the
+  forward rules. New real-nft fixtures (single interface; wildcards and dotted
+  names) are listings of nftables 1.0.9 after applying the rendered script
+  twice.
+- `nft_real_test.ts` feeds every shape to a real `nft -c`, applies it twice and
+  compares the table's JSON read-back with the rendered rules. It runs `nft`
+  when present, else the container `nft-check:local` (ubuntu:24.04 plus nftables
+  and netbase; without netbase `ip6 nexthdr ipv6-icmp` does not resolve), else
+  it is skipped. It ran in this round.
+- No forward_policy input: trusting the CNI interfaces in both directions covers
+  pod to node and pod egress (checked live with the equivalent hand-added
+  rules), so the forward policy stays `drop`.
+
+Review of 16f38c5:
+
+- HIGH `trusted_interfaces` accepted the uplink (`eth0`, `e*`, `wg*`): the
+  input-chain accept comes before the SSH rules, so it would have opened every
+  port and bypassed `management_cidrs`. Fixed: with any trusted interface set, a
+  read-only script reports the interfaces of the IPv4 and IPv6 default routes
+  and of the route to the SSH client (`$SSH_CLIENT`); an entry that matches one
+  (exact, or `x*` as a prefix) is refused with a `HostConfigError` before the
+  revert is armed, and a probe that fails or returns junk refuses too. `lo` and
+  patterns matching it, a leading `-`, and a `*` after fewer than two literal
+  characters are refused by the grammar. With none set no probe runs.
+- MEDIUM the real-nft test could apply the drop-policy table in the host's own
+  netns when run as root with nft installed. It now always uses the container,
+  with a `mktemp` file.
+- LOW the leading `-` rule is part of the schema regex.
+
+2026.10.17.3 (first adopt re-run and review of cec6bfd):
+
+- The first adopt re-run of the stack re-applied `allow_ssh_from_anywhere` to a
+  locked-down host for about 20 seconds before lockdown closed it again.
+  `apply_firewall` now reads the live managed table and refuses to replace a
+  management-only SSH rule with an open one unless `allow_widening_ssh_exposure`
+  is set. This is the model's own guard; the stack workflow also stops asking
+  for it.
+- A rebuilt server that Cherry gave the address of a deleted one inherited the
+  deleted one's record, so `apply_base` ran 0 steps. Records now carry an
+  optional `identity` (the provider server id); every method refuses a record
+  for another identity, and the new `forget` action empties the records of a
+  machine that is gone. Records written without an identity are accepted and
+  then stamped.
+- HIGH (review): the uplink probe ran under `sudo`, whose env_reset strips
+  `SSH_CLIENT`, so a management NIC that was not the default route could be
+  trusted. The probe now runs without sudo (checked against a real shell: exit 3
+  when `SSH_CLIENT` is empty or when run under `sudo -n`), and fails closed:
+  `set
+  -e`, no `2>/dev/null`, a missing `ip`, no default route or no session
+  route all refuse; ECMP `nexthops[].dev` are read. The test fake now returns no
+  session route when the probe is wrapped in sudo. The apply script does not
+  repeat the check (a small window between probe and apply, accepted and
+  documented).
+- The shell tests ignore a broken stdin pipe when the script exits before
+  reading.

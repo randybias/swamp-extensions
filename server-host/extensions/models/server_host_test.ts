@@ -112,7 +112,9 @@ function fakeTransport(
     // Unscripted nft reads answer like a host: no managed table in the
     // ruleset, and the rendered table when it is read back after an apply.
     const stdout = r.stdout ??
-      (command.includes("'nft' '-j' 'list' 'ruleset'")
+      (command.includes("ip -4 -j route show default")
+        ? '[{"dst":"default","dev":"enp1s0"}]\n---\n[]\n---\n[{"dev":"wg0"}]'
+        : command.includes("'nft' '-j' 'list' 'ruleset'")
         ? '{"nftables":[]}'
         : command.includes("'nft' '-j' 'list' 'table'")
         ? expectedListing(FIREWALL)
@@ -1306,6 +1308,7 @@ Deno.test("real nft output: apply verifies, then commit and an identical re-appl
     {
       management_cidrs: string[];
       allow_tcp: number[];
+      trusted_interfaces?: string[];
       json: unknown;
     }
   >;
@@ -1331,6 +1334,7 @@ Deno.test("real nft output: apply verifies, then commit and an identical re-appl
       ...FIREWALL_ARGS,
       management_cidrs: x.management_cidrs,
       allow_tcp: x.allow_tcp,
+      trusted_interfaces: x.trusted_interfaces ?? [],
       allow_udp: [],
     });
     const ctx = createModelTestContext({ globalArgs: {} });
@@ -1692,4 +1696,447 @@ Deno.test("observation: ssh_exposure is unknown when the host disagrees with the
   assertEquals(o.drift.includes("ruleset"), true);
   assertEquals(o.ssh_exposure, "unknown");
   assertEquals(o.pending_revoke, ["oldops"]);
+});
+
+const isRouteProbe = (c: string) => c.includes("ip -4 -j route show default");
+const ROUTES = [
+  '[{"dst":"default","gateway":"192.0.2.1","dev":"enp1s0"}]',
+  "---",
+  "[]",
+  "---",
+  '[{"dst":"198.51.100.100","dev":"wg0","prefsrc":"198.51.100.2"}]',
+].join("\n");
+
+function applyWithTrusted(
+  trusted: string[],
+  reply: { code: number; stdout?: string } = { code: 0, stdout: ROUTES },
+) {
+  const f = fakeTransport((c) =>
+    // Under sudo, env_reset strips SSH_CLIENT: the real script exits 3 there.
+    isRouteProbe(c)
+      ? (c.includes("'sudo'") ? { code: 3 } : reply)
+      : c.includes("'nft' '-j' 'list' 'table'")
+      ? {
+        code: 0,
+        stdout: expectedListing({ ...FIREWALL, trustedInterfaces: trusted }),
+      }
+      : { code: 0 }
+  );
+  const m = modelWith(f);
+  const ctx = createModelTestContext({ globalArgs: {} });
+  const run = () =>
+    m.methods.apply_firewall.execute(
+      m.methods.apply_firewall.arguments.parse({
+        ...FIREWALL_ARGS,
+        trusted_interfaces: trusted,
+      }),
+      ctx.context,
+    );
+  return { f, run, ctx };
+}
+
+Deno.test("trusted_interfaces: the CNI bridge is accepted, with the uplink and session interfaces left out", async () => {
+  const { f, run } = applyWithTrusted(["kube-bridge", "cali*"]);
+  const out = await run();
+  assertEquals(out.result.changed, true);
+  assertEquals(f.commands.filter(isRouteProbe).length, 1);
+  // sudo is on (the default) yet the probe is not wrapped in it.
+  assertEquals(f.commands.find(isRouteProbe)!.includes("'sudo'"), false);
+  // The probe is read-only and comes before anything is armed.
+  assertEquals(
+    f.commands.findIndex(isRouteProbe) < f.commands.findIndex(isArm),
+    true,
+  );
+});
+
+Deno.test("trusted_interfaces: an interface that carries the default route or the SSH session is refused before arming", async () => {
+  for (
+    const trusted of [["enp1s0"], ["enp*"], ["wg0"], ["wg*"], [
+      "kube-bridge",
+      "enp1s0",
+    ]]
+  ) {
+    const { f, run, ctx } = applyWithTrusted(trusted);
+    await assertRejects(
+      run,
+      Error,
+      "carries the SSH session or the default route",
+    );
+    assertEquals(f.commands.some(isArm), false, trusted.join());
+    assertEquals(f.commands.some(isGuardedApply), false, trusted.join());
+    assertEquals(ctx.getWrittenResources().length, 0, trusted.join());
+  }
+});
+
+Deno.test("trusted_interfaces: a route probe that fails or returns junk refuses rather than guessing", async () => {
+  for (
+    const reply of [
+      { code: 1 },
+      { code: 0, stdout: "not json" },
+      { code: 0, stdout: '{"dev":"eth0"}' },
+    ]
+  ) {
+    const { f, run } = applyWithTrusted(["kube-bridge"], reply);
+    await assertRejects(run, Error);
+    assertEquals(f.commands.some(isArm), false);
+  }
+});
+
+Deno.test("trusted_interfaces: with none set no route probe runs, so the command stream is the 17.1 one", async () => {
+  const { f, run } = applyWithTrusted([]);
+  await run();
+  assertEquals(f.commands.some(isRouteProbe), false);
+});
+
+Deno.test("trusted_interfaces: one-character prefixes and a leading dash are refused by the schema", () => {
+  const m = createModel();
+  const parse = (v: string) =>
+    m.methods.render_firewall.arguments.safeParse({
+      host: SSH.host,
+      management_cidrs: ["192.0.2.0/24"],
+      trusted_interfaces: [v],
+    }).success;
+  for (const bad of ["e*", "-x", "*", "l*"]) {
+    assertEquals(parse(bad), false, bad);
+  }
+  for (const ok of ["kube-bridge", "cali*", "tunl0", "lo0*"]) {
+    assertEquals(parse(ok), true, ok);
+  }
+});
+
+Deno.test("trusted_interfaces: render_firewall rejects patterns that match loopback", async () => {
+  const m = createModel();
+  const ctx = createModelTestContext({ globalArgs: {} });
+  for (const bad of ["lo", "lo*"]) {
+    await assertRejects(
+      () =>
+        m.methods.render_firewall.execute(
+          m.methods.render_firewall.arguments.parse({
+            host: SSH.host,
+            management_cidrs: ["192.0.2.0/24"],
+            trusted_interfaces: [bad],
+          }),
+          ctx.context,
+        ),
+      Error,
+      "loopback",
+    );
+  }
+});
+
+Deno.test("trusted_interfaces: a management NIC that is not the default route is caught through the session route, and ECMP next hops count", async () => {
+  const eth1Session = [
+    '[{"dst":"default","gateway":"192.0.2.1","dev":"eth0"}]',
+    "---",
+    "[]",
+    "---",
+    '[{"dst":"198.51.100.100","dev":"eth1"}]',
+  ].join("\n");
+  const ecmp = [
+    '[{"dst":"default","flags":[],"nexthops":[{"gateway":"192.0.2.1","dev":"eth0"},{"gateway":"192.0.2.2","dev":"eth2"}]}]',
+    "---",
+    "[]",
+    "---",
+    '[{"dst":"198.51.100.100","dev":"wg0"}]',
+  ].join("\n");
+  for (
+    const [trusted, stdout] of [
+      [["eth1"], eth1Session],
+      [["eth*"], eth1Session],
+      [["eth2"], ecmp],
+      [["wg0"], ecmp],
+    ] as const
+  ) {
+    const { f, run } = applyWithTrusted([...trusted], { code: 0, stdout });
+    await assertRejects(
+      run,
+      Error,
+      "carries the SSH session or the default route",
+    );
+    assertEquals(f.commands.some(isArm), false, trusted.join());
+  }
+});
+
+Deno.test("trusted_interfaces: the probe fails closed: no ip, no default route, no session route, a bad shape", async () => {
+  const cases: [string, { code: number; stdout?: string }][] = [
+    ["ip missing", { code: 127 }],
+    ["SSH_CLIENT empty", { code: 3 }],
+    ["no default route", {
+      code: 0,
+      stdout: '[]\n---\n[]\n---\n[{"dev":"wg0"}]',
+    }],
+    ["no session route", {
+      code: 0,
+      stdout: '[{"dev":"eth0"}]\n---\n[]\n---\n[]',
+    }],
+    ["two parts", {
+      code: 0,
+      stdout: '[{"dev":"eth0"}]\n---\n[{"dev":"wg0"}]',
+    }],
+    ["empty", { code: 0, stdout: "" }],
+  ];
+  for (const [name, reply] of cases) {
+    const { f, run } = applyWithTrusted(["kube-bridge"], reply);
+    await assertRejects(run, Error, "", name);
+    assertEquals(f.commands.some(isArm), false, name);
+  }
+});
+
+Deno.test("trusted_interfaces: the probe script is read-only and fails closed", async () => {
+  const { UPLINK_SCRIPT } = await import("./_lib/plans.ts");
+  assertEquals(UPLINK_SCRIPT.startsWith("set -e\n"), true);
+  assertEquals(UPLINK_SCRIPT.includes("2>/dev/null"), false);
+  assertEquals(UPLINK_SCRIPT.includes("exit 3"), true);
+  assertEquals(
+    /route (add|del|flush|replace|change)/.test(UPLINK_SCRIPT),
+    false,
+  );
+});
+
+const MGMT_LISTING = () => expectedListing(FIREWALL);
+const ANYWHERE_LISTING = () =>
+  expectedListing({ ...FIREWALL, allowSshFromAnywhere: true });
+
+function widen(
+  live: string,
+  extra: Record<string, unknown> = {},
+  tool: "apply_firewall" | "lockdown" = "apply_firewall",
+) {
+  const f = fakeTransport((c) =>
+    c.includes("'nft' '-j' 'list' 'ruleset'")
+      ? { code: 0, stdout: live }
+      : c.includes("'nft' '-j' 'list' 'table'")
+      ? {
+        code: 0,
+        stdout: expectedListing({
+          ...FIREWALL,
+          allowSshFromAnywhere: tool === "apply_firewall",
+        }),
+      }
+      : { code: 0 }
+  );
+  const m = modelWith(f);
+  const ctx = createModelTestContext({ globalArgs: {} });
+  const run = () =>
+    m.methods[tool].execute(
+      m.methods[tool].arguments.parse({
+        ...FIREWALL_ARGS,
+        allow_ssh_from_anywhere: tool === "apply_firewall",
+        ...extra,
+      }),
+      ctx.context,
+    );
+  return { f, run };
+}
+
+Deno.test("exposure: apply_firewall refuses to reopen SSH to anywhere on a host the live table has locked down", async () => {
+  const { f, run } = widen(MGMT_LISTING());
+  await assertRejects(run, Error, "refusing to open SSH to anywhere again");
+  assertEquals(f.commands.some(isArm), false);
+  assertEquals(f.commands.some(isGuardedApply), false);
+});
+
+Deno.test("exposure: it proceeds when asked, when already open, when there is no table, and lockdown is unaffected", async () => {
+  const asked = widen(MGMT_LISTING(), { allow_widening_ssh_exposure: true });
+  assertEquals((await asked.run()).result.changed, true);
+  const open = widen(ANYWHERE_LISTING());
+  assertEquals((await open.run()).result.changed, true);
+  const none = widen('{"nftables":[]}');
+  assertEquals((await none.run()).result.changed, true);
+  const lock = widen(MGMT_LISTING(), {}, "lockdown");
+  assertEquals((await lock.run()).result.changed, true);
+});
+
+Deno.test("exposure: liveSshExposure reads the normalized input chain", async () => {
+  const { liveSshExposure } = await import("./server_host.ts");
+  assertEquals(liveSshExposure(["tcp.dport in n:22 ; accept"], 22), "anywhere");
+  assertEquals(
+    liveSshExposure(["ip.saddr in a4:1-2 ; tcp.dport in n:22 ; accept"], 22),
+    "management-only",
+  );
+  assertEquals(liveSshExposure(["tcp.dport in n:80 ; accept"], 22), "none");
+  assertEquals(liveSshExposure([], 22), "none");
+});
+
+Deno.test("identity: a record made for another machine is refused by every method, not trusted", async () => {
+  const stored = await baseStored("ops");
+  const key = `state-${hostInstance(SSH.host)}`;
+  (stored[key] as Record<string, unknown>).identity = "server-1";
+  const args = { ...BASE_ARGS, admin_user: "ops" };
+  for (
+    const [name, call] of [
+      [
+        "apply_base",
+        (m: ReturnType<typeof modelWith>, c: never) =>
+          m.methods.apply_base.execute(
+            m.methods.apply_base.arguments.parse({
+              ...args,
+              identity: "server-2",
+            }),
+            c,
+          ),
+      ],
+      [
+        "get",
+        (m: ReturnType<typeof modelWith>, c: never) =>
+          m.methods.get.execute(
+            m.methods.get.arguments.parse({ ...SSH, identity: "server-2" }),
+            c,
+          ),
+      ],
+      [
+        "apply_firewall",
+        (m: ReturnType<typeof modelWith>, c: never) =>
+          m.methods.apply_firewall.execute(
+            m.methods.apply_firewall.arguments.parse({
+              ...FIREWALL_ARGS,
+              identity: "server-2",
+            }),
+            c,
+          ),
+      ],
+      [
+        "commit",
+        (m: ReturnType<typeof modelWith>, c: never) =>
+          m.methods.commit.execute(
+            m.methods.commit.arguments.parse({ ...SSH, identity: "server-2" }),
+            c,
+          ),
+      ],
+    ] as const
+  ) {
+    const f = fakeTransport();
+    const ctx = createModelTestContext({
+      globalArgs: {},
+      storedResources: stored,
+    });
+    await assertRejects(
+      () => call(modelWith(f), ctx.context as never),
+      Error,
+      "made for another machine",
+    );
+    assertEquals(
+      f.commands.some(isArm) || f.commands.some(isGuardedApply),
+      false,
+      name,
+    );
+    assertEquals(ctx.getWrittenResources().length, 0, name);
+  }
+});
+
+Deno.test("identity: the same identity, or none given, works, and the identity is recorded", async () => {
+  const stored = await baseStored("ops");
+  const key = `state-${hostInstance(SSH.host)}`;
+  (stored[key] as Record<string, unknown>).identity = "server-1";
+  const f = fakeTransport();
+  const ctx = createModelTestContext({
+    globalArgs: {},
+    storedResources: stored,
+  });
+  const m = modelWith(f);
+  await m.methods.apply_base.execute(
+    m.methods.apply_base.arguments.parse({
+      ...BASE_ARGS,
+      admin_user: "ops",
+      identity: "server-1",
+    }),
+    ctx.context,
+  );
+  await m.methods.apply_base.execute(
+    m.methods.apply_base.arguments.parse({ ...BASE_ARGS, admin_user: "ops" }),
+    ctx.context,
+  );
+  const last = ctx.getWrittenResources().filter((r) =>
+    r.name.startsWith("state-")
+  )
+    .at(-1)!.data as { identity?: string };
+  assertEquals(last.identity, "server-1");
+  // A first record gets the identity that was given.
+  const fresh = createModelTestContext({ globalArgs: {} });
+  await modelWith(fakeTransport()).methods.apply_base.execute(
+    m.methods.apply_base.arguments.parse({
+      ...BASE_ARGS,
+      admin_user: "ops",
+      identity: "server-9",
+    }),
+    fresh.context,
+  );
+  assertEquals(
+    (fresh.getWrittenResources().find((r) => r.name.startsWith("state-"))!
+      .data as { identity?: string }).identity,
+    "server-9",
+  );
+});
+
+Deno.test("forget: empties the record so a rebuilt host is configured from scratch", async () => {
+  const stored = await baseStored("ops");
+  const key = `state-${hostInstance(SSH.host)}`;
+  (stored[key] as Record<string, unknown>).identity = "server-1";
+  const keep = structuredClone(stored);
+  const f = fakeTransport();
+  const ctx = createModelTestContext({
+    globalArgs: {},
+    storedResources: stored,
+  });
+  const m = modelWith(f);
+  assertEquals(m.methods.forget.kind, "action");
+  assertEquals(m.methods.forget.description.startsWith("DESTRUCTIVE."), true);
+  const out = await m.methods.forget.execute(
+    m.methods.forget.arguments.parse({ host: SSH.host, identity: "server-1" }),
+    ctx.context,
+  );
+  assertEquals(out.result.forgotten, true);
+  assertEquals(f.commands.length, 0);
+  const rec = ctx.getWrittenResources().find((r) => r.name === key)!
+    .data as Record<
+      string,
+      unknown
+    >;
+  assertEquals(Object.keys(rec).sort(), [
+    "forgotten_at",
+    "host",
+    "observed_at",
+  ]);
+  // A mismatched identity is refused (on a context that still holds the record).
+  const again = createModelTestContext({
+    globalArgs: {},
+    storedResources: keep,
+  });
+  await assertRejects(
+    () =>
+      m.methods.forget.execute(
+        m.methods.forget.arguments.parse({
+          host: SSH.host,
+          identity: "server-2",
+        }),
+        again.context,
+      ),
+    Error,
+    "another machine",
+  );
+});
+
+Deno.test("forget: the next apply_base on the same address runs every step (not '0 steps')", async () => {
+  const f = fakeTransport();
+  // The record after forget holds no base, so nothing is considered applied.
+  const ctx = createModelTestContext({
+    globalArgs: {},
+    storedResources: {
+      [`state-${hostInstance(SSH.host)}`]: {
+        host: SSH.host,
+        forgotten_at: "2026-01-01T00:00:00.000Z",
+        observed_at: "2026-01-01T00:00:00.000Z",
+      },
+    },
+  });
+  const m = modelWith(f);
+  const out = await m.methods.apply_base.execute(
+    m.methods.apply_base.arguments.parse({ ...BASE_ARGS, admin_user: "ops" }),
+    ctx.context,
+  );
+  assertEquals(
+    out.result.changed.includes("packages") || f.commands.length > 0,
+    true,
+  );
+  assertEquals(f.commands.length > 0, true);
 });

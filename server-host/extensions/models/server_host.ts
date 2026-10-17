@@ -27,6 +27,7 @@ import {
   assertUser,
   AUTHORIZED_KEY_RE,
   HostConfigError,
+  IFACE_PATTERN_RE,
   isCidr,
   PACKAGE_RE,
   SYSCTL_KEY_RE,
@@ -43,6 +44,7 @@ import {
   rulesetSha256,
 } from "./_lib/nftables.ts";
 import {
+  assertTrustedNotUplink,
   type EmittedStep,
   executePlan,
   HostOpsError,
@@ -101,6 +103,9 @@ const SshFields = {
   ),
   port: z.number().int().min(1).max(65535).default(22).describe("SSH port"),
   user: z.string().regex(USER_RE).describe("Remote login name"),
+  identity: z.string().max(128).regex(/^[A-Za-z0-9._:-]+$/).optional().describe(
+    "Opaque identity of the machine behind host, such as the provider's server id. A record made for a different identity is refused, so a rebuilt host that receives a deleted host's address does not inherit its state",
+  ),
   host_key_policy: HostKeyPolicy,
   host_keys: z.array(z.string().max(2048)).min(1).max(16).describe(
     "Pinned host keys in ssh-keyscan format, one per entry",
@@ -135,6 +140,15 @@ const FirewallFields = {
   allow_ssh_from_anywhere: z.boolean().default(false).describe(
     "Acknowledge that the SSH port is reachable from any source",
   ),
+  allow_widening_ssh_exposure: z.boolean().default(false).describe(
+    "Allow apply_firewall with allow_ssh_from_anywhere to replace a live management-only SSH rule; refused otherwise",
+  ),
+  trusted_interfaces: z.array(z.string().max(15).regex(IFACE_PATTERN_RE)).max(
+    16,
+  )
+    .default([]).describe(
+      "Interface names or prefix* patterns whose traffic is accepted into and through the host, such as a Kubernetes CNI bridge; empty renders the same ruleset as earlier versions",
+    ),
 };
 
 const BaseFields = {
@@ -193,6 +207,11 @@ const ApplyBaseArgs = z.strictObject({
 
 const ProbeArgs = z.strictObject({ ...SshFields });
 
+const ForgetArgs = z.strictObject({
+  host: SshFields.host,
+  identity: SshFields.identity,
+});
+
 const BaseStateSchema = z.strictObject({
   packages: z.array(z.string()),
   admin_user: z.string(),
@@ -212,6 +231,9 @@ const FirewallStateSchema = z.strictObject({
 
 const HostStateSchema = z.strictObject({
   host: z.string(),
+  // Opaque identity of the machine this record was made for.
+  identity: z.string().optional(),
+  forgotten_at: z.string().optional(),
   base: BaseStateSchema.optional(),
   firewall: FirewallStateSchema.optional(),
   // Previous managed accounts whose grants could not be taken back yet.
@@ -221,6 +243,7 @@ const HostStateSchema = z.strictObject({
 
 const RevertSchema = z.strictObject({
   host: z.string(),
+  identity: z.string().optional(),
   // swamp-quality-ignore credentials-sensitive-field
   token: z.string(),
   phase: z.enum(["firewall", "lockdown"]),
@@ -309,6 +332,35 @@ function isOpen(record: Revert | null): record is Revert {
     record.cancelled_at === undefined;
 }
 
+/**
+ * Refuses a record made for a different machine. Without a given identity, or
+ * a recorded one, there is nothing to compare.
+ */
+function assertIdentity(
+  recorded: string | undefined,
+  given: string | undefined,
+  host: string,
+): void {
+  if (given !== undefined && recorded !== undefined && recorded !== given) {
+    throw new HostConfigError(
+      `The records for ${host} were made for another machine (${recorded}, not ${given}); run forget for it first`,
+    );
+  }
+}
+
+/** The ssh exposure the live managed input chain gives `port`. */
+export function liveSshExposure(
+  inputRules: readonly string[],
+  port: number,
+): "anywhere" | "management-only" | "none" {
+  const dport = `tcp.dport in n:${port}`;
+  if (inputRules.some((r) => r === `${dport} ; accept`)) return "anywhere";
+  if (inputRules.some((r) => r.includes("saddr") && r.includes(dport))) {
+    return "management-only";
+  }
+  return "none";
+}
+
 /** The recorded, still-open revert for `host`, if there is one. */
 async function currentRevert(
   context: Ctx,
@@ -381,6 +433,7 @@ function rulesFrom(a: {
   default_policy: "drop";
   ssh_port: number;
   allow_ssh_from_anywhere: boolean;
+  trusted_interfaces?: string[];
 }): FirewallRules {
   const rules: FirewallRules = {
     managementCidrs: a.management_cidrs,
@@ -389,6 +442,9 @@ function rulesFrom(a: {
     defaultPolicy: a.default_policy,
     sshPort: a.ssh_port,
     allowSshFromAnywhere: a.allow_ssh_from_anywhere,
+    ...(a.trusted_interfaces?.length
+      ? { trustedInterfaces: a.trusted_interfaces }
+      : {}),
   };
   assertFirewallRules(rules);
   return rules;
@@ -429,13 +485,30 @@ export function createModel(overrides: Partial<HostDeps> = {}) {
     exposure: "management-only" | "anywhere",
   ) {
     const t = await openTarget(context, args);
+    // Read-only, before anything is armed: a trusted interface must not be the
+    // one carrying this session or the default route.
+    await assertTrustedNotUplink(deps, t, rules.trustedInterfaces ?? []);
     const ruleset = renderRuleset(rules);
     const ruleset_sha256 = await rulesetSha256(ruleset);
     const managed_sha256 = await expectedManagedSha256(rules);
     const stored = await context.readResource(stateName(args.host)) as
       | HostState
       | null;
+    assertIdentity(stored?.identity, args.identity, args.host);
     const record = await currentRevert(context, args.host);
+    assertIdentity(record?.identity, args.identity, args.host);
+    // Never widen a live management-only SSH rule back to anywhere unless asked.
+    if (rules.allowSshFromAnywhere && !args.allow_widening_ssh_exposure) {
+      const live = await probeState(deps, t, { sudo: args.sudo });
+      if (
+        liveSshExposure(live.managed_input_rules, rules.sshPort) ===
+          "management-only"
+      ) {
+        throw new HostConfigError(
+          `${args.host} is locked down to its management CIDRs; refusing to open SSH to anywhere again. Set allow_widening_ssh_exposure to do it on purpose`,
+        );
+      }
+    }
     if (stored?.firewall?.ruleset_sha256 === ruleset_sha256) {
       const probe = await probeState(deps, t, {
         sudo: args.sudo,
@@ -491,6 +564,7 @@ export function createModel(overrides: Partial<HostDeps> = {}) {
           revertName(args.host),
           {
             host: args.host,
+            ...(args.identity ? { identity: args.identity } : {}),
             token,
             phase,
             unit: unitName(token),
@@ -515,6 +589,7 @@ export function createModel(overrides: Partial<HostDeps> = {}) {
       phase,
       exposure,
       deps.now(),
+      args.identity ?? stored?.identity,
     );
     context.logger.info("{phase} on {host}: armed {token}, {count} steps", {
       phase,
@@ -597,6 +672,7 @@ export function createModel(overrides: Partial<HostDeps> = {}) {
     const stored = await context.readResource(stateName(args.host)) as
       | HostState
       | null;
+    assertIdentity(stored?.identity, args.identity, args.host);
     const revert = await context.readResource(revertName(args.host)) as
       | Revert
       | null;
@@ -642,7 +718,11 @@ export function createModel(overrides: Partial<HostDeps> = {}) {
     const state = await context.writeResource(
       "host_state",
       stateName(args.host),
-      mergeState(stored, { host: args.host, observed_at: probe.observed_at }),
+      mergeState(stored, {
+        host: args.host,
+        observed_at: probe.observed_at,
+        ...(args.identity ? { identity: args.identity } : {}),
+      }),
     );
     const seen = await context.writeResource(
       "observation",
@@ -666,10 +746,23 @@ export function createModel(overrides: Partial<HostDeps> = {}) {
   }
   return {
     type: "@randybias/server-host",
-    version: "2026.10.17.1",
+    version: "2026.10.17.3",
     description:
       "Harden a Linux host over SSH in three phases: base packages and users, an nftables firewall rendered from inputs, and an SSH lockdown. The SSH key is named by a vault reference and the firewall and lockdown phases arm a host-side revert timer before they change anything.",
-    upgrades: [],
+    upgrades: [
+      {
+        toVersion: "2026.10.17.2",
+        description:
+          "Adds the optional trusted_interfaces input; stored attributes are unchanged",
+        upgradeAttributes: (old: Record<string, unknown>) => old,
+      },
+      {
+        toVersion: "2026.10.17.3",
+        description:
+          "Adds identity, allow_widening_ssh_exposure and the forget action; stored attributes are unchanged",
+        upgradeAttributes: (old: Record<string, unknown>) => old,
+      },
+    ],
     globalArguments: GlobalArgsSchema,
     resources: {
       host_state: {
@@ -721,6 +814,7 @@ export function createModel(overrides: Partial<HostDeps> = {}) {
           const stored = await context.readResource(stateName(args.host)) as
             | HostState
             | null;
+          assertIdentity(stored?.identity, args.identity, args.host);
           const packages = [...args.packages].sort();
           const keys = [...args.authorized_keys];
           const sysctl_sha256 = await rulesetSha256(
@@ -812,6 +906,9 @@ export function createModel(overrides: Partial<HostDeps> = {}) {
           });
           const state: HostState = {
             host: args.host,
+            ...((args.identity ?? stored?.identity)
+              ? { identity: (args.identity ?? stored?.identity)! }
+              : {}),
             base: {
               packages,
               admin_user: args.admin_user,
@@ -924,9 +1021,19 @@ export function createModel(overrides: Partial<HostDeps> = {}) {
           context: Ctx,
         ) => {
           const t = await openTarget(context, args);
+          assertIdentity(
+            (await context.readResource(stateName(args.host)) as
+              | HostState
+              | null)?.identity,
+            args.identity,
+            args.host,
+          );
           let stored = await context.readResource(revertName(args.host)) as
             | Revert
             | null;
+          if (isOpen(stored)) {
+            assertIdentity(stored.identity, args.identity, args.host);
+          }
           if (!stored || !isOpen(stored)) {
             // The record may be missing although the host is armed (a failure
             // between arming and recording); the host's own marker is the truth.
@@ -1035,6 +1142,47 @@ export function createModel(overrides: Partial<HostDeps> = {}) {
           };
         },
       },
+      forget: {
+        kind: "action" as const,
+        description:
+          "DESTRUCTIVE. Delete what this model recorded for a host that no longer exists: its phase state, revert record and pending revokes. Makes no remote call; run it after the machine is gone, never to clear a live host's record.",
+        arguments: ForgetArgs,
+        execute: async (args: z.infer<typeof ForgetArgs>, context: Ctx) => {
+          const stored = await context.readResource(stateName(args.host)) as
+            | HostState
+            | null;
+          assertIdentity(stored?.identity, args.identity, args.host);
+          const now = new Date(deps.now()).toISOString();
+          const handles = [];
+          // Records cannot be removed from inside a method, so each is replaced
+          // by an empty one: no base, no firewall, no open revert.
+          handles.push(
+            await context.writeResource("host_state", stateName(args.host), {
+              host: args.host,
+              forgotten_at: now,
+              observed_at: now,
+            }),
+          );
+          const revert = await context.readResource(revertName(args.host)) as
+            | Revert
+            | null;
+          if (revert && isOpen(revert)) {
+            handles.push(
+              await context.writeResource("revert", revertName(args.host), {
+                ...revert,
+                cancelled_at: now,
+              }),
+            );
+          }
+          context.logger.info("Forgot the records of {host}", {
+            host: args.host,
+          });
+          return {
+            dataHandles: handles,
+            result: { host: args.host, forgotten: true },
+          };
+        },
+      },
       get: {
         description:
           "READ-ONLY. Probe the host and record what it sees as the observation resource: revert timer and expiry, managed ruleset hash, drift and SSH exposure. A failed probe is an error, not an observation.",
@@ -1061,6 +1209,7 @@ function mergeState(
   const merged = { ...(stored ?? {}), ...patch };
   return {
     host: merged.host,
+    ...(merged.identity ? { identity: merged.identity } : {}),
     ...(merged.base ? { base: merged.base } : {}),
     ...(merged.firewall ? { firewall: merged.firewall } : {}),
     ...(merged.pending_revoke?.length
@@ -1079,9 +1228,11 @@ async function writeFirewallState(
   mode: "firewall" | "lockdown",
   sshExposure: "management-only" | "anywhere",
   now: number,
+  identity?: string,
 ): Promise<{ name: string }> {
   return await context.writeResource("host_state", name, {
     host,
+    ...(identity ? { identity } : {}),
     ...(stored?.base ? { base: stored.base } : {}),
     ...(stored?.pending_revoke?.length
       ? { pending_revoke: stored.pending_revoke }
@@ -1101,5 +1252,5 @@ async function writeFirewallState(
 export const model = {
   ...createModel(),
   type: "@randybias/server-host",
-  version: "2026.10.17.1",
+  version: "2026.10.17.3",
 };

@@ -1,0 +1,92 @@
+{
+  "extension": "@randybias/cephadm",
+  "version": "2026.10.17.3",
+  "reviewedAt": "2026-10-17T19:00:00Z",
+  "dimensions": [
+    {
+      "id": "credentials-secrets",
+      "verdict": "pass",
+      "note": "The SSH private key is sensitive-marked on the string and its nullish wrapper; the canonical vendored _lib/ssh.ts (blob 8f132c43, reviewed in ssh-host 2026.10.17.3) loads it into a short-lived per-call ssh-agent over stdin, so no key text, key path or -i option reaches argv or disk (live cell e: ps scan clean, IdentityFile=none, IdentityAgent per call). The ControlMaster/multiplex path and the in-memory inline-key nonce map are gone. The S3 accessKey/secretKey are sensitive and used only to sign SigV4; RGW user keys and CSI client keys go into sensitive, vaulted resource fields. Known external issue swamp-club lab 3555: README examples pass secrets as vault references only and never show --json. No secret-like literals in the 2026.10.17.3 history (fixtures RFC 5737, placeholder password, sha256('abc') vector)."
+    },
+    {
+      "id": "logging-quality",
+      "verdict": "pass",
+      "note": "Methods log structured, value-free summaries (host, method, verdict); remote stderr and S3 transport detail are URL-stripped and truncated before they reach logs or errors."
+    },
+    {
+      "id": "error-handling",
+      "verdict": "pass",
+      "note": "Failures are typed (validate, transport, unverifiable, protected, object-leak-*, policy rollback) with bounded detail. Under the canonical transport every ssh exit 255 is a typed transport error; every canonical SshError except its typed timeout maps to an outcome-unknown TransportError (never classified from message text), so a mid-session reset or auth failure is never re-sent (tests assert exactly one ssh spawn). A call without budgetMs keeps the 30s budget + 5s grace. Over-cap stdout throws (the canonical truncate option is never passed). cephDeleteFs fails closed unless the client count is a non-negative integer; cephRemoveOsds refuses unless health is OK or WARN. Residual LOW: toTransportError reads .message from non-Error throws."
+    },
+    {
+      "id": "testing-completeness",
+      "verdict": "pass",
+      "note": "602 unit/contract tests with an injected canonical CommandRunner (no socket), including the wipe guard refusal matrix (guard r9 signed off, protected_devices.ts blob 62743884 unchanged), SigV4 known-answer tests, workflow catalog tests (succeeded-only edges; every step input key checked against its method's strict schema) and plain-object method contexts, including a model test that runs a method twice under insecure_tofu and asserts learn-then-reuse of the persisted pin. The transport swap was checked with a harness: 3200 distinct remote commands and stdin bodies byte-identical to the pre-swap code. Live at a792f41 on a bare-metal host: 12/13 pass plus 1 observation (guard and wipe cells G1-G6 on scsi_debug RAM disks with OS disks dry-run, strict and wrong-pin refusal, insecure_tofu persists and reuses the pin, a bare host-key line refused, the legacy strictHostKeyChecking input refused naming host_key_policy, ps scan clean); the observation (strict without host_keys uses the persisted pin) is intended and documented. Every cluster cell stays BLOCKED (needs three or more hosts with free whole disks), which is why the channel is beta."
+    },
+    {
+      "id": "idempotency-resilience",
+      "verdict": "pass",
+      "note": "Every ensure/apply method reads first and converges or does nothing (bootstrap no-ops on an existing cluster, placement converges to an explicit list keeping quorum, pools/fs/users adopt); delete paths are double-confirmed and re-runs are clean no-ops; maintenance enter/exit prove their effect. Residual LOW: probe-cleanup fallback after an unreadable version listing reports success after a plain DELETE. wipeDiskToRaw reports alreadyRaw only for a zero sector 0 with no table signature and an empty wipefs; otherwise it wipes and zeroes sector 0. Under insecure_tofu the first-seen key is persisted per host:port only after the first authenticated command runs (persisted is set only after the write succeeds) and reused as the pin on later runs; strict uses supplied pins first, then a persisted pin, and refuses with neither."
+    },
+    {
+      "id": "api-contracts",
+      "verdict": "pass",
+      "note": "Public cephadm/ceph CLI over SSH (pinned cephadm binary from a caller-supplied URL), Ceph RGW admin via radosgw-admin, and the RGW S3 API with SigV4; PutObjectAcl (not a second PutObject) for the leak probe; versioning is the three-state model."
+    },
+    {
+      "id": "resource-management",
+      "verdict": "pass",
+      "note": "One SSH process per call under the canonical transport, with a per-call ssh-agent and temp known_hosts torn down after it; no ControlMaster. Remote temp files are removed in finally paths; S3 responses are capped at 1 MiB; every wait is bounded, and an SSH call without an explicit budget gets the 35s default."
+    },
+    {
+      "id": "published-surface-hygiene",
+      "verdict": "pass",
+      "note": "Manifest @randybias/cephadm, two-sentence description, Apache-2.0, additionalFiles README.md and LICENSE.txt (LOGBOOK not packaged). Destructive methods lead with DESTRUCTIVE., read-only with READ-ONLY.; README method table regenerated from source (50 methods, 22 workflows). Fixtures are synthetic (RFC 5737, example.com/.test); leak scan, gitleaks and fixture guard pass. Clean-room provenance is logged in docs/CLEANROOM.md. README documents the transport, the host-key policies and the persisted-pin behaviour."
+    },
+    {
+      "id": "schema-strictness",
+      "verdict": "pass",
+      "note": "Global arguments are an empty strictObject; every method argument object is strict with grammars and bounds. host_key_policy is a required strict|insecure_tofu enum and host_keys an optional bounded array of ssh-keyscan lines that must each name their host (a bare type-blob line is refused, so one host's key cannot pass for another's); keyPath and privateKey together are refused; workflow host_keys inputs carry maxItems 64; the persisted hostkeys resource schema is bounded. Residual MEDIUM: the stored hostkeys record is cast, not re-validated, on read. Bucket policy documents are parsed, validated and re-serialized from the validated structure."
+    },
+    {
+      "id": "lifetime-gc",
+      "verdict": "pass",
+      "note": "34 result resources lifetime infinite with garbageCollection 10; the CSI key resource keeps 2 versions; the hostkeys resource holds one record per host:port."
+    },
+    {
+      "id": "crud-completeness",
+      "verdict": "pass",
+      "note": "Host prep, bootstrap, enrol, mon/mgr/mds/osd placement, pools, CephFS, CSI users and keys, maintenance, teardown, RGW users and buckets, plus verify methods for each; every mutator is kind action (25 methods), so no verb tombstones the definition; 22 workflows gate every mutation behind a pre-check and manual approval."
+    },
+    {
+      "id": "preflight-checks",
+      "verdict": "pass",
+      "note": "wipeDiskToRaw refuses any device that backs the running or bootable system (protected-device closure over lsblk, blkid, mdstat, mdadm --examine, pvs and ZFS; BIOS-boot/ESP partitions, EFI evidence and MBR boot code in sector 0 of every disk behind a candidate, including multipath, md, LVM and crypt stacks) unless that disk's own serial is acknowledged, and refuses when lsblk and blkid disagree; destructive teardown requires the named fsid; placement changes are judged against live quorum first. Every destructive method enforces its own precondition in-method (guard, health, in-use, joint ok-to-stop, fsid), and every destructive workflow re-gates after approval (swamp lab 3583). Residual MEDIUM: a non-ESP-typed, unmounted EFI boot partition is unprotected on an EFI host where efibootmgr is missing or fails. LOW L-9b: a dm device on a partition of a boot-code disk is refused and cannot be acknowledged (fail-closed)."
+    },
+    {
+      "id": "instance-names",
+      "verdict": "pass",
+      "note": "Workflows address the instance cephadm or cephadm-<purpose>-<item> for a fan-out, and each assert reads the record from the instance that wrote it."
+    },
+    {
+      "id": "data-access",
+      "verdict": "pass",
+      "note": "Every host, credential and target arrives as method arguments, so one generic definition serves any cluster; the model reads no other model's data."
+    },
+    {
+      "id": "version-upgrades",
+      "verdict": "pass",
+      "note": "2026.10.17.3 adds an identity upgrade entry: strictHostKeyChecking/multiplex were method inputs, never stored attributes, so nothing stored changes. The breaking method-input rename (strictHostKeyChecking -> host_key_policy + host_keys, multiplex dropped) is stated in the release note, README and LOGBOOK; the bundled workflows pass the new inputs and a caller passing the legacy input gets an error listing host_key_policy (live cell d). The chain 2026.10.17.1 -> .2 -> .3 is spelled out on the model export, with a test keeping it equal to the factory's chain. Residual LOW: the migration description duplicates MODEL_UPGRADES."
+    }
+  ],
+  "panel": {
+    "codex-astra": "conformance seat. 132d036: routed (with terra) 3 High: message-text retry classification re-sent outcome-unknown commands; workflows still passed strictHostKeyChecking; no default timeout; Mediums spawn bridge, keyPath+privateKey, optional readResource/TOFU test, no-op migration, sessionFor dup \u2014 all fixed in 1af45cc. 1af45cc: Medium persisted-before-write (fixed a792f41); Medium keyPath vs vault rule refuted (by spec); Lows migration dup, test router dup (residuals).",
+    "codex-terra": "adversarial seat. 1af45cc: HIGH persist-before-write refuted as stated (a failed persist is a non-TransportError and is never re-sent) and the ordering fixed in a792f41; Medium truncated output refuted (session never passes the canonical truncate option, over-cap stdout throws); Medium workflow host_keys bounds fixed in a792f41 (maxItems 64).",
+    "tightness-astra": "COULD-BE-TIGHTER, ~259 lines removable at 1af45cc; the 30 repeated SSH-field projections deduped in a792f41 (sessionFor/sshRequest); test-helper Lows left as residuals.",
+    "glm-advisory": "adversarial-glm rc=0 on 1af45cc: persist ordering (fixed), truncation (refuted), stored hostkeys not re-validated on read (MEDIUM residual), timeout aborted classification (resent only on resend any; MEDIUM residual pending a typed pre-auth kind upstream), budget+grace widening and non-Error message (LOW residuals).",
+    "transport-identity": "_lib/ssh.ts blob 8f132c43 (canonical ssh-host 2026.10.17.3); _lib/protected_devices.ts blob 62743884 (guard r9); _lib/wipe.ts differs from 2026.10.17.2 only in its 2 import lines.",
+    "merge-prep": "Merged lane/d1-cephadm-ssh a792f41 (quality dedupe after 1af45cc CLEAN; recorded commands identical per the lane harness; self-reviewed against TRIAGE 4b-4h). Post-live changes are LOGBOOK/README only; the published bytes are the live-tested code.",
+    "live": "a792f41 on bare metal: 12/13 pass + 1 observation (wipeDiskToRaw only, scsi_debug RAM disks, OS disks dry-run). Cluster cells BLOCKED (need three or more hosts).",
+    "prior-art": "None: no published Swamp package covers cephadm, Rook or Ceph cluster operations; @dataverket/versitygw is an S3 gateway reader only."
+  }
+}

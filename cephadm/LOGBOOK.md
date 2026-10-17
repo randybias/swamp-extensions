@@ -864,7 +864,7 @@ stripped. Host address and OS-disk serials are redacted. Result: 12/13 pass plus
 
 `strictHostKeyChecking` is gone from every SSH method; use `host_key_policy`
 (`strict` | `insecure_tofu`) plus `host_keys` (ssh-keyscan lines, each naming
-its host). `multiplex` is dropped. The 25 bundled workflows were updated to pass
+its host). `multiplex` is dropped. The 22 bundled workflows were updated to pass
 `host_key_policy`/`host_keys` (catalog test checks every step input against the
 method's strict schema). A caller still passing `strictHostKeyChecking` gets
 `Unknown method input(s): strictHostKeyChecking. Valid inputs are: ...

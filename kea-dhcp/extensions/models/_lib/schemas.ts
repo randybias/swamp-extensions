@@ -222,6 +222,8 @@ const ConfigStateSchema = z.strictObject({
 
 const RevertStateSchema = z.strictObject({
   host: z.string(),
+  // The revert token is a random correlation id, not a credential.
+  // swamp-quality-ignore credentials-sensitive-field
   token: z.string(),
   armed_at: z.string(),
   expires_at: z.string(),
@@ -241,6 +243,7 @@ const ObservationSchema = z.strictObject({
   kea_hash: z.string().optional(),
   sockets: z.array(z.string()),
   revert_armed: z.boolean(),
+  // swamp-quality-ignore credentials-sensitive-field
   revert_token: z.string().optional(),
   revert_expires_at: z.string().optional(),
   drift: z.array(z.string()),

@@ -6,13 +6,19 @@
 #              version may only be re-gated with exactly that hash
 azure-vm:
   channel: beta
-  ci: false
-  published: {}
+  ci: true
+  published:
+    2026.10.17.1: a33456c899d2a3e182e44da27e5998f72c877b9751c6b7c8f3abb4aa2de0f9d0
+  notes:
+    2026.10.17.1: 'First release, beta. Generic Azure virtual machine lifecycle over Azure Resource Manager REST: create (adopts an existing VM, never a second), get/sync, start, stop, deallocate (real deallocation, optional hibernate) and delete (an action; deleting an absent VM is a no-op), with long-running operations polled. Auth is a service principal from the vault via OAuth2 client credentials; the secret travels only in the token request body and the token is held in memory per call; there is no az CLI path. SSH public-key admin only. Live testing was not possible in this release (no throwaway Azure subscription); every live cell is recorded as blocked, so it stays on beta.'
 
 azure-nsg:
   channel: beta
-  ci: false
-  published: {}
+  ci: true
+  published:
+    2026.10.17.1: 36bf4978f3b5f5d20ded7cb5ac13d146cf9b4c018920931daa4f69b2c183649b
+  notes:
+    2026.10.17.1: 'First release, beta. Generic Azure network security group rules over Azure Resource Manager REST: get/sync, ensure_rule (idempotent converge of one rule), remove_rule, apply_rule_set (plans first; applies only with an explicit flag; refuses the whole set with zero writes on any collision or invalid rule; never deletes undeclared rules) and delete (an action). Rule comparison uses the real read-back shape (singular field beside an empty plural list). Auth as in azure-vm. Live testing was not possible in this release; every live cell is recorded as blocked, so it stays on beta.'
 
 ssh-host:
   channel: beta

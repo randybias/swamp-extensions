@@ -1,0 +1,90 @@
+{
+  "extension": "@randybias/k0s-cluster",
+  "version": "2026.10.17.3",
+  "reviewedAt": "2026-10-17T19:30:00Z",
+  "dimensions": [
+    {
+      "id": "credentials-secrets",
+      "verdict": "pass",
+      "note": "The SSH private key reaches a short-lived ssh-agent over stdin (canonical _lib/ssh.ts blob fe0139f0, which also keeps the upload content digest off every argv and remote script). Config, join token and manifest uploads are mode 0600 under umask 077. The admin kubeconfig is returned only as a sensitive value or written to a caller-named vault key through context.vaultService.put; a vault write failure is a fixed message with no backend text. Helm values are redacted from stored and returned renders. Download tokens come from a vault reference or K0S_DOWNLOAD_TOKEN and go in an Authorization header; URLs with user info, query or fragment are rejected. Live: kubeconfig-shaped console text 0 (store_in_vault cells). Residual MEDIUM (terra, delta, carried from ssh-host): the vendored upload result returns the content SHA-256. Known external issue swamp-club lab 3555: README examples use vault references only and warn against --json. 2026.10.17.3: config_file_sha256 (a hash of the real k0s.yaml, which carries the plaintext keepalived authPass under CPLB) is removed; a CPLB install test asserts no written state holds the authPass or that field. The status config_sha256 is computed on the node by a fixed fail-closed script (publicShaScript) that redacts canonical authPass lines and refuses (no digest, drift unknown) on an unreadable file, any non-canonical or block authPass line, or a helm values: key; sync calls it only when the record has has_helm_values === false (9a11d94 High, fixed in a101b99, real-sh test, live R4a-c and R6 null). The script carries no content-derived hash; only the digest returns. The controller join_token and authPass are sensitive inputs; the join token is uploaded as a file, never put on argv. No secret-like literals in the 17.3 history (test fixtures use placeholder passwords)."
+    },
+    {
+      "id": "logging-quality",
+      "verdict": "pass",
+      "note": "Methods log with structured placeholders (host, version, role, counts); no key, token, kubeconfig, manifest content or Helm values in log fields; remote stderr is never reflected into messages."
+    },
+    {
+      "id": "error-handling",
+      "verdict": "pass",
+      "note": "Every ssh exit 255 is a typed transport error; remote non-zero exits are checked for install, restart, reset (stop, reset and config removal each verified) and uploads. A failed restart restores the previous k0s.yaml, or removes a first-time one. wait_ready returns ready false on timeout but raises on connection, auth or host-key failure. Residual MEDIUM (astra, terra; raised HIGH and downgraded): a failed cat of an existing k0s.yaml is treated as absence, so a later failed restart removes it; as root this needs an I/O error, the file is a deterministic render of the caller's inputs and install recreates it, and the error says it was removed. Residual MEDIUM (terra): get/sync and apply_helm observation helpers turn some non-zero kubectl/ls exits into empty results; rollback ignores the exit of rm and the recovery restart. 2026.10.17.2 reset: k0s stop is skipped when systemctl is-active reports inactive or failed, and a stop failure continues only when a re-check reports inactive or failed; any other unit state is a typed ResetStateError (no stderr matching). A failing k0s reset removes nothing (unit-tested, live 6a/6b). A failed sha256sum is a typed error, not a mismatch. A failed post-reset cleanup is a typed ResetCleanupError with cleanup_pending kept in state. 2026.10.17.3 upgrade: version tuple gates refuse a downgrade and a Kubernetes minor skip; the staged binary is verified before anything stops (live 6: bad SHA refused, PID unchanged); any failure restores the previous binary, restarts and waits for health, and a failed rollback raises ROLLBACK FAILED naming the good binary's path. Residual MEDIUM (terra): a state-write or k0s.old removal failure after a successful host upgrade leaves k0s.old, so a later upgrade refuses until it is removed by hand."
+    },
+    {
+      "id": "testing-completeness",
+      "verdict": "pass",
+      "note": "151 unit tests with injected SSH, download and clock fakes, plus golden render fixtures; reset is driven through a plain-object context. Live end-to-end for 2026.10.17.1 on an Ubuntu 24.04 VPS with strict pins across 6554ea0, 3cc23a3 and 27a214e (every cell passes). Live for 2026.10.17.2: cells 1-6 pass on 356bb45 (install, reset, reset again, foreign binary kept, immutable file then pending cleanup finished, failing k0s reset and non-executable binary change nothing); F1 (reset of a stopped unit) failed there and passes on 3832bdf with F1b and reset-again; 4-prime passes on behaviour (the binary_removed/reason result fields are not printed by swamp without --json). 50e2f2d (unknown unit states refused, removal outcome persisted) is covered by unit tests only. Residual LOW (astra, delta): the ExecStart fixture copies live-host output; three reset tests could be table-driven. 2026.10.17.3: 179 unit tests (golden renders for cplb, etcd-peer, external-address, nllb; upgrade lock/rollback; a real-sh run of the drift script over canonical and smuggle forms). Live on bare metal: 15/15 on 8d63885 (17.2 reset baseline, byte-identical render, install, bad-SHA, lock, same-version no-op, downgrade refused, real upgrade v1.36.3 -> v1.36.4, concurrent upgrades, controller_worker + no_taints, reset) and 11/11 on a101b99 (host from vault.get for install/upgrade/reset, the lab 3585 case; drift clean, changed, and unknown for three non-canonical authPass forms and helm values; a real upgrade). Residual LOW: a canonical authPass line was not exercised live (unit-tested)."
+    },
+    {
+      "id": "idempotency-resilience",
+      "verdict": "pass",
+      "note": "install re-verifies the installed binary digest and version and adopts an active unit without a second install (live: MainPID and config SHA unchanged); apply_manifests uploads only changed files and removes undeclared ones (live: resourceVersion unchanged); apply_helm restarts only when k0s.yaml changes; reset on a host with no unit is a clean no-op (live). Re-running install without the helm block after apply_helm rewrites k0s.yaml without those extensions and restarts the controller; the README says to always pass the full desired helm set. Residual: manifest stacks are not applied atomically. 2026.10.17.2: a reset whose cleanup failed keeps cleanup_pending and the binary digest, and a rerun with no unit finishes the cleanup (live 5a/5b); reset again on a clean host is a no-op (live). 2026.10.17.3: upgrade to the installed version is a no-op (live 4); two concurrent upgrades: exactly one runs, the other is refused by /run/k0s-upgrade.lock, which reset also honours (live 7, 8); reset again is a no-op (live R9)."
+    },
+    {
+      "id": "api-contracts",
+      "verdict": "pass",
+      "note": "Targets k0s on Linux with systemd over the canonical OpenSSH transport; single installs k0s install controller --enable-worker --no-taints (live-verified: no control-plane taint), k0s.k0sproject.io/v1beta1 config. The installed role is read from systemctl show -p ExecStart (real struct format recorded live). Residual MEDIUM (astra, terra, delta): the ExecStart classifier matches tokens anywhere in argv[] and the first true flag, so a hand-modified unit could be misclassified; require /usr/local/bin/k0s then controller and last-occurrence flags. 2026.10.17.3 adds controller_worker (k0s controller --enable-worker=true --no-taints=true, live 9), a controller join_token, etcd.peerAddress and the HA ClusterConfig fields api.externalAddress, network.nodeLocalLoadBalancing and network.controlPlaneLoadBalancing (keepalived VIP), checked against the upstream ClusterConfig shape with goldens (k0s config validate is lenient). Residual MEDIUM: config drift for Helm-values installs is always unknown."
+    },
+    {
+      "id": "resource-management",
+      "verdict": "pass",
+      "note": "Temporary agent and known_hosts files are removed by the transport; remote output is capped. 2026.10.17.2 reset removes the unit, /var/lib/k0s, /etc/k0s and the process, and the binary at the fixed path /usr/local/bin/k0s only when its SHA-256 equals the digest install recorded (live: nothing left; a foreign binary is kept). Residual MEDIUM (terra HIGH, downgraded; README warns): /etc/k0s is removed wholesale, including user drop-ins such as containerd.d or registry credentials. Residual MEDIUM (live cell 4): reset still runs a foreign binary for k0s stop and k0s reset and trusts their exit 0. Residual LOW (terra HIGH, downgraded: needs a concurrent root writer on the target; astra MEDIUM): a hash-then-rm race on the binary. 2026.10.17.3: k0s.old exists only during the swap and is removed after a successful upgrade (live 3c); the upgrade lock directory is removed in a finally and a failed removal is a warning."
+    },
+    {
+      "id": "published-surface-hygiene",
+      "verdict": "pass",
+      "note": "Manifest @randybias/k0s-cluster 2026.10.17.2 (model version literals match), Apache-2.0, additionalFiles README.md and LICENSE.txt, LOGBOOK not packaged. install, apply_manifests, apply_helm and reset descriptions start DESTRUCTIVE. Plain-object model export so the catalog sees type and version. Fixtures use RFC 5737 addresses; leak scan, gitleaks and fixture guard pass. Residual MEDIUM (astra): kubeconfig is described READ-ONLY while store_in_vault overwrites the named vault key. LOW (astra): SSH grammars duplicate the transport's; test-only YAML serializer; unused digests in tests. 2026.10.17.3: manifest and model version literals 2026.10.17.3; upgrade is DESTRUCTIVE; plain-object model export; fixtures RFC 5737; leak scan, gitleaks and fixture guard pass. LOGBOOK addresses redacted (<bm1>)."
+    },
+    {
+      "id": "schema-strictness",
+      "verdict": "pass",
+      "note": "Strict argument objects; every caller value reaching the remote shell has an allowlist grammar and is quoted as one argv element; k0s version, SHA-256, CIDRs (IPv6 parsed strictly), api_address (validated IP), Helm charts and values (bounded depth and size) and manifest paths (no duplicates, no traversal) are bounded. pod_cidr and service_cidr are required with no defaults. Residual LOW (terra): confirm_host and confirm_role_change lack a length bound and host grammar. 2026.10.17.3: every new input is strict and off by default (unset render and install argv byte-identical to 2026.10.17.2, live 2a); upgrade version and SHA-256 use the install grammars; the keepalived schema bounds authPass (1-8 characters, sensitive) and the VIP list (1-16 CIDRs)."
+    },
+    {
+      "id": "lifetime-gc",
+      "verdict": "pass",
+      "note": "state, hostkeys, kubeconfig, readiness, manifests, helm, status and config resources: lifetime infinite, garbageCollection 10."
+    },
+    {
+      "id": "crud-completeness",
+      "verdict": "pass",
+      "note": "install (create/update/adopt), get and sync (read), apply_manifests and apply_helm (reconcile), reset (destroy). reset is kind action, not a model delete, because one definition holds many hosts (run ruling 1); requires confirm_host equal to the SSH host (live-verified)."
+    },
+    {
+      "id": "preflight-checks",
+      "verdict": "pass",
+      "note": "The release binary SHA-256 is verified before anything runs (live: a bad SHA installs nothing); host keys are pinned or persisted TOFU before any operation; a role change is refused without confirm_role_change equal to the host and happens only after the replacement binary is verified (live)."
+    },
+    {
+      "id": "instance-names",
+      "verdict": "pass",
+      "note": "Records are keyed by user, host and port (host:22 never shares a record with host:2222); helm and manifest records add a suffix per target. 2026.10.17.3: a host supplied through vault.get is keyed by the real host, not masked (live R1). A 2026.10.17.2 record written with a vault-sourced host stays unreadable (swamp-club lab 3585); recovery by re-running install to adopt is documented in the README."
+    },
+    {
+      "id": "data-access",
+      "verdict": "pass",
+      "note": "Methods read only this model's own records (host keys, state) for the target given in the arguments, so one definition drives a fleet."
+    },
+    {
+      "id": "version-upgrades",
+      "verdict": "pass",
+      "note": "2026.10.17.2 adds a no-op upgrade entry 2026.10.17.1 -> 2026.10.17.2: the state resource gains only optional fields (cleanup_pending, binary_removed, binary_removal_reason), so existing records stay valid. A host installed by an earlier lane build as controller+worker with the control-plane taint is detected from the unit ExecStart and migrated only with confirm_role_change (live-verified in 2026.10.17.1). 2026.10.17.3 adds an upgrades entry 2026.10.17.2 -> 2026.10.17.3: state gains has_helm_values (optional) and drops config_file_sha256 (ignored if present). Legacy records (has_helm_values undefined) report config drift unknown rather than a false change."
+    }
+  ],
+  "panel": {
+    "codex-astra": "codex conformance + tightness seats over each 17.3 round; final rounds: 109ad61 CLEAN; 9a11d94 1 High (status hash over Helm values and non-canonical authPass, fixed in a101b99), Mediums (unreadable file hashed as empty, fixed in a101b99; stale rollback path in the error, fixed; test placeholder password, refuted: synthetic fixture). tightness-astra: COULD-BE-TIGHTER, not BLOATED.",
+    "codex-terra": "codex adversarial seat over the same rounds; 9a11d94: no Critical/High; Mediums: k0s.old left after a post-upgrade state/cleanup failure (residual), masked-host 17.2 records (lab 3585, documented with an install-adopt recovery).",
+    "triage": "Chain of triage rounds ending 109ad61 CLEAN, 9a11d94 ROUTED 1 High (fail-closed drift), a101b99 fix self-reviewed at merge prep against TRIAGE 4b-4h: no new context use, no parser differential (non-canonical authPass refused), no hash on argv, no killable remote command, TOFU unchanged. No Critical/High.",
+    "merge-prep": "Merged lane/d3-k0s-cluster-3 a101b99 on main after cephadm 2026.10.17.3; diff scope k0s-cluster/ plus one release.yaml note line; _lib/ssh.ts equals fe0139f0. No code change at merge prep (post-live rule); only LOGBOOK edits.",
+    "live": "receipts: 15/15 on 8d63885 and 11/11 on a101b99 on a bare-metal host; redacted matrix in the LOGBOOK.",
+    "ocr-llm": "adversarial-glm advisory seat ran (rc=0); nothing beyond the codex findings was verified as Critical/High."
+  }
+}

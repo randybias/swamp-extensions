@@ -11,6 +11,8 @@ import {
   getScript,
   parseKnownHosts,
   parseRollbackDir,
+  rollbackLockLines,
+  signalTrapLines,
 } from "./push.ts";
 
 Deno.test("scripts accept only valid interface names", () => {
@@ -239,4 +241,77 @@ Deno.test("apply compares the full address set; delete survives a broken config"
     deleteScript("wg0", 60),
     'wg-quick down "$i" >/dev/null 2>&1 || ip link delete "$i"',
   );
+});
+
+Deno.test("a signalled remote script runs its EXIT cleanup", async () => {
+  const dir = await Deno.makeTempDir({ prefix: "wgsig." });
+  const stage = `${dir}/stage`;
+  await Deno.mkdir(stage);
+  try {
+    for (
+      const [sig, code] of [["TERM", 143], ["HUP", 129], ["INT", 130], [
+        "PIPE",
+        141,
+      ]] as const
+    ) {
+      await Deno.writeTextFile(`${stage}/wg0.key`, "SECRET\n");
+      const script = [
+        "set -eu",
+        `stage=${JSON.stringify(stage)}`,
+        'cleanup() { rm -f "$stage/wg0.key"; }',
+        "trap cleanup EXIT",
+        ...signalTrapLines(),
+        `kill -${sig} $$`,
+        "echo SHOULD-NOT-RUN",
+      ].join("\n");
+      const out = await new Deno.Command("sh", {
+        args: ["-c", script],
+        stdout: "piped",
+        stderr: "piped",
+      }).output();
+      assertEquals(out.code, code, sig);
+      assertEquals(
+        new TextDecoder().decode(out.stdout).includes("SHOULD-NOT-RUN"),
+        false,
+        sig,
+      );
+      assertEquals(
+        await Deno.stat(`${stage}/wg0.key`).then(() => true, () => false),
+        false,
+        `${sig}: the staged key is removed`,
+      );
+    }
+  } finally {
+    await Deno.remove(dir, { recursive: true });
+  }
+});
+
+Deno.test("the rollback lock waits out a held lock instead of abandoning", async () => {
+  const dir = await Deno.makeTempDir({ prefix: "wglock." });
+  const lock = `${dir}/wg0.lock`;
+  const script = [
+    "set -eu",
+    `d=${JSON.stringify(dir)}`,
+    "i=wg0",
+    ...rollbackLockLines(),
+    "echo acquired",
+  ].join("\n");
+  const holder = new Deno.Command("sh", {
+    args: ["-c", `exec 9>"${lock}"; flock 9; sleep 2`],
+    stdout: "null",
+    stderr: "null",
+  }).spawn();
+  await new Promise((r) => setTimeout(r, 300));
+  try {
+    const out = await new Deno.Command("sh", {
+      args: ["-c", script],
+      stdout: "piped",
+      stderr: "piped",
+    }).output();
+    assertEquals(out.code, 0);
+    assertStringIncludes(new TextDecoder().decode(out.stdout), "acquired");
+  } finally {
+    await holder.output();
+    await Deno.remove(dir, { recursive: true });
+  }
 });

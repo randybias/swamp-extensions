@@ -143,8 +143,11 @@ echoes method arguments, so pass the key as a vault reference only.
   The private key and config are streamed straight into the remote command over
   ssh stdin, never on `argv` and never written to the node by the transport; the
   key file WireGuard reads is staged by the script itself, at mode 0600, under
-  its own trap. Every remote command carries a bounded deadline, and a session
-  that outlives it is killed and reported as a transport error.
+  its own trap. Each remote command runs under a remote deadline
+  (`ssh.command_timeout_s`, default 300 s, capped at 110 s) as well as a local
+  one: the remote process group is killed at the deadline, so a hung `wg-quick`
+  cannot keep the node lock past it, and a not-yet-confirmed change is reverted
+  by the retrying rollback. A hang is reported as a transport error.
 - Upgrading from 2026.10.17.4: `host_key_policy: accept-new` now maps to
   `insecure_tofu` and `insecure` is refused (the transport cannot honour it
   safely); `ssh.host_keys` entries that are `{type, key}` objects are accepted

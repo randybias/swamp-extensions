@@ -17,6 +17,7 @@ import {
   exec,
   type ExecResult,
   type HostKeyInfo,
+  quoteArgv,
   SshConfigError,
   type SshDeps,
   SshError,
@@ -143,7 +144,14 @@ function knownHostsLines(
  */
 export function sshTransport(t: SshTarget, deps: SshDeps): Transport {
   const target = canonicalTarget(t);
-  const timeoutMs = (t.command_timeout_s ?? DEFAULT_COMMAND_TIMEOUT_S) * 1000;
+  // The remote deadline is capped below the apply rollback window so the lock a
+  // hung body holds is always released before the rollback fires; the local ssh
+  // outlives it so the remote `timeout` reports first.
+  const deadlineS = Math.min(
+    t.command_timeout_s ?? DEFAULT_COMMAND_TIMEOUT_S,
+    APPLY_ROLLBACK_SECONDS - 10,
+  );
+  const timeoutMs = (deadlineS + 15) * 1000;
   return async (script, stdin) => {
     let learnedLines: string | undefined;
     if (
@@ -164,9 +172,17 @@ export function sshTransport(t: SshTarget, deps: SshDeps): Transport {
       learnedLines = knownHostsLines(t.host, t.port, waited.host_keys);
       target.host_keys = learnedLines.split("\n").filter((l) => l !== "");
     }
+    // Bound the REMOTE side too: `timeout` runs the script in its own process
+    // group and kills that group at the deadline, so a hung wg-quick cannot
+    // hold the node lock past it and an armed rollback can still acquire the
+    // lock and restore. The outer `sh -c` survives the kill and reports the
+    // code (124 = TERM, 137 = KILL).
+    const bounded = `timeout -k 5 ${deadlineS} ${
+      quoteArgv(["sh", "-c", script])
+    }; exit $?`;
     let res: ExecResult;
     try {
-      res = await exec(deps, target, ["sh", "-c", script], {
+      res = await exec(deps, target, ["sh", "-c", bounded], {
         ...(stdin !== undefined ? { stdin } : {}),
         timeoutMs,
       });
@@ -285,10 +301,7 @@ function launchRollbackLines(windowSeconds: number): string[] {
     'sleep "$1"',
     "shift",
     "rb=$1; d=$2; i=$3; up=$4; epoch=$5",
-    "if command -v flock >/dev/null 2>&1; then",
-    '  exec 9>"$d/.$i.lock"',
-    "  flock -w 60 9 || exit 1",
-    "fi",
+    ...rollbackLockLines(),
     'if [ ! -e "$rb/epoch" ]; then exit 0; fi',
     'if [ -e "$rb/disarm" ]; then rm -rf "$rb"; exit 0; fi',
     'if [ "$(cat "$d/.$i.epoch" 2>/dev/null || echo stale)" != "$epoch" ]; then rm -rf "$rb"; exit 0; fi',
@@ -398,6 +411,38 @@ function addrCheckLines(): string[] {
   ];
 }
 
+/**
+ * Traps that turn a signal into a normal exit so the `EXIT` trap (which removes
+ * the staging directory and its 0600 key copy) still runs.
+ */
+export function signalTrapLines(): string[] {
+  return [
+    "trap 'exit 129' HUP",
+    "trap 'exit 130' INT",
+    "trap 'exit 143' TERM",
+    "trap 'exit 141' PIPE",
+  ];
+}
+
+/**
+ * Rollback lock lines: the holder is a bounded apply/delete, so wait it out
+ * rather than abandon the generation. `timeout` frees the lock when it kills a
+ * hung body, so the rollback still reverts; a 900 s cap stops a truly stuck
+ * holder pinning the rollback forever.
+ */
+export function rollbackLockLines(): string[] {
+  return [
+    "if command -v flock >/dev/null 2>&1; then",
+    '  exec 9>"$d/.$i.lock"',
+    "  waited=0",
+    "  while ! flock -w 5 9; do",
+    "    waited=$((waited + 5))",
+    '    if [ "$waited" -ge 900 ]; then exit 1; fi',
+    "  done",
+    "fi",
+  ];
+}
+
 /** Seconds the remote rollback waits before restoring a changed interface. */
 export const APPLY_ROLLBACK_SECONDS = 120;
 
@@ -411,8 +456,14 @@ export const APPLY_ROLLBACK_SECONDS = 120;
  * success it leaves a detached rollback armed and prints `rb=<dir>` for a fresh
  * connection to disarm; prints `changed=0|1`.
  */
-export function applyScript(iface: string): string {
+export function applyScript(
+  iface: string,
+  rollbackSeconds: number = APPLY_ROLLBACK_SECONDS,
+): string {
   assertIface(iface);
+  if (!Number.isInteger(rollbackSeconds) || rollbackSeconds < 1) {
+    throw new Error(`Invalid rollback window: ${rollbackSeconds}`);
+  }
   return [
     "set -eu",
     "umask 077",
@@ -425,6 +476,7 @@ export function applyScript(iface: string): string {
     'stage=$(mktemp -d "$d/.$i.stage.XXXXXX")',
     'cleanup() { rm -rf "$stage"; }',
     "trap cleanup EXIT",
+    ...signalTrapLines(),
     'cfg="$stage/$i.conf"',
     'kf="$stage/$i.key"',
     'cat > "$cfg"',
@@ -448,7 +500,7 @@ export function applyScript(iface: string): string {
     '  epoch=$(cat "$d/.$i.epoch" 2>/dev/null || echo 0)',
     '  if [ "$1" = 1 ]; then epoch=$((epoch + 1)); echo "$epoch" > "$d/.$i.epoch"; fi',
     ...backupLines(),
-    ...launchRollbackLines(APPLY_ROLLBACK_SECONDS),
+    ...launchRollbackLines(rollbackSeconds),
     "}",
     // Peers, endpoints, allowed IPs, keepalive and listen port; no counters.
     "live_sig() {",

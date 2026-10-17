@@ -16,7 +16,7 @@ import {
   TransportError,
   type TransportResult,
 } from "./_lib/push.ts";
-import { type CommandRunner, quoteArgv, type SshDeps } from "./_lib/ssh.ts";
+import { type CommandRunner, type SshDeps } from "./_lib/ssh.ts";
 import { MeshSchema } from "./_lib/render.ts";
 import { createModel, model, type as modelType } from "./wireguard_mesh.ts";
 
@@ -490,8 +490,11 @@ Deno.test("sshTransport streams stdin into the remote command, never on argv", a
     assert(!line.includes("mktemp"), c.cmd);
     assert(!line.includes("exec 3<"), c.cmd);
   }
-  // The remote command is exactly `sh -c <script>`; no wrapper or temp file.
-  assertEquals(ssh.args.at(-1), "'sh' '-c' 'echo hi'");
+  // The remote command is the unchanged script under a remote deadline; no
+  // temp file.
+  const remote = ssh.args.at(-1) ?? "";
+  assert(remote.includes("timeout -k 5"));
+  assert(remote.includes("echo hi"));
   // A per-command deadline is set so a hung session is killed.
   assert((ssh.timeoutMs ?? 0) > 0);
   // A supplied pin that applies to no host is refused, not silently accepted.
@@ -722,10 +725,12 @@ Deno.test("transport command diff: a secret never reaches a remote temp file (ol
   for (const marker of OLD_TEMP_FILE_COMMANDS) {
     assertEquals(commands.some((c) => c.includes(marker)), false, marker);
   }
-  // New: exactly one remote command, the unchanged script, and the secret on
-  // the ssh process's stdin.
+  // New: exactly one remote command, the unchanged script under a remote
+  // deadline, and the secret on the ssh process's stdin.
   assertEquals(commands.length, 1);
-  assertEquals(commands[0], quoteArgv(["sh", "-c", script]));
+  assert(commands[0].includes("timeout -k 5"));
+  // A distinctive line of the script survives quoting verbatim.
+  assert(commands[0].includes("IFS= read -r key"));
   const ssh = rec.calls.find((c) => c.cmd === "ssh")!;
   assertEquals(ssh.stdin, "PRIVATEKEY\n[Interface]\n");
   assert((ssh.timeoutMs ?? 0) > 0);

@@ -87,7 +87,7 @@ const SshSchema = z.strictObject({
   command_timeout_s: z.number().int().min(10).max(3600).default(
     DEFAULT_COMMAND_TIMEOUT_S,
   ).describe(
-    "Deadline in seconds for one remote command; a hung session is killed and reported as a transport error.",
+    "Deadline in seconds for one remote command. The remote process group is killed (SIGTERM, then SIGKILL 5 s later) and the run is reported as a transport error; the effective deadline is capped at 110 s so an armed rollback can always acquire the lock before it fires.",
   ),
   max_output_bytes: z.number().int().min(1).max(104857600).optional().describe(
     "Cap in bytes on captured output.",
@@ -477,7 +477,7 @@ export function createModel(deps: Partial<Deps> = {}) {
       {
         toVersion: "2026.10.17.6",
         description:
-          "Re-vendored the canonical ssh.ts (blob 8f132c43) and dropped the remote temp-file workaround: the private key and config are streamed straight into the remote command over stdin, so no secret bytes touch remote disk; every remote command carries a bounded timeout. No stored-attribute changes.",
+          "Re-vendored the canonical ssh.ts (blob 8f132c43) and dropped the remote temp-file workaround: the private key and config are streamed straight into the remote command over stdin, so no secret bytes touch remote disk. Each remote command now runs under a remote deadline (new optional ssh.command_timeout_s, default 300 s, capped at 110 s so an armed rollback can acquire the lock) as well as a local one; a hang is reverted by the retrying rollback. Adds the ssh.command_timeout_s input; no stored-attribute changes.",
         upgradeAttributes: (old: Record<string, unknown>) => old,
       },
     ],

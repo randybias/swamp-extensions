@@ -202,6 +202,10 @@ const clusterFields = {
       "keepalived VRRP auth password, at most 8 characters; wire with a vault reference.",
     ),
   }).describe("Control-plane keepalived VIP; omit for none.").nullish(),
+  etcd_peer_address: z.string().max(45).refine(isIp, "must be an IP address")
+    .describe(
+      "etcd peer address written to spec.storage.etcd.peerAddress; use the private or mesh address when the API address is not directly reachable between nodes.",
+    ).nullish(),
 };
 
 const externalAndLocalLbRefine = (v: {
@@ -625,6 +629,7 @@ function renderInput(args: {
     virtual_ips: string[];
     auth_pass: string;
   } | null;
+  etcd_peer_address?: string | null;
   helm: z.infer<typeof HELM_CHART>[];
 }): K0sConfigInput {
   return {
@@ -644,6 +649,9 @@ function renderInput(args: {
       : {}),
     ...(args.control_plane_load_balancing
       ? { control_plane_load_balancing: args.control_plane_load_balancing }
+      : {}),
+    ...(args.etcd_peer_address
+      ? { etcd_peer_address: args.etcd_peer_address }
       : {}),
     helm: args.helm.map((chart) => ({
       chart: chart.chart,

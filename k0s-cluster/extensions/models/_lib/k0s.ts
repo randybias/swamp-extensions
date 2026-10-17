@@ -87,6 +87,8 @@ export interface K0sConfigInput {
   node_local_load_balancing?: boolean;
   /** Control-plane keepalived VIPs (CIDR); omit for none. */
   control_plane_load_balancing?: { virtual_ips: string[]; auth_pass: string };
+  /** etcd peer address; omit keeps k0s's default (the API address). */
+  etcd_peer_address?: string;
   /** Helm extensions to declare. */
   helm: HelmChartInput[];
 }
@@ -453,6 +455,10 @@ export function renderK0sConfig(input: K0sConfigInput): string {
     lines.push("      enabled: true");
   }
   lines.push("  storage:");
+  if (input.etcd_peer_address) {
+    lines.push("    etcd:");
+    lines.push(`      peerAddress: ${yamlScalar(input.etcd_peer_address)}`);
+  }
   lines.push(`    type: ${yamlScalar(input.storage_type)}`);
   lines.push("  telemetry:");
   lines.push(`    enabled: ${input.telemetry_enabled}`);

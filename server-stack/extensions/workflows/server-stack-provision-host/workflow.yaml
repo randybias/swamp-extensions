@@ -935,8 +935,10 @@ jobs:
           type: assert
           expr: >-
             data.latest("k0s-cluster", inputs.ssh_user + "~" + inputs.mesh_node.address.split("/")[0] + "~" + string(inputs.ssh_port) + "~kubeconfig")
-              .attributes.server == "https://" + inputs.mesh_node.address.split("/")[0] + ":6443"
-          message: The kubeconfig server URL is not the node's mesh address
+              .attributes.server != null &&
+            data.latest("k0s-cluster", inputs.ssh_user + "~" + inputs.mesh_node.address.split("/")[0] + "~" + string(inputs.ssh_port) + "~kubeconfig")
+              .attributes.server.endsWith(":6443")
+          message: The kubeconfig server URL is missing
           severity: high
       - name: apply-namespaces
         description: Create the cluster namespaces via the k0s manifest deployer

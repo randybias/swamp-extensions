@@ -72,10 +72,9 @@ Deno.test("the API address is the mesh address for install, kubeconfig and the c
   for (const step of ["install-k0s", "kubeconfig", "apply-nats"]) {
     assertStringIncludes(stepText(s, step), api);
   }
-  assertStringIncludes(
-    stepText(s, "check-kubeconfig"),
-    '"https://" + inputs.mesh_node.address.split("/")[0] + ":6443"',
-  );
+  // The stored record masks the host (`https://***:6443`), so the check can only
+  // assert a server URL exists; the step's log line shows the mesh URL.
+  assertStringIncludes(stepText(s, "check-kubeconfig"), 'endsWith(":6443")');
 });
 
 Deno.test("the NATS probe passes its port as a string and its timeout in milliseconds", async () => {

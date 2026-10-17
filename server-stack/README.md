@@ -131,7 +131,7 @@ swamp workflow run @randybias/server-stack-teardown-host \
   `cali*` and the like for another CNI) is passed to both firewall steps. This
   needs `@randybias/server-host` 2026.10.17.2 or later.
 - The API server binds the mesh address (`api_address`), and the kubeconfig the
-  workflow stores points at it; `check-kubeconfig` asserts that.
+  workflow stores points at it; the step's log line shows it.
 
 ## License
 

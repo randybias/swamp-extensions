@@ -92,7 +92,9 @@ maintainer's e2e repo):
   and its timeout in seconds (the model takes milliseconds); both fixed.
 - The stored kubeconfig pointed at the node's public address. `api_address` is
   now the mesh address for `install`, `apply_helm` and `kubeconfig`, and
-  `check-kubeconfig` asserts the URL is `https://<mesh>:6443`.
+  `check-kubeconfig` asserts a `:6443` URL exists (the stored record masks the
+  host, so the log line `server https://<mesh>:6443` is the evidence of the
+  address).
 - `apply-nats` was skipped in every run: a step that depends on a `forEach` step
   with nothing to iterate gets no state from it, so even
   `or[succeeded, skipped]` never matched. `apply-nats` now has no dependency on

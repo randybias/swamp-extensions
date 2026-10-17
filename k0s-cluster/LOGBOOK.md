@@ -256,3 +256,10 @@ unless noted:
 - LOW: `confirm_host`/`confirm_role_change` unbounded; ExecStart fixture copied
   from a live host; SSH grammars duplicate the transport's; test-only YAML
   serializer.
+
+- 2026-10-17 (2026.10.17.2): `reset` now removes the `/etc/k0s` directory
+  (including k0s's own `containerd*` placeholders) and the k0s binary, but only
+  the binary at the recorded path whose SHA-256 still matches what `install`
+  recorded; a differing or unrecorded binary is left in place. A host with no
+  k0s unit is still a clean no-op, so a second reset does nothing. Three unit
+  tests cover the matching, differing and unrecorded cases. Not yet run live.

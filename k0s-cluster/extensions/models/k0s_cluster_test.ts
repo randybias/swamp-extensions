@@ -14,7 +14,7 @@ import {
 } from "./_lib/k0s.ts";
 import { sha256Hex, SshError } from "./_lib/ssh.ts";
 import type { SshTransport } from "./_lib/transport.ts";
-import { createModel, type K0sDeps } from "./k0s_cluster.ts";
+import { createModel, type K0sDeps, targetId } from "./k0s_cluster.ts";
 
 const HOST = "192.0.2.10";
 const KEY = "PLACEHOLDER-PRIVATE-KEY-NOT-REAL";
@@ -759,6 +759,121 @@ Deno.test("reset stops and resets an installed cluster", async () => {
   assertEquals(
     fake.execs.some((argv) => argv[0] === "rm" && argv[2] === K0S_CONFIG_PATH),
     true,
+  );
+});
+
+Deno.test("reset removes the config dir and the installed binary", async () => {
+  const fake = makeDeps({
+    exec: (argv) => {
+      if (
+        argv[0] === "systemctl" && argv[1] === "cat" &&
+        argv[2] === "k0scontroller"
+      ) {
+        return { code: 0, stdout: "unit\n" };
+      }
+      if (argv[0] === "systemctl" && argv[1] === "cat") return ABSENT;
+      if (argv[0] === "sha256sum" && argv[1] === K0S_BINARY_PATH) {
+        return { code: 0, stdout: `${PAYLOAD_SHA}  ${K0S_BINARY_PATH}\n` };
+      }
+      return { code: 0, stdout: "" };
+    },
+  });
+  const model = createModel(fake.deps);
+  const args = model.methods.reset.arguments.parse({
+    ssh: SSH,
+    confirm_host: HOST,
+  });
+  const { context } = createModelTestContext({
+    storedResources: {
+      [targetId({ host: HOST, port: 22, user: "root" })]: {
+        binary_sha256: PAYLOAD_SHA,
+      },
+    },
+  });
+  const out = await model.methods.reset.execute(args, context);
+  assertEquals(out.result.reset, true);
+  assertEquals(
+    fake.execs.some((argv) =>
+      argv[0] === "rm" && argv[1] === "-rf" && argv[2] === "/etc/k0s"
+    ),
+    true,
+  );
+  assertEquals(
+    fake.execs.some((argv) =>
+      argv[0] === "rm" && argv[1] === "-f" && argv[2] === K0S_BINARY_PATH
+    ),
+    true,
+  );
+});
+
+Deno.test("reset keeps a binary whose digest is not the installed one", async () => {
+  const fake = makeDeps({
+    exec: (argv) => {
+      if (
+        argv[0] === "systemctl" && argv[1] === "cat" &&
+        argv[2] === "k0scontroller"
+      ) {
+        return { code: 0, stdout: "unit\n" };
+      }
+      if (argv[0] === "systemctl" && argv[1] === "cat") return ABSENT;
+      if (argv[0] === "sha256sum" && argv[1] === K0S_BINARY_PATH) {
+        return { code: 0, stdout: `${"f".repeat(64)}  ${K0S_BINARY_PATH}\n` };
+      }
+      return { code: 0, stdout: "" };
+    },
+  });
+  const model = createModel(fake.deps);
+  const args = model.methods.reset.arguments.parse({
+    ssh: SSH,
+    confirm_host: HOST,
+  });
+  const { context } = createModelTestContext({
+    storedResources: {
+      [targetId({ host: HOST, port: 22, user: "root" })]: {
+        binary_sha256: PAYLOAD_SHA,
+      },
+    },
+  });
+  await model.methods.reset.execute(args, context);
+  assertEquals(
+    fake.execs.some((argv) =>
+      argv[0] === "rm" && argv[1] === "-f" && argv[2] === K0S_BINARY_PATH
+    ),
+    false,
+  );
+});
+
+Deno.test("reset removes the config dir but no binary when none is recorded", async () => {
+  const fake = makeDeps({
+    exec: (argv) => {
+      if (
+        argv[0] === "systemctl" && argv[1] === "cat" &&
+        argv[2] === "k0scontroller"
+      ) {
+        return { code: 0, stdout: "unit\n" };
+      }
+      if (argv[0] === "systemctl" && argv[1] === "cat") return ABSENT;
+      return { code: 0, stdout: "" };
+    },
+  });
+  const model = createModel(fake.deps);
+  const args = model.methods.reset.arguments.parse({
+    ssh: SSH,
+    confirm_host: HOST,
+  });
+  const { context } = createModelTestContext();
+  await model.methods.reset.execute(args, context);
+  assertEquals(
+    fake.execs.some((argv) =>
+      argv[0] === "rm" && argv[1] === "-rf" && argv[2] === "/etc/k0s"
+    ),
+    true,
+  );
+  assertEquals(
+    fake.execs.some((argv) =>
+      argv[0] === "rm" && argv[1] === "-f" && argv[2] === K0S_BINARY_PATH
+    ),
+    false,
   );
 });
 

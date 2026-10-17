@@ -828,7 +828,15 @@ async function readLive(
 function buildK0sModel(deps: K0sDeps) {
   return {
     type: "@randybias/k0s-cluster",
-    version: "2026.10.17.1",
+    version: "2026.10.17.2",
+    upgrades: [
+      {
+        toVersion: "2026.10.17.2",
+        description:
+          "reset now also removes /etc/k0s and the k0s binary it installed; stored attributes are unchanged",
+        upgradeAttributes: (old: Record<string, unknown>) => old,
+      },
+    ],
     description:
       "Install, inspect and reset a SHA-256-pinned k0s Kubernetes cluster on one host over SSH, including the rendered k0s.yaml, readiness, the admin kubeconfig, manifest stacks and Helm charts. One definition serves any host; state is keyed by the target host.",
     globalArguments: z.strictObject({}),
@@ -1856,6 +1864,47 @@ function buildK0sModel(deps: K0sDeps) {
               `could not remove the k0s configuration on ${target.host} (exit ${cleaned.exit_code})`,
             );
           }
+          // `k0s reset` leaves its containerd* placeholders in the config
+          // directory; the directory is the model's to remove.
+          const dirGone = await deps.ssh.exec(target, [
+            "rm",
+            "-rf",
+            K0S_CONFIG_DIR,
+          ]);
+          if (!ok(dirGone)) {
+            throw new Error(
+              `could not remove ${K0S_CONFIG_DIR} on ${target.host} (exit ${dirGone.exit_code})`,
+            );
+          }
+          // Remove the binary only when the host still has exactly the binary
+          // this model installed; never remove one it did not install.
+          const recorded = await context.readResource(targetId(target)) as
+            | { binary_sha256?: string | null }
+            | null;
+          if (recorded?.binary_sha256) {
+            const sum = await deps.ssh.exec(target, [
+              "sha256sum",
+              K0S_BINARY_PATH,
+            ]);
+            const remote = sum.stdout.trim().split(/\s+/)[0]?.toLowerCase();
+            if (ok(sum) && remote === recorded.binary_sha256.toLowerCase()) {
+              const binGone = await deps.ssh.exec(target, [
+                "rm",
+                "-f",
+                K0S_BINARY_PATH,
+              ]);
+              if (!ok(binGone)) {
+                throw new Error(
+                  `could not remove the k0s binary on ${target.host} (exit ${binGone.exit_code})`,
+                );
+              }
+            } else {
+              context.logger.info(
+                "Leaving {path} on {host}: its digest is not the installed binary",
+                { path: K0S_BINARY_PATH, host: target.host },
+              );
+            }
+          }
           context.logger.info("Reset k0s on {host}", { host: target.host });
           const handle = await context.writeResource(
             "state",
@@ -1892,5 +1941,5 @@ export function createModel(deps: K0sDeps): K0sClusterModel {
 export const model = {
   ...buildK0sModel(defaultK0sDeps),
   type: "@randybias/k0s-cluster",
-  version: "2026.10.17.1",
+  version: "2026.10.17.2",
 } satisfies K0sClusterModel;

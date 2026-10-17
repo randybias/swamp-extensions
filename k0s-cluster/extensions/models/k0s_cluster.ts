@@ -45,6 +45,7 @@ import {
   K0S_VERSION_RE,
   K0S_WORKER_TOKEN_PATH,
   type K0sConfigInput,
+  k8sMinor,
   type NodeStatus,
   ok,
   parseCharts,
@@ -267,6 +268,22 @@ const InstallArgs = z.strictObject({
     "Helm extensions declared in k0s.yaml.",
   ),
 }).superRefine(externalAndLocalLbRefine);
+
+const UpgradeArgs = z.strictObject({
+  ssh: SSH,
+  k0s_version: VERSION,
+  k0s_binary_sha256: SHA256,
+  k0s_download_url: URL.nullish().describe(
+    "Optional binary URL override; the SHA-256 check still applies.",
+  ),
+  k0s_download_token: z.string().max(4096).meta({ sensitive: true }).nullish()
+    .describe(
+      "Bearer token for a private release mirror, sent as an Authorization header; wire with a vault.get(...) expression.",
+    ),
+  ready_timeout_s: z.number().int().min(10).max(7200).default(600).describe(
+    "Give up waiting for the new version to become healthy after this many seconds.",
+  ),
+});
 
 const WaitReadyArgs = z.strictObject({
   ssh: SSH,
@@ -1442,6 +1459,186 @@ function buildK0sModel(deps: K0sDeps) {
             }),
           );
           return { dataHandles: [...handles, handle], result };
+        },
+      },
+
+      upgrade: {
+        kind: "action" as const,
+        description:
+          "DESTRUCTIVE. Upgrade the installed k0s binary to the pinned version, downloading and verifying it before anything is stopped; a downgrade or a skipped Kubernetes minor is refused and the same version is a no-op. Stops the unit, swaps the binary, starts it and waits for readiness; on any failure the previous binary is restored and restarted. Never resets, so cluster data is preserved.",
+        arguments: UpgradeArgs,
+        execute: async (args: z.infer<typeof UpgradeArgs>, context: Ctx) => {
+          const { target, handles } = await resolveTarget(
+            deps,
+            context,
+            args.ssh,
+          );
+          const stored = await context.readResource(targetId(target)) as
+            | z.infer<typeof StateSchema>
+            | null;
+          if (!stored?.installed || !stored.service) {
+            throw new Error(
+              `no installed k0s service recorded for ${target.host}; run install first`,
+            );
+          }
+          const service = stored.service;
+          const from = stored.k0s_version;
+          const to = args.k0s_version;
+          if (from === to) {
+            return {
+              dataHandles: handles,
+              result: { upgraded: false, k0s_version: to },
+            };
+          }
+          if (from) {
+            const diff = k8sMinor(to) - k8sMinor(from);
+            if (diff < 0) {
+              throw new Error(`refusing to downgrade k0s ${from} -> ${to}`);
+            }
+            if (diff > 1) {
+              throw new Error(
+                `refusing to skip a Kubernetes minor: ${from} -> ${to}`,
+              );
+            }
+          }
+          // Everything that can fail without touching the host happens first:
+          // the artifact is downloaded and verified, then staged next to the
+          // running binary and re-verified on the host.
+          const uname = await deps.ssh.exec(target, ["uname", "-m"]);
+          if (!ok(uname)) {
+            throw new Error(
+              `could not read the architecture of ${target.host} (exit ${uname.exit_code})`,
+            );
+          }
+          const arch = archFromUname(uname.stdout);
+          const url = downloadUrl(to, arch, args.k0s_download_url ?? undefined);
+          const token = args.k0s_download_token ??
+            Deno.env.get("K0S_DOWNLOAD_TOKEN");
+          const bytes = await deps.fetch(
+            url,
+            token
+              ? { headers: { Authorization: `Bearer ${token}` } }
+              : undefined,
+          );
+          const binarySha = await verifyBinary(
+            bytes,
+            args.k0s_binary_sha256,
+            url,
+          );
+          const stagedPath = `${K0S_BINARY_PATH}.new`;
+          const backupPath = `${K0S_BINARY_PATH}.old`;
+          await deps.ssh.upload(target, {
+            path: stagedPath,
+            content: bytes,
+            mode: "0755",
+          });
+          const stagedSha = parseSha256(
+            (await deps.ssh.exec(target, ["sha256sum", stagedPath])).stdout,
+          );
+          if (stagedSha !== binarySha) {
+            await deps.ssh.exec(target, ["rm", "-f", stagedPath]);
+            throw new Error(
+              `the staged k0s binary on ${target.host} does not match the pinned SHA-256; removed it before stopping anything`,
+            );
+          }
+          /** Puts the previous binary back and restarts the unit. */
+          const restore = async (): Promise<void> => {
+            await deps.ssh.exec(target, ["rm", "-f", stagedPath]);
+            await deps.ssh.exec(target, ["mv", backupPath, K0S_BINARY_PATH]);
+            await deps.ssh.exec(target, ["systemctl", "restart", service]);
+          };
+          const stopped = await deps.ssh.exec(target, [
+            "systemctl",
+            "stop",
+            service,
+          ]);
+          if (!ok(stopped)) {
+            await deps.ssh.exec(target, ["rm", "-f", stagedPath]);
+            throw new Error(
+              `systemctl stop ${service} failed on ${target.host} (exit ${stopped.exit_code}); nothing was changed`,
+            );
+          }
+          const saved = await deps.ssh.exec(target, [
+            "mv",
+            K0S_BINARY_PATH,
+            backupPath,
+          ]);
+          if (!ok(saved)) {
+            await deps.ssh.exec(target, ["systemctl", "start", service]);
+            await deps.ssh.exec(target, ["rm", "-f", stagedPath]);
+            throw new Error(
+              `could not move the running k0s binary aside on ${target.host} (exit ${saved.exit_code}); the old service was restarted`,
+            );
+          }
+          const promoted = await deps.ssh.exec(target, [
+            "mv",
+            stagedPath,
+            K0S_BINARY_PATH,
+          ]);
+          if (!ok(promoted)) {
+            await restore();
+            throw new Error(
+              `could not promote the new k0s binary on ${target.host} (exit ${promoted.exit_code}); restored the previous binary`,
+            );
+          }
+          const started = await deps.ssh.exec(target, [
+            "systemctl",
+            "start",
+            service,
+          ]);
+          if (!ok(started)) {
+            await restore();
+            throw new Error(
+              `systemctl start ${service} failed on ${target.host} (exit ${started.exit_code}); restored the previous binary`,
+            );
+          }
+          try {
+            await waitUnitHealthy(deps, target, service, args.ready_timeout_s);
+          } catch (error) {
+            await restore();
+            throw error;
+          }
+          const version = await deps.ssh.exec(target, [
+            K0S_BINARY_PATH,
+            "version",
+          ]);
+          if (!ok(version) || !version.stdout.includes(to)) {
+            await restore();
+            throw new Error(
+              `${target.host} did not report k0s ${to} after the upgrade; restored the previous binary`,
+            );
+          }
+          await deps.ssh.exec(target, ["rm", "-f", backupPath]);
+          const handle = await context.writeResource(
+            "state",
+            targetId(target),
+            StateSchema.parse({
+              ...whoOf(target),
+              role: stored.role,
+              k0s_version: to,
+              binary_sha256: binarySha,
+              config_sha256: stored.config_sha256,
+              config_file_sha256: stored.config_file_sha256,
+              service,
+              installed: true,
+              adopted: stored.adopted,
+              observed_at: iso(deps.now()),
+            }),
+          );
+          context.logger.info("Upgraded k0s on {host}: {from} -> {to}", {
+            host: target.host,
+            from: from ?? "unknown",
+            to,
+          });
+          return {
+            dataHandles: [...handles, handle],
+            result: {
+              upgraded: true,
+              from,
+              k0s_version: to,
+              binary_sha256: binarySha,
+            },
+          };
         },
       },
 

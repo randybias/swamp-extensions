@@ -206,6 +206,13 @@ export function archFromUname(uname: string): K0sArch {
   }
 }
 
+/** The major.minor of a k0s/Kubernetes version, for skew checks. */
+export function k8sMinor(version: string): number {
+  const m = /^v?(\d+)\.(\d+)/.exec(version);
+  if (!m) throw new Error(`cannot read a Kubernetes minor from ${version}`);
+  return Number(m[1]) * 1000 + Number(m[2]);
+}
+
 /** Returns the pinned release URL, or the caller's override. */
 export function downloadUrl(
   version: string,

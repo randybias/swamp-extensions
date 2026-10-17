@@ -2565,6 +2565,67 @@ Deno.test("kubeconfig builds the server URL from api_address and stores that kub
   assertEquals(v6.result.server, "https://[2001:db8::7]:6444");
 });
 
+const UP_FROM = "v1.31.2+k0s.0";
+const UP_TO = "v1.32.0+k0s.0";
+function upgradeState(overrides: Record<string, unknown> = {}) {
+  return {
+    host: HOST,
+    port: 22,
+    user: "root",
+    role: "single",
+    k0s_version: UP_FROM,
+    binary_sha256: PAYLOAD_SHA,
+    config_sha256: "c".repeat(64),
+    config_file_sha256: "d".repeat(64),
+    service: "k0scontroller",
+    installed: true,
+    adopted: false,
+    observed_at: new Date().toISOString(),
+    ...overrides,
+  };
+}
+function upgradeRouter(
+  overrides: (
+    argv: string[],
+  ) => { code?: number; stdout?: string } | undefined = () => undefined,
+) {
+  return (argv: string[]) => {
+    const override = overrides(argv);
+    if (override) return override;
+    if (argv[0] === "uname") return { code: 0, stdout: "x86_64\n" };
+    if (argv[0] === "sha256sum" && argv[1] === `${K0S_BINARY_PATH}.new`) {
+      return { code: 0, stdout: `${PAYLOAD_SHA}  ${K0S_BINARY_PATH}.new\n` };
+    }
+    if (argv[0] === "systemctl" && argv[1] === "is-active") {
+      return { code: 0, stdout: "active\n" };
+    }
+    if (argv[0] === K0S_BINARY_PATH && argv[1] === "kubectl") {
+      return { code: 0, stdout: "ok\n" };
+    }
+    if (argv[0] === K0S_BINARY_PATH && argv[1] === "version") {
+      return { code: 0, stdout: `${UP_TO}\n` };
+    }
+    return { code: 0, stdout: "", stderr: "" };
+  };
+}
+function upgradeArgs(overrides: Record<string, unknown> = {}) {
+  return createModel(makeDeps().deps).methods.upgrade.arguments.parse({
+    ssh: SSH,
+    k0s_version: UP_TO,
+    k0s_binary_sha256: PAYLOAD_SHA,
+    ...overrides,
+  });
+}
+function upgradeContext(overrides: Record<string, unknown> = {}) {
+  return createModelTestContext({
+    storedResources: {
+      [targetId({ host: HOST, port: 22, user: "root" })]: upgradeState(
+        overrides,
+      ),
+    },
+  });
+}
+
 Deno.test("the exact install argv for each role and join", async () => {
   const cases: [Record<string, unknown>, string[]][] = [
     [{ role: "single" }, [
@@ -2612,6 +2673,101 @@ Deno.test("the exact install argv for each role and join", async () => {
       JSON.stringify(overrides),
     );
   }
+});
+
+Deno.test("upgrade to the same version is a no-op", async () => {
+  const fake = makeDeps({
+    exec: upgradeRouter(),
+    fetch: () => Promise.resolve(PAYLOAD),
+  });
+  const model = createModel(fake.deps);
+  const { context } = upgradeContext();
+  const out = await model.methods.upgrade.execute(
+    upgradeArgs({ k0s_version: UP_FROM }),
+    context,
+  );
+  assertEquals(out.result.upgraded, false);
+  assertEquals(fake.execs.some((a) => a[1] === "stop"), false);
+});
+
+Deno.test("upgrade refuses a downgrade and a skipped minor", async () => {
+  const model = createModel(makeDeps().deps);
+  const { context } = upgradeContext();
+  await assertRejects(
+    () =>
+      model.methods.upgrade.execute(
+        upgradeArgs({ k0s_version: "v1.30.0+k0s.0" }),
+        context,
+      ),
+    Error,
+    "downgrade",
+  );
+  await assertRejects(
+    () =>
+      model.methods.upgrade.execute(
+        upgradeArgs({ k0s_version: "v1.33.0+k0s.0" }),
+        context,
+      ),
+    Error,
+    "skip",
+  );
+});
+
+Deno.test("upgrade verifies the binary before stopping anything", async () => {
+  const fake = makeDeps({
+    exec: upgradeRouter(),
+    fetch: () => Promise.resolve(new TextEncoder().encode("wrong payload")),
+  });
+  const model = createModel(fake.deps);
+  const { context } = upgradeContext();
+  await assertRejects(
+    () => model.methods.upgrade.execute(upgradeArgs(), context),
+    Error,
+  );
+  assertEquals(
+    fake.execs.some((a) => a[0] === "systemctl" && a[1] === "stop"),
+    false,
+  );
+});
+
+Deno.test("upgrade restores the previous binary when the start fails", async () => {
+  let started = false;
+  const fake = makeDeps({
+    exec: upgradeRouter((argv) => {
+      if (argv[0] === "systemctl" && argv[1] === "start") {
+        started = true;
+        return { code: 1 };
+      }
+      return undefined;
+    }),
+    fetch: () => Promise.resolve(PAYLOAD),
+  });
+  const model = createModel(fake.deps);
+  const { context } = upgradeContext();
+  await assertRejects(
+    () => model.methods.upgrade.execute(upgradeArgs(), context),
+    Error,
+    "restored",
+  );
+  assertEquals(started, true);
+  assertEquals(
+    fake.execs.some((a) => a[0] === "mv" && a[2] === K0S_BINARY_PATH),
+    true,
+  );
+});
+
+Deno.test("upgrade swaps the binary and records the new version", async () => {
+  const fake = makeDeps({
+    exec: upgradeRouter(),
+    fetch: () => Promise.resolve(PAYLOAD),
+  });
+  const model = createModel(fake.deps);
+  const { context, getWrittenResources } = upgradeContext();
+  const out = await model.methods.upgrade.execute(upgradeArgs(), context);
+  assertEquals(out.result.upgraded, true);
+  assertEquals(out.result.k0s_version, UP_TO);
+  const state = getWrittenResources().find((r) => r.specName === "state");
+  assertEquals((state!.data as { k0s_version: string }).k0s_version, UP_TO);
 });
 
 Deno.test("an install in the old tainted single mode is detected, never silently adopted", async () => {

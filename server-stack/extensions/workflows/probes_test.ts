@@ -62,31 +62,104 @@ const haveHelm = await new Deno.Command("helm", {
   stderr: "null",
 }).output().then((r) => r.code === 0, () => false);
 
-/** Starts a NATS server on a loopback port; returns its stop function. */
+/** Runs docker and returns its trimmed stdout (empty on any failure). */
+async function dockerOut(...args: string[]): Promise<string> {
+  try {
+    const r = await new Deno.Command("docker", {
+      args,
+      stdout: "piped",
+      stderr: "piped",
+    }).output();
+    const text = new TextDecoder();
+    // `docker logs` replays the container's stderr on its own stderr.
+    return r.code === 0
+      ? `${text.decode(r.stdout)}${
+        args[0] === "logs" ? text.decode(r.stderr) : ""
+      }`.trim()
+      : "";
+  } catch {
+    return "";
+  }
+}
+
+/** True once the server on `port` has sent its INFO line (within 2 s). */
+async function answersInfo(port: number): Promise<boolean> {
+  let conn: Deno.Conn | undefined;
+  try {
+    conn = await Deno.connect({ hostname: "127.0.0.1", port });
+    // A peer that accepts and never writes (docker's proxy before the server
+    // is up) would block read() forever; closing the connection ends it.
+    const timer = setTimeout(() => conn?.close(), 2000);
+    try {
+      const buf = new Uint8Array(16);
+      const n = await conn.read(buf);
+      return n !== null &&
+        new TextDecoder().decode(buf.subarray(0, n)).startsWith("INFO");
+    } finally {
+      clearTimeout(timer);
+    }
+  } catch {
+    return false; // refused, reset, or closed by the timer
+  } finally {
+    try {
+      conn?.close();
+    } catch { /* already closed */ }
+  }
+}
+
+/**
+ * Starts a NATS server and returns its port and stop function. Docker picks
+ * the host port (a fixed one collides with a parallel run), and the server is
+ * waited for until it sends INFO (the published port accepts connections
+ * before the server inside is listening, so a fixed sleep is a race).
+ */
 async function nats(
-  port: number,
   serverArgs: string[],
   dockerArgs: string[] = [],
-): Promise<() => Promise<void>> {
-  // Unique per start, so a parallel run cannot remove this container.
-  const name = `probe-nats-${port}-${crypto.randomUUID().slice(0, 8)}`;
+): Promise<{ port: number; stop: () => Promise<void> }> {
+  const name = `probe-nats-${crypto.randomUUID().slice(0, 8)}`;
   const code = await docker(
     "run",
     "-d",
-    "--rm",
     "--name",
     name,
     "-p",
-    `127.0.0.1:${port}:4222`,
+    // host port left empty: docker picks a free one
+    "127.0.0.1::4222", // leak-allow(docker -p host-ip::container-port, empty host port)
     ...dockerArgs,
     NATS_IMAGE,
     ...serverArgs,
   );
   assertEquals(code, 0);
-  await new Promise((r) => setTimeout(r, 1500));
-  return async () => {
+  const stop = async () => {
     await docker("rm", "-f", name);
   };
+  try {
+    // The mapping can lag `docker run -d` under load, so it is polled too.
+    let port = 0;
+    for (let i = 0; i < 100 && !port; i++) {
+      const mapped = await dockerOut("port", name, "4222/tcp");
+      port = Number(mapped.split("\n")[0].split(":").pop()) || 0;
+      if (!port) await new Promise((r) => setTimeout(r, 100));
+    }
+    assert(
+      port > 0,
+      `docker published a port for ${name}: ${await dockerOut(
+        "inspect",
+        "-f",
+        "{{.State.Status}} exit={{.State.ExitCode}} {{.State.Error}}",
+        name,
+      )} / ${await dockerOut("logs", name)}`,
+    );
+    for (let i = 0; i < 100 && !await answersInfo(port); i++) {
+      await new Promise((r) => setTimeout(r, 100));
+    }
+    assert(await answersInfo(port), "NATS answers INFO within 10 s");
+    return { port, stop };
+  } catch (err) {
+    await stop();
+    throw err;
+  }
 }
 
 const target = (port: number) => ({
@@ -100,9 +173,9 @@ Deno.test({
     "the unauthenticated probe is unchanged and passes against a plain server",
   ignore: !haveNats,
   fn: async () => {
-    const stop = await nats(14223, []);
+    const { port, stop } = await nats([]);
     try {
-      const r = await bash(await script("verify", "probe-nats"), target(14223));
+      const r = await bash(await script("verify", "probe-nats"), target(port));
       assertEquals(r.code, 0);
       assertStringIncludes(r.out, "INFO {");
       assertStringIncludes(r.out, "+OK");
@@ -118,17 +191,17 @@ Deno.test({
   ignore: !haveNats,
   fn: async () => {
     const token = 'tok"en\\x';
-    const stop = await nats(14224, ["--auth", token]);
+    const { port, stop } = await nats(["--auth", token]);
     try {
       const run = await script("verify", "probe-nats-auth");
-      const ok = await bash(run, { ...target(14224), NATS_TOKEN: token });
+      const ok = await bash(run, { ...target(port), NATS_TOKEN: token });
       assertStringIncludes(ok.out, '"auth_required":true');
       assertStringIncludes(ok.out, "\n+OK");
       assertStringIncludes(
         ok.out,
         "unauthenticated: -ERR 'Authorization Violation'",
       );
-      const bad = await bash(run, { ...target(14224), NATS_TOKEN: "wrong" });
+      const bad = await bash(run, { ...target(port), NATS_TOKEN: "wrong" });
       assertEquals(bad.out.includes("\n+OK"), false);
     } finally {
       await stop();
@@ -140,16 +213,25 @@ Deno.test("the mesh wait gives up quietly at its bound, and answers at once when
   const run = await script("host", "wait-mesh");
   const base = { PATH: Deno.env.get("PATH") ?? "", WAIT: "4" };
   const started = Date.now();
+  // A port nothing listens on: bind an ephemeral one and release it.
+  const probe = Deno.listen({ hostname: "127.0.0.1", port: 0 });
+  const closed = (probe.addr as Deno.NetAddr).port;
+  probe.close();
   for (const host of ["127.0.0.1", "192.0.2.1"]) {
-    const r = await bash(run, { ...base, HOST: host, PORT: "14999" });
+    const r = await bash(run, { ...base, HOST: host, PORT: String(closed) });
     assertEquals(r.code, 0);
     assertStringIncludes(r.out, "no answer from");
   }
   assert(Date.now() - started < 20_000, "each wait stays near its bound");
-  const listener = Deno.listen({ hostname: "127.0.0.1", port: 14998 });
+  const listener = Deno.listen({ hostname: "127.0.0.1", port: 0 });
+  const open = (listener.addr as Deno.NetAddr).port;
   try {
-    const r = await bash(run, { ...base, HOST: "127.0.0.1", PORT: "14998" });
-    assertStringIncludes(r.out, "answered 127.0.0.1:14998");
+    const r = await bash(run, {
+      ...base,
+      HOST: "127.0.0.1",
+      PORT: String(open),
+    });
+    assertStringIncludes(r.out, `answered 127.0.0.1:${open}`);
   } finally {
     listener.close();
   }
@@ -202,9 +284,8 @@ Deno.test({
       assertStringIncludes(stanza, '"token": $NATS_TOKEN');
       await Deno.writeTextFile(`${dir}/nats.conf`, `{ ${stanza} }\n`);
       await Deno.chmod(`${dir}/nats.conf`, 0o644);
-      const token = crypto.randomUUID();
-      const stop = await nats(
-        14225,
+      const token = `k${crypto.randomUUID()}`;
+      const { port, stop } = await nats(
         ["-c", "/etc/nats/nats.conf"],
         [
           "-v",
@@ -215,11 +296,11 @@ Deno.test({
       );
       try {
         const run = await script("verify", "probe-nats-auth");
-        const ok = await bash(run, { ...target(14225), NATS_TOKEN: token });
+        const ok = await bash(run, { ...target(port), NATS_TOKEN: token });
         assertStringIncludes(ok.out, "\n+OK");
         assertStringIncludes(ok.out, "Authorization Violation");
         const literal = await bash(run, {
-          ...target(14225),
+          ...target(port),
           NATS_TOKEN: "$NATS_TOKEN",
         });
         assertEquals(literal.out.includes("\n+OK"), false);
@@ -237,9 +318,13 @@ Deno.test("the token shape check accepts a generated token and rejects anything 
   const verdict = async (token: string) =>
     (await bash(run, { PATH: Deno.env.get("PATH") ?? "", NATS_TOKEN: token }))
       .code;
-  assertEquals(await verdict("0123456789abcdef0123456789abcdef"), 0);
+  assertEquals(await verdict("k0123456789abcdef0123456789abcdef"), 0);
   for (
     const bad of [
+      // NATS reads these as numbers or dates and fails to start.
+      "0123456789abcdef0123456789abcdef",
+      "6e50123456789abcdef",
+      "2026-10-17T00:00:00Z-abc",
       "short",
       'has"quote0123456789',
       "new\nline0123456789abcdef",

@@ -216,3 +216,25 @@ this environment.
 - `_lib/ssh.ts` resynced to the canonical blob `fe0139f0` (ssh-host
   2026.10.17.2): upload no longer sends the content sha256 on the remote command
   line; the libvirt fake now returns the written hash and mode.
+
+## Delta-live-2 review round 3 (52f8449)
+
+- HIGH `insecure_tofu` was offered but learned keys were never persisted, so
+  every later call would trust whatever key the host presented. Per RULINGS 4g
+  the model is now `strict`-only with a required non-empty `host_keys` list;
+  `insecure_tofu` is no longer accepted and the README examples pin keys.
+- MEDIUM `undefine_domain remove_volumes` kept "vda" by target, which is wrong
+  for a foreign domain whose root is `sda` (root leaks) and could delete a
+  foreign `vda` data image. `define_domain` now records the resolved boot volume
+  path as `root_disk` on `domain_state`, and `undefine_domain` keeps only the
+  disk whose source equals it, detaching every other disk before
+  `--remove-all-storage`. A domain with no recorded root, or none matching,
+  refuses `remove_volumes`. Tests: root at `sda`, no record, no match.
+- MEDIUM explicit `extra_disks` targets were reserved only as they were reached,
+  so an implicit disk listed first could take a later explicit `vdb`. Explicit
+  targets are now reserved up front (duplicates rejected) before any implicit
+  allocation; a test covers both orderings.
+- LOW a genuine 137 (e.g. OOM-killed virsh) is no longer indistinguishable from
+  the timeout kill: the console wrapper records elapsed seconds with `date` and
+  only maps 137 to success when the bound was actually reached.
+- 106 tests; gates 0-6 PASS offline; ssh.ts blob fe0139f0 unchanged.

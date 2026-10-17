@@ -16,17 +16,17 @@ One definition manages any hypervisor: the SSH target, the libvirt URI and every
 operand are method arguments. State is keyed by the canonical
 `{host, port, user}` plus the resource name.
 
-| Method             | Kind   | Description                                                                                                                                         |
-| ------------------ | ------ | --------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `define_network`   | action | Define a network (raw XML or structured), start and autostart it; `replace=true` to redefine                                                        |
-| `undefine_network` | action | Stop a network if active and undefine it; use this to remove the `default` network                                                                  |
-| `clone_volume`     | action | Clone a golden volume or zvol in a pool to a new volume, via the pool driver (`vol-clone`)                                                          |
-| `define_domain`    | action | Define a KVM domain from a pool volume with ACPI and a pty console, plus optional extra/CD-ROM disks; optionally start it                           |
-| `power`            | action | `start`, `shutdown`, `destroy`, `reboot`, `suspend`, `resume`; idempotent toward the desired state, `shutdown` waits for power-off                  |
-| `console`          | query  | Attach to the serial console under a hard timeout; returns `bytes` and `sha256`, not the text                                                       |
-| `undefine_domain`  | action | Destroy the domain if running, then undefine it; `remove_volumes` removes its volumes but keeps an attached seed ISO unless `remove_attached_media` |
-| `get`              | query  | Report networks, domains and pool volumes from `net-list`, `list` and `vol-list`                                                                    |
-| `sync`             | query  | Probe the host and report drift between the last recorded inventory and the live state                                                              |
+| Method             | Kind   | Description                                                                                                                                                                                             |
+| ------------------ | ------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `define_network`   | action | Define a network (raw XML or structured), start and autostart it; `replace=true` to redefine                                                                                                            |
+| `undefine_network` | action | Stop a network if active and undefine it; use this to remove the `default` network                                                                                                                      |
+| `clone_volume`     | action | Clone a golden volume or zvol in a pool to a new volume, via the pool driver (`vol-clone`)                                                                                                              |
+| `define_domain`    | action | Define a KVM domain from a pool volume with ACPI and a pty console, plus optional extra/CD-ROM disks; optionally start it                                                                               |
+| `power`            | action | `start`, `shutdown`, `destroy`, `reboot`, `suspend`, `resume`; idempotent toward the desired state, `shutdown` waits for power-off                                                                      |
+| `console`          | query  | Attach to the serial console under a hard timeout; returns `bytes` and `sha256`, not the text                                                                                                           |
+| `undefine_domain`  | action | Destroy the domain if running, then undefine it; `remove_volumes` removes the boot volume recorded by `define_domain` and detaches every other disk (keeping a seed ISO) unless `remove_attached_media` |
+| `get`              | query  | Report networks, domains and pool volumes from `net-list`, `list` and `vol-list`                                                                                                                        |
+| `sync`             | query  | Probe the host and report drift between the last recorded inventory and the live state                                                                                                                  |
 
 `define_network`, `undefine_network`, `clone_volume`, `define_domain`, `power`
 and `undefine_domain` are `kind: action`, so a single method call cannot mark
@@ -82,9 +82,9 @@ from a volume that does not exist, so it always follows a successful clone.
 - `private_key` is a sensitive argument, marked `.meta({ sensitive: true })`,
   and is delivered to the remote only through the SSH agent/stdin path — never
   in remote `argv` and never in a log. Pass it from a vault reference.
-- The host-key policy is required on every call: `strict` trusts only the pinned
-  `host_keys`, and `insecure_tofu` is an explicit opt-in, never a default. There
-  is no silent `accept-new`.
+- The host-key policy is `strict` only, with a required non-empty `host_keys`
+  list. The model persists no learned keys, so `insecure_tofu` is not offered
+  and there is no silent trust-on-first-use.
 - The `console` capture can carry boot or login secrets, so the
   `console_capture` resource marks `text` sensitive. The method returns only
   `bytes` and `sha256`, never the text, because swamp has no sensitive result
@@ -137,20 +137,23 @@ swamp behavior run @randybias/libvirt define_network hypervisor \
 
 swamp behavior run @randybias/libvirt clone_volume hypervisor \
   --input host=192.0.2.20 --input user=root --input uri=qemu:///system \
-  --input host_key_policy=insecure_tofu \
+  --input host_key_policy=strict \
+  --input 'host_keys=["192.0.2.20 ssh-ed25519 AAAA..."]' \
   --input 'private_key={"vault":"prod","key":"hypervisor-key"}' \
   --input pool=pool-a --input source_volume=golden --input target_volume=node-a-root
 
 swamp behavior run @randybias/libvirt define_domain hypervisor \
   --input host=192.0.2.20 --input user=root --input uri=qemu:///system \
-  --input host_key_policy=insecure_tofu \
+  --input host_key_policy=strict \
+  --input 'host_keys=["192.0.2.20 ssh-ed25519 AAAA..."]' \
   --input 'private_key={"vault":"prod","key":"hypervisor-key"}' \
   --input name=node-a --input pool=pool-a --input volume=node-a-root \
   --input vcpus=2 --input memory_mib=2048 --input network=net-a --input start=true
 
 swamp behavior run @randybias/libvirt console hypervisor \
   --input host=192.0.2.20 --input user=root --input uri=qemu:///system \
-  --input host_key_policy=insecure_tofu \
+  --input host_key_policy=strict \
+  --input 'host_keys=["192.0.2.20 ssh-ed25519 AAAA..."]' \
   --input 'private_key={"vault":"prod","key":"hypervisor-key"}' \
   --input name=node-a --input timeout_s=10
 ```

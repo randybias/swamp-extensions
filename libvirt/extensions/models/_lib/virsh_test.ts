@@ -24,15 +24,16 @@ Deno.test("consoleArgv: one quoted command and a timeout-to-zero wrapper", () =>
   assertEquals(argv[1], "-c");
   const script = argv[2];
   assertEquals(
-    script.startsWith("'timeout' '-s' 'KILL' '15' 'script' '-qec' "),
+    script.includes("'timeout' '-s' 'KILL' '15' 'script' '-qec' "),
     true,
   );
   // `script -qec` must receive exactly one argument: the whole quoted command.
   assertEquals(script.includes("virsh"), true);
   assertEquals(script.includes("qemu:///system"), true);
   assertEquals(script.includes("'/dev/null'"), true);
+  assertEquals(script.includes("[ $rc -eq 124 ]"), true);
   assertEquals(
-    script.includes("case $rc in 0|124|137) exit 0;; *) exit $rc;; esac"),
+    script.includes("[ $rc -eq 137 ] && [ $((end - start)) -ge 14 ]"),
     true,
   );
   assertEquals(script.includes("--timeout"), false);

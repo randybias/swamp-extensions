@@ -129,8 +129,14 @@ export function consoleArgv(
     inner,
     "/dev/null",
   ]);
-  const script =
-    `${cmd}; rc=$?; case $rc in 0|124|137) exit 0;; *) exit $rc;; esac`;
+  // 124 is timeout's own exit and 137 is the SIGKILL it sends, but a virsh
+  // killed by something else (e.g. the OOM killer) also exits 137. Only treat a
+  // 137 as a timeout when the bound was actually reached.
+  const budget = Math.max(0, timeoutS - 1);
+  const script = `start=$(date +%s); ${cmd}; rc=$?; end=$(date +%s); ` +
+    `if [ $rc -eq 124 ]; then exit 0; fi; ` +
+    `if [ $rc -eq 137 ] && [ $((end - start)) -ge ${budget} ]; then exit 0; fi; ` +
+    `exit $rc`;
   return ["sh", "-c", script];
 }
 

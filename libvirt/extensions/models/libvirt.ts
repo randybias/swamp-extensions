@@ -82,8 +82,8 @@ export const denoLibvirtDeps: LibvirtDeps = { ...denoDeps, token: randomToken };
 
 const GlobalArgsSchema = z.strictObject({});
 
-const HostKeyPolicy = z.enum(["strict", "insecure_tofu"]).describe(
-  "strict trusts only host_keys; insecure_tofu trusts whatever key the host presents on first contact",
+const HostKeyPolicy = z.literal("strict").describe(
+  "Only 'strict' is accepted: pin the host's keys with a non-empty host_keys list. The model persists no learned keys, so insecure_tofu is not offered.",
 );
 
 const SshFields = {
@@ -91,8 +91,8 @@ const SshFields = {
   port: z.number().int().min(1).max(65535).default(22).describe("SSH port"),
   user: z.string().min(1).max(32).describe("SSH login name"),
   host_key_policy: HostKeyPolicy,
-  host_keys: z.array(z.string().max(2048)).max(16).optional().describe(
-    "Pinned host keys in ssh-keyscan format; required for strict",
+  host_keys: z.array(z.string().max(2048)).min(1).max(16).describe(
+    "Pinned host keys in ssh-keyscan format; required.",
   ),
   private_key: z.string().min(1).meta({ sensitive: true }).describe(
     "Private key in PEM or OpenSSH format; pass a vault reference",
@@ -313,6 +313,9 @@ const DomainStateSchema = z.strictObject({
   state: z.string().optional(),
   vcpus: z.number().int().optional(),
   memory_mib: z.number().int().optional(),
+  root_disk: z.string().optional().describe(
+    "Resolved path of the boot volume, recorded by define_domain",
+  ),
   observed_at: z.string(),
 });
 
@@ -404,8 +407,8 @@ function targetOf(a: {
   host: string;
   port: number;
   user: string;
-  host_key_policy: "strict" | "insecure_tofu";
-  host_keys?: string[];
+  host_key_policy: "strict";
+  host_keys: string[];
   private_key: string;
   connect_timeout_s: number;
   max_output_bytes: number;
@@ -957,7 +960,17 @@ export function createModel(overrides: Partial<LibvirtDeps> = {}) {
             device: "disk",
             readonly: false,
           }];
+          // Reserve every explicit target before allocating any implicit one,
+          // so an implicit disk cannot steal a target requested later.
           const usedTargets = new Set<string>(["vda"]);
+          for (const extra of args.extra_disks) {
+            if (extra.target === undefined) continue;
+            assertName(extra.target, "disk target");
+            if (usedTargets.has(extra.target)) {
+              throw new LibvirtError(`duplicate disk target ${extra.target}`);
+            }
+            usedTargets.add(extra.target);
+          }
           let virtioIndex = 1;
           let sdIndex = 0;
           for (const extra of args.extra_disks) {
@@ -965,23 +978,18 @@ export function createModel(overrides: Partial<LibvirtDeps> = {}) {
             const bus = extra.bus ?? (device === "cdrom" ? "sata" : "virtio");
             let target: string;
             if (extra.target !== undefined) {
-              assertName(extra.target, "disk target");
-              if (usedTargets.has(extra.target)) {
-                throw new LibvirtError(
-                  `duplicate disk target ${extra.target}`,
-                );
-              }
               target = extra.target;
             } else if (bus === "virtio") {
               while (usedTargets.has(`vd${diskLetter(virtioIndex)}`)) {
                 virtioIndex++;
               }
               target = `vd${diskLetter(virtioIndex++)}`;
+              usedTargets.add(target);
             } else {
               while (usedTargets.has(`sd${diskLetter(sdIndex)}`)) sdIndex++;
               target = `sd${diskLetter(sdIndex++)}`;
+              usedTargets.add(target);
             }
-            usedTargets.add(target);
             disks.push({
               path: extra.path,
               format: extra.format ?? (device === "cdrom" ? "raw" : "qcow2"),
@@ -1039,6 +1047,7 @@ export function createModel(overrides: Partial<LibvirtDeps> = {}) {
               state: domainState(before),
               vcpus: Number(before["cpu(s)"] ?? "") || undefined,
               memory_mib: memoryMib(before),
+              root_disk: volPath,
               observed_at: new Date(deps.now()).toISOString(),
             },
           );
@@ -1287,16 +1296,32 @@ export function createModel(overrides: Partial<LibvirtDeps> = {}) {
             }
           }
           if (args.remove_volumes && !args.remove_attached_media) {
-            // Detach every disk except the primary boot disk (target vda) so
-            // `--remove-all-storage` cannot delete an extra disk, including a
-            // read-only root image this extension did not create.
+            // Keep only the disk recorded as this domain's root volume and
+            // detach every other disk, so `--remove-all-storage` deletes the
+            // root but cannot delete an extra disk or a seed this extension
+            // did not create. A domain with no recorded root refuses.
+            const recorded = await context.readResource(
+              instanceName("dom", args, args.name),
+            ) as { root_disk?: string } | null;
+            const rootDisk = recorded?.root_disk;
+            if (rootDisk === undefined) {
+              throw new LibvirtError(
+                `refusing to remove volumes for ${args.name}: no recorded root disk; run define_domain first, or pass remove_attached_media`,
+              );
+            }
             const blk = await virsh(deps, t, args.uri, [
               "domblklist",
               args.name,
               "--details",
             ]);
-            for (const entry of parseBlkListDetails(blk.stdout)) {
-              if (entry.target === "vda") continue;
+            const entries = parseBlkListDetails(blk.stdout);
+            if (!entries.some((entry) => entry.source === rootDisk)) {
+              throw new LibvirtError(
+                `refusing to remove volumes for ${args.name}: no attached disk matches the recorded root ${rootDisk}`,
+              );
+            }
+            for (const entry of entries) {
+              if (entry.source === rootDisk) continue;
               if (entry.source === "" || entry.source === "-") continue;
               assertName(entry.target, "disk target");
               const detach = await virshTry(deps, t, args.uri, [

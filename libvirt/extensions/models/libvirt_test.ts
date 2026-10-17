@@ -1,6 +1,15 @@
-import { assertEquals, assertRejects } from "jsr:@std/assert@1.0.19";
+import {
+  assertEquals,
+  assertRejects,
+  assertThrows,
+} from "jsr:@std/assert@1.0.19";
 import { createModelTestContext } from "jsr:@swamp-club/swamp-testing@0.20261014.55";
-import { createModel, type LibvirtDeps, targetKey } from "./libvirt.ts";
+import {
+  createModel,
+  instanceName,
+  type LibvirtDeps,
+  targetKey,
+} from "./libvirt.ts";
 import { type CommandRunner, sha256Hex, SshError } from "./_lib/ssh.ts";
 import { renderNetworkXml } from "./_lib/xml.ts";
 
@@ -114,6 +123,19 @@ function has(f: Fake, sub: string): boolean {
 
 function modelWith(f: Fake) {
   return createModel(f.deps);
+}
+
+/** A stored domain_state record with its resolved root disk. */
+function domState(name: string, rootDisk: string) {
+  return {
+    [instanceName("dom", SSH, name)]: {
+      target: TARGET,
+      name,
+      present: true,
+      root_disk: rootDisk,
+      observed_at: "2026-10-17T00:00:00.000Z",
+    },
+  };
 }
 
 Deno.test("schema: empty globals; mutating methods are actions; private_key sensitive", () => {
@@ -751,10 +773,21 @@ Deno.test("undefine_domain: absent no-op; running destroy + undefine with volume
   const running = fakeLibvirt(seq([
     ["'dominfo'", () => ({ code: 0, stdout: RUNNING })],
     ["'destroy'", () => ({ code: 0 })],
+    [
+      "'domblklist'",
+      () => ({
+        code: 0,
+        stdout:
+          " Type   Device   Target   Source\n----\n file   disk     vda      /p/root.qcow2\n",
+      }),
+    ],
     ["'undefine'", () => ({ code: 0 })],
   ]));
   const rm = modelWith(running);
-  const rc = createModelTestContext({ globalArgs: {} });
+  const rc = createModelTestContext({
+    globalArgs: {},
+    storedResources: domState("node-a", "/p/root.qcow2"),
+  });
   const out = await rm.methods.undefine_domain.execute(
     rm.methods.undefine_domain.arguments.parse({
       ...SSH,
@@ -1031,7 +1064,10 @@ Deno.test("undefine_domain keeps a seed ISO unless asked to remove it", async ()
       name: "node-a",
       remove_volumes: true,
     }),
-    createModelTestContext({ globalArgs: {} }).context,
+    createModelTestContext({
+      globalArgs: {},
+      storedResources: domState("node-a", "/p/root.qcow2"),
+    }).context,
   );
   assertEquals(has(kept, "'detach-disk'"), true);
   assertEquals(
@@ -1150,7 +1186,10 @@ Deno.test("undefine_domain detaches every non-boot disk before removing volumes"
       name: "node-a",
       remove_volumes: true,
     }),
-    createModelTestContext({ globalArgs: {} }).context,
+    createModelTestContext({
+      globalArgs: {},
+      storedResources: domState("node-a", "/p/root.qcow2"),
+    }).context,
   );
   const detached = f.commands.filter((c) => c.includes("'detach-disk'"));
   assertEquals(detached.some((c) => c.includes("'vdb'")), true);
@@ -1166,7 +1205,7 @@ Deno.test("undefine_domain refuses an invalid disk target from domblklist", asyn
       () => ({
         code: 0,
         stdout:
-          " Type   Device   Target   Source\n----\n file   disk     vda;id   /p/x\n",
+          " Type   Device   Target   Source\n----\n file   disk     vda      /p/root.qcow2\n file   disk     vda;id   /p/x\n",
       }),
     ],
     ["'undefine'", () => ({ code: 0 })],
@@ -1180,7 +1219,10 @@ Deno.test("undefine_domain refuses an invalid disk target from domblklist", asyn
           name: "node-a",
           remove_volumes: true,
         }),
-        createModelTestContext({ globalArgs: {} }).context,
+        createModelTestContext({
+          globalArgs: {},
+          storedResources: domState("node-a", "/p/root.qcow2"),
+        }).context,
       ),
     Error,
     "Not a valid disk target",
@@ -1275,4 +1317,151 @@ Deno.test("define_network: the start error strips control characters", async () 
     "bad bridge",
   );
   assertEquals(error.message.includes("\u0001"), false);
+});
+
+Deno.test("undefine_domain refuses remove_volumes without a recorded root", async () => {
+  const f = fakeLibvirt(seq([
+    ["'dominfo'", () => ({ code: 0, stdout: SHUT_OFF })],
+  ]));
+  await assertRejects(
+    () =>
+      modelWith(f).methods.undefine_domain.execute(
+        modelWith(f).methods.undefine_domain.arguments.parse({
+          ...SSH,
+          uri: URI,
+          name: "node-a",
+          remove_volumes: true,
+        }),
+        createModelTestContext({ globalArgs: {} }).context,
+      ),
+    Error,
+    "no recorded root disk",
+  );
+  assertEquals(has(f, "'undefine'"), false);
+});
+
+Deno.test("undefine_domain refuses when no disk matches the recorded root", async () => {
+  const f = fakeLibvirt(seq([
+    ["'dominfo'", () => ({ code: 0, stdout: SHUT_OFF })],
+    [
+      "'domblklist'",
+      () => ({
+        code: 0,
+        stdout:
+          " Type   Device   Target   Source\n----\n file   disk     sda      /p/other.qcow2\n",
+      }),
+    ],
+  ]));
+  await assertRejects(
+    () =>
+      modelWith(f).methods.undefine_domain.execute(
+        modelWith(f).methods.undefine_domain.arguments.parse({
+          ...SSH,
+          uri: URI,
+          name: "node-a",
+          remove_volumes: true,
+        }),
+        createModelTestContext({
+          globalArgs: {},
+          storedResources: domState("node-a", "/p/root.qcow2"),
+        }).context,
+      ),
+    Error,
+    "no attached disk matches the recorded root",
+  );
+});
+
+Deno.test("undefine_domain keeps a root disk at a non-vda target", async () => {
+  const f = fakeLibvirt(seq([
+    ["'dominfo'", () => ({ code: 0, stdout: SHUT_OFF })],
+    [
+      "'domblklist'",
+      () => ({
+        code: 0,
+        stdout:
+          " Type   Device   Target   Source\n----\n file   disk     sda      /p/root.qcow2\n file   disk     sdb      /p/extra.qcow2\n",
+      }),
+    ],
+    ["'detach-disk'", () => ({ code: 0 })],
+    ["'undefine'", () => ({ code: 0 })],
+  ]));
+  await modelWith(f).methods.undefine_domain.execute(
+    modelWith(f).methods.undefine_domain.arguments.parse({
+      ...SSH,
+      uri: URI,
+      name: "node-a",
+      remove_volumes: true,
+    }),
+    createModelTestContext({
+      globalArgs: {},
+      storedResources: domState("node-a", "/p/root.qcow2"),
+    }).context,
+  );
+  const detached = f.commands.filter((c) => c.includes("'detach-disk'"));
+  assertEquals(detached.some((c) => c.includes("'sdb'")), true);
+  assertEquals(detached.some((c) => c.includes("'sda'")), false);
+});
+
+Deno.test("define_domain reserves explicit targets before allocating implicit", async () => {
+  const run = async (extra_disks: unknown[]) => {
+    const f = fakeLibvirt(seq([
+      ["'vol-info'", () => ({ code: 0, stdout: "Name: node-a-root\n" })],
+      ["'vol-path'", () => ({ code: 0, stdout: "/p/node-a-root.qcow2\n" })],
+      [
+        "'dominfo'",
+        (n) =>
+          n === 0
+            ? { code: 1, stderr: "error: failed to get domain" }
+            : { code: 0, stdout: SHUT_OFF },
+      ],
+      ["'define'", () => ({ code: 0 })],
+    ]));
+    await modelWith(f).methods.define_domain.execute(
+      modelWith(f).methods.define_domain.arguments.parse({
+        ...SSH,
+        uri: URI,
+        name: "node-a",
+        pool: "pool-a",
+        volume: "node-a-root",
+        vcpus: 1,
+        memory_mib: 1024,
+        extra_disks,
+      }),
+      createModelTestContext({ globalArgs: {} }).context,
+    );
+    return f.uploads[0];
+  };
+  // An implicit disk before the explicit vdb must not take vdb.
+  const implicitFirst = await run([
+    { path: "/p/a.qcow2" },
+    { path: "/p/b.qcow2", target: "vdb" },
+  ]);
+  assertEquals(
+    implicitFirst.includes("<target dev='vdc' bus='virtio'/>"),
+    true,
+  );
+  // And the same when the explicit vdb comes first.
+  const explicitFirst = await run([
+    { path: "/p/b.qcow2", target: "vdb" },
+    { path: "/p/a.qcow2" },
+  ]);
+  assertEquals(
+    explicitFirst.includes("<target dev='vdc' bus='virtio'/>"),
+    true,
+  );
+});
+
+Deno.test("schema: host_key_policy is strict-only with required host_keys", () => {
+  const m = createModel();
+  assertThrows(() =>
+    m.methods.get.arguments.parse({
+      ...SSH,
+      host_key_policy: "insecure_tofu",
+    })
+  );
+  assertThrows(() => m.methods.get.arguments.parse({ ...SSH, host_keys: [] }));
+  assertEquals(
+    m.methods.get.arguments.safeParse({ ...SSH, uri: URI }).success,
+    true,
+  );
 });

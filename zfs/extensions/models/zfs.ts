@@ -1524,4 +1524,8 @@ export function createModel(deps: ZfsDeps): ZfsModel {
 }
 
 /** Production model definition. */
-export const model: ZfsModel = buildZfsModel(defaultZfsDeps);
+export const model = {
+  ...buildZfsModel(defaultZfsDeps),
+  type: "@randybias/zfs",
+  version: "2026.10.17.1",
+} satisfies ZfsModel;

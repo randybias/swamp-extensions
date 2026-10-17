@@ -35,13 +35,13 @@ export interface Step {
   script?: string;
 }
 
-/** Devices whose MTU is raised, parent-first. */
+/**
+ * Existing parent devices whose MTU this change raises, before the backend
+ * applies. Created VLANs and bridges get their MTU from the renderer, so a
+ * raise step is emitted only for a physical NIC that already exists.
+ */
 export function mtuRaiseOrder(cfg: NetConfig): DeviceNode[] {
-  const graph = deviceGraph(cfg);
-  const order = { ethernet: 0, vlan: 1, bridge: 2 } as const;
-  return graph.filter((n) => n.mtu > 0).sort((a, b) =>
-    order[a.kind] - order[b.kind]
-  );
+  return deviceGraph(cfg).filter((n) => n.kind === "ethernet" && n.mtu > 0);
 }
 
 /** Devices whose MTU is lowered, child-first. */

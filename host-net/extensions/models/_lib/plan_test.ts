@@ -15,6 +15,7 @@ const CFG: NetConfig = {
   backend: "netplan",
   bridgeType: "linux",
   mode: "additive",
+  managementChangeAck: false,
   managementInterface: "enp1s0",
   ethernets: [{ name: "enp1s0", mtu: 9000 }],
   vlans: [{
@@ -28,16 +29,10 @@ const CFG: NetConfig = {
 };
 
 Deno.test("MTU raise is parent-first; lower is child-first", () => {
-  assertEquals(mtuRaiseOrder(CFG).map((n) => n.name), [
-    "enp1s0",
-    "enp1s0.100",
-    "br0",
-  ]);
-  assertEquals(mtuLowerOrder(CFG).map((n) => n.name), [
-    "br0",
-    "enp1s0.100",
-    "enp1s0",
-  ]);
+  // Only existing parents are raised before apply; created devices get their
+  // MTU from the renderer.
+  assertEquals(mtuRaiseOrder(CFG).map((n) => n.name), ["enp1s0"]);
+  assertEquals(mtuLowerOrder(CFG).map((n) => n.name), ["enp1s0"]);
 });
 
 Deno.test("arm precedes every mtu/write/apply step", () => {

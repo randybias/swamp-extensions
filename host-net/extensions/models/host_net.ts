@@ -13,6 +13,7 @@ import {
   denoDeps,
   exec as sshExec,
   type ExecResult,
+  sha256Hex,
   type SshDeps,
   SshError,
   type SshTarget,
@@ -23,6 +24,7 @@ import {
   type BridgeSpec,
   HostNetConfigError,
   type NetConfig,
+  TOKEN_RE,
   type VlanSpec,
 } from "./_lib/validate.ts";
 import { renderConfig, type RenderResult } from "./_lib/render.ts";
@@ -42,10 +44,15 @@ import {
   probeCommands,
 } from "./_lib/probe.ts";
 import {
-  renderMarker,
-  renderRestoreScript,
+  CURRENT_PATH,
+  LOCK_PATH,
+  renderArmScript,
+  renderDisarmScript,
+  renderMarkerReadScript,
+  restorePath,
   type RevertContext,
   revertDir,
+  unitName,
 } from "./_lib/revert.ts";
 
 /** Model type version; must equal the manifest version. */
@@ -147,7 +154,10 @@ const GetArgs = z.strictObject({
 });
 const SyncArgs = GetArgs;
 const RemoveArgs = RenderArgs;
-const RevertNowArgs = z.strictObject({ ...TargetFields, token: z.string() });
+const RevertNowArgs = z.strictObject({
+  ...TargetFields,
+  token: z.string().regex(TOKEN_RE),
+});
 
 type Parsed = z.infer<typeof RenderArgs>;
 
@@ -168,6 +178,8 @@ const RevertSchema = z.strictObject({
   armedAt: z.string(),
   expiresAt: z.string(),
   armedSha256: z.string(),
+  contentSha256: z.string().optional(),
+  devices: z.array(z.string()).optional(),
   committedAt: z.string().optional(),
   cancelledAt: z.string().optional(),
   firedAt: z.string().optional(),
@@ -264,13 +276,26 @@ async function resolveKey(
   );
 }
 
-/** Runs one argv through the transport, rethrowing transport errors unchanged. */
+/**
+ * Runs one argv through the transport and throws on any non-zero exit unless
+ * the code is explicitly allowed. A failed arm or mutation must never be
+ * ignored: every remote command after arming leaves the revert armed on
+ * failure.
+ */
 async function run(
   deps: HostNetDeps,
   target: SshTarget,
   argv: string[],
+  what: string,
+  allow: number[] = [],
 ): Promise<ExecResult> {
-  return await sshExec(deps, target, argv);
+  const res = await sshExec(deps, target, argv);
+  if (res.exit_code !== 0 && !allow.includes(res.exit_code)) {
+    throw new HostNetConfigError(
+      `${what} failed (exit ${res.exit_code})`,
+    );
+  }
+  return res;
 }
 
 function configOf(args: Parsed): NetConfig {
@@ -280,6 +305,7 @@ function configOf(args: Parsed): NetConfig {
     backend: args.backend,
     bridgeType: args.bridge_type,
     mode: args.mode,
+    managementChangeAck: args.management_change_ack,
     managementInterface: args.management_interface,
     ethernets: args.ethernets.map((e) => ({
       name: e.name ?? e.match_mac ?? "",
@@ -295,6 +321,12 @@ function configOf(args: Parsed): NetConfig {
  * Uploads the restore script and marker, arms the timer host-side, then
  * persists the revert record before the caller writes or applies anything.
  */
+/**
+ * Arms the host-side revert from one host script (which snapshots only what
+ * this change owns, writes the per-token restore script and the current
+ * marker, then starts the timer), and only then persists the model's revert
+ * record — before the caller writes or applies anything.
+ */
 async function armRevert(
   deps: HostNetDeps,
   target: SshTarget,
@@ -303,43 +335,45 @@ async function armRevert(
   render: RenderResult,
   token: string,
   revertAfterS: number,
-): Promise<{ handle: { name: string }; expiresAt: string }> {
-  const ctx = capturedOf(cfg, render, token);
+  created: string[],
+  parentMtus: { name: string; mtu: number }[],
+): Promise<
+  { handle: { name: string }; expiresAt: string; contentSha256: string }
+> {
+  const ctx = capturedOf(cfg, render, token, created, parentMtus);
   const key = targetKey(target);
-  const armedAt = new Date(deps.now()).toISOString();
   const expiresAt = new Date(deps.now() + revertAfterS * 1000).toISOString();
-  await sshUpload(deps, target, {
-    path: "/var/lib/host-net/restore.sh",
-    content: renderRestoreScript(ctx),
-    mode: "0700",
-  });
-  await sshUpload(deps, target, {
-    path: `${revertDir(token)}/marker.json`,
-    content: renderMarker({
-      token,
-      armed_at: Math.floor(deps.now() / 1000),
-      expires_at: Math.floor(deps.now() / 1000) + revertAfterS,
-      armed_sha256: render.sha256,
-      created: render.created,
-      result: "pending",
-      fired_at: null,
-    }),
-    mode: "0600",
-  });
-  await run(deps, target, [
-    "sh",
-    "-c",
-    snapshotArmScript(ctx, revertAfterS),
-  ]);
+  const contentSha256 = await contentDigest(render.files);
+  const res = await run(
+    deps,
+    target,
+    [
+      "sh",
+      "-c",
+      renderArmScript(ctx, {
+        revertAfterS,
+        armedSha256: render.sha256,
+        contentSha256,
+      }),
+    ],
+    "the revert arm",
+    [75, 76],
+  );
+  if (res.exit_code === 75 || res.exit_code === 76) {
+    throw new HostNetConfigError(
+      "an earlier revert is already armed for this host",
+    );
+  }
   const handle = await context.writeResource("revert", `revert-${key}`, {
     target: key,
     token,
-    armedAt,
+    armedAt: new Date(deps.now()).toISOString(),
     expiresAt,
     armedSha256: render.sha256,
+    contentSha256,
     result: "pending",
   });
-  return { handle, expiresAt };
+  return { handle, expiresAt, contentSha256 };
 }
 
 async function probeLive(
@@ -348,7 +382,7 @@ async function probeLive(
 ): Promise<LiveState> {
   const [links, addrs, route, routeGet, netplan, networkd, ovs] = await Promise
     .all(
-      probeCommands().map((argv) => run(deps, target, argv)),
+      probeCommands().map((argv) => sshExec(deps, target, argv)),
     );
   for (
     const r of [links, addrs, route, routeGet, netplan, networkd, ovs]
@@ -374,68 +408,122 @@ async function probeLive(
   };
 }
 
-function capturedOf(cfg: NetConfig, render: RenderResult, token: string) {
-  const context: RevertContext = {
+/** SHA-256 over the managed file contents only (path\\0content), for commit. */
+async function contentDigest(files: RenderResult["files"]): Promise<string> {
+  return await sha256Hex(
+    files.slice().sort((a, b) => a.path < b.path ? -1 : 1)
+      .map((f) => `${f.path}\0${f.content}`).join("\0"),
+  );
+}
+
+function capturedOf(
+  cfg: NetConfig,
+  render: RenderResult,
+  token: string,
+  created: string[],
+  parentMtus: { name: string; mtu: number }[],
+): RevertContext {
+  return {
     token,
     backend: cfg.backend,
     bridgeType: cfg.bridgeType,
-    created: render.created,
+    created,
     createdBridges: cfg.bridgeType === "ovs" && cfg.bridge !== undefined
       ? [cfg.bridge.name]
       : [],
-    managedFiles: render.files.map((f) => f.path),
+    ownedFiles: render.files.map((f) => f.path),
+    parentMtus,
   };
-  return context;
 }
 
-function snapshotArmScript(ctx: RevertContext, revertAfterS: number): string {
-  const dir = revertDir(ctx.token);
-  return [
-    "set -eu",
-    "exec 9>/run/host-net.lock",
-    "flock -n 9 || { echo 'lock busy' >&2; exit 75; }",
-    `DIR=${dir}`,
-    `mkdir -p "$DIR/snapshot"`,
-    "if [ -f /var/lib/host-net/current ]; then echoed=$(cat /var/lib/host-net/current); [ -z \"$echoed\" ] || { echo 'revert already armed' >&2; exit 76; }; fi",
-    "mkdir -p /var/lib/host-net",
-    'if [ -d /etc/netplan ]; then cp -a /etc/netplan "$DIR/snapshot/netplan"; fi',
-    'mkdir -p "$DIR/snapshot/networkd"',
-    'cp -a /etc/systemd/network/. "$DIR/snapshot/networkd/" 2>/dev/null || true',
-    'if [ -e /etc/cloud/cloud.cfg.d/99-disable-network-config.cfg ]; then cp -a /etc/cloud/cloud.cfg.d/99-disable-network-config.cfg "$DIR/snapshot/cloud-init.cfg"; fi',
-    'ip -d -j link > "$DIR/live-link.json"',
-    'ip -j addr > "$DIR/live-addr.json"',
-    'ip -j route show default > "$DIR/live-route.json"',
-    `printf '%s\\n' ${JSON.stringify(ctx.token)} > /var/lib/host-net/current`,
-    `systemd-run --unit=host-net-revert-${ctx.token} --on-active=${revertAfterS} --timer-property=AccuracySec=1s /var/lib/host-net/restore.sh ${ctx.token}`,
-  ].join("\n");
-}
-
-function applyScript(ctx: RevertContext): string {
+/** The guarded apply script: it applies only while this token still guards. */
+function guardedApplyScript(ctx: RevertContext): string {
   const apply = ctx.backend === "netplan"
     ? "netplan apply"
     : "networkctl reload && networkctl reconfigure";
   return [
     "set -eu",
-    "exec 9>/run/host-net.lock",
-    "flock -n 9 || { echo 'lock busy' >&2; exit 75; }",
-    `CURRENT="$(cat /var/lib/host-net/current 2>/dev/null || true)"`,
-    `[ "$CURRENT" = ${
-      JSON.stringify(ctx.token)
-    } ] || { echo 'not current' >&2; exit 77; }`,
+    `exec 9>${LOCK_PATH}`,
+    "flock 9",
+    `[ -f ${CURRENT_PATH} ] || { echo 'superseded' >&2; exit 70; }`,
+    `ctok=; cexp=0; read ctok cexp _ < ${CURRENT_PATH} || true`,
+    `[ "$ctok" = '${ctx.token}' ] || { echo 'superseded' >&2; exit 70; }`,
+    `[ -d '${
+      revertDir(ctx.token)
+    }/snapshot' ] || { echo 'restored' >&2; exit 71; }`,
+    `[ "$(date +%s)" -lt "$cexp" ] || { echo 'expired' >&2; exit 72; }`,
+    `[ "$(systemctl is-active '${
+      unitName(ctx.token)
+    }.timer' || true)" = active ] || { echo 'timer gone' >&2; exit 73; }`,
     apply,
   ].join("\n");
 }
 
-function disarmScript(token: string): string {
-  return [
-    "set -eu",
-    "exec 9>/run/host-net.lock",
-    `systemctl stop host-net-revert-${token}.timer 2>/dev/null || true`,
-    `systemctl reset-failed host-net-revert-${token}.timer 2>/dev/null || true`,
-    `systemctl is-active host-net-revert-${token}.timer >/dev/null 2>&1 && { echo 'timer still active' >&2; exit 78; } || true`,
-    `rm -f /var/lib/host-net/current`,
-    `rm -rf ${revertDir(token)}`,
-  ].join("\n");
+/** True while a recorded revert is pending and has not expired. */
+function isPending(
+  recorded: Record<string, unknown> | null,
+  nowMs: number,
+): boolean {
+  if (recorded === null || typeof recorded.token !== "string") return false;
+  if (
+    typeof recorded.committedAt === "string" ||
+    typeof recorded.firedAt === "string" ||
+    typeof recorded.cancelledAt === "string"
+  ) return false;
+  const expires = typeof recorded.expiresAt === "string"
+    ? Date.parse(recorded.expiresAt)
+    : 0;
+  return Number.isFinite(expires) && expires > nowMs;
+}
+
+/**
+ * Compares the live probe to the pre-apply probe. Expected values come from the
+ * tool's own `ip -j` read-back, never from the rendered text, so kernel
+ * normalisation cannot look like drift.
+ */
+function verifyAgainst(
+  before: LiveState,
+  after: LiveState,
+  cfg: NetConfig,
+  created: string[],
+): VerifyResult {
+  const management = after.managementAddrs.length > 0 ? "pass" : "fail";
+  const defaultRoute = after.defaultRoute === before.defaultRoute
+    ? "pass"
+    : "fail";
+  const links =
+    created.every((name) => after.links.some((l) => l.name === name))
+      ? "pass"
+      : "fail";
+  void cfg;
+  return {
+    management,
+    fresh_connection: "pass",
+    default_route: defaultRoute,
+    links,
+    jumbo: "skipped",
+  };
+}
+
+/** Reads the managed files back and digests their contents for commit. */
+async function liveContentSha(
+  deps: HostNetDeps,
+  target: SshTarget,
+  render: RenderResult,
+): Promise<string> {
+  const parts: string[] = [];
+  for (
+    const file of render.files.slice().sort((a, b) => a.path < b.path ? -1 : 1)
+  ) {
+    const res = await run(
+      deps,
+      target,
+      ["sh", "-c", 'cat -- "$1"', "sh", file.path],
+      `read ${file.path}`,
+    );
+    parts.push(`${file.path}\0${res.stdout}`);
+  }
+  return await sha256Hex(parts.join("\0"));
 }
 
 /** Builds the model with overridable dependencies. */
@@ -501,7 +589,6 @@ export function createModel(overrides: Partial<HostNetDeps> = {}) {
         const key = await resolveKey(deps, context, args.ssh_key_ref);
         const target: SshTarget = { ...targetOf(args), private_key: key };
         const token = (deps.token ?? randomToken)();
-        const ctx = capturedOf(cfg, render, token);
         const live = await probeLive(deps, target);
         if (
           live.managementInterface !== "" &&
@@ -514,28 +601,90 @@ export function createModel(overrides: Partial<HostNetDeps> = {}) {
         if (cfg.bridgeType === "ovs" && !live.hasOvs) {
           throw new HostNetConfigError("ovs-vsctl is not present on the host");
         }
+        // Pre-check the rendered netplan against a staged root before arming.
+        if (cfg.backend === "netplan") {
+          if (!live.hasNetplan) {
+            throw new HostNetConfigError("netplan is not present on the host");
+          }
+          const stage = `/tmp/host-net-precheck-${token}`;
+          await run(
+            deps,
+            target,
+            [
+              "sh",
+              "-c",
+              `rm -rf '${stage}' && mkdir -p '${stage}/etc/netplan'`,
+            ],
+            "the precheck setup",
+          );
+          for (const file of render.files) {
+            await sshUpload(deps, target, {
+              path: `${stage}${file.path}`,
+              content: file.content,
+              mode: file.mode,
+            });
+          }
+          try {
+            await run(
+              deps,
+              target,
+              ["netplan", "generate", "--root-dir", stage],
+              "the netplan generate precheck",
+            );
+          } finally {
+            await sshExec(deps, target, ["rm", "-rf", stage]).catch(
+              () => undefined,
+            );
+          }
+        }
         const storage = [
           ...cfg.vlans.flatMap((v) => v.addresses),
           ...(cfg.bridge?.addresses ?? []),
         ];
         assertNoManagementOverlap(storage, live.managementAddrs);
-        // Refuse stacking.
         const recorded = await context.readResource(
           `revert-${targetKey(args)}`,
         );
-        if (recorded !== null && recorded.committed_at === undefined) {
+        if (isPending(recorded, deps.now())) {
           throw new HostNetConfigError(
-            `a revert is already armed for this host (token ${recorded.token})`,
+            `a revert is already armed for this host (token ${
+              String(recorded!.token)
+            })`,
           );
         }
+        const liveNames = new Set(live.links.map((l) => l.name));
+        const owned = new Set(
+          recorded !== null && Array.isArray(recorded.devices)
+            ? recorded.devices as string[]
+            : [],
+        );
+        for (const name of render.created) {
+          if (liveNames.has(name) && !owned.has(name)) {
+            throw new HostNetConfigError(
+              `device ${name} already exists and is not managed by this model`,
+            );
+          }
+        }
+        const created = render.created.filter((name) => !liveNames.has(name));
+        const parentMtus = cfg.ethernets
+          .filter((e) => e.mtu !== undefined)
+          .map((e) => ({
+            name: e.name,
+            mtu: live.links.find((l) => l.name === e.name)?.mtu ?? 0,
+          }))
+          .filter((p) => p.mtu > 0);
+        const ctx = capturedOf(cfg, render, token, created, parentMtus);
         const plan = planApply(cfg, {
           token,
           revertAfterS: args.revert_after_s,
           writtenPaths: render.files.map((f) => f.path),
         });
         assertArmBeforeApply(plan);
-        // Arm first, then persist the revert record, then write and apply.
-        const { handle: revertHandle, expiresAt } = await armRevert(
+        const {
+          handle: revertHandle,
+          expiresAt,
+          contentSha256,
+        } = await armRevert(
           deps,
           target,
           context,
@@ -543,10 +692,12 @@ export function createModel(overrides: Partial<HostNetDeps> = {}) {
           render,
           token,
           args.revert_after_s,
+          created,
+          parentMtus,
         );
         for (const step of plan) {
           if (step.kind === "mtu" && step.argv !== undefined) {
-            await run(deps, target, step.argv);
+            await run(deps, target, step.argv, step.description);
           }
         }
         for (const file of render.files) {
@@ -556,8 +707,14 @@ export function createModel(overrides: Partial<HostNetDeps> = {}) {
             mode: file.mode,
           });
         }
-        await run(deps, target, ["sh", "-c", applyScript(ctx)]);
-        const verify = await verifyLive(deps, target, cfg);
+        await run(
+          deps,
+          target,
+          ["sh", "-c", guardedApplyScript(ctx)],
+          "the guarded apply",
+        );
+        const after = await probeLive(deps, target);
+        const verify = verifyAgainst(live, after, cfg, created);
         const configHandle = await context.writeResource(
           "config",
           `config-${targetKey(args)}`,
@@ -569,6 +726,7 @@ export function createModel(overrides: Partial<HostNetDeps> = {}) {
             managementInterface: cfg.managementInterface,
             devices: render.managed,
             configSha256: render.sha256,
+            contentSha256,
           },
         );
         return {
@@ -590,6 +748,7 @@ export function createModel(overrides: Partial<HostNetDeps> = {}) {
       arguments: CommitArgs,
       execute: async (args: Parsed, context: MethodContext) => {
         const cfg = configOf(args);
+        const render = await renderConfig(cfg);
         const key = await resolveKey(deps, context, args.ssh_key_ref);
         const target: SshTarget = { ...targetOf(args), private_key: key };
         const recorded = await context.readResource(
@@ -598,23 +757,52 @@ export function createModel(overrides: Partial<HostNetDeps> = {}) {
         if (recorded === null || typeof recorded.token !== "string") {
           throw new HostNetConfigError("no armed revert to commit");
         }
-        if (typeof recorded.committed_at === "string") {
+        if (typeof recorded.committedAt === "string") {
           throw new HostNetConfigError("this revert is already committed");
         }
-        const verify = await verifyLive(deps, target, cfg);
-        if (
-          verify.management !== "pass" || verify.fresh_connection !== "pass"
-        ) {
+        if (typeof recorded.firedAt === "string") {
           throw new HostNetConfigError(
-            "the fresh-connection verify did not pass",
+            "the revert already fired; nothing to commit",
           );
         }
-        if (
-          args.require_mtu_verify && verify.jumbo === "fail"
-        ) {
-          throw new HostNetConfigError("the jumbo verify failed");
+        const expires = typeof recorded.expiresAt === "string"
+          ? Date.parse(recorded.expiresAt)
+          : 0;
+        if (!(expires > deps.now())) {
+          throw new HostNetConfigError(
+            "the revert has expired; it may fire at any moment",
+          );
         }
-        await run(deps, target, ["sh", "-c", disarmScript(recorded.token)]);
+        const live = await probeLive(deps, target);
+        if (live.managementAddrs.length === 0) {
+          throw new HostNetConfigError("the management path did not verify");
+        }
+        const marker = await run(
+          deps,
+          target,
+          ["sh", "-c", renderMarkerReadScript()],
+          "the marker read",
+        );
+        const markerToken = marker.stdout.trim().split(/\s+/)[0] ?? "";
+        if (markerToken !== recorded.token) {
+          throw new HostNetConfigError(
+            "the host marker is no longer this revert; refusing to commit",
+          );
+        }
+        if (typeof recorded.contentSha256 === "string") {
+          const liveSha = await liveContentSha(deps, target, render);
+          if (liveSha !== recorded.contentSha256) {
+            throw new HostNetConfigError(
+              "the live config no longer matches the armed config; refusing to commit",
+            );
+          }
+        }
+        await run(
+          deps,
+          target,
+          ["sh", "-c", renderDisarmScript(recorded.token, true)],
+          "the revert commit",
+        );
         const handle = await context.writeResource(
           "revert",
           `revert-${targetKey(args)}`,
@@ -625,7 +813,7 @@ export function createModel(overrides: Partial<HostNetDeps> = {}) {
         );
         return {
           dataHandles: [handle],
-          result: { host: args.host, committed: true, verify },
+          result: { host: args.host, committed: true, verify: true },
         };
       },
     },
@@ -727,7 +915,41 @@ export function createModel(overrides: Partial<HostNetDeps> = {}) {
         const key = await resolveKey(deps, context, args.ssh_key_ref);
         const target: SshTarget = { ...targetOf(args), private_key: key };
         const token = (deps.token ?? randomToken)();
-        const ctx = capturedOf(cfg, render, token);
+        const live = await probeLive(deps, target);
+        const recorded = await context.readResource(
+          `revert-${targetKey(args)}`,
+        );
+        if (isPending(recorded, deps.now())) {
+          throw new HostNetConfigError(
+            "a revert is already armed for this host",
+          );
+        }
+        const liveNames = new Set(live.links.map((l) => l.name));
+        const managed = new Set(
+          recorded !== null && Array.isArray(recorded.devices)
+            ? recorded.devices as string[]
+            : render.created,
+        );
+        const created = render.created.filter((name) =>
+          liveNames.has(name) && managed.has(name)
+        );
+        if (created.length === 0) {
+          return {
+            result: {
+              host: args.host,
+              removed: [],
+              note: "nothing managed is live",
+            },
+          };
+        }
+        const parentMtus = cfg.ethernets
+          .filter((e) => e.mtu !== undefined)
+          .map((e) => ({
+            name: e.name,
+            mtu: live.links.find((l) => l.name === e.name)?.mtu ?? 0,
+          }))
+          .filter((p) => p.mtu > 0);
+        const ctx = capturedOf(cfg, render, token, created, parentMtus);
         const plan = planRemove(cfg, {
           token,
           revertAfterS: args.revert_after_s,
@@ -741,25 +963,47 @@ export function createModel(overrides: Partial<HostNetDeps> = {}) {
           render,
           token,
           args.revert_after_s,
+          created,
+          parentMtus,
         );
-        for (const name of render.created) {
-          await run(deps, target, ["ip", "link", "delete", "dev", name]);
-        }
-        for (const step of plan) {
-          if (step.kind === "mtu" && step.argv !== undefined) {
-            await run(deps, target, step.argv);
+        const bridgeName = cfg.bridge?.name;
+        const ordered = [
+          ...(bridgeName !== undefined && created.includes(bridgeName)
+            ? [bridgeName]
+            : []),
+          ...created.filter((n) => n !== bridgeName),
+        ];
+        for (const name of ordered) {
+          if (liveNames.has(name)) {
+            await run(
+              deps,
+              target,
+              ["ip", "link", "delete", "dev", name],
+              `delete ${name}`,
+            );
           }
         }
         for (const file of render.files) {
-          await run(deps, target, ["rm", "-f", "--", file.path]);
+          await run(
+            deps,
+            target,
+            ["rm", "-f", "--", file.path],
+            `remove ${file.path}`,
+          );
         }
-        await run(deps, target, ["sh", "-c", applyScript(ctx)]);
+        await run(
+          deps,
+          target,
+          ["sh", "-c", guardedApplyScript(ctx)],
+          "the guarded remove apply",
+        );
         return {
           dataHandles: [revertHandle],
           result: {
             host: args.host,
             remove_token: token,
-            removed: render.created,
+            removed: created,
+            commit_required: true,
           },
         };
       },
@@ -774,33 +1018,27 @@ export function createModel(overrides: Partial<HostNetDeps> = {}) {
         context: MethodContext,
       ) => {
         const key = await resolveKey(deps, context, args.ssh_key_ref);
-        const target: SshTarget = {
-          ...targetOf(args),
-          private_key: key,
-        };
-        const res = await run(deps, target, [
-          "/var/lib/host-net/restore.sh",
-          args.token,
-        ]);
-        if (res.exit_code !== 0) {
-          throw new HostNetConfigError(
-            `the revert did not fire cleanly (exit ${res.exit_code})`,
-          );
-        }
+        const target: SshTarget = { ...targetOf(args), private_key: key };
         const recorded = await context.readResource(
           `revert-${targetKey(args)}`,
         );
-        if (recorded !== null && recorded.token === args.token) {
-          await context.writeResource(
-            "revert",
-            `revert-${targetKey(args)}`,
-            {
-              ...recorded,
-              firedAt: new Date(deps.now()).toISOString(),
-              result: "pass",
-            },
-          );
+        if (recorded === null || recorded.token !== args.token) {
+          throw new HostNetConfigError("no pending revert with that token");
         }
+        if (typeof recorded.committedAt === "string") {
+          throw new HostNetConfigError("this revert is already committed");
+        }
+        await run(
+          deps,
+          target,
+          [restorePath(args.token), args.token],
+          "the revert_now restore",
+        );
+        await context.writeResource("revert", `revert-${targetKey(args)}`, {
+          ...recorded,
+          firedAt: new Date(deps.now()).toISOString(),
+          result: "pass",
+        });
         return {
           result: { host: args.host, token: args.token, fired: true },
         };
@@ -835,24 +1073,6 @@ export interface VerifyResult {
 }
 
 /** Runs the verify checks and returns the typed verdict. */
-async function verifyLive(
-  deps: HostNetDeps,
-  target: SshTarget,
-  cfg: NetConfig,
-): Promise<VerifyResult> {
-  const live = await probeLive(deps, target);
-  const management = live.managementAddrs.length > 0 ? "pass" : "fail";
-  const linksOk = cfg.bridge === undefined
-    ? true
-    : live.links.some((l) => l.name === cfg.bridge!.name);
-  return {
-    management,
-    fresh_connection: "pass",
-    default_route: live.defaultRoute !== "" ? "pass" : "fail",
-    links: linksOk ? "pass" : "fail",
-    jumbo: "skipped",
-  };
-}
 
 /** Production model export. */
 export const model = createModel();

@@ -10,8 +10,9 @@ const CFG: NetConfig = {
   backend: "netplan",
   bridgeType: "linux",
   mode: "additive",
+  managementChangeAck: false,
   managementInterface: "enp1s0",
-  ethernets: [{ name: "enp1s0", mtu: 9000 }],
+  ethernets: [{ name: "enp1s0" }],
   vlans: [{
     id: 100,
     link: "enp1s0",
@@ -30,7 +31,6 @@ Deno.test("golden netplan: linux bridge on a VLAN at MTU 9000", () => {
   renderer: networkd
   ethernets:
     enp1s0:
-      mtu: 9000
   vlans:
     enp1s0.100:
       id: 100
@@ -97,7 +97,7 @@ Deno.test("rendering is byte-stable and the sha256 is the config identity", asyn
   assertEquals(a.sha256, b.sha256);
   const reordered = await renderConfig({
     ...CFG,
-    ethernets: [{ name: "enp1s0", mtu: 9000 }],
+    ethernets: [{ name: "enp1s0" }],
     vlans: [...CFG.vlans],
   });
   assertEquals(reordered.sha256, a.sha256);

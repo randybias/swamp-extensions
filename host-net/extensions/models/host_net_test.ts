@@ -18,7 +18,7 @@ const NET = {
   backend: "netplan" as const,
   bridge_type: "linux" as const,
   management_interface: "enp1s0",
-  ethernets: [{ name: "enp1s0", mtu: 9000 }],
+  ethernets: [{ name: "enp1s0" }],
   vlans: [{
     id: 100,
     link: "enp1s0",
@@ -33,7 +33,7 @@ interface Fake {
   calls: string[];
 }
 
-function fakeRun(): Fake {
+function fakeRun(opts: { links?: unknown[]; armCode?: number } = {}): Fake {
   const calls: string[] = [];
   const run: CommandRunner = (cmd, args, _options = {}) => {
     if (cmd === "ssh-agent") {
@@ -55,6 +55,13 @@ function fakeRun(): Fake {
     }
     const command = args[args.length - 1];
     calls.push(command);
+    if (command.includes("systemd-run")) {
+      return Promise.resolve({
+        code: opts.armCode ?? 0,
+        stdout: "",
+        stderr: "",
+      });
+    }
     if (command.includes("echo MISSING")) {
       return Promise.resolve({ code: 0, stdout: "MISSING\n", stderr: "" });
     }
@@ -62,7 +69,11 @@ function fakeRun(): Fake {
       return Promise.resolve({ code: 0, stdout: "", stderr: "" });
     }
     if (command.includes("'-d' '-j' 'link'")) {
-      return Promise.resolve({ code: 0, stdout: "[]", stderr: "" });
+      return Promise.resolve({
+        code: 0,
+        stdout: JSON.stringify(opts.links ?? []),
+        stderr: "",
+      });
     }
     if (command.includes("'-j' 'addr'")) {
       return Promise.resolve({
@@ -189,7 +200,7 @@ Deno.test("apply arms before it writes or applies", async () => {
   assertEquals(out.result.revert_token, "0000000000000000");
   const armAt = fake.calls.findIndex((c) => c.includes("systemd-run"));
   const mtuAt = fake.calls.findIndex((c) => c.includes("'ip' 'link' 'set'"));
-  const applyAt = fake.calls.findIndex((c) => c.includes("netplan apply"));
+  const applyAt = fake.calls.findIndex((c) => c.includes("superseded"));
   assertEquals(armAt >= 0, true);
   assertEquals(armAt < applyAt, true);
   assertEquals(armAt < mtuAt || mtuAt < 0, true);
@@ -208,6 +219,8 @@ Deno.test("apply refuses when a revert is already armed", async () => {
       "revert-root@192.0.2.20:22": {
         token: "deadbeefdeadbeef",
         target: "root@192.0.2.20:22",
+        armedAt: new Date(1_760_400_000_000).toISOString(),
+        expiresAt: new Date(1_760_400_300_000).toISOString(),
       },
     },
   });
@@ -223,7 +236,14 @@ Deno.test("apply refuses when a revert is already armed", async () => {
 });
 
 Deno.test("remove arms before deleting and deletes only created devices", async () => {
-  const fake = fakeRun();
+  const fake = fakeRun({
+    links: [{
+      ifname: "enp1s0.100",
+      mtu: 9000,
+      operstate: "UP",
+      linkinfo: { info_kind: "vlan", info_data: { id: 100 } },
+    }],
+  });
   const m = modelWith(fake);
   const ctx = createModelTestContext({ globalArgs: {} });
   await m.methods.remove.execute(
@@ -242,7 +262,17 @@ Deno.test("remove arms before deleting and deletes only created devices", async 
 Deno.test("revert_now runs the restore script for the token", async () => {
   const fake = fakeRun();
   const m = modelWith(fake);
-  const ctx = createModelTestContext({ globalArgs: {} });
+  const ctx = createModelTestContext({
+    globalArgs: {},
+    storedResources: {
+      "revert-root@192.0.2.20:22": {
+        token: "0000000000000000",
+        target: "root@192.0.2.20:22",
+        armedAt: new Date(1_760_400_000_000).toISOString(),
+        expiresAt: new Date(1_760_400_300_000).toISOString(),
+      },
+    },
+  });
   const out = await m.methods.revert_now.execute(
     m.methods.revert_now.arguments.parse({ ...SSH, token: "0000000000000000" }),
     ctx.context as never,
@@ -250,7 +280,7 @@ Deno.test("revert_now runs the restore script for the token", async () => {
   assertEquals(out.result.fired, true);
   assertEquals(
     fake.calls.some((c) =>
-      c.includes("/var/lib/host-net/restore.sh") &&
+      c.includes("/revert/0000000000000000/restore.sh") &&
       c.includes("0000000000000000")
     ),
     true,
@@ -270,4 +300,58 @@ Deno.test("commit refuses without an armed revert", async () => {
     Error,
     "no armed revert",
   );
+});
+
+Deno.test("an arm failure aborts before any network change", async () => {
+  const fake = fakeRun({ armCode: 76 });
+  const m = modelWith(fake);
+  const ctx = createModelTestContext({ globalArgs: {} });
+  await assertRejects(
+    () =>
+      m.methods.apply.execute(
+        m.methods.apply.arguments.parse({ ...NET }),
+        ctx.context as never,
+      ),
+    Error,
+    "already armed",
+  );
+  assertEquals(fake.calls.some((c) => c.includes("'ip' 'link' 'set'")), false);
+  // The real config is never written (only the staged pre-check copy is).
+  assertEquals(
+    fake.calls.some((c) => c.includes("f='/etc/netplan/90-host-net.yaml'")),
+    false,
+  );
+  assertEquals(fake.calls.some((c) => c.includes("superseded")), false);
+  assertEquals(ctx.getWrittenResources().length, 0);
+});
+
+Deno.test("the vaultService object resolves the SSH key", async () => {
+  const fake = fakeRun();
+  const m = createModel({
+    run: fake.run,
+    now: () => 1_760_400_000_000,
+    sleep: () => Promise.resolve(),
+    token: () => "0000000000000000",
+  });
+  const ctx = createModelTestContext({ globalArgs: {} });
+  const calls: [string, string][] = [];
+  (ctx.context as unknown as {
+    vaultService: { get: (v: string, k: string) => Promise<string> };
+  }).vaultService = {
+    get: (v, k) => {
+      calls.push([v, k]);
+      return Promise.resolve("FAKEKEY");
+    },
+  };
+  await m.methods.get.execute(
+    m.methods.get.arguments.parse({
+      ...SSH,
+      backend: "netplan",
+      bridge_type: "linux",
+      management_interface: "enp1s0",
+      revert_after_s: 300,
+    }),
+    ctx.context as never,
+  );
+  assertEquals(calls, [["prod", "host-net-key"]]);
 });

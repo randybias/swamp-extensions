@@ -84,7 +84,8 @@ const BASE: NetConfig = {
   backend: "netplan",
   bridgeType: "linux",
   mode: "additive",
-  managementInterface: "enp1s0",
+  managementChangeAck: false,
+  managementInterface: "eno1",
   ethernets: [{ name: "enp1s0", mtu: 9000 }],
   vlans: [{
     id: 100,
@@ -170,4 +171,22 @@ Deno.test("deviceGraph orders ethernets, VLANs then the bridge", () => {
   });
   assertEquals(graph.map((n) => n.kind), ["ethernet", "vlan", "bridge"]);
   assertEquals(graph.map((n) => n.name), ["enp1s0", "enp1s0.100", "br0"]);
+});
+
+Deno.test("the management interface is protected unless takeover is acknowledged", () => {
+  const withMgmtBridge: NetConfig = {
+    ...BASE,
+    managementInterface: "enp1s0",
+    bridge: { name: "br0", interfaces: ["enp1s0"], mtu: 9000, addresses: [] },
+  };
+  assertThrows(
+    () => validateConfig(withMgmtBridge),
+    HostNetConfigError,
+    "management interface",
+  );
+  validateConfig({
+    ...withMgmtBridge,
+    mode: "takeover",
+    managementChangeAck: true,
+  });
 });

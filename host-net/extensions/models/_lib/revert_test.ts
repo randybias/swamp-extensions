@@ -1,7 +1,11 @@
 import { assertEquals, assertThrows } from "jsr:@std/assert@1.0.19";
 import {
+  renderArmScript,
+  renderDisarmScript,
   renderMarker,
+  renderMarkerReadScript,
   renderRestoreScript,
+  restorePath,
   type RevertContext,
   revertDir,
 } from "./revert.ts";
@@ -12,53 +16,95 @@ const CTX: RevertContext = {
   bridgeType: "ovs",
   created: ["enp1s0.100", "br0"],
   createdBridges: ["br0"],
-  managedFiles: ["/etc/netplan/90-host-net.yaml"],
+  ownedFiles: ["/etc/netplan/90-host-net.yaml"],
+  parentMtus: [{ name: "enp1s0", mtu: 1500 }],
 };
 
-Deno.test("the restore deletes only the created devices and never flushes OVS", () => {
+Deno.test("restore deletes only created devices (bridge first) and never flushes OVS", () => {
   const script = renderRestoreScript(CTX);
-  assertEquals(script.includes('ip link delete dev "$dev"'), true);
-  assertEquals(script.includes(`for dev in 'enp1s0.100' 'br0'`), true);
-  assertEquals(script.includes('ovs-vsctl --if-exists del-br "$br"'), true);
-  assertEquals(script.includes(`for br in 'br0'`), true);
-  // It must never restore or flush the whole database.
+  assertEquals(
+    script.includes(
+      `for dev in 'br0' 'enp1s0.100'; do ip link delete dev "$dev"`,
+    ),
+    true,
+  );
+  assertEquals(script.includes("ovs-vsctl --if-exists del-br"), true);
   assertEquals(script.includes("ovsdb-client"), false);
-  assertEquals(script.includes("del-br --all"), false);
-  assertEquals(script.includes("ip link delete dev enp1s0"), false);
+  assertEquals(script.includes("ip link delete dev 'enp1s0'"), false);
+  // Restores the parent MTU and only the owned file.
+  assertEquals(script.includes("ip link set dev 'enp1s0' mtu 1500"), true);
+  assertEquals(script.includes("/etc/netplan/90-host-net.yaml"), true);
 });
 
-Deno.test("the restore is token-guarded and never reboots", () => {
+Deno.test("restore is token-guarded, fail-closed and never reboots", () => {
   const script = renderRestoreScript(CTX);
-  assertEquals(script.includes("superseded"), true);
-  assertEquals(script.includes("flock -n 9"), true);
+  assertEquals(script.includes("read cur _ <"), true);
+  assertEquals(script.includes('rm -rf "$DIR"'), true);
+  assertEquals(script.includes("trap 'RESULT=fail; write_result' EXIT"), true);
+  assertEquals(script.includes("write_result"), true);
   assertEquals(script.includes("systemctl reboot"), false);
   assertEquals(script.includes("shutdown -r"), false);
-  assertEquals(script.includes("fired_at"), true);
+  // The default-route check must require a non-empty route.
+  assertEquals(script.includes('[ -n "$(ip -j route show default'), true);
 });
 
-Deno.test("marker round-trips and rejects a bad token", () => {
+Deno.test("restore exits non-zero when invoked with the wrong token", () => {
+  const script = renderRestoreScript(CTX);
+  assertEquals(script.includes('[ "${1-}" = "$TOKEN" ]'), true);
+  assertEquals(script.includes("exit 64"), true);
+});
+
+Deno.test("arm script creates state, snapshots owned files, writes the per-token restore and arms", () => {
+  const script = renderArmScript(CTX, {
+    revertAfterS: 300,
+    armedSha256: "a".repeat(64),
+    contentSha256: "b".repeat(64),
+  });
+  assertEquals(script.includes('mkdir -p "/var/lib/host-net"'), true);
+  assertEquals(script.includes("flock 9"), true);
+  assertEquals(script.includes("systemd-run"), true);
+  assertEquals(script.includes(restorePath(CTX.token)), true);
+  assertEquals(script.includes("HOST_NET_RESTORE"), true);
+  assertEquals(script.includes("exit 76"), true);
+  assertEquals(script.includes("/etc/netplan"), true);
+});
+
+Deno.test("arm refuses an invalid sha and honours the token check", () => {
+  assertThrows(
+    () =>
+      renderArmScript(CTX, {
+        revertAfterS: 300,
+        armedSha256: "short",
+        contentSha256: "b".repeat(64),
+      }),
+    Error,
+  );
+  assertThrows(() => revertDir("../etc"), Error);
+});
+
+Deno.test("disarm requires an active timer for commit and is tolerant for abandon", () => {
+  const commit = renderDisarmScript(CTX.token, true);
+  assertEquals(commit.includes("state=$(systemctl is-active"), true);
+  assertEquals(commit.includes("exit 1"), true);
+  assertEquals(
+    commit.includes(`systemctl stop "host-net-revert-${CTX.token}.service"`),
+    true,
+  );
+  const abandon = renderDisarmScript(CTX.token, false);
+  assertEquals(abandon.includes("exit 1"), false);
+  assertEquals(abandon.includes("2>/dev/null || true"), true);
+});
+
+Deno.test("marker round-trips; the read script only cats the current marker", () => {
   const marker = {
     token: CTX.token,
-    armed_at: 1,
     expires_at: 2,
     armed_sha256: "a".repeat(64),
+    content_sha256: "b".repeat(64),
     created: CTX.created,
     result: "pending" as const,
     fired_at: null,
   };
   assertEquals(JSON.parse(renderMarker(marker)).token, CTX.token);
-  assertThrows(() => revertDir("../etc"), Error);
-  assertThrows(() => renderMarker({ ...marker, token: "short" }), Error);
-});
-
-Deno.test("networkd restore removes only the managed prefix and restores the snapshot", () => {
-  const script = renderRestoreScript({
-    ...CTX,
-    backend: "networkd",
-    bridgeType: "linux",
-    createdBridges: [],
-  });
-  assertEquals(script.includes("90-host-net-*"), true);
-  assertEquals(script.includes("networkctl reload"), true);
-  assertEquals(script.includes("netplan apply"), false);
+  assertEquals(renderMarkerReadScript().includes("cat"), true);
 });

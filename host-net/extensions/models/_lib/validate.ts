@@ -208,6 +208,8 @@ export interface NetConfig {
   bridgeType: "linux" | "ovs";
   /** Whether the change may move management addressing. */
   mode: "additive" | "takeover";
+  /** Explicit acknowledgement for a takeover that touches management. */
+  managementChangeAck: boolean;
   /** Name of the interface carrying the SSH session and default route. */
   managementInterface: string;
   /** Physical NICs. */
@@ -245,6 +247,20 @@ export function validateConfig(cfg: NetConfig): void {
   if (cfg.backend === "networkd" && cfg.bridgeType !== "linux") {
     throw new HostNetConfigError(
       "backend networkd supports only linux bridges",
+    );
+  }
+  // Enslaving the management interface, or changing its MTU, may drop the SSH
+  // session; it needs an explicit takeover and acknowledgement.
+  const mgmt = cfg.managementInterface;
+  const mgmtEth = cfg.ethernets.find((e) => e.name === mgmt);
+  const mgmtEnslaved = cfg.bridge?.interfaces.includes(mgmt) ?? false;
+  const mgmtMtu = mgmtEth?.mtu !== undefined;
+  if (
+    (mgmtEnslaved || mgmtMtu) &&
+    !(cfg.mode === "takeover" && cfg.managementChangeAck)
+  ) {
+    throw new HostNetConfigError(
+      "the change touches the management interface; use mode takeover with management_change_ack",
     );
   }
   const names = new Set<string>();

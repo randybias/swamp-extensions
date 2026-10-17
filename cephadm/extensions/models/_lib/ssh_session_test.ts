@@ -1,48 +1,47 @@
 /**
- * Tests for the cephadm session layer: TOFU pin learning and persistence.
+ * Tests for the cephadm session layer: error classification, the default
+ * timeout, the mutually-exclusive key sources, and TOFU pin persistence.
  *
  * @module
  */
 
-import { assertEquals } from "jsr:@std/assert@1.0.19";
+import {
+  assertEquals,
+  assertRejects,
+  assertThrows,
+} from "jsr:@std/assert@1.0.19";
+import type { CommandRunner, RunOptions } from "./ssh.ts";
+import { LocalRefusalError, PhaseError } from "./errors.ts";
 import {
   openSession,
   type SessionContext,
-  type Spawner,
   type SshDeps,
   toTarget,
 } from "./ssh_session.ts";
+import { runStep } from "./ssh_session.ts";
 
-const encoder = new TextEncoder();
 const BLOB = "AAAAC3NzaC1lZDI1NTE5AAAAIFakeKey";
+const KEY_LINE = `192.0.2.10 ssh-ed25519 ${BLOB}`;
 
-function fakeSpawner(
-  handler: (
-    cmd: string,
-    command: string,
-  ) => { code: number; stdout: string; stderr: string },
-): { spawn: Spawner; scans: () => number } {
-  let scans = 0;
-  const spawn: Spawner = (cmd, args) => {
-    const command = args.at(-1) ?? "";
-    if (cmd === "ssh-keyscan") scans++;
-    return {
-      stdin: new WritableStream<Uint8Array>({
-        write() {},
-        close() {},
-      }),
-      output: () => {
-        const r = handler(cmd, command);
-        return Promise.resolve({
-          code: r.code,
-          stdout: encoder.encode(r.stdout),
-          stderr: encoder.encode(r.stderr),
-        });
-      },
-      kill: () => {},
-    };
+interface Call {
+  cmd: string;
+  args: string[];
+  options: RunOptions;
+}
+
+function fakeRunner(
+  handler: (cmd: string, args: string[], options: RunOptions) => {
+    code: number;
+    stdout: string;
+    stderr: string;
+  },
+): { run: CommandRunner; calls: Call[] } {
+  const calls: Call[] = [];
+  const run: CommandRunner = (cmd, args, options = {}) => {
+    calls.push({ cmd, args, options });
+    return Promise.resolve(handler(cmd, args, options));
   };
-  return { spawn, scans: () => scans };
+  return { run, calls };
 }
 
 function storeContext(): {
@@ -78,65 +77,141 @@ const REQUEST = {
   host_keys: null,
 };
 
-Deno.test("openSession learns and persists pins on first insecure_tofu use", async () => {
-  const fake = fakeSpawner((cmd, command) =>
-    cmd === "ssh-keyscan"
-      ? { code: 0, stdout: `${command} ssh-ed25519 ${BLOB}\n`, stderr: "" }
-      : { code: 0, stdout: "ok", stderr: "" }
-  );
+Deno.test("a mid-session reset or auth failure is outcome-unknown and not re-sent", async () => {
+  for (
+    const stderr of [
+      "Read from remote host 192.0.2.10: Connection reset by peer",
+      "client_loop: send disconnect: Connection reset by peer",
+      "admin@192.0.2.10: Permission denied (publickey).",
+    ]
+  ) {
+    const fake = fakeRunner((cmd) =>
+      cmd === "ssh"
+        ? { code: 255, stdout: "", stderr }
+        : { code: 0, stdout: "", stderr: "" }
+    );
+    const deps: SshDeps = {
+      run: fake.run,
+      now: () => 0,
+      sleep: () => Promise.resolve(),
+    };
+    const { context } = storeContext();
+    const session = await openSession(
+      deps,
+      toTarget({
+        ...REQUEST,
+        host_key_policy: "strict",
+        host_keys: [KEY_LINE],
+      }),
+      context,
+    );
+    let error: unknown;
+    try {
+      await runStep(
+        { sleep: deps.sleep },
+        session,
+        { command: "true", phase: "t", resend: "dropped" },
+      );
+    } catch (e) {
+      error = e;
+    }
+    assertEquals(error instanceof PhaseError, true, stderr);
+    assertEquals(
+      fake.calls.filter((c) => c.cmd === "ssh").length,
+      1,
+      "exactly one ssh spawn",
+    );
+  }
+});
+
+Deno.test("a call without budgetMs keeps the 30s + 5s default timeout", async () => {
+  const fake = fakeRunner(() => ({ code: 0, stdout: "", stderr: "" }));
   const deps: SshDeps = {
-    spawn: fake.spawn,
+    run: fake.run,
+    now: () => 0,
+    sleep: () => Promise.resolve(),
+  };
+  const { context } = storeContext();
+  const session = await openSession(
+    deps,
+    toTarget({ ...REQUEST, host_key_policy: "strict", host_keys: [KEY_LINE] }),
+    context,
+  );
+  await session.run({ command: "true" });
+  assertEquals(fake.calls[0].options.timeoutMs, 35_000);
+  await session.run({ command: "true", budgetMs: 1_000 });
+  assertEquals(fake.calls[1].options.timeoutMs, 6_000);
+});
+
+Deno.test("toTarget refuses keyPath and privateKey together", () => {
+  assertThrows(
+    () =>
+      toTarget({
+        ...REQUEST,
+        keyPath: "/home/admin/.ssh/id",
+        privateKey: "KEY\n",
+      }),
+    LocalRefusalError,
+    "exactly one",
+  );
+  assertThrows(
+    () => toTarget({ ...REQUEST, host_key_policy: undefined as never }),
+    LocalRefusalError,
+    "host_key_policy",
+  );
+});
+
+Deno.test("openSession learns once, persists after the first run, then reuses", async () => {
+  const fake = fakeRunner((cmd, args) => {
+    if (cmd === "ssh-keyscan") {
+      return {
+        code: 0,
+        stdout: `${args.at(-1)} ssh-ed25519 ${BLOB}\n`,
+        stderr: "",
+      };
+    }
+    return { code: 0, stdout: "ok", stderr: "" };
+  });
+  const deps: SshDeps = {
+    run: fake.run,
     now: () => 0,
     sleep: () => Promise.resolve(),
   };
   const { context, written } = storeContext();
   const session = await openSession(deps, toTarget(REQUEST), context);
+  assertEquals(written.length, 0, "nothing persisted before the run");
   const res = await session.run({ command: "true" });
   assertEquals(res.stdout, "ok");
-  assertEquals(fake.scans(), 1);
+  assertEquals(fake.calls.filter((c) => c.cmd === "ssh-keyscan").length, 1);
   assertEquals(written.length, 1);
-  assertEquals(written[0].specName, "hostkeys");
   assertEquals(written[0].name, "hostkeys-192.0.2.10-22");
-  const pins = written[0].data.host_keys as string[];
-  assertEquals(pins[0].startsWith("192.0.2.10 "), true);
-  // A recorded pin is re-verified, never re-learned.
+  // The second session reads the persisted pin and makes no keyscan.
   const session2 = await openSession(deps, toTarget(REQUEST), context);
   await session2.run({ command: "true" });
-  assertEquals(fake.scans(), 1, "the stored pin is reused");
-});
-
-Deno.test("toTarget requires a host-key policy", () => {
-  let threw = false;
-  try {
-    toTarget({ ...REQUEST, host_key_policy: undefined as never });
-  } catch {
-    threw = true;
-  }
-  assertEquals(threw, true);
+  assertEquals(fake.calls.filter((c) => c.cmd === "ssh-keyscan").length, 1);
 });
 
 Deno.test("openSession refuses a bare pin before any connection", async () => {
-  const fake = fakeSpawner(() => ({ code: 0, stdout: "", stderr: "" }));
+  const fake = fakeRunner(() => ({ code: 0, stdout: "", stderr: "" }));
   const deps: SshDeps = {
-    spawn: fake.spawn,
+    run: fake.run,
     now: () => 0,
     sleep: () => Promise.resolve(),
   };
   const { context } = storeContext();
-  let message = "";
-  try {
-    await openSession(
-      deps,
-      toTarget({
-        ...REQUEST,
-        host_key_policy: "strict",
-        host_keys: [`ssh-ed25519 ${BLOB}`],
-      }),
-      context,
-    );
-  } catch (e) {
-    message = (e as Error).message;
-  }
-  assertEquals(message.includes("must name its host"), true);
-  assertEquals(fake.scans(), 0);
+  await assertRejects(
+    () =>
+      openSession(
+        deps,
+        toTarget({
+          ...REQUEST,
+          host_key_policy: "strict",
+          host_keys: [`ssh-ed25519 ${BLOB}`],
+        }),
+        context,
+      ),
+    LocalRefusalError,
+    "must name its host",
+  );
+  assertEquals(fake.calls.length, 0);
 });

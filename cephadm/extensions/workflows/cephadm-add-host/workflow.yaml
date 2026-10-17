@@ -17,10 +17,16 @@ inputs:
       type: string
       default: ""
       description: Absolute local path to a private key; empty uses the runner default
-    strictHostKeyChecking:
+    host_key_policy:
       type: string
-      enum: ["yes", "no"]
-      description: Host-key policy, yes strict or no explicitly insecure
+      enum: ["strict", "insecure_tofu"]
+      description: Host-key policy; strict requires host_keys
+    host_keys:
+      type: array
+      items:
+        type: string
+      default: []
+      description: ssh-keyscan host keys, each naming its host; required for strict
     fsid:
       type: string
       description: Expected cluster fsid, an RFC 4122 UUID
@@ -34,7 +40,7 @@ inputs:
     - adminHost
     - port
     - sshUser
-    - strictHostKeyChecking
+    - host_key_policy
     - fsid
     - host
     - addr
@@ -66,7 +72,9 @@ jobs:
             port: ${{ inputs.port }}
             sshUser: ${{ inputs.sshUser }}
             keyPath: '${{ inputs.keyPath == "" ? dyn(null) : dyn(inputs.keyPath) }}'
-            strictHostKeyChecking: ${{ inputs.strictHostKeyChecking }}
+            host_key_policy: ${{ inputs.host_key_policy }}
+
+            host_keys: ${{ inputs.host_keys }}
             fsid: ${{ inputs.fsid }}
             host: ${{ inputs.host }}
             addr: ${{ inputs.addr }}
@@ -88,7 +96,9 @@ jobs:
             port: ${{ inputs.port }}
             sshUser: ${{ inputs.sshUser }}
             keyPath: '${{ inputs.keyPath == "" ? dyn(null) : dyn(inputs.keyPath) }}'
-            strictHostKeyChecking: ${{ inputs.strictHostKeyChecking }}
+            host_key_policy: ${{ inputs.host_key_policy }}
+
+            host_keys: ${{ inputs.host_keys }}
       - name: assert-host-present
         description: Assert the host list contains the registered hostname
         dependsOn:

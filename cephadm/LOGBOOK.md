@@ -778,3 +778,34 @@ its host; a bare `type blob` line is refused. The call-site changes were
 import-only plus the session construction (the earlier 46-site map); the command
 strings are unchanged, so the rendered scripts and remote command text are
 byte-identical and only the transport args differ (the `sh -c` wrapper).
+
+## Prior art sweep
+
+No published Swamp package covers cephadm, Rook or Ceph cluster operations (a
+sweep of the registry found none). The closest is `@dataverket/versitygw`, which
+is an S3 gateway reader and does not manage hosts, disks or a Ceph cluster. This
+extension therefore stands alone.
+
+## Transport review (132d036) fixes
+
+- Retry safety: every canonical `SshError` except its typed timeout maps to
+  `TransportError` kind "other", cause null; none is classified from message
+  text, so a mid-session reset or auth failure is outcome-unknown and is never
+  re-sent. Tests cover reset/reset/auth and assert exactly one ssh spawn.
+  Requires a typed pre-auth kind upstream to ever retry safely again.
+- Default timeout: a call without `budgetMs` uses the old 30s budget + 5s grace
+  (35s), so a hung disk or remote cannot hang the method.
+- Canonical seam: the session layer takes the canonical `CommandRunner` and
+  `denoRunner`; the bespoke spawn bridge, its dead truncation branch and
+  `killGraceMs` are gone. Tests inject a `CommandRunner`.
+- `toTarget` refuses `keyPath` + `privateKey` together.
+- `readResource` is required on both `MethodContext` and `SessionContext`; TOFU
+  pins are persisted only after the first authenticated command runs. A model
+  test runs a method twice and asserts one keyscan, then zero and the stored
+  pin.
+- The 2026.10.17.3 migration is identity (SSH fields are method inputs, not
+  stored attributes); the description says so, and the bundled workflows now
+  pass `host_key_policy`/`host_keys`. A catalog test checks every step input key
+  against its method's strict schema.
+- `HostKeysSchema` is bounded; the release note cites blob 8f132c43 and notes
+  `-F /dev/null` ignores `~/.ssh/config`.

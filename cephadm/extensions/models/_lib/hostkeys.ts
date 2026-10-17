@@ -16,12 +16,12 @@ import { isHostKeyLine } from "./validate.ts";
 
 /** One pinned set of host keys for a host and port. */
 export const HostKeysSchema = z.strictObject({
-  host: z.string(),
+  host: z.string().max(253),
   port: z.number().int().min(1).max(65535),
   host_keys: z.array(
-    z.string().refine(isHostKeyLine, "an ssh-keyscan line"),
-  ),
-  learned_at: z.string(),
+    z.string().max(8192).refine(isHostKeyLine, "an ssh-keyscan line"),
+  ).min(1).max(64),
+  learned_at: z.string().max(64),
 });
 
 /** A persisted host-key pin. */

@@ -17,6 +17,7 @@
 
 import { assert, assertEquals } from "jsr:@std/assert@1.0.19";
 import { Environment } from "npm:@marcbachmann/cel-js@7.6.1";
+import { model } from "../models/cephadm.ts";
 
 /** A JSON-like parsed YAML object. */
 type Json = Record<string, unknown>;
@@ -268,7 +269,10 @@ function synthValue(name: string, schema: Json): unknown {
   if (name === "monIp" || name === "addr") return "192.0.2.10";
   if (name === "publicNet" || name === "clusterNet") return "192.0.2.0/24";
   if (name === "sshUser" || name === "adminUsername") return "root";
-  if (name === "strictHostKeyChecking") return "yes";
+  if (name === "host_key_policy") return "strict";
+  if (name === "host_keys") {
+    return ["192.0.2.10 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFakeKey"];
+  }
   if (name === "scheme") return "replicated";
   if (name === "cephImage") return "registry.example.com/ceph/ceph:v19.2.1";
   return "example";
@@ -356,14 +360,60 @@ for (const { rel, doc } of catalog) {
     assert(required.includes("port"), "port must be required");
     assert(required.includes("sshUser"), "sshUser must be required");
     assert(
-      required.includes("strictHostKeyChecking"),
-      "strictHostKeyChecking must be required",
+      required.includes("host_key_policy"),
+      "host_key_policy must be required",
     );
     assertEquals(
-      asObj(props.strictHostKeyChecking).enum,
-      ["yes", "no"],
-      "strictHostKeyChecking enum must be exactly yes/no",
+      asObj(props.host_key_policy).enum,
+      ["strict", "insecure_tofu"],
+      "host_key_policy enum must be exactly strict/insecure_tofu",
     );
+    assert("host_keys" in props, "host_keys input missing");
+    assertEquals(
+      asObj(props.host_keys).type,
+      "array",
+      "host_keys must be an array",
+    );
+  });
+
+  Deno.test(`${label}: every step input key is a method argument`, () => {
+    const methods = model.methods as unknown as Record<
+      string,
+      {
+        arguments: {
+          shape: Record<
+            string,
+            { safeParse: (v: unknown) => { success: boolean } }
+          >;
+        };
+      }
+    >;
+    for (const { step } of steps(doc)) {
+      const t = task(step);
+      if (asStr(t.type) !== "model_method") continue;
+      const methodName = asStr(t.methodName);
+      const method = methods[methodName];
+      assert(method !== undefined, `unknown method ${methodName}`);
+      const shape = method.arguments.shape;
+      const inputs = asObj(t.inputs);
+      for (const key of Object.keys(inputs)) {
+        assert(
+          key in shape,
+          `${name}: step ${
+            asStr(step.name)
+          } passes unknown input ${key} to ${methodName}`,
+        );
+      }
+      for (const [key, field] of Object.entries(shape)) {
+        if (field.safeParse(undefined).success) continue; // optional or defaulted
+        assert(
+          key in inputs,
+          `${name}: step ${
+            asStr(step.name)
+          } omits required ${key} for ${methodName}`,
+        );
+      }
+    }
   });
 
   Deno.test(`${label}: every instance is cephadm or a per-item cephadm-* `, () => {

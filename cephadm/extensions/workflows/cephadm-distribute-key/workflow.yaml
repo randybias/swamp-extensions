@@ -17,10 +17,16 @@ inputs:
       type: string
       default: ""
       description: Absolute local path to a private key; empty uses the runner default
-    strictHostKeyChecking:
+    host_key_policy:
       type: string
-      enum: ["yes", "no"]
-      description: Host-key policy, yes strict or no explicitly insecure
+      enum: ["strict", "insecure_tofu"]
+      description: Host-key policy; strict requires host_keys
+    host_keys:
+      type: array
+      items:
+        type: string
+      default: []
+      description: ssh-keyscan host keys, each naming its host; required for strict
     cephPubKey:
       type: string
       description: Cluster public key line to install, keytype and blob only
@@ -39,7 +45,7 @@ inputs:
     - adminHost
     - port
     - sshUser
-    - strictHostKeyChecking
+    - host_key_policy
     - cephPubKey
     - hosts
 jobs:
@@ -104,7 +110,9 @@ jobs:
           inputs:
             sshUser: ${{ inputs.sshUser }}
             keyPath: '${{ inputs.keyPath == "" ? dyn(null) : dyn(inputs.keyPath) }}'
-            strictHostKeyChecking: ${{ inputs.strictHostKeyChecking }}
+            host_key_policy: ${{ inputs.host_key_policy }}
+
+            host_keys: ${{ inputs.host_keys }}
             cephPubKey: ${{ inputs.cephPubKey }}
             hosts: ${{ inputs.hosts }}
   - name: prove-key
@@ -124,7 +132,9 @@ jobs:
             port: ${{ inputs.port }}
             sshUser: ${{ inputs.sshUser }}
             keyPath: '${{ inputs.keyPath == "" ? dyn(null) : dyn(inputs.keyPath) }}'
-            strictHostKeyChecking: ${{ inputs.strictHostKeyChecking }}
+            host_key_policy: ${{ inputs.host_key_policy }}
+
+            host_keys: ${{ inputs.host_keys }}
             hosts: ${{ inputs.hosts.map(h, h.host) }}
             cephPubKey: ${{ inputs.cephPubKey }}
             throwOnFail: false
@@ -164,7 +174,9 @@ jobs:
             port: ${{ inputs.port }}
             sshUser: ${{ inputs.sshUser }}
             keyPath: '${{ inputs.keyPath == "" ? dyn(null) : dyn(inputs.keyPath) }}'
-            strictHostKeyChecking: ${{ inputs.strictHostKeyChecking }}
+            host_key_policy: ${{ inputs.host_key_policy }}
+
+            host_keys: ${{ inputs.host_keys }}
             hostName: ${{ self.hostItem.host }}
   - name: assert-hosts
     description: Assert cephadm reachability from the per-item check records

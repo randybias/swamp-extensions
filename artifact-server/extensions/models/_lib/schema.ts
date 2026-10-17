@@ -274,6 +274,9 @@ export const InstallArgs = RenderConfigArgs.extend({
  */
 export const MAX_INLINE_BYTES = 134217728;
 
+/** The largest base64 string that decodes to {@link MAX_INLINE_BYTES}. */
+export const MAX_BASE64_CHARS = 4 * Math.ceil(MAX_INLINE_BYTES / 3);
+
 /** The upload argument. */
 export const UploadArgsSchema = z.strictObject({
   ...CommonArgs,
@@ -285,8 +288,8 @@ export const UploadArgsSchema = z.strictObject({
     .nullish().describe(
       "UTF-8 content, held in memory by swamp. Cap 128 MiB; larger artifacts must use fetch.",
     ),
-  content_base64: z.string().max(178956971).meta({ sensitive: true }).nullish()
-    .describe(
+  content_base64: z.string().max(MAX_BASE64_CHARS).meta({ sensitive: true })
+    .nullish().describe(
       "Base64 content, for binary payloads. Cap 128 MiB decoded; larger artifacts must use fetch.",
     ),
   sha256: z.string().regex(SHA256_RE).nullish().describe(

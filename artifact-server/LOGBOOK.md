@@ -175,13 +175,17 @@ After the review rounds, one deliberate simplification pass:
   best-effort systemd mask) block the service start during the package install,
   the managed config is written after, and a post-start `ss` check fails the
   install if nginx left a wildcard listener on a port we did not configure.
-- Inline `upload` is capped at 128 MiB (schema and run time); larger artifacts
-  must use the host-side pinned `fetch`, which never puts the bytes on the
-  control host.
+- The mask also blocks the package from enabling nginx, so after the config is
+  in place install runs `systemctl enable nginx`, starts or reloads it, and
+  asserts `systemctl is-enabled nginx`; the service now survives a reboot.
+- Inline `upload` is capped at 128 MiB (schema and run time), with the base64
+  cap computed as `4*ceil(N/3)`; larger artifacts must use the host-side pinned
+  `fetch`, which never puts the bytes on the control host.
 - `uninstall` restores the package default site that `install` removed, using
-  the snapshot recorded in the `config` resource.
-- `prune` removes an emptied hash directory and refuses a symlinked hash
-  directory with a clear error instead of silently skipping it.
+  the snapshot recorded in the `config` resource, and only when it is currently
+  absent, so a second uninstall is a no-op.
+- `prune` removes an emptied hash directory and refuses a symlinked entry under
+  `sha256/` or `bundles/` with a clear error instead of silently skipping it.
 - A rolled-back install removes the served root when the model created it.
 
 ## Open spec questions resolved by the simplest safe option

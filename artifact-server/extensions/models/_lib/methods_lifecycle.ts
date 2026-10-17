@@ -230,7 +230,13 @@ export const lifecycleMethods: Record<string, ArtifactServerMethod> = {
         default_site_content?: string | null;
       } | null;
       let defaultRestored = false;
-      if (stored?.removed_default_site) {
+      const defaultNow = await probeFile(
+        activeDeps,
+        target,
+        NGINX_DEFAULT_SITE,
+        true,
+      );
+      if (stored?.removed_default_site && defaultNow.state === "missing") {
         const snap: LinkSnap = stored.default_site_target != null
           ? {
             path: NGINX_DEFAULT_SITE,

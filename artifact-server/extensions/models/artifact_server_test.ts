@@ -12,6 +12,7 @@ import {
 } from "./_lib/test_support.ts";
 import { sha256Hex } from "./_lib/ssh.ts";
 import { BUNDLE_DIR, SHA256SUMS_FILE, treeHash } from "./_lib/layout.ts";
+import { MAX_BASE64_CHARS, MAX_INLINE_BYTES } from "./_lib/schema.ts";
 import { NGINX_ENABLED_PATH, NGINX_SITE_PATH } from "./_lib/nginx.ts";
 
 Deno.test("the model type, version and empty global arguments are as specified", () => {
@@ -571,4 +572,9 @@ Deno.test("upload refuses content over max_upload_bytes at run time", async () =
     context,
   );
   assertEquals((ok.result as { sha256: string }).sha256.length, 64);
+});
+
+Deno.test("the base64 cap decodes to the inline byte cap", () => {
+  assertEquals(MAX_BASE64_CHARS, 4 * Math.ceil(MAX_INLINE_BYTES / 3));
+  assertEquals(MAX_BASE64_CHARS, 178956972);
 });

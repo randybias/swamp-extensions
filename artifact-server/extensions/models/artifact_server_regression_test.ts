@@ -1,6 +1,6 @@
 import { assertEquals, assertRejects } from "jsr:@std/assert@1.0.19";
 import { makeFakeRemote } from "./_lib/fake_remote.ts";
-import { base, modelFor, ROOT, SITE_ARGS } from "./_lib/test_support.ts";
+import { base, modelFor, ROOT, seed, SITE_ARGS } from "./_lib/test_support.ts";
 import { SHA256SUMS_FILE } from "./_lib/layout.ts";
 import { sha256Hex } from "./_lib/ssh.ts";
 import {
@@ -117,7 +117,7 @@ Deno.test("prune refuses a symlinked hash directory and deletes nothing", async 
   await assertRejects(
     () => m.methods.plan_prune.execute(base(), context),
     Error,
-    "symlinked hash directories",
+    "symlinked object directories",
   );
   assertEquals(host.files.has(`${ROOT}/sha256/${orphan}/data`), true);
 });
@@ -393,4 +393,76 @@ Deno.test("uninstall restores the default site install removed", async () => {
     true,
   );
   assertEquals(host.files.get(NGINX_DEFAULT_SITE)?.content, "default site\n");
+});
+
+Deno.test("install enables nginx at boot and asserts it", async () => {
+  const host = makeFakeRemote();
+  const { m, context } = modelFor(host);
+  await m.methods.install.execute(
+    base({ ...SITE_ARGS, tls: { mode: "none", plaintext_ack: true } }),
+    context,
+  );
+  assertEquals(host.nginxEnabled, true);
+  assertEquals(
+    host.commands.some((c) => c.includes("argv:systemctl is-enabled nginx")),
+    true,
+  );
+});
+
+Deno.test("install fails when nginx cannot be enabled at boot", async () => {
+  const host = makeFakeRemote();
+  host.failEnable = true;
+  const { m, context } = modelFor(host);
+  await assertRejects(
+    () =>
+      m.methods.install.execute(
+        base({ ...SITE_ARGS, tls: { mode: "none", plaintext_ack: true } }),
+        context,
+      ),
+    Error,
+    "could not enable nginx at boot",
+  );
+});
+
+Deno.test("a second uninstall does not restore the default site again", async () => {
+  const host = makeFakeRemote();
+  host.setFile(NGINX_DEFAULT_SITE, "default site\n", "644");
+  const { m, context } = modelFor(host);
+  await m.methods.install.execute(
+    base({
+      ...SITE_ARGS,
+      tls: { mode: "none", plaintext_ack: true },
+      disable_default_site: true,
+    }),
+    context,
+  );
+  const first = await m.methods.uninstall.execute(base(), context);
+  assertEquals(
+    (first.result as { default_site_restored: boolean })
+      .default_site_restored,
+    true,
+  );
+  host.commands.length = 0;
+  const second = await m.methods.uninstall.execute(base(), context);
+  assertEquals(
+    (second.result as { default_site_restored: boolean })
+      .default_site_restored,
+    false,
+  );
+  assertEquals(
+    host.commands.some((c) => c.includes("argv:systemctl reload")),
+    false,
+  );
+});
+
+Deno.test("prune refuses a symlink under bundles/", async () => {
+  const host = makeFakeRemote();
+  await seed(host);
+  host.symlinks.add(`${ROOT}/bundles/${"e".repeat(64)}`);
+  const { m, context } = modelFor(host);
+  await assertRejects(
+    () => m.methods.plan_prune.execute(base(), context),
+    Error,
+    "symlinked object directories",
+  );
 });

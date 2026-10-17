@@ -64,8 +64,9 @@ workflow resume with overridden inputs cannot skip a gate:
   directory holding that sentinel.
 - `install` never lets the package default site come up: it blocks service
   starts (`policy-rc.d` and a systemd mask) while the package is installed, and
-  only then writes the managed config and the enabled link. After starting or
-  reloading it checks with `ss` that nginx added no wildcard listener on a port
+  only then writes the managed config and the enabled link. It then enables
+  nginx at boot (`systemctl enable`), starts or reloads it, asserts it is
+  enabled, and checks with `ss` that nginx added no wildcard listener on a port
   the install did not configure.
 - `install` snapshots the site file, the enabled link, the default site, the TLS
   files and the htpasswd before it changes anything. Any failure after the
@@ -77,9 +78,9 @@ workflow resume with overridden inputs cannot skip a gate:
   temp files are never served.
 - Object paths read back from the host must match `sha256/<64-hex>/<name>` or
   `bundles/<64-hex>`; anything else is ignored. `prune` refuses to run when
-  `sha256/`, `bundles/` or a hash directory is a symlink, so a planted link
-  cannot redirect `rm` outside the root, and it removes a hash directory once
-  its last blob is gone.
+  `sha256/` or `bundles/` holds a symlinked entry, so a planted link cannot
+  redirect `rm` outside the root, and it removes a hash directory once its last
+  blob is gone.
 - `upload` refuses when the computed hash differs from a supplied `sha256`, and
   caps inline content at 128 MiB; larger artifacts use `fetch`.
 - `fetch` is idempotent (a present object is not downloaded again), stays on
@@ -88,8 +89,8 @@ workflow resume with overridden inputs cannot skip a gate:
 - `prune` recomputes the plan and refuses when it differs from `plan_sha256`; a
   change since planning deletes nothing.
 - `uninstall` is a clean no-op when the site is absent, removes the site's TLS
-  files and htpasswd, restores the default site `install` removed, and never
-  removes the nginx package.
+  files and htpasswd, restores the default site `install` removed (once), and
+  never removes the nginx package.
 
 `SHA256SUMS` is rebuilt under an exclusive `flock` from the blob paths present
 and renamed into place: each line records the content address in the path, not a

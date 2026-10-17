@@ -319,9 +319,11 @@ export async function rollbackInstall(
 }
 
 /**
- * Proves the rendered config with `nginx -t`, starts nginx when it is not yet
- * running (or reloads it), then fails if a wildcard nginx listener appeared on
- * a port this install did not configure.
+ * Proves the rendered config with `nginx -t`, enables nginx at boot, starts or
+ * reloads it, asserts it is enabled, then fails if a wildcard nginx listener
+ * appeared on a port this install did not configure. The mask installNginx used
+ * to keep the default site down also blocks the package from enabling nginx, so
+ * enabling here is what makes the service survive a reboot.
  */
 export async function verifyAndReload(
   deps: SshDeps,
@@ -335,6 +337,10 @@ export async function verifyAndReload(
       `nginx -t failed on the rendered config: ${test.stderr.slice(0, 300)}`,
     );
   }
+  const enable = await execSudo(deps, target, ["systemctl", "enable", "nginx"]);
+  if (enable.exit_code !== 0) {
+    throw new SshError("could not enable nginx at boot");
+  }
   const active = await execSudo(deps, target, [
     "systemctl",
     "is-active",
@@ -344,6 +350,21 @@ export async function verifyAndReload(
   const action = active.exit_code === 0 ? "reload" : "start";
   const started = await execSudo(deps, target, ["systemctl", action, "nginx"]);
   if (started.exit_code !== 0) throw new SshError(`nginx ${action} failed`);
+  const enabled = await execSudo(deps, target, [
+    "systemctl",
+    "is-enabled",
+    "nginx",
+  ]);
+  if (
+    enabled.exit_code !== 0 ||
+    /^(disabled|masked)/m.test(enabled.stdout.trim())
+  ) {
+    throw new SshError(
+      `nginx is not enabled at boot: ${
+        enabled.stdout.trim() || enabled.stderr.trim()
+      }`,
+    );
+  }
   const after = await nginxWildcardPorts(deps, target);
   const offenders = [...after].filter((p) =>
     !before.has(p) && !allowed.includes(p)

@@ -17,6 +17,7 @@ import {
   BLOB_DIR,
   BLOB_REL_ERE,
   BLOB_REL_RE,
+  BUNDLE_DIR,
   LOCK_FILE,
   REFS_DIR,
   SHA256SUMS_FILE,
@@ -113,7 +114,7 @@ export function removeObjectsScript(root: string, paths: string[]): string {
  * and the glob loops skip such entries, so without this a planted link would be
  * quietly ignored rather than reported.
  */
-export async function assertNoSymlinkedHashDirs(
+export async function assertNoSymlinkedObjectDirs(
   deps: SshDeps,
   target: SshTarget,
   root: string,
@@ -122,14 +123,14 @@ export async function assertNoSymlinkedHashDirs(
   const result = await runScript(
     deps,
     target,
-    `r=${r}\nfind "$r/${BLOB_DIR}" -mindepth 1 -maxdepth 1 -type l 2>/dev/null`,
+    `r=${r}\nfind "$r/${BLOB_DIR}" "$r/${BUNDLE_DIR}" -mindepth 1 -maxdepth 1 -type l 2>/dev/null`,
   );
   const offenders = result.stdout.split("\n").map((l) => l.trim()).filter(
     Boolean,
   );
   if (offenders.length > 0) {
     throw new SshError(
-      `refusing to prune: symlinked hash directories present: ${
+      `refusing to prune: symlinked object directories present: ${
         offenders.join(", ")
       }`,
     );

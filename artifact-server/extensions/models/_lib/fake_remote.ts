@@ -58,6 +58,10 @@ export interface FakeRemote {
   ssOutput: string;
   /** `ss` output to adopt once nginx (re)starts. */
   ssOutputAfter: string;
+  /** Whether `systemctl is-enabled nginx` reports enabled. */
+  nginxEnabled: boolean;
+  /** When true, `systemctl enable nginx` fails. */
+  failEnable: boolean;
   /** Supplies a body for a fetched URL, or null for a 404. */
   curl: (url: string) => string | null;
   /** Certificate `notBefore` line returned by the fake openssl. */
@@ -142,6 +146,8 @@ export function makeFakeRemote(): FakeRemote {
     failArgv: () => false,
     ssOutput: "",
     ssOutputAfter: "",
+    nginxEnabled: true,
+    failEnable: false,
     curl: () => null,
     certNotBefore: "notBefore=Jan  1 00:00:00 2020 GMT",
     certNotAfter: "notAfter=Jan  1 00:00:00 2100 GMT",
@@ -228,6 +234,18 @@ async function handle(
       return host.failNginxTest
         ? { code: 1, stdout: "", stderr: "nginx: configuration test failed" }
         : ok("nginx: configuration test is successful\n");
+    }
+    if (argv[0] === "systemctl" && argv[1] === "enable") {
+      if (host.failEnable) {
+        return { code: 1, stdout: "", stderr: "enable failed" };
+      }
+      host.nginxEnabled = true;
+      return ok();
+    }
+    if (argv[0] === "systemctl" && argv[1] === "is-enabled") {
+      return host.nginxEnabled
+        ? ok("enabled\n")
+        : { code: 1, stdout: "disabled\n", stderr: "" };
     }
     if (
       argv[0] === "systemctl" && (argv[1] === "reload" || argv[1] === "start")
@@ -423,10 +441,15 @@ async function handle(
   if (/^if \[ -L /.test(script)) return ok();
   if (/maxdepth 1 -type l/.test(script)) {
     const r = assign(script, "r")!;
-    const prefix = `${r}/sha256/`;
-    const links = [...host.symlinks].filter((p) =>
-      p.startsWith(prefix) && !p.slice(prefix.length).includes("/")
-    );
+    const links = [...host.symlinks].filter((p) => {
+      for (const dir of ["sha256", "bundles"]) {
+        const prefix = `${r}/${dir}/`;
+        if (p.startsWith(prefix) && !p.slice(prefix.length).includes("/")) {
+          return true;
+        }
+      }
+      return false;
+    });
     return ok(links.length ? `${links.join("\n")}\n` : "");
   }
   if (/^mkdir -p /.test(script)) {

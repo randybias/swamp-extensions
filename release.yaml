@@ -4,6 +4,11 @@
 #   ci:      false until the first push; then true
 #   published: version -> contentHash, recorded with every push; a published
 #              version may only be re-gated with exactly that hash
+ssh-host:
+  channel: beta
+  ci: false
+  published: {}
+
 cherry-servers:
   channel: beta
   ci: true

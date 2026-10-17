@@ -1361,3 +1361,307 @@ export async function verifyMgrPlacement(
     },
   };
 }
+
+// ---------------------------------------------------------------------------
+// cephVerifyPool
+// ---------------------------------------------------------------------------
+
+/** Arguments for the pool check. */
+export interface PoolVerifyArgs {
+  /** Pool name. */
+  poolName: string;
+  /** Expected size (replicas, or k+m). */
+  expectedSize: number;
+  /** Expected min_size, when asserted. */
+  expectedMinSize?: number | null;
+  /** Expected EC shape, when asserted. */
+  expectedErasureProfile?:
+    | { k: number; m: number; failureDomain: string }
+    | null;
+  /** Optional MDS assertion. */
+  mds?:
+    | { fsName: string; expectedActive: number; expectedStandby: number }
+    | null;
+  /** Settle budget in ms. */
+  settleMs?: number | null;
+  /** Backoff ceiling in ms. */
+  settlePollIntervalMs?: number | null;
+}
+
+/** The raw observation one poll makes. */
+interface PoolObservation {
+  pool: Record<string, unknown> | null;
+  availablePools: string[];
+  pgReadable: boolean;
+  pgStats: { pgid: string; state: string }[];
+  ecProfileRaw: unknown;
+  ecReadable: boolean;
+  mds: { active: number; standby: number } | null;
+}
+
+/** Asserts a pool's size, PGs, EC shape and optional MDS state. */
+export async function verifyPool(
+  deps: PrepDeps,
+  session: SshSession,
+  args: PoolVerifyArgs,
+  log?: Logger,
+): Promise<VerifyOutcome> {
+  const budget = args.settleMs ?? 0;
+  const ceiling = args.settlePollIntervalMs ?? 10_000;
+  const started = deps.now();
+
+  const evaluate = (o: PoolObservation): VerifyOutcome => {
+    const expected: Record<string, unknown> = {
+      pool: {
+        size: args.expectedSize,
+        ...(args.expectedMinSize !== undefined && args.expectedMinSize !== null
+          ? { minSize: args.expectedMinSize }
+          : {}),
+      },
+    };
+    const actual: Record<string, unknown> = {};
+    const detail: Record<string, unknown> = {};
+    const skipped: { check: string; reason: string }[] = [];
+
+    if (o.pool === null) {
+      actual.pool = null;
+      detail.pool = { reason: "pool absent", availablePools: o.availablePools };
+      for (const check of ["pgs", "ec", "mds"]) {
+        skipped.push({ check, reason: "pool absent" });
+      }
+      return {
+        pass: false,
+        expected,
+        actual,
+        detail: { ...detail, skipped },
+        subject: args.poolName,
+      };
+    }
+
+    const size = typeof o.pool.size === "number" ? o.pool.size : null;
+    const minSize = typeof o.pool.min_size === "number"
+      ? o.pool.min_size
+      : null;
+    const sizeOk = size === args.expectedSize;
+    const minAsserted = args.expectedMinSize !== undefined &&
+      args.expectedMinSize !== null;
+    const minOk = !minAsserted || minSize === args.expectedMinSize;
+    actual.pool = { size, minSize };
+    detail.pool = { size, minSize, minSizeAsserted: minAsserted };
+    if (!minAsserted) {
+      detail.pool = {
+        ...detail.pool as object,
+        minSizeNote: "observed but not certified",
+      };
+    }
+    const skipReason = o.pool === null
+      ? "pool absent"
+      : !sizeOk
+      ? "size mismatch"
+      : !minOk
+      ? "min_size mismatch"
+      : null;
+    if (skipReason !== null) {
+      for (const check of ["pgs", "ec", "mds"]) {
+        skipped.push({ check, reason: skipReason });
+      }
+      return {
+        pass: false,
+        expected,
+        actual,
+        detail: { ...detail, skipped },
+        subject: args.poolName,
+      };
+    }
+
+    // pgs
+    const total = o.pgStats.length;
+    const clean = o.pgStats.filter((p) => {
+      const tokens = p.state.split("+");
+      return tokens.includes("active") && tokens.includes("clean");
+    });
+    const pgsOk = total > 0 && clean.length === total;
+    actual.pgs = `${clean.length}/${total} active+clean`;
+    detail.pgs = { dirty: o.pgStats.filter((p) => !clean.includes(p)) };
+    if (total === 0) detail.pgs = { reason: "no PGs" };
+
+    // ec
+    const profile = typeof o.pool.erasure_code_profile === "string" &&
+        o.pool.erasure_code_profile !== ""
+      ? o.pool.erasure_code_profile
+      : null;
+    let ecOk = true;
+    if (args.expectedErasureProfile) {
+      expected.ec = args.expectedErasureProfile;
+      if (profile === null) {
+        ecOk = false;
+        actual.ec = null;
+        detail.ec = { reason: "not erasure-coded" };
+      } else if (!o.ecReadable) {
+        ecOk = false;
+        actual.ec = { profile };
+        detail.ec = {
+          reason: "EC profile could not be read; absence is not a pass",
+          profile,
+        };
+      } else {
+        const p = o.ecProfileRaw as Record<string, unknown>;
+        const kRaw = p?.k;
+        const mRaw = p?.m;
+        const k = Number(kRaw);
+        const m = Number(mRaw);
+        const fd = p?.["crush-failure-domain"];
+        const ecPass = Number.isInteger(k) && Number.isInteger(m) &&
+          k === args.expectedErasureProfile.k &&
+          m === args.expectedErasureProfile.m &&
+          fd === args.expectedErasureProfile.failureDomain;
+        ecOk = ecPass;
+        actual.ec = {
+          k: Number.isInteger(k) ? k : kRaw,
+          m: Number.isInteger(m) ? m : mRaw,
+          failureDomain: fd,
+        };
+        detail.ec = { profile, content: p };
+      }
+    } else {
+      actual.ec = { profile, asserted: false };
+      detail.ec = { profile, asserted: false, note: "not asserted" };
+    }
+
+    // mds
+    let mdsOk = true;
+    if (args.mds) {
+      expected.mds = {
+        active: args.mds.expectedActive,
+        standbyAtLeast: args.mds.expectedStandby,
+      };
+      const observed = o.mds ?? { active: 0, standby: 0 };
+      mdsOk = observed.active === args.mds.expectedActive &&
+        observed.standby >= args.mds.expectedStandby;
+      actual.mds = observed;
+      detail.mds = observed;
+    }
+
+    return {
+      pass: sizeOk && minOk && pgsOk && ecOk && mdsOk,
+      expected,
+      actual,
+      detail: { ...detail, skipped },
+      subject: args.poolName,
+    };
+  };
+
+  const result = await settle(deps, {
+    budgetMs: budget,
+    ceilingMs: ceiling,
+    read: async (): Promise<PoolObservation> => {
+      let detailJson = await read(
+        deps,
+        session,
+        "osd pool ls detail",
+        "pool",
+        log,
+      );
+      if (!Array.isArray(detailJson)) detailJson = [];
+      const pools = detailJson as Record<string, unknown>[];
+      const pool = pools.find((p) => p.pool_name === args.poolName) ?? null;
+      const availablePools = pools.flatMap((p) =>
+        typeof p.pool_name === "string" ? [p.pool_name] : []
+      );
+      let pgStats: { pgid: string; state: string }[] = [];
+      let pgReadable = false;
+      let ecProfileRaw: unknown = null;
+      let ecReadable = false;
+      let mds: { active: number; standby: number } | null = null;
+      const size = pool && typeof pool.size === "number" ? pool.size : null;
+      const minSize = pool && typeof pool.min_size === "number"
+        ? pool.min_size
+        : null;
+      const gateOk = pool !== null && size === args.expectedSize &&
+        (args.expectedMinSize === undefined || args.expectedMinSize === null ||
+          minSize === args.expectedMinSize);
+      if (gateOk && pool) {
+        const pgs = await read(
+          deps,
+          session,
+          `pg ls-by-pool ${quote(args.poolName)}`,
+          "pool",
+          log,
+        ) as {
+          pg_stats?: { pgid?: unknown; state?: unknown }[];
+        };
+        pgReadable = true;
+        pgStats = (pgs.pg_stats ?? []).flatMap((p) =>
+          typeof p.pgid === "string" && typeof p.state === "string"
+            ? [{ pgid: p.pgid, state: p.state }]
+            : []
+        );
+        const profile = typeof pool.erasure_code_profile === "string" &&
+            pool.erasure_code_profile !== ""
+          ? pool.erasure_code_profile
+          : null;
+        if (args.expectedErasureProfile && profile !== null) {
+          ecProfileRaw = await read(
+            deps,
+            session,
+            `osd erasure-code-profile get ${quote(profile)}`,
+            "pool",
+            log,
+          );
+          ecReadable = true;
+        }
+        if (args.mds) {
+          const status = await read(
+            deps,
+            session,
+            `fs status ${quote(args.mds.fsName)}`,
+            "pool",
+            log,
+          ) as {
+            mdsmap?: { state?: unknown }[];
+          };
+          const states = (status.mdsmap ?? []).map((m) =>
+            typeof m.state === "string" ? m.state.toLowerCase() : ""
+          );
+          mds = {
+            active: states.filter((s) => s === "active").length,
+            standby: states.filter((s) => s === "standby").length,
+          };
+        }
+      }
+      return {
+        pool,
+        availablePools,
+        pgReadable,
+        pgStats,
+        ecProfileRaw,
+        ecReadable,
+        mds,
+      };
+    },
+    pass: (o) => evaluate(o).pass,
+  });
+
+  const observation: PoolObservation = result.value ?? {
+    pool: null,
+    availablePools: [],
+    pgReadable: false,
+    pgStats: [],
+    ecProfileRaw: null,
+    ecReadable: false,
+    mds: null,
+  };
+  const verdict = evaluate(observation);
+  const firstReadPassed = result.attempts === 1 && verdict.pass;
+  verdict.detail = {
+    ...verdict.detail,
+    settle: {
+      settleMs: budget,
+      attempts: result.attempts,
+      elapsedMs: deps.now() - started,
+      firstReadPassed,
+      observedTransition: result.attempts > 1 && verdict.pass,
+    },
+  };
+  return verdict;
+}

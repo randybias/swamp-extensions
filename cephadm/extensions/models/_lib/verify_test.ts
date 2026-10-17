@@ -20,6 +20,7 @@ import {
   verifyMonPlacement,
   verifyMonQuorum,
   verifyOsd,
+  verifyPool,
 } from "./verify.ts";
 
 const deps = {
@@ -988,4 +989,148 @@ Deno.test("mgr placement reports a collision with an active MDS", async () => {
     return { code: 0, stdout: hosts, stderr: "" };
   });
   assertEquals((await verifyMgrPlacement(deps, none, ["node-mgr"])).pass, true);
+});
+
+Deno.test("pool check asserts size, min_size and clean PGs with skip reasons", async () => {
+  const pool = JSON.stringify([{ pool_name: "rbd", size: 3, min_size: 2 }]);
+  const pgs = JSON.stringify({
+    pg_stats: [{ pgid: "1.0", state: "active+clean" }, {
+      pgid: "1.1",
+      state: "active+clean",
+    }],
+  });
+  const s = vSession((body) => {
+    if (body.includes("osd pool ls detail")) {
+      return { code: 0, stdout: pool, stderr: "" };
+    }
+    if (body.includes("pg ls-by-pool")) {
+      return { code: 0, stdout: pgs, stderr: "" };
+    }
+    return { code: 0, stdout: "[]", stderr: "" };
+  });
+  const pass = await verifyPool(deps, s, { poolName: "rbd", expectedSize: 3 });
+  assertEquals(pass.pass, true);
+  assertEquals(pass.subject, "rbd");
+  assertEquals((pass.actual as { pgs: string }).pgs, "2/2 active+clean");
+  assertEquals(pass.detail.settle !== undefined, true);
+
+  const mismatch = await verifyPool(deps, s, {
+    poolName: "rbd",
+    expectedSize: 2,
+  });
+  assertEquals(mismatch.pass, false);
+  assertEquals(
+    (mismatch.detail.skipped as { reason: string }[])[0].reason,
+    "size mismatch",
+  );
+
+  const badMin = await verifyPool(deps, s, {
+    poolName: "rbd",
+    expectedSize: 3,
+    expectedMinSize: 4,
+  });
+  assertEquals(badMin.pass, false);
+  assertEquals(
+    (badMin.detail.skipped as { reason: string }[])[0].reason,
+    "min_size mismatch",
+  );
+});
+
+Deno.test("pool check fails on dirty PGs and parses EC content", async () => {
+  const ecPool = JSON.stringify([{
+    pool_name: "ec",
+    size: 5,
+    min_size: 4,
+    erasure_code_profile: "ec_k3_m2_host",
+  }]);
+  const dirty = JSON.stringify({
+    pg_stats: [{ pgid: "1.0", state: "active+clean" }, {
+      pgid: "1.1",
+      state: "peering",
+    }],
+  });
+  const s = vSession((body) => {
+    if (body.includes("osd pool ls detail")) {
+      return { code: 0, stdout: ecPool, stderr: "" };
+    }
+    if (body.includes("pg ls-by-pool")) {
+      return { code: 0, stdout: dirty, stderr: "" };
+    }
+    if (body.includes("erasure-code-profile get")) {
+      return {
+        code: 0,
+        stdout: '{"k":"3","m":"2","crush-failure-domain":"host"}',
+        stderr: "",
+      };
+    }
+    return { code: 0, stdout: "[]", stderr: "" };
+  });
+  const dirtyVerdict = await verifyPool(deps, s, {
+    poolName: "ec",
+    expectedSize: 5,
+  });
+  assertEquals(dirtyVerdict.pass, false);
+  assertEquals(
+    (dirtyVerdict.detail.pgs as { dirty: unknown[] }).dirty.length,
+    1,
+  );
+
+  const ecPass = await verifyPool(deps, s, {
+    poolName: "ec",
+    expectedSize: 5,
+    expectedErasureProfile: { k: 3, m: 2, failureDomain: "host" },
+  });
+  assertEquals(ecPass.pass, false); // dirty PG also fails
+  assertEquals((ecPass.actual as { ec: { k: number } }).ec.k, 3);
+
+  // A non-integer k stays visible as the raw string.
+  const bad = vSession((body) => {
+    if (body.includes("osd pool ls detail")) {
+      return { code: 0, stdout: ecPool, stderr: "" };
+    }
+    if (body.includes("pg ls-by-pool")) {
+      return {
+        code: 0,
+        stdout: '{"pg_stats":[{"pgid":"1.0","state":"active+clean"}]}',
+        stderr: "",
+      };
+    }
+    if (body.includes("erasure-code-profile get")) {
+      return {
+        code: 0,
+        stdout: '{"k":"three","m":"2","crush-failure-domain":"host"}',
+        stderr: "",
+      };
+    }
+    return { code: 0, stdout: "[]", stderr: "" };
+  });
+  const badVerdict = await verifyPool(deps, bad, {
+    poolName: "ec",
+    expectedSize: 5,
+    expectedErasureProfile: { k: 3, m: 2, failureDomain: "host" },
+  });
+  assertEquals(badVerdict.pass, false);
+  assertEquals((badVerdict.actual as { ec: { k: unknown } }).ec.k, "three");
+});
+
+Deno.test("pool check fails closed and reports the available pools", async () => {
+  const s = vSession((body) =>
+    body.includes("osd pool ls detail")
+      ? {
+        code: 0,
+        stdout: '[{"pool_name":"other","size":3,"min_size":2}]',
+        stderr: "",
+      }
+      : { code: 0, stdout: "[]", stderr: "" }
+  );
+  const verdict = await verifyPool(deps, s, {
+    poolName: "missing",
+    expectedSize: 3,
+  });
+  assertEquals(verdict.pass, false);
+  assertEquals(verdict.actual, { pool: null });
+  assertEquals(
+    (verdict.detail.pool as { availablePools: string[] }).availablePools,
+    ["other"],
+  );
 });

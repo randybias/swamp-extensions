@@ -39,6 +39,7 @@ import {
 } from "./_lib/ssh.ts";
 import {
   CAPS_SCHEMA,
+  CEPH_ID_REF_SCHEMA,
   CEPH_ID_SCHEMA,
   CEPHADM_VERSION_SCHEMA,
   CIDR_SCHEMA,
@@ -91,6 +92,7 @@ import {
   verifyMonPlacement,
   verifyMonQuorum,
   verifyOsd,
+  verifyPool,
 } from "./_lib/verify.ts";
 import { fail, TransportError } from "./_lib/errors.ts";
 import { wipeDiskToRaw, type WipeRecord } from "./_lib/wipe.ts";
@@ -480,6 +482,37 @@ const VerifyOsdArgs = z.strictObject({
     "Settle budget in ms; 0 means one read.",
   ),
   osdPollIntervalMs: z.number().int().min(1).nullish().describe(
+    "Backoff ceiling in ms.",
+  ),
+});
+
+const PoolErasureProfileSchema = z.strictObject({
+  k: z.number().int().min(1),
+  m: z.number().int().min(1),
+  failureDomain: CEPH_ID_SCHEMA,
+});
+
+const VerifyPoolMdsSchema = z.strictObject({
+  fsName: CEPH_ID_REF_SCHEMA,
+  expectedActive: z.number().int().min(0),
+  expectedStandby: z.number().int().min(0),
+});
+
+const VerifyPoolArgs = z.strictObject({
+  ...VerifyCommon,
+  poolName: CEPH_ID_REF_SCHEMA.describe(
+    "Pool to check; a leading dot is allowed.",
+  ),
+  expectedSize: z.number().int().min(1).describe("Replica count, or k+m."),
+  expectedMinSize: z.number().int().min(1).nullish().describe(
+    "Durability floor to assert.",
+  ),
+  expectedErasureProfile: PoolErasureProfileSchema.nullish().describe(
+    "EC shape to assert.",
+  ),
+  mds: VerifyPoolMdsSchema.nullish().describe("Optional MDS state assertion."),
+  settleMs: z.number().int().min(0).nullish().describe("Settle budget in ms."),
+  settlePollIntervalMs: z.number().int().min(1).nullish().describe(
     "Backoff ceiling in ms.",
   ),
 });
@@ -2066,6 +2099,51 @@ export function createCephadmModel(overrides: Partial<CephadmDeps> = {}) {
             host: args.host,
             phase: "mgr-placement",
             key: `cephVerifyMgrPlacement-${args.host}`,
+            outcome,
+            throwOnFail: args.throwOnFail ?? true,
+          });
+          return { dataHandles: [handle] };
+        } finally {
+          await session.close();
+        }
+      },
+    },
+
+    cephVerifyPool: {
+      description:
+        "READ-ONLY. Assert a pool exists at the expected size with every PG active+clean, optionally its min_size, erasure-code shape and MDS state. Writes the verdict before throwing, then throws when it fails unless throwOnFail is false.",
+      arguments: VerifyPoolArgs,
+      execute: async (
+        args: z.infer<typeof VerifyPoolArgs>,
+        context: MethodContext,
+      ) => {
+        const session = await openSession(
+          deps,
+          toTarget({
+            host: args.host,
+            sshUser: args.sshUser,
+            port: args.port,
+            keyPath: args.keyPath,
+            privateKey: args.privateKey,
+            strictHostKeyChecking: args.strictHostKeyChecking,
+          }),
+          { multiplex: args.multiplex ?? false },
+        );
+        try {
+          const outcome = await verifyPool(deps, session, {
+            poolName: args.poolName,
+            expectedSize: args.expectedSize,
+            expectedMinSize: args.expectedMinSize,
+            expectedErasureProfile: args.expectedErasureProfile,
+            mds: args.mds,
+            settleMs: args.settleMs,
+            settlePollIntervalMs: args.settlePollIntervalMs,
+          }, context.logger);
+          const handle = await persistVerdict(context, deps, {
+            method: "cephVerifyPool",
+            host: args.host,
+            phase: "pool",
+            key: `cephVerifyPool-${args.host}-${args.poolName}`,
             outcome,
             throwOnFail: args.throwOnFail ?? true,
           });

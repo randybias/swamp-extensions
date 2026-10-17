@@ -13,6 +13,7 @@ import { z } from "npm:zod@4.3.6";
 import {
   CAPS_RE,
   CEPH_ID_CREATE_RE,
+  CEPH_ID_REF_RE,
   CEPHADM_VERSION_RE,
   DEB_PACKAGE_RE,
   FSID_RE,
@@ -148,6 +149,12 @@ export const PLACEMENT_SCHEMA = z.array(PLACEMENT_HOST_SCHEMA).min(1).max(64)
     (hosts) => new Set(hosts).size === hosts.length,
     "placement hosts must be unique",
   );
+
+/** Ceph identifier in the reference direction; a leading dot is allowed. */
+export const CEPH_ID_REF_SCHEMA = z.string().regex(
+  CEPH_ID_REF_RE,
+  "a Ceph identifier (leading dot allowed, not only dots)",
+).refine((v) => !/^\.+$/.test(v), "must not be only dots");
 
 /** A Ceph caps expression. */
 export const CAPS_SCHEMA = z.string().regex(

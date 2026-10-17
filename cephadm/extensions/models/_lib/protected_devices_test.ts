@@ -111,10 +111,10 @@ function plain(overrides: Partial<ProbeInputs> = {}): ProbeInputs {
     swaps: file(SWAP_HEADER),
     mdstat: { state: "absent" },
     links: ok(""),
-    // A working blkid that knows the root partition and nothing else, so a raw
+    // A working blkid that knows one unrelated device and nothing else, so a raw
     // disk is "empty, unrelated". Tests that need it to fail say so.
     blkid: ok(
-      '/dev/sda2: UUID="11111111-2222-3333-4444-555555555555" TYPE="ext4"\n',
+      '/dev/sdz9: UUID="99999999-0000-0000-0000-000000000000" TYPE="ext4"\n',
     ),
     zpool: missing,
     pvs: missing,
@@ -1845,4 +1845,76 @@ Deno.test("24c btrfs root spanning sda1 and the whole disk sdc: sdc is judged by
     { ...base, blkid: ok(`/dev/sda1: UUID="${BTRFS_UUID}" TYPE="btrfs"\n`) },
     ["/dev/sdc"],
   );
+});
+
+Deno.test("25a lsblk and blkid disagreeing about a type or UUID refuses everything", () => {
+  const rows = lsblk(
+    {
+      name: "sda",
+      type: "disk",
+      children: [{
+        name: "sda1",
+        type: "part",
+        fstype: "ext4",
+        uuid: BTRFS_UUID,
+        mounts: ["/"],
+      }],
+    },
+    { name: "sdc", type: "disk" },
+  );
+  const base = plain({
+    lsblk: rows,
+    findmnt: findmnt({ target: "/", source: "/dev/sda1", fstype: "ext4" }),
+    fstab: file(""),
+  });
+  // Agreement: fine.
+  safe(
+    { ...base, blkid: ok(`/dev/sda1: UUID="${BTRFS_UUID}" TYPE="ext4"\\n`) },
+    ["/dev/sdc"],
+  );
+  // lsblk says ext4, blkid says btrfs: the stale lsblk type must not win, and
+  // an unrelated candidate is refused as well.
+  refused(
+    { ...base, blkid: ok(`/dev/sda1: UUID="${BTRFS_UUID}" TYPE="btrfs"\\n`) },
+    ["/dev/sdc"],
+    "unverifiable",
+  );
+  // Same type, different UUID.
+  refused(
+    {
+      ...base,
+      blkid: ok(
+        `/dev/sda1: UUID="deadbeef-0000-0000-0000-000000000000" TYPE="ext4"\\n`,
+      ),
+    },
+    ["/dev/sdc"],
+    "unverifiable",
+  );
+});
+
+Deno.test("25b a multipath candidate cannot escape the empty-type check", () => {
+  const rows = lsblk(
+    {
+      name: "sda",
+      type: "disk",
+      children: [{ name: "sda1", type: "part", fstype: "ext4", mounts: ["/"] }],
+    },
+    {
+      name: "sdc",
+      type: "disk",
+      children: [{ name: "mpatha", type: "mpath", path: "/dev/mapper/mpatha" }],
+    },
+    { name: "sdd", type: "disk" },
+  );
+  const base = plain({
+    lsblk: rows,
+    findmnt: findmnt({ target: "/", source: "/dev/sda1", fstype: "ext4" }),
+    fstab: file(""),
+    links: ok("/dev/mapper/mpatha /dev/dm-5\\n"),
+  });
+  for (const failing of [missing, NO_SB, { code: 2, stdout: "" }]) {
+    refused({ ...base, blkid: failing }, ["/dev/sdc"], "unverifiable");
+  }
+  // With a working blkid that knows nothing of it, it is empty and unrelated.
+  safe(base, ["/dev/sdc"]);
 });

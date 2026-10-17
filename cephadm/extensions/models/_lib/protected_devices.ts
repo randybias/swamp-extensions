@@ -218,6 +218,8 @@ interface Node {
 interface Graph {
   nodes: Map<string, Node>;
   byName: Map<string, Node>;
+  /** Devices whose lsblk and blkid answers disagree about type or UUID. */
+  disagreements: string[];
 }
 
 function str(value: unknown): string {
@@ -306,18 +308,28 @@ function parseLsblkGraph(
   }
   // A host without udev gives lsblk empty identifier columns; blkid, read as
   // root, still knows them. Fill what is empty, never overwrite.
+  const disagreements: string[] = [];
   if (blkid) {
     const ids = parseBlkid(blkid);
     for (const node of nodes.values()) {
       const have = ids.get(node.path);
       if (!have) continue;
+      // Two readers of the same superblock must agree; a stale row in one of
+      // them is exactly how a live device looks like something else.
+      if (
+        (node.fstype && have.TYPE && node.fstype !== have.TYPE) ||
+        (node.uuid && have.UUID &&
+          normalizeUuid(node.uuid) !== normalizeUuid(have.UUID))
+      ) {
+        disagreements.push(node.path);
+      }
       if (!node.fstype && have.TYPE) node.fstype = have.TYPE;
       if (!node.uuid && have.UUID) node.uuid = have.UUID;
       if (!node.partuuid && have.PARTUUID) node.partuuid = have.PARTUUID;
       if (!node.label && have.LABEL) node.label = have.LABEL;
     }
   }
-  return { nodes, byName };
+  return { nodes, byName, disagreements };
 }
 
 /** Lowercase hex with separators removed, so mdadm and blkid UUIDs compare. */
@@ -650,6 +662,11 @@ function resolveSpec(
 /** Computes the protected set from the probes, or throws {@link Unverifiable}. */
 function compute(input: ProbeInputs): ProtectedSet {
   const graph = parseLsblkGraph(input.lsblk, input.blkid);
+  if (graph.disagreements.length > 0) {
+    unverifiable("lsblk and blkid disagree about a device", {
+      device: graph.disagreements[0],
+    });
+  }
   const resolver = new Resolver(graph, input.links);
   const mounts = parseFindmnt(input.findmnt);
   const collector = new Collector(graph);
@@ -1199,8 +1216,7 @@ function conflict(
       // has children to judge instead, escapes.
       if (
         !blkidUsable && node.fstype === "" &&
-        (node.type === "part" ||
-          (node.type === "disk" && node.children.size === 0)) &&
+        (node.type !== "disk" || node.children.size === 0) &&
         !(probe && probe.code === 0 && parseExamineUuid(probe.stdout))
       ) {
         return {

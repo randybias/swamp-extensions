@@ -496,6 +496,53 @@ for (const { rel, doc } of catalog) {
   });
 }
 
+Deno.test("every gated mutating step directly depends on each gate and the approval", () => {
+  const failures: string[] = [];
+  for (const { rel, doc } of catalog) {
+    for (const jobRaw of asArr(doc.jobs)) {
+      const job = asObj(jobRaw);
+      const jobSteps = asArr(job.steps).map(asObj);
+      const approvals = jobSteps.filter((s) =>
+        asStr(task(s).type) === "manual_approval"
+      ).map((s) => asStr(s.name));
+      if (approvals.length === 0) continue;
+      const assertSteps = jobSteps.filter((s) =>
+        asStr(task(s).type) === "assert"
+      ).map((s) => asStr(s.name));
+      const mutating = jobSteps.filter((s) => {
+        const t = task(s);
+        return asStr(t.type) === "model_method" &&
+          !READ_ONLY_METHODS.has(asStr(t.methodName));
+      });
+      for (const m of mutating) {
+        const name = asStr(m.name);
+        const anc = ancestors(jobSteps, name);
+        const approvalAnc = approvals.filter((a) => anc.has(a));
+        if (approvalAnc.length === 0) continue;
+        const gateAnc = assertSteps.filter((a) => anc.has(a));
+        const direct = asArr(m.dependsOn).map(asObj);
+        const directByName = new Map(
+          direct.map((d) => [asStr(d.step), asStr(asObj(d.condition).type)]),
+        );
+        for (const required of [...approvalAnc, ...gateAnc]) {
+          if (!directByName.has(required)) {
+            failures.push(
+              `${rel}: ${name} lacks a direct dependency on ${required}`,
+            );
+          } else if (directByName.get(required) !== "succeeded") {
+            failures.push(
+              `${rel}: ${name} -> ${required} is not succeeded-only (${
+                directByName.get(required)
+              })`,
+            );
+          }
+        }
+      }
+    }
+  }
+  assertEquals(failures, [], failures.join("\n"));
+});
+
 Deno.test("optional inputs are referenced only inside has() ternaries", () => {
   const failures: string[] = [];
   for (const { rel, doc } of catalog) {

@@ -78,10 +78,48 @@ jobs:
             cephVerifyMgrPlacement-${{ inputs.adminHost }}. Dropping a host
             removes its mgr.
           timeout: 3600
+      - name: recheck-mgr-placement
+        description: Re-judge the mgr placement after approval
+        dependsOn:
+          - step: approve
+            condition:
+              type: succeeded
+        task:
+          type: model_method
+          modelIdOrName: cephadm
+          methodName: cephVerifyMgrPlacement
+          inputs:
+            host: ${{ inputs.adminHost }}
+            port: ${{ inputs.port }}
+            sshUser: ${{ inputs.sshUser }}
+            keyPath: '${{ inputs.keyPath == "" ? dyn(null) : dyn(inputs.keyPath) }}'
+            strictHostKeyChecking: ${{ inputs.strictHostKeyChecking }}
+            placement: ${{ inputs.placement }}
+            throwOnFail: false
+      - name: assert-recheck-mgr-placement
+        description: Assert the post-approval mgr placement re-check passed
+        dependsOn:
+          - step: recheck-mgr-placement
+            condition:
+              type: succeeded
+        task:
+          type: assert
+          expr: >-
+            data.latest("cephadm", "cephVerifyMgrPlacement-" + inputs.adminHost).attributes.pass == true
+          message: >-
+            Expected the mgr placement to pass pre-check, observed
+            reasons=${{ data.latest("cephadm", "cephVerifyMgrPlacement-" + inputs.adminHost).attributes.detail.reasons }}
+          severity: high
       - name: apply-mgr
         description: Apply the explicit mgr placement through the orchestrator
         dependsOn:
           - step: approve
+            condition:
+              type: succeeded
+          - step: assert-mgr-placement
+            condition:
+              type: succeeded
+          - step: assert-recheck-mgr-placement
             condition:
               type: succeeded
         task:

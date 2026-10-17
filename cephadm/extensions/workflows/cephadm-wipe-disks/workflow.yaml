@@ -100,10 +100,50 @@ jobs:
             cephVerifyDisksRaw-${{ inputs.host }}. A real run destroys data and
             cannot be undone.
           timeout: 3600
+      - name: recheck-disks
+        description: Re-check the named disks after approval
+        dependsOn:
+          - step: approve
+            condition:
+              type: succeeded
+        task:
+          type: model_method
+          modelIdOrName: cephadm
+          methodName: cephVerifyDisksRaw
+          inputs:
+            host: ${{ inputs.host }}
+            port: ${{ inputs.port }}
+            sshUser: ${{ inputs.sshUser }}
+            keyPath: '${{ inputs.keyPath == "" ? dyn(null) : dyn(inputs.keyPath) }}'
+            strictHostKeyChecking: ${{ inputs.strictHostKeyChecking }}
+            dataDevices: ${{ inputs.dataDevices }}
+            throwOnFail: false
+      - name: assert-recheck-raw
+        description: Assert the post-approval disk re-check passed
+        dependsOn:
+          - step: recheck-disks
+            condition:
+              type: succeeded
+        task:
+          type: assert
+          expr: >-
+            size(data.latest("cephadm", "cephVerifyDisksRaw-" + inputs.host).attributes.detail.mounted) == 0 &&
+            size(data.latest("cephadm", "cephVerifyDisksRaw-" + inputs.host).attributes.detail.unobserved) == 0
+          message: >-
+            Expected no mounted or unobserved disk before wiping, observed
+            mounted=${{ data.latest("cephadm", "cephVerifyDisksRaw-" + inputs.host).attributes.detail.mounted }}
+            unobserved=${{ data.latest("cephadm", "cephVerifyDisksRaw-" + inputs.host).attributes.detail.unobserved }}
+          severity: high
       - name: wipe-disks
         description: Wipe or plan the named disks to raw via SSH
         dependsOn:
           - step: approve
+            condition:
+              type: succeeded
+          - step: assert-gate-raw
+            condition:
+              type: succeeded
+          - step: assert-recheck-raw
             condition:
               type: succeeded
         task:

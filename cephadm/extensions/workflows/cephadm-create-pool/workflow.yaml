@@ -87,10 +87,34 @@ jobs:
             or profile ${{ has(inputs.erasureProfile) ? inputs.erasureProfile : "unset" }}
             on ${{ inputs.host }}. This changes cluster data placement.
           timeout: 3600
+      - name: assert-recheck-scheme
+        description: Re-check the scheme inputs after approval
+        dependsOn:
+          - step: approve
+            condition:
+              type: succeeded
+        task:
+          type: assert
+          expr: >-
+            inputs.scheme == "replicated"
+              ? (has(inputs.size) && !has(inputs.erasureProfile))
+              : (has(inputs.erasureProfile) && !has(inputs.size))
+          message: >-
+            Expected replicated to carry size and no erasureProfile, or erasure
+            to carry erasureProfile and no size. Observed scheme=${{ inputs.scheme }}
+            size=${{ has(inputs.size) ? inputs.size : "unset" }}
+            erasureProfile=${{ has(inputs.erasureProfile) ? inputs.erasureProfile : "unset" }}
+          severity: high
       - name: create-pool
         description: Create or converge the pool through ceph
         dependsOn:
           - step: approve
+            condition:
+              type: succeeded
+          - step: assert-scheme-inputs
+            condition:
+              type: succeeded
+          - step: assert-recheck-scheme
             condition:
               type: succeeded
         task:

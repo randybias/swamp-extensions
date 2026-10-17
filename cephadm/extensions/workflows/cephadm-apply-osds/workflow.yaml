@@ -158,10 +158,77 @@ jobs:
             ${{ inputs.adminHost }}. The pre-check record is
             cephVerifyOsdClaimable-${{ inputs.adminHost }}.
           timeout: 3600
+      - name: assert-recheck-mode
+        description: Re-check the OSD mode inputs after approval
+        dependsOn:
+          - step: approve
+            condition:
+              type: succeeded
+        task:
+          type: assert
+          expr: >-
+            inputs.allAvailableDevices == true
+              ? (inputs.targetHost == "" && size(inputs.excludeDevices) > 0)
+              : (inputs.targetHost != "" && has(inputs.targetPort) && size(inputs.dataDevices) > 0)
+          message: >-
+            Expected one complete OSD mode: fleet-wide needs a non-empty
+            excludeDevices; by-serial needs targetHost, targetPort and
+            dataDevices. Observed allAvailableDevices=${{ inputs.allAvailableDevices }}
+            targetHost=${{ inputs.targetHost }}
+            targetPort=${{ has(inputs.targetPort) ? inputs.targetPort : "unset" }}
+            dataDevices=${{ inputs.dataDevices }} excludeDevices=${{ inputs.excludeDevices }}
+          severity: high
+      - name: recheck-osd-claimable
+        description: Re-judge claimable disks after approval
+        dependsOn:
+          - step: assert-recheck-mode
+            condition:
+              type: succeeded
+        task:
+          type: model_method
+          modelIdOrName: cephadm
+          methodName: cephVerifyOsdClaimable
+          inputs:
+            host: ${{ inputs.adminHost }}
+            port: ${{ inputs.port }}
+            sshUser: ${{ inputs.sshUser }}
+            keyPath: '${{ inputs.keyPath == "" ? dyn(null) : dyn(inputs.keyPath) }}'
+            strictHostKeyChecking: ${{ inputs.strictHostKeyChecking }}
+            allAvailableDevices: ${{ inputs.allAvailableDevices }}
+            excludeDevices: ${{ inputs.excludeDevices }}
+            targetHost: ${{ inputs.targetHost }}
+            dataDevices: ${{ inputs.dataDevices }}
+            throwOnFail: false
+      - name: assert-recheck-osd-claimable
+        description: Assert the post-approval claimable re-check passed
+        dependsOn:
+          - step: recheck-osd-claimable
+            condition:
+              type: succeeded
+        task:
+          type: assert
+          expr: >-
+            data.latest("cephadm", "cephVerifyOsdClaimable-" + inputs.adminHost).attributes.pass == true
+          message: >-
+            Expected the OSD selection to be claimable, observed
+            reasons=${{ data.latest("cephadm", "cephVerifyOsdClaimable-" + inputs.adminHost).attributes.detail.reasons }}
+          severity: high
       - name: apply-osds
         description: Apply the OSD service through the orchestrator
         dependsOn:
           - step: approve
+            condition:
+              type: succeeded
+          - step: assert-mode
+            condition:
+              type: succeeded
+          - step: assert-osd-claimable
+            condition:
+              type: succeeded
+          - step: assert-recheck-mode
+            condition:
+              type: succeeded
+          - step: assert-recheck-osd-claimable
             condition:
               type: succeeded
         task:

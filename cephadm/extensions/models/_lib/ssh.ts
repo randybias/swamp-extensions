@@ -237,17 +237,28 @@ export const SOCKET_PATH_LIMIT = 103;
 /** Namespace subdirectory, so sockets never collide with other ssh tooling. */
 export const SOCKET_NAMESPACE = "swamp-cephadm-ssh";
 
+/**
+ * A random per-process nonce. A control-socket name is derived from this,
+ * never from private-key bytes, so key material can never influence argv.
+ */
+const PROCESS_NONCE = (() => {
+  const bytes = crypto.getRandomValues(new Uint8Array(8));
+  return Array.from(bytes).map((b) => b.toString(16).padStart(2, "0")).join("");
+})();
+
 /** Resolves the control-socket path for a target, falling back under /tmp if too long. */
 export async function controlSocketPath(
   target: Target,
   env: (key: string) => string | undefined = (k) => Deno.env.get(k),
 ): Promise<ControlSocket> {
-  // A master is reusable only within one trust and one credential identity,
-  // so a strict connection can never ride a master opened with checking off.
+  // A master is reusable only within one trust, so a strict connection can
+  // never ride a master opened with checking off. The identity never contains
+  // private-key bytes: a key path is not secret, and inline key content is
+  // represented only by the per-process nonce.
   const identity = target.keyPath !== undefined
     ? `path:${target.keyPath}`
     : target.privateKey !== undefined
-    ? `inline:${target.privateKey}`
+    ? `inline:${PROCESS_NONCE}`
     : "agent";
   const name = `${
     (await shortHash(

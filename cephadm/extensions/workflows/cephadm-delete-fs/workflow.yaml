@@ -81,10 +81,49 @@ jobs:
             cephGetConnBundle-${{ inputs.host }}. This deletion cannot be
             undone.
           timeout: 3600
+      - name: recheck-evidence
+        description: Re-read the connection bundle after approval
+        dependsOn:
+          - step: approve
+            condition:
+              type: succeeded
+        task:
+          type: model_method
+          modelIdOrName: cephadm
+          methodName: cephGetConnBundle
+          inputs:
+            host: ${{ inputs.host }}
+            port: ${{ inputs.port }}
+            sshUser: ${{ inputs.sshUser }}
+            keyPath: '${{ inputs.keyPath == "" ? dyn(null) : dyn(inputs.keyPath) }}'
+            strictHostKeyChecking: ${{ inputs.strictHostKeyChecking }}
+      - name: assert-recheck-confirm
+        description: Assert the post-approval confirmation re-check passed
+        dependsOn:
+          - step: recheck-evidence
+            condition:
+              type: succeeded
+        task:
+          type: assert
+          expr: >-
+            inputs.confirmFsName == inputs.fsName &&
+            data.latest("cephadm", "cephGetConnBundle-" + inputs.host).attributes.filesystems.exists(f, f == inputs.fsName)
+          message: >-
+            Expected confirmFsName to equal fsName and the volume to exist,
+            observed fsName=${{ inputs.fsName }}
+            confirmFsName=${{ inputs.confirmFsName }}
+            filesystems=${{ data.latest("cephadm", "cephGetConnBundle-" + inputs.host).attributes.filesystems }}
+          severity: high
       - name: delete-fs
         description: Delete the volume, its MDS and its pools via ceph
         dependsOn:
           - step: approve
+            condition:
+              type: succeeded
+          - step: assert-confirm
+            condition:
+              type: succeeded
+          - step: assert-recheck-confirm
             condition:
               type: succeeded
         task:

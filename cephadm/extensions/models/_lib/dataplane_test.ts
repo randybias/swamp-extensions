@@ -675,3 +675,80 @@ Deno.test("the pool-delete gate is reset even when turning it on fails", async (
     "the volume was never removed",
   );
 });
+
+Deno.test("OSD removal refuses by itself on HEALTH_ERR", async () => {
+  const s = dpSession((body) => {
+    if (body.includes("osd tree")) {
+      return {
+        code: 0,
+        stdout: '{"nodes":[{"id":3,"type":"osd"}]}',
+        stderr: "",
+      };
+    }
+    if (body.includes("health detail")) {
+      return { code: 0, stdout: '{"status":"HEALTH_ERR"}', stderr: "" };
+    }
+    return { code: 0, stdout: "", stderr: "" };
+  });
+  await assertRejects(
+    () => removeOsds(deps, s.session, { osdIds: [3] }),
+    PhaseError,
+    "HEALTH_ERR",
+  );
+  assertEquals(s.bodies.some((b) => b.includes("osd out")), false);
+  assertEquals(s.bodies.some((b) => b.includes("orch osd rm")), false);
+});
+
+Deno.test("OSD removal refuses by itself when an OSD is not safe to destroy", async () => {
+  const s = dpSession((body) => {
+    if (body.includes("osd tree")) {
+      return {
+        code: 0,
+        stdout: '{"nodes":[{"id":3,"type":"osd"}]}',
+        stderr: "",
+      };
+    }
+    if (body.includes("health detail")) {
+      return { code: 0, stdout: '{"status":"HEALTH_OK"}', stderr: "" };
+    }
+    if (body.includes("safe-to-destroy")) {
+      return { code: 1, stdout: "", stderr: "OSD 3 is not safe to destroy" };
+    }
+    return { code: 0, stdout: "", stderr: "" };
+  });
+  await assertRejects(
+    () => removeOsds(deps, s.session, { osdIds: [3] }),
+    PhaseError,
+    "not safe to destroy",
+  );
+  assertEquals(s.bodies.some((b) => b.includes("osd out")), false);
+});
+
+Deno.test("filesystem deletion refuses by itself while clients are connected", async () => {
+  const s = dpSession((body) => {
+    if (body.includes("fs status")) {
+      return {
+        code: 0,
+        stdout: '{"clients":[{"id":1,"hostname":"c1"}]}',
+        stderr: "",
+      };
+    }
+    if (body.includes("fs ls")) {
+      return {
+        code: 0,
+        stdout:
+          '[{"name":"cephfs","metadata_pool":"cephfs.cephfs.meta","data_pools":["cephfs.cephfs.data"]}]',
+        stderr: "",
+      };
+    }
+    return { code: 0, stdout: "", stderr: "" };
+  });
+  await assertRejects(
+    () =>
+      deleteFs(deps, s.session, { fsName: "cephfs", confirmFsName: "cephfs" }),
+    PhaseError,
+    "in use by clients",
+  );
+  assertEquals(s.bodies.some((b) => b.includes("orch rm")), false);
+  assertEquals(s.bodies.some((b) => b.includes("fs volume rm")), false);
+});

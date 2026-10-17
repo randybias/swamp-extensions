@@ -413,3 +413,34 @@ a secret. Fixtures are synthetic only (RFC 5737 addresses, `.test` names).
   runs (wipefs -a, sgdisk --zap-all, then a zeroed sector 0) and the raw check
   re-probes sector 0 and signatures, failing `wipe.raw-signatures` if they
   survive. protected_devices.ts is untouched.
+
+## 2026-10-17: catalog A fixes (lane/d6-catfix)
+
+- Catalog keeps lane/cephadm-int's workflows (catalog A); lane/d6's catalog was
+  retired.
+- HIGH: every gated destructive step now depends directly, succeeded-only, on
+  every safety-gate assert and on the approval step (TRIAGE 4d). catalog_test.ts
+  asserts the direct edges for every gated mutating step.
+- MEDIUM (swamp lab 3583): a plain `resume --input` can run the mutation on a
+  new target with the pre-gate reused. Every gated workflow now re-runs its gate
+  after approval (a second gate step depending on approve) and the mutation
+  depends on both gates and approve. Applied to wipe-disks, remove-osds,
+  delete-fs, apply-mgr, apply-mon, apply-osds, create-pool and distribute-key.
+- HIGH (4h): the control-socket name no longer contains private-key bytes. It is
+  derived from host/port/user, the host-key policy, a non-secret key path, and a
+  per-process random nonce; a test proves the key content cannot influence the
+  socket name or the ssh argv.
+- In-method destructive safety (lab 3583: workflow gates cannot be the only
+  protection):
+  - cephRemoveOsds refuses when cluster health is HEALTH_ERR and refuses any
+    requested OSD that `osd safe-to-destroy` does not accept, before any
+    mutation.
+  - cephDeleteFs refuses while `fs status` reports connected clients, before any
+    mutation.
+  - wipeDiskToRaw already gates on the protected-device set and mount state (its
+    module is untouched).
+  - cephApplyOsd already enforces the D19 exclude list against the orchestrator
+    device inventory before applying.
+  - cephRmCluster already refuses a foreign or unobserved fsid before purging.
+- LOW: the remove-osds health assert message and the distribute-key check-host
+  assert message no longer interpolate a map; they name scalar observations.

@@ -89,10 +89,51 @@ jobs:
             cephVerifyMonPlacement-${{ inputs.adminHost }}. This can shrink the
             mon set.
           timeout: 3600
+      - name: recheck-mon-placement
+        description: Re-judge the mon placement after approval
+        dependsOn:
+          - step: approve
+            condition:
+              type: succeeded
+        task:
+          type: model_method
+          modelIdOrName: cephadm
+          methodName: cephVerifyMonPlacement
+          inputs:
+            host: ${{ inputs.adminHost }}
+            port: ${{ inputs.port }}
+            sshUser: ${{ inputs.sshUser }}
+            keyPath: '${{ inputs.keyPath == "" ? dyn(null) : dyn(inputs.keyPath) }}'
+            strictHostKeyChecking: ${{ inputs.strictHostKeyChecking }}
+            placement: ${{ inputs.placement }}
+            throwOnFail: false
+      - name: assert-recheck-mon-placement
+        description: Assert the post-approval mon placement re-check passed
+        dependsOn:
+          - step: recheck-mon-placement
+            condition:
+              type: succeeded
+        task:
+          type: assert
+          expr: >-
+            data.latest("cephadm", "cephVerifyMonPlacement-" + inputs.adminHost).attributes.pass == true
+          message: >-
+            Expected the mon placement to pass pre-check, observed
+            reasons=${{ data.latest("cephadm", "cephVerifyMonPlacement-" + inputs.adminHost).attributes.detail.reasons }}
+            current=${{ data.latest("cephadm", "cephVerifyMonPlacement-" + inputs.adminHost).attributes.detail.currentHosts }}
+            removed=${{ data.latest("cephadm", "cephVerifyMonPlacement-" + inputs.adminHost).attributes.detail.removedHosts }}
+            added=${{ data.latest("cephadm", "cephVerifyMonPlacement-" + inputs.adminHost).attributes.detail.addedHosts }}
+          severity: high
       - name: apply-mon
         description: Apply the explicit mon placement through the orchestrator
         dependsOn:
           - step: approve
+            condition:
+              type: succeeded
+          - step: assert-mon-placement
+            condition:
+              type: succeeded
+          - step: assert-recheck-mon-placement
             condition:
               type: succeeded
         task:

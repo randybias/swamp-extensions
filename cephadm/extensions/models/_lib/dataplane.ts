@@ -870,6 +870,34 @@ export async function removeOsds(
   if (presentIds.length === 0) {
     return { requested, removed: [], skippedAbsent, zap };
   }
+  // In-method safety. The workflow gate is not the only protection: a plain
+  // resume with overridden inputs can run this method on a new target with the
+  // gate skipped, so the method must refuse an unsafe cluster itself.
+  const health = await readJson(deps, session, "health detail", {
+    phase: "cephRemoveOsds.health",
+  }, log) as { status?: unknown } | null;
+  const healthStatus = typeof health?.status === "string"
+    ? health.status.toUpperCase()
+    : "";
+  if (healthStatus === "HEALTH_ERR") {
+    fail(
+      "cephRemoveOsds",
+      "refusing to remove OSDs while cluster health is HEALTH_ERR",
+      { status: healthStatus },
+    );
+  }
+  for (const id of presentIds) {
+    const safe = await runMut(deps, session, `osd safe-to-destroy ${id}`, {
+      phase: "cephRemoveOsds.safe-to-destroy",
+      allowNonZero: true,
+    }, log);
+    if (safe.code !== 0) {
+      fail("cephRemoveOsds", "an OSD is not safe to destroy", {
+        id,
+        stderr: safe.stderr.slice(0, 300),
+      });
+    }
+  }
   await runMut(deps, session, `osd out ${presentIds.join(" ")}`, {
     phase: "cephRemoveOsds.out",
   }, log);
@@ -991,6 +1019,23 @@ export async function deleteFs(
   }
   const backing = [entry.metadata_pool ?? "", ...(entry.data_pools ?? [])]
     .filter((p) => p !== "");
+  // In-method safety. The workflow confirmation gate can be skipped by a
+  // resume with overridden inputs, so the method refuses a filesystem still in
+  // use by clients on its own.
+  const fsStatus = await readJson(
+    deps,
+    session,
+    `fs status ${quote(args.fsName)}`,
+    { phase: "cephDeleteFs.in-use" },
+    log,
+  ) as { clients?: unknown } | null;
+  if (Array.isArray(fsStatus?.clients) && fsStatus.clients.length > 0) {
+    fail(
+      "cephDeleteFs",
+      "refusing to delete a filesystem still in use by clients",
+      { fsName: args.fsName, clients: fsStatus.clients.length },
+    );
+  }
   const before = new Set(
     ((await readJson(deps, session, "osd pool ls", {
       phase: "cephDeleteFs.pools-before",

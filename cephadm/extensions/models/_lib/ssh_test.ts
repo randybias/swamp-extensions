@@ -744,3 +744,44 @@ Deno.test(
     );
   },
 );
+
+Deno.test("private key content cannot influence the control socket or argv", async () => {
+  const env = () => "/tmp";
+  const a = await controlSocketPath(
+    toTarget({
+      host: "192.0.2.10",
+      sshUser: "admin",
+      strictHostKeyChecking: "yes",
+      privateKey: "KEY-A\n",
+    }),
+    env,
+  );
+  const b = await controlSocketPath(
+    toTarget({
+      host: "192.0.2.10",
+      sshUser: "admin",
+      strictHostKeyChecking: "yes",
+      privateKey: "KEY-B\n",
+    }),
+    env,
+  );
+  // Same process and target: the socket name must not vary with the key bytes.
+  assertEquals(a.path, b.path);
+  const f = fakeSpawner(() => ({ code: 0, stdout: "", stderr: "" }));
+  const session = await openSession(
+    deps(f.spawn),
+    toTarget({
+      host: "192.0.2.10",
+      sshUser: "admin",
+      strictHostKeyChecking: "yes",
+      privateKey: "KEY-A\n",
+    }),
+    { multiplex: true, env },
+  );
+  await session.run({ command: "true" });
+  const args = f.records[0].args;
+  assertEquals(args.some((x) => x.includes("KEY-A")), false);
+  const controlPath = args.find((x) => x.startsWith("ControlPath="));
+  assertEquals(controlPath !== undefined, true);
+  assertEquals(controlPath?.includes("KEY-A"), false);
+});

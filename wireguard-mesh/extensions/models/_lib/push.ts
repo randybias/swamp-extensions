@@ -375,6 +375,26 @@ function routeCheckLines(): string[] {
   ];
 }
 
+/**
+ * Shell function `addr_check FILE`: sets `addr_ok=1` only when the live
+ * interface carries exactly the `Address` entries of FILE. A missing address and
+ * an extra global one both count; link-local addresses are ignored.
+ */
+function addrCheckLines(): string[] {
+  return [
+    "addr_check() {",
+    "  addr_ok=1",
+    "  want=0",
+    "  for a in $(sed -n 's/^Address *= *//p' \"$1\" | tr ',' ' '); do",
+    "    want=$((want + 1))",
+    '    if ! ip -o addr show dev "$i" 2>/dev/null | grep -qF " $a "; then addr_ok=0; fi',
+    "  done",
+    '  have=$(ip -o addr show dev "$i" scope global 2>/dev/null | wc -l)',
+    '  if [ "$have" -ne "$want" ]; then addr_ok=0; fi',
+    "}",
+  ];
+}
+
 /** Seconds the remote rollback waits before restoring a changed interface. */
 export const APPLY_ROLLBACK_SECONDS = 120;
 
@@ -431,6 +451,7 @@ export function applyScript(iface: string): string {
     "live_sig() {",
     '  wg show "$i" dump 2>/dev/null | { IFS= read -r first || true; printf "%s\\n" "$first" | cut -f2,3,4; cut -f1,3,4,8 | sort; }',
     "}",
+    ...addrCheckLines(),
     ...pendingRbLines(),
     "changed=0",
     "if pending_rb; then changed=1; fi",
@@ -439,15 +460,7 @@ export function applyScript(iface: string): string {
     'if [ "$up" = 0 ]; then changed=1; fi',
     "live_drift=0",
     'if [ "$up" = 1 ] && [ "$changed" = 0 ]; then',
-    "  addr_ok=1",
-    "  want=0",
-    "  for a in $(sed -n 's/^Address *= *//p' \"$cfg\" | tr ',' ' '); do",
-    "    want=$((want + 1))",
-    '    if ! ip -o addr show dev "$i" 2>/dev/null | grep -qF " $a "; then addr_ok=0; fi',
-    "  done",
-    // An address nobody asked for is drift too (link-local ones are ignored).
-    '  have=$(ip -o addr show dev "$i" scope global 2>/dev/null | wc -l)',
-    '  if [ "$have" -ne "$want" ]; then addr_ok=0; fi',
+    '  addr_check "$cfg"',
     '  if [ "$addr_ok" = 0 ]; then',
     "    live_drift=1",
     "  else",
@@ -468,10 +481,7 @@ export function applyScript(iface: string): string {
     'old_routes=$(route_sig "$d/$i.conf")',
     'if ! { mv "$kf" "$d/$i.key" && mv "$cfg" "$d/$i.conf"; }; then fail_restore; fi',
     'new_routes=$(route_sig "$d/$i.conf")',
-    "addr_ok=1",
-    "for a in $(sed -n 's/^Address *= *//p' \"$d/$i.conf\" | tr ',' ' '); do",
-    '  if ! ip -o addr show dev "$i" 2>/dev/null | grep -qF " $a "; then addr_ok=0; fi',
-    "done",
+    'addr_check "$d/$i.conf"',
     'if [ "$up" = 1 ] && [ "$addr_ok" = 1 ] && [ "$old_routes" = "$new_routes" ]; then',
     '  wg-quick strip "$d/$i.conf" > "$stage/committed.wg"',
     '  if ! wg syncconf "$i" "$stage/committed.wg"; then fail_restore; fi',

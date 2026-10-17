@@ -174,3 +174,28 @@ Round 5 (escalation fixer, on d3 5bdd12e):
   delete, delete again, plus drift repair (peer removed behind the script's
   back), double confirm, and a confirm after the rollback ran (exit 3, previous
   address restored). It is skipped in the default test run.
+
+Round 6 (review r5 at 19016ab):
+
+- HIGH retry inside the rollback window reported a no-op and left the old
+  rollback live. Fixed: under the lock, both `apply` and `delete` look for a
+  rollback directory of the current generation that has not been disarmed
+  (`pending_rb`) before any `changed=0` exit. If one exists the run is a change:
+  it starts a new generation, which retires the old rollback, and returns its
+  own `rb=` for the fresh-connection confirmation. The old directory's confirm
+  now fails with "superseded" (exit 4). Run against real WireGuard in a
+  namespace: apply without confirming, retry, confirm the retry, and the first
+  rollback restores nothing; the same for delete.
+- MEDIUM stale extra address survived `changed=0`. Fixed: `addr_check` compares
+  the count of global addresses as well as the presence of each desired one, and
+  the same check decides between syncconf and recreation. Extra routes are still
+  not detected (only missing ones are).
+- MEDIUM drift probe on an adopted interface had no epoch file. Fixed:
+  `arm_rollback` writes `0` first when the file is missing.
+- MEDIUM missing `flock`: apply and delete now refuse up front (exit 75), as
+  confirm does.
+- MEDIUM delete failed under `set -e` when the config was gone or corrupt.
+  Fixed: `wg-quick down` falls back to `ip link delete`, then the interface is
+  verified gone.
+- LOW apply description cut to three sentences; `ssh.private_key` and CIDR
+  strings are bounded.

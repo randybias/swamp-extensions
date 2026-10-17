@@ -248,3 +248,35 @@ Deno.test("applyScript arms a rollback before any live change on every path", ()
 Deno.test("the rollback script exits quietly when its directory is gone", () => {
   assertStringIncludes(applyScript("wg0"), '[ ! -e "$rb/epoch" ]');
 });
+
+Deno.test("a pending earlier change forces a new generation before any no-op exit", () => {
+  for (const s of [applyScript("wg0"), deleteScript("wg0", 60)]) {
+    const pending = s.indexOf("if pending_rb; then changed=1; fi");
+    const noop = s.indexOf('echo "changed=0"');
+    assertEquals(pending > 0 && pending < noop, true);
+  }
+  // The check looks for a current-generation, undisarmed rollback directory.
+  const s = applyScript("wg0");
+  assertStringIncludes(s, '"$d"/.$i.rollback.*');
+  assertStringIncludes(s, '[ ! -e "$p/disarm" ]');
+});
+
+Deno.test("flock is required up front, and an adopted interface gets an epoch before arming", () => {
+  for (const s of [applyScript("wg0"), deleteScript("wg0", 60)]) {
+    const need = s.indexOf('echo "flock is required" >&2; exit 75');
+    assertEquals(need > 0 && need < s.indexOf("mktemp"), true);
+  }
+  const s = applyScript("wg0");
+  assertStringIncludes(s, '[ -e "$d/.$i.epoch" ] || echo 0 > "$d/.$i.epoch"');
+});
+
+Deno.test("apply compares the full address set; delete survives a broken config", () => {
+  const s = applyScript("wg0");
+  assertStringIncludes(s, 'if [ "$have" -ne "$want" ]; then addr_ok=0; fi');
+  // The same check guards both the probe and the recreate decision.
+  assertEquals(s.split("addr_check ").length - 1 >= 2, true);
+  assertStringIncludes(
+    deleteScript("wg0", 60),
+    'wg-quick down "$i" >/dev/null 2>&1 || ip link delete "$i"',
+  );
+});

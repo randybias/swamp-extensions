@@ -1,0 +1,1733 @@
+{
+  "single_cidr": {
+    "management_cidrs": [
+      "198.51.100.0/24"
+    ],
+    "allow_tcp": [
+      8080
+    ],
+    "nft_version": "nftables v1.0.9 (Ubuntu 24.04)",
+    "text": "table inet server_host {\n\tchain input {\n\t\ttype filter hook input priority filter; policy drop;\n\t\tct state established,related accept\n\t\tiifname \"lo\" accept\n\t\tip protocol icmp accept\n\t\tip6 nexthdr ipv6-icmp accept\n\t\tip saddr 198.51.100.0/24 tcp dport 22 accept\n\t\ttcp dport 8080 accept\n\t}\n\n\tchain forward {\n\t\ttype filter hook forward priority filter; policy drop;\n\t}\n\n\tchain output {\n\t\ttype filter hook output priority filter; policy accept;\n\t}\n}",
+    "json": {
+      "nftables": [
+        {
+          "metainfo": {
+            "version": "1.0.9",
+            "release_name": "Old Doc Yak #3",
+            "json_schema_version": 1
+          }
+        },
+        {
+          "table": {
+            "family": "inet",
+            "name": "server_host",
+            "handle": 24
+          }
+        },
+        {
+          "chain": {
+            "family": "inet",
+            "table": "server_host",
+            "name": "input",
+            "handle": 1,
+            "type": "filter",
+            "hook": "input",
+            "prio": 0,
+            "policy": "drop"
+          }
+        },
+        {
+          "chain": {
+            "family": "inet",
+            "table": "server_host",
+            "name": "forward",
+            "handle": 2,
+            "type": "filter",
+            "hook": "forward",
+            "prio": 0,
+            "policy": "drop"
+          }
+        },
+        {
+          "chain": {
+            "family": "inet",
+            "table": "server_host",
+            "name": "output",
+            "handle": 3,
+            "type": "filter",
+            "hook": "output",
+            "prio": 0,
+            "policy": "accept"
+          }
+        },
+        {
+          "rule": {
+            "family": "inet",
+            "table": "server_host",
+            "chain": "input",
+            "handle": 4,
+            "expr": [
+              {
+                "match": {
+                  "op": "in",
+                  "left": {
+                    "ct": {
+                      "key": "state"
+                    }
+                  },
+                  "right": [
+                    "established",
+                    "related"
+                  ]
+                }
+              },
+              {
+                "accept": null
+              }
+            ]
+          }
+        },
+        {
+          "rule": {
+            "family": "inet",
+            "table": "server_host",
+            "chain": "input",
+            "handle": 5,
+            "expr": [
+              {
+                "match": {
+                  "op": "==",
+                  "left": {
+                    "meta": {
+                      "key": "iifname"
+                    }
+                  },
+                  "right": "lo"
+                }
+              },
+              {
+                "accept": null
+              }
+            ]
+          }
+        },
+        {
+          "rule": {
+            "family": "inet",
+            "table": "server_host",
+            "chain": "input",
+            "handle": 6,
+            "expr": [
+              {
+                "match": {
+                  "op": "==",
+                  "left": {
+                    "payload": {
+                      "protocol": "ip",
+                      "field": "protocol"
+                    }
+                  },
+                  "right": "icmp"
+                }
+              },
+              {
+                "accept": null
+              }
+            ]
+          }
+        },
+        {
+          "rule": {
+            "family": "inet",
+            "table": "server_host",
+            "chain": "input",
+            "handle": 7,
+            "expr": [
+              {
+                "match": {
+                  "op": "==",
+                  "left": {
+                    "payload": {
+                      "protocol": "ip6",
+                      "field": "nexthdr"
+                    }
+                  },
+                  "right": "ipv6-icmp"
+                }
+              },
+              {
+                "accept": null
+              }
+            ]
+          }
+        },
+        {
+          "rule": {
+            "family": "inet",
+            "table": "server_host",
+            "chain": "input",
+            "handle": 8,
+            "expr": [
+              {
+                "match": {
+                  "op": "==",
+                  "left": {
+                    "payload": {
+                      "protocol": "ip",
+                      "field": "saddr"
+                    }
+                  },
+                  "right": {
+                    "prefix": {
+                      "addr": "198.51.100.0",
+                      "len": 24
+                    }
+                  }
+                }
+              },
+              {
+                "match": {
+                  "op": "==",
+                  "left": {
+                    "payload": {
+                      "protocol": "tcp",
+                      "field": "dport"
+                    }
+                  },
+                  "right": 22
+                }
+              },
+              {
+                "accept": null
+              }
+            ]
+          }
+        },
+        {
+          "rule": {
+            "family": "inet",
+            "table": "server_host",
+            "chain": "input",
+            "handle": 9,
+            "expr": [
+              {
+                "match": {
+                  "op": "==",
+                  "left": {
+                    "payload": {
+                      "protocol": "tcp",
+                      "field": "dport"
+                    }
+                  },
+                  "right": 8080
+                }
+              },
+              {
+                "accept": null
+              }
+            ]
+          }
+        }
+      ]
+    }
+  },
+  "slash32": {
+    "management_cidrs": [
+      "198.51.100.3/32"
+    ],
+    "allow_tcp": [],
+    "nft_version": "nftables v1.0.9 (Ubuntu 24.04)",
+    "text": "table inet server_host {\n\tchain input {\n\t\ttype filter hook input priority filter; policy drop;\n\t\tct state established,related accept\n\t\tiifname \"lo\" accept\n\t\tip protocol icmp accept\n\t\tip6 nexthdr ipv6-icmp accept\n\t\tip saddr 198.51.100.3 tcp dport 22 accept\n\t}\n\n\tchain forward {\n\t\ttype filter hook forward priority filter; policy drop;\n\t}\n\n\tchain output {\n\t\ttype filter hook output priority filter; policy accept;\n\t}\n}",
+    "json": {
+      "nftables": [
+        {
+          "metainfo": {
+            "version": "1.0.9",
+            "release_name": "Old Doc Yak #3",
+            "json_schema_version": 1
+          }
+        },
+        {
+          "table": {
+            "family": "inet",
+            "name": "server_host",
+            "handle": 26
+          }
+        },
+        {
+          "chain": {
+            "family": "inet",
+            "table": "server_host",
+            "name": "input",
+            "handle": 1,
+            "type": "filter",
+            "hook": "input",
+            "prio": 0,
+            "policy": "drop"
+          }
+        },
+        {
+          "chain": {
+            "family": "inet",
+            "table": "server_host",
+            "name": "forward",
+            "handle": 2,
+            "type": "filter",
+            "hook": "forward",
+            "prio": 0,
+            "policy": "drop"
+          }
+        },
+        {
+          "chain": {
+            "family": "inet",
+            "table": "server_host",
+            "name": "output",
+            "handle": 3,
+            "type": "filter",
+            "hook": "output",
+            "prio": 0,
+            "policy": "accept"
+          }
+        },
+        {
+          "rule": {
+            "family": "inet",
+            "table": "server_host",
+            "chain": "input",
+            "handle": 4,
+            "expr": [
+              {
+                "match": {
+                  "op": "in",
+                  "left": {
+                    "ct": {
+                      "key": "state"
+                    }
+                  },
+                  "right": [
+                    "established",
+                    "related"
+                  ]
+                }
+              },
+              {
+                "accept": null
+              }
+            ]
+          }
+        },
+        {
+          "rule": {
+            "family": "inet",
+            "table": "server_host",
+            "chain": "input",
+            "handle": 5,
+            "expr": [
+              {
+                "match": {
+                  "op": "==",
+                  "left": {
+                    "meta": {
+                      "key": "iifname"
+                    }
+                  },
+                  "right": "lo"
+                }
+              },
+              {
+                "accept": null
+              }
+            ]
+          }
+        },
+        {
+          "rule": {
+            "family": "inet",
+            "table": "server_host",
+            "chain": "input",
+            "handle": 6,
+            "expr": [
+              {
+                "match": {
+                  "op": "==",
+                  "left": {
+                    "payload": {
+                      "protocol": "ip",
+                      "field": "protocol"
+                    }
+                  },
+                  "right": "icmp"
+                }
+              },
+              {
+                "accept": null
+              }
+            ]
+          }
+        },
+        {
+          "rule": {
+            "family": "inet",
+            "table": "server_host",
+            "chain": "input",
+            "handle": 7,
+            "expr": [
+              {
+                "match": {
+                  "op": "==",
+                  "left": {
+                    "payload": {
+                      "protocol": "ip6",
+                      "field": "nexthdr"
+                    }
+                  },
+                  "right": "ipv6-icmp"
+                }
+              },
+              {
+                "accept": null
+              }
+            ]
+          }
+        },
+        {
+          "rule": {
+            "family": "inet",
+            "table": "server_host",
+            "chain": "input",
+            "handle": 8,
+            "expr": [
+              {
+                "match": {
+                  "op": "==",
+                  "left": {
+                    "payload": {
+                      "protocol": "ip",
+                      "field": "saddr"
+                    }
+                  },
+                  "right": "198.51.100.3"
+                }
+              },
+              {
+                "match": {
+                  "op": "==",
+                  "left": {
+                    "payload": {
+                      "protocol": "tcp",
+                      "field": "dport"
+                    }
+                  },
+                  "right": 22
+                }
+              },
+              {
+                "accept": null
+              }
+            ]
+          }
+        }
+      ]
+    }
+  },
+  "numeric_vs_lexical": {
+    "management_cidrs": [
+      "198.51.100.64/26",
+      "198.51.100.128/25"
+    ],
+    "allow_tcp": [
+      443,
+      80
+    ],
+    "nft_version": "nftables v1.0.9 (Ubuntu 24.04)",
+    "text": "table inet server_host {\n\tchain input {\n\t\ttype filter hook input priority filter; policy drop;\n\t\tct state established,related accept\n\t\tiifname \"lo\" accept\n\t\tip protocol icmp accept\n\t\tip6 nexthdr ipv6-icmp accept\n\t\tip saddr { 198.51.100.64/26, 198.51.100.128/25 } tcp dport 22 accept\n\t\ttcp dport { 80, 443 } accept\n\t}\n\n\tchain forward {\n\t\ttype filter hook forward priority filter; policy drop;\n\t}\n\n\tchain output {\n\t\ttype filter hook output priority filter; policy accept;\n\t}\n}",
+    "json": {
+      "nftables": [
+        {
+          "metainfo": {
+            "version": "1.0.9",
+            "release_name": "Old Doc Yak #3",
+            "json_schema_version": 1
+          }
+        },
+        {
+          "table": {
+            "family": "inet",
+            "name": "server_host",
+            "handle": 28
+          }
+        },
+        {
+          "chain": {
+            "family": "inet",
+            "table": "server_host",
+            "name": "input",
+            "handle": 1,
+            "type": "filter",
+            "hook": "input",
+            "prio": 0,
+            "policy": "drop"
+          }
+        },
+        {
+          "chain": {
+            "family": "inet",
+            "table": "server_host",
+            "name": "forward",
+            "handle": 2,
+            "type": "filter",
+            "hook": "forward",
+            "prio": 0,
+            "policy": "drop"
+          }
+        },
+        {
+          "chain": {
+            "family": "inet",
+            "table": "server_host",
+            "name": "output",
+            "handle": 3,
+            "type": "filter",
+            "hook": "output",
+            "prio": 0,
+            "policy": "accept"
+          }
+        },
+        {
+          "rule": {
+            "family": "inet",
+            "table": "server_host",
+            "chain": "input",
+            "handle": 4,
+            "expr": [
+              {
+                "match": {
+                  "op": "in",
+                  "left": {
+                    "ct": {
+                      "key": "state"
+                    }
+                  },
+                  "right": [
+                    "established",
+                    "related"
+                  ]
+                }
+              },
+              {
+                "accept": null
+              }
+            ]
+          }
+        },
+        {
+          "rule": {
+            "family": "inet",
+            "table": "server_host",
+            "chain": "input",
+            "handle": 5,
+            "expr": [
+              {
+                "match": {
+                  "op": "==",
+                  "left": {
+                    "meta": {
+                      "key": "iifname"
+                    }
+                  },
+                  "right": "lo"
+                }
+              },
+              {
+                "accept": null
+              }
+            ]
+          }
+        },
+        {
+          "rule": {
+            "family": "inet",
+            "table": "server_host",
+            "chain": "input",
+            "handle": 6,
+            "expr": [
+              {
+                "match": {
+                  "op": "==",
+                  "left": {
+                    "payload": {
+                      "protocol": "ip",
+                      "field": "protocol"
+                    }
+                  },
+                  "right": "icmp"
+                }
+              },
+              {
+                "accept": null
+              }
+            ]
+          }
+        },
+        {
+          "rule": {
+            "family": "inet",
+            "table": "server_host",
+            "chain": "input",
+            "handle": 7,
+            "expr": [
+              {
+                "match": {
+                  "op": "==",
+                  "left": {
+                    "payload": {
+                      "protocol": "ip6",
+                      "field": "nexthdr"
+                    }
+                  },
+                  "right": "ipv6-icmp"
+                }
+              },
+              {
+                "accept": null
+              }
+            ]
+          }
+        },
+        {
+          "rule": {
+            "family": "inet",
+            "table": "server_host",
+            "chain": "input",
+            "handle": 9,
+            "expr": [
+              {
+                "match": {
+                  "op": "==",
+                  "left": {
+                    "payload": {
+                      "protocol": "ip",
+                      "field": "saddr"
+                    }
+                  },
+                  "right": {
+                    "set": [
+                      {
+                        "prefix": {
+                          "addr": "198.51.100.64",
+                          "len": 26
+                        }
+                      },
+                      {
+                        "prefix": {
+                          "addr": "198.51.100.128",
+                          "len": 25
+                        }
+                      }
+                    ]
+                  }
+                }
+              },
+              {
+                "match": {
+                  "op": "==",
+                  "left": {
+                    "payload": {
+                      "protocol": "tcp",
+                      "field": "dport"
+                    }
+                  },
+                  "right": 22
+                }
+              },
+              {
+                "accept": null
+              }
+            ]
+          }
+        },
+        {
+          "rule": {
+            "family": "inet",
+            "table": "server_host",
+            "chain": "input",
+            "handle": 11,
+            "expr": [
+              {
+                "match": {
+                  "op": "==",
+                  "left": {
+                    "payload": {
+                      "protocol": "tcp",
+                      "field": "dport"
+                    }
+                  },
+                  "right": {
+                    "set": [
+                      80,
+                      443
+                    ]
+                  }
+                }
+              },
+              {
+                "accept": null
+              }
+            ]
+          }
+        }
+      ]
+    }
+  },
+  "contained": {
+    "management_cidrs": [
+      "198.51.100.0/24",
+      "198.51.100.128/25"
+    ],
+    "allow_tcp": [],
+    "allow_udp": null,
+    "text": "table inet server_host {\n\tchain input {\n\t\ttype filter hook input priority filter; policy drop;\n\t\tct state established,related accept\n\t\tiifname \"lo\" accept\n\t\tip protocol icmp accept\n\t\tip6 nexthdr ipv6-icmp accept\n\t\tip saddr { 198.51.100.0/24 } tcp dport 22 accept\n\t}\n\n\tchain forward {\n\t\ttype filter hook forward priority filter; policy drop;\n\t}\n\n\tchain output {\n\t\ttype filter hook output priority filter; policy accept;\n\t}\n}\n",
+    "json": {
+      "nftables": [
+        {
+          "metainfo": {
+            "version": "1.0.9",
+            "release_name": "Old Doc Yak #3",
+            "json_schema_version": 1
+          }
+        },
+        {
+          "table": {
+            "family": "inet",
+            "name": "server_host",
+            "handle": 6
+          }
+        },
+        {
+          "chain": {
+            "family": "inet",
+            "table": "server_host",
+            "name": "input",
+            "handle": 1,
+            "type": "filter",
+            "hook": "input",
+            "prio": 0,
+            "policy": "drop"
+          }
+        },
+        {
+          "chain": {
+            "family": "inet",
+            "table": "server_host",
+            "name": "forward",
+            "handle": 2,
+            "type": "filter",
+            "hook": "forward",
+            "prio": 0,
+            "policy": "drop"
+          }
+        },
+        {
+          "chain": {
+            "family": "inet",
+            "table": "server_host",
+            "name": "output",
+            "handle": 3,
+            "type": "filter",
+            "hook": "output",
+            "prio": 0,
+            "policy": "accept"
+          }
+        },
+        {
+          "rule": {
+            "family": "inet",
+            "table": "server_host",
+            "chain": "input",
+            "handle": 4,
+            "expr": [
+              {
+                "match": {
+                  "op": "in",
+                  "left": {
+                    "ct": {
+                      "key": "state"
+                    }
+                  },
+                  "right": [
+                    "established",
+                    "related"
+                  ]
+                }
+              },
+              {
+                "accept": null
+              }
+            ]
+          }
+        },
+        {
+          "rule": {
+            "family": "inet",
+            "table": "server_host",
+            "chain": "input",
+            "handle": 5,
+            "expr": [
+              {
+                "match": {
+                  "op": "==",
+                  "left": {
+                    "meta": {
+                      "key": "iifname"
+                    }
+                  },
+                  "right": "lo"
+                }
+              },
+              {
+                "accept": null
+              }
+            ]
+          }
+        },
+        {
+          "rule": {
+            "family": "inet",
+            "table": "server_host",
+            "chain": "input",
+            "handle": 6,
+            "expr": [
+              {
+                "match": {
+                  "op": "==",
+                  "left": {
+                    "payload": {
+                      "protocol": "ip",
+                      "field": "protocol"
+                    }
+                  },
+                  "right": "icmp"
+                }
+              },
+              {
+                "accept": null
+              }
+            ]
+          }
+        },
+        {
+          "rule": {
+            "family": "inet",
+            "table": "server_host",
+            "chain": "input",
+            "handle": 7,
+            "expr": [
+              {
+                "match": {
+                  "op": "==",
+                  "left": {
+                    "payload": {
+                      "protocol": "ip6",
+                      "field": "nexthdr"
+                    }
+                  },
+                  "right": "ipv6-icmp"
+                }
+              },
+              {
+                "accept": null
+              }
+            ]
+          }
+        },
+        {
+          "rule": {
+            "family": "inet",
+            "table": "server_host",
+            "chain": "input",
+            "handle": 9,
+            "expr": [
+              {
+                "match": {
+                  "op": "==",
+                  "left": {
+                    "payload": {
+                      "protocol": "ip",
+                      "field": "saddr"
+                    }
+                  },
+                  "right": {
+                    "set": [
+                      {
+                        "prefix": {
+                          "addr": "198.51.100.0",
+                          "len": 24
+                        }
+                      }
+                    ]
+                  }
+                }
+              },
+              {
+                "match": {
+                  "op": "==",
+                  "left": {
+                    "payload": {
+                      "protocol": "tcp",
+                      "field": "dport"
+                    }
+                  },
+                  "right": 22
+                }
+              },
+              {
+                "accept": null
+              }
+            ]
+          }
+        }
+      ]
+    }
+  },
+  "adjacent": {
+    "management_cidrs": [
+      "198.51.100.0/25",
+      "198.51.100.128/25"
+    ],
+    "allow_tcp": [],
+    "allow_udp": null,
+    "text": "table inet server_host {\n\tchain input {\n\t\ttype filter hook input priority filter; policy drop;\n\t\tct state established,related accept\n\t\tiifname \"lo\" accept\n\t\tip protocol icmp accept\n\t\tip6 nexthdr ipv6-icmp accept\n\t\tip saddr { 198.51.100.0/24 } tcp dport 22 accept\n\t}\n\n\tchain forward {\n\t\ttype filter hook forward priority filter; policy drop;\n\t}\n\n\tchain output {\n\t\ttype filter hook output priority filter; policy accept;\n\t}\n}\n",
+    "json": {
+      "nftables": [
+        {
+          "metainfo": {
+            "version": "1.0.9",
+            "release_name": "Old Doc Yak #3",
+            "json_schema_version": 1
+          }
+        },
+        {
+          "table": {
+            "family": "inet",
+            "name": "server_host",
+            "handle": 7
+          }
+        },
+        {
+          "chain": {
+            "family": "inet",
+            "table": "server_host",
+            "name": "input",
+            "handle": 1,
+            "type": "filter",
+            "hook": "input",
+            "prio": 0,
+            "policy": "drop"
+          }
+        },
+        {
+          "chain": {
+            "family": "inet",
+            "table": "server_host",
+            "name": "forward",
+            "handle": 2,
+            "type": "filter",
+            "hook": "forward",
+            "prio": 0,
+            "policy": "drop"
+          }
+        },
+        {
+          "chain": {
+            "family": "inet",
+            "table": "server_host",
+            "name": "output",
+            "handle": 3,
+            "type": "filter",
+            "hook": "output",
+            "prio": 0,
+            "policy": "accept"
+          }
+        },
+        {
+          "rule": {
+            "family": "inet",
+            "table": "server_host",
+            "chain": "input",
+            "handle": 4,
+            "expr": [
+              {
+                "match": {
+                  "op": "in",
+                  "left": {
+                    "ct": {
+                      "key": "state"
+                    }
+                  },
+                  "right": [
+                    "established",
+                    "related"
+                  ]
+                }
+              },
+              {
+                "accept": null
+              }
+            ]
+          }
+        },
+        {
+          "rule": {
+            "family": "inet",
+            "table": "server_host",
+            "chain": "input",
+            "handle": 5,
+            "expr": [
+              {
+                "match": {
+                  "op": "==",
+                  "left": {
+                    "meta": {
+                      "key": "iifname"
+                    }
+                  },
+                  "right": "lo"
+                }
+              },
+              {
+                "accept": null
+              }
+            ]
+          }
+        },
+        {
+          "rule": {
+            "family": "inet",
+            "table": "server_host",
+            "chain": "input",
+            "handle": 6,
+            "expr": [
+              {
+                "match": {
+                  "op": "==",
+                  "left": {
+                    "payload": {
+                      "protocol": "ip",
+                      "field": "protocol"
+                    }
+                  },
+                  "right": "icmp"
+                }
+              },
+              {
+                "accept": null
+              }
+            ]
+          }
+        },
+        {
+          "rule": {
+            "family": "inet",
+            "table": "server_host",
+            "chain": "input",
+            "handle": 7,
+            "expr": [
+              {
+                "match": {
+                  "op": "==",
+                  "left": {
+                    "payload": {
+                      "protocol": "ip6",
+                      "field": "nexthdr"
+                    }
+                  },
+                  "right": "ipv6-icmp"
+                }
+              },
+              {
+                "accept": null
+              }
+            ]
+          }
+        },
+        {
+          "rule": {
+            "family": "inet",
+            "table": "server_host",
+            "chain": "input",
+            "handle": 9,
+            "expr": [
+              {
+                "match": {
+                  "op": "==",
+                  "left": {
+                    "payload": {
+                      "protocol": "ip",
+                      "field": "saddr"
+                    }
+                  },
+                  "right": {
+                    "set": [
+                      {
+                        "prefix": {
+                          "addr": "198.51.100.0",
+                          "len": 24
+                        }
+                      }
+                    ]
+                  }
+                }
+              },
+              {
+                "match": {
+                  "op": "==",
+                  "left": {
+                    "payload": {
+                      "protocol": "tcp",
+                      "field": "dport"
+                    }
+                  },
+                  "right": 22
+                }
+              },
+              {
+                "accept": null
+              }
+            ]
+          }
+        }
+      ]
+    }
+  },
+  "unaligned_range": {
+    "management_cidrs": [
+      "198.51.100.64/26",
+      "198.51.100.128/26"
+    ],
+    "allow_tcp": [],
+    "allow_udp": null,
+    "text": "table inet server_host {\n\tchain input {\n\t\ttype filter hook input priority filter; policy drop;\n\t\tct state established,related accept\n\t\tiifname \"lo\" accept\n\t\tip protocol icmp accept\n\t\tip6 nexthdr ipv6-icmp accept\n\t\tip saddr { 198.51.100.64-198.51.100.191 } tcp dport 22 accept\n\t}\n\n\tchain forward {\n\t\ttype filter hook forward priority filter; policy drop;\n\t}\n\n\tchain output {\n\t\ttype filter hook output priority filter; policy accept;\n\t}\n}\n",
+    "json": {
+      "nftables": [
+        {
+          "metainfo": {
+            "version": "1.0.9",
+            "release_name": "Old Doc Yak #3",
+            "json_schema_version": 1
+          }
+        },
+        {
+          "table": {
+            "family": "inet",
+            "name": "server_host",
+            "handle": 8
+          }
+        },
+        {
+          "chain": {
+            "family": "inet",
+            "table": "server_host",
+            "name": "input",
+            "handle": 1,
+            "type": "filter",
+            "hook": "input",
+            "prio": 0,
+            "policy": "drop"
+          }
+        },
+        {
+          "chain": {
+            "family": "inet",
+            "table": "server_host",
+            "name": "forward",
+            "handle": 2,
+            "type": "filter",
+            "hook": "forward",
+            "prio": 0,
+            "policy": "drop"
+          }
+        },
+        {
+          "chain": {
+            "family": "inet",
+            "table": "server_host",
+            "name": "output",
+            "handle": 3,
+            "type": "filter",
+            "hook": "output",
+            "prio": 0,
+            "policy": "accept"
+          }
+        },
+        {
+          "rule": {
+            "family": "inet",
+            "table": "server_host",
+            "chain": "input",
+            "handle": 4,
+            "expr": [
+              {
+                "match": {
+                  "op": "in",
+                  "left": {
+                    "ct": {
+                      "key": "state"
+                    }
+                  },
+                  "right": [
+                    "established",
+                    "related"
+                  ]
+                }
+              },
+              {
+                "accept": null
+              }
+            ]
+          }
+        },
+        {
+          "rule": {
+            "family": "inet",
+            "table": "server_host",
+            "chain": "input",
+            "handle": 5,
+            "expr": [
+              {
+                "match": {
+                  "op": "==",
+                  "left": {
+                    "meta": {
+                      "key": "iifname"
+                    }
+                  },
+                  "right": "lo"
+                }
+              },
+              {
+                "accept": null
+              }
+            ]
+          }
+        },
+        {
+          "rule": {
+            "family": "inet",
+            "table": "server_host",
+            "chain": "input",
+            "handle": 6,
+            "expr": [
+              {
+                "match": {
+                  "op": "==",
+                  "left": {
+                    "payload": {
+                      "protocol": "ip",
+                      "field": "protocol"
+                    }
+                  },
+                  "right": "icmp"
+                }
+              },
+              {
+                "accept": null
+              }
+            ]
+          }
+        },
+        {
+          "rule": {
+            "family": "inet",
+            "table": "server_host",
+            "chain": "input",
+            "handle": 7,
+            "expr": [
+              {
+                "match": {
+                  "op": "==",
+                  "left": {
+                    "payload": {
+                      "protocol": "ip6",
+                      "field": "nexthdr"
+                    }
+                  },
+                  "right": "ipv6-icmp"
+                }
+              },
+              {
+                "accept": null
+              }
+            ]
+          }
+        },
+        {
+          "rule": {
+            "family": "inet",
+            "table": "server_host",
+            "chain": "input",
+            "handle": 9,
+            "expr": [
+              {
+                "match": {
+                  "op": "==",
+                  "left": {
+                    "payload": {
+                      "protocol": "ip",
+                      "field": "saddr"
+                    }
+                  },
+                  "right": {
+                    "set": [
+                      {
+                        "range": [
+                          "198.51.100.64",
+                          "198.51.100.191"
+                        ]
+                      }
+                    ]
+                  }
+                }
+              },
+              {
+                "match": {
+                  "op": "==",
+                  "left": {
+                    "payload": {
+                      "protocol": "tcp",
+                      "field": "dport"
+                    }
+                  },
+                  "right": 22
+                }
+              },
+              {
+                "accept": null
+              }
+            ]
+          }
+        }
+      ]
+    }
+  },
+  "same_network_host_bits": {
+    "management_cidrs": [
+      "198.51.100.0/24",
+      "198.51.100.1/24"
+    ],
+    "allow_tcp": [],
+    "allow_udp": null,
+    "text": "table inet server_host {\n\tchain input {\n\t\ttype filter hook input priority filter; policy drop;\n\t\tct state established,related accept\n\t\tiifname \"lo\" accept\n\t\tip protocol icmp accept\n\t\tip6 nexthdr ipv6-icmp accept\n\t\tip saddr { 198.51.100.0/24 } tcp dport 22 accept\n\t}\n\n\tchain forward {\n\t\ttype filter hook forward priority filter; policy drop;\n\t}\n\n\tchain output {\n\t\ttype filter hook output priority filter; policy accept;\n\t}\n}\n",
+    "json": {
+      "nftables": [
+        {
+          "metainfo": {
+            "version": "1.0.9",
+            "release_name": "Old Doc Yak #3",
+            "json_schema_version": 1
+          }
+        },
+        {
+          "table": {
+            "family": "inet",
+            "name": "server_host",
+            "handle": 9
+          }
+        },
+        {
+          "chain": {
+            "family": "inet",
+            "table": "server_host",
+            "name": "input",
+            "handle": 1,
+            "type": "filter",
+            "hook": "input",
+            "prio": 0,
+            "policy": "drop"
+          }
+        },
+        {
+          "chain": {
+            "family": "inet",
+            "table": "server_host",
+            "name": "forward",
+            "handle": 2,
+            "type": "filter",
+            "hook": "forward",
+            "prio": 0,
+            "policy": "drop"
+          }
+        },
+        {
+          "chain": {
+            "family": "inet",
+            "table": "server_host",
+            "name": "output",
+            "handle": 3,
+            "type": "filter",
+            "hook": "output",
+            "prio": 0,
+            "policy": "accept"
+          }
+        },
+        {
+          "rule": {
+            "family": "inet",
+            "table": "server_host",
+            "chain": "input",
+            "handle": 4,
+            "expr": [
+              {
+                "match": {
+                  "op": "in",
+                  "left": {
+                    "ct": {
+                      "key": "state"
+                    }
+                  },
+                  "right": [
+                    "established",
+                    "related"
+                  ]
+                }
+              },
+              {
+                "accept": null
+              }
+            ]
+          }
+        },
+        {
+          "rule": {
+            "family": "inet",
+            "table": "server_host",
+            "chain": "input",
+            "handle": 5,
+            "expr": [
+              {
+                "match": {
+                  "op": "==",
+                  "left": {
+                    "meta": {
+                      "key": "iifname"
+                    }
+                  },
+                  "right": "lo"
+                }
+              },
+              {
+                "accept": null
+              }
+            ]
+          }
+        },
+        {
+          "rule": {
+            "family": "inet",
+            "table": "server_host",
+            "chain": "input",
+            "handle": 6,
+            "expr": [
+              {
+                "match": {
+                  "op": "==",
+                  "left": {
+                    "payload": {
+                      "protocol": "ip",
+                      "field": "protocol"
+                    }
+                  },
+                  "right": "icmp"
+                }
+              },
+              {
+                "accept": null
+              }
+            ]
+          }
+        },
+        {
+          "rule": {
+            "family": "inet",
+            "table": "server_host",
+            "chain": "input",
+            "handle": 7,
+            "expr": [
+              {
+                "match": {
+                  "op": "==",
+                  "left": {
+                    "payload": {
+                      "protocol": "ip6",
+                      "field": "nexthdr"
+                    }
+                  },
+                  "right": "ipv6-icmp"
+                }
+              },
+              {
+                "accept": null
+              }
+            ]
+          }
+        },
+        {
+          "rule": {
+            "family": "inet",
+            "table": "server_host",
+            "chain": "input",
+            "handle": 9,
+            "expr": [
+              {
+                "match": {
+                  "op": "==",
+                  "left": {
+                    "payload": {
+                      "protocol": "ip",
+                      "field": "saddr"
+                    }
+                  },
+                  "right": {
+                    "set": [
+                      {
+                        "prefix": {
+                          "addr": "198.51.100.0",
+                          "len": 24
+                        }
+                      }
+                    ]
+                  }
+                }
+              },
+              {
+                "match": {
+                  "op": "==",
+                  "left": {
+                    "payload": {
+                      "protocol": "tcp",
+                      "field": "dport"
+                    }
+                  },
+                  "right": 22
+                }
+              },
+              {
+                "accept": null
+              }
+            ]
+          }
+        }
+      ]
+    }
+  },
+  "v6_contained": {
+    "management_cidrs": [
+      "2001:db8::/48",
+      "2001:db8:0:1::1/128"
+    ],
+    "allow_tcp": [],
+    "allow_udp": null,
+    "text": "table inet server_host {\n\tchain input {\n\t\ttype filter hook input priority filter; policy drop;\n\t\tct state established,related accept\n\t\tiifname \"lo\" accept\n\t\tip protocol icmp accept\n\t\tip6 nexthdr ipv6-icmp accept\n\t\tip6 saddr { 2001:db8::/48 } tcp dport 22 accept\n\t}\n\n\tchain forward {\n\t\ttype filter hook forward priority filter; policy drop;\n\t}\n\n\tchain output {\n\t\ttype filter hook output priority filter; policy accept;\n\t}\n}\n",
+    "json": {
+      "nftables": [
+        {
+          "metainfo": {
+            "version": "1.0.9",
+            "release_name": "Old Doc Yak #3",
+            "json_schema_version": 1
+          }
+        },
+        {
+          "table": {
+            "family": "inet",
+            "name": "server_host",
+            "handle": 10
+          }
+        },
+        {
+          "chain": {
+            "family": "inet",
+            "table": "server_host",
+            "name": "input",
+            "handle": 1,
+            "type": "filter",
+            "hook": "input",
+            "prio": 0,
+            "policy": "drop"
+          }
+        },
+        {
+          "chain": {
+            "family": "inet",
+            "table": "server_host",
+            "name": "forward",
+            "handle": 2,
+            "type": "filter",
+            "hook": "forward",
+            "prio": 0,
+            "policy": "drop"
+          }
+        },
+        {
+          "chain": {
+            "family": "inet",
+            "table": "server_host",
+            "name": "output",
+            "handle": 3,
+            "type": "filter",
+            "hook": "output",
+            "prio": 0,
+            "policy": "accept"
+          }
+        },
+        {
+          "rule": {
+            "family": "inet",
+            "table": "server_host",
+            "chain": "input",
+            "handle": 4,
+            "expr": [
+              {
+                "match": {
+                  "op": "in",
+                  "left": {
+                    "ct": {
+                      "key": "state"
+                    }
+                  },
+                  "right": [
+                    "established",
+                    "related"
+                  ]
+                }
+              },
+              {
+                "accept": null
+              }
+            ]
+          }
+        },
+        {
+          "rule": {
+            "family": "inet",
+            "table": "server_host",
+            "chain": "input",
+            "handle": 5,
+            "expr": [
+              {
+                "match": {
+                  "op": "==",
+                  "left": {
+                    "meta": {
+                      "key": "iifname"
+                    }
+                  },
+                  "right": "lo"
+                }
+              },
+              {
+                "accept": null
+              }
+            ]
+          }
+        },
+        {
+          "rule": {
+            "family": "inet",
+            "table": "server_host",
+            "chain": "input",
+            "handle": 6,
+            "expr": [
+              {
+                "match": {
+                  "op": "==",
+                  "left": {
+                    "payload": {
+                      "protocol": "ip",
+                      "field": "protocol"
+                    }
+                  },
+                  "right": "icmp"
+                }
+              },
+              {
+                "accept": null
+              }
+            ]
+          }
+        },
+        {
+          "rule": {
+            "family": "inet",
+            "table": "server_host",
+            "chain": "input",
+            "handle": 7,
+            "expr": [
+              {
+                "match": {
+                  "op": "==",
+                  "left": {
+                    "payload": {
+                      "protocol": "ip6",
+                      "field": "nexthdr"
+                    }
+                  },
+                  "right": "ipv6-icmp"
+                }
+              },
+              {
+                "accept": null
+              }
+            ]
+          }
+        },
+        {
+          "rule": {
+            "family": "inet",
+            "table": "server_host",
+            "chain": "input",
+            "handle": 9,
+            "expr": [
+              {
+                "match": {
+                  "op": "==",
+                  "left": {
+                    "payload": {
+                      "protocol": "ip6",
+                      "field": "saddr"
+                    }
+                  },
+                  "right": {
+                    "set": [
+                      {
+                        "prefix": {
+                          "addr": "2001:db8::",
+                          "len": 48
+                        }
+                      }
+                    ]
+                  }
+                }
+              },
+              {
+                "match": {
+                  "op": "==",
+                  "left": {
+                    "payload": {
+                      "protocol": "tcp",
+                      "field": "dport"
+                    }
+                  },
+                  "right": 22
+                }
+              },
+              {
+                "accept": null
+              }
+            ]
+          }
+        }
+      ]
+    }
+  }
+}

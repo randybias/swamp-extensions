@@ -1,0 +1,21 @@
+# Managed by @randybias/server-host. Edit the model inputs, not this file.
+add table inet server_host
+delete table inet server_host
+table inet server_host {
+	chain input {
+		type filter hook input priority filter; policy drop;
+		ct state established,related accept
+		iifname "lo" accept
+		ip protocol icmp accept
+		ip6 nexthdr ipv6-icmp accept
+		ip saddr { 192.0.2.0/24 } tcp dport 2222 accept
+		tcp dport { 22, 443, 8443 } accept
+		udp dport { 51820 } accept
+	}
+	chain forward {
+		type filter hook forward priority filter; policy drop;
+	}
+	chain output {
+		type filter hook output priority filter; policy accept;
+	}
+}

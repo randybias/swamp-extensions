@@ -65,3 +65,8 @@ k0s-cluster:
   channel: beta
   ci: false
   published: {}
+
+server-host:
+  channel: beta
+  ci: false
+  published: {}

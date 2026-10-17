@@ -333,3 +333,14 @@ the triage checks, no Critical/High. `_lib/ssh.ts` is the canonical blob
 
 - Prior art: the registry has no k0s package. `@shelson/k3s` and `@rjeschmi/vm`
   are adjacent but do not cover a k0s cluster.
+
+- 2026-10-17 (17.3): reset crashed live with "Secret
+  '...root~***~22-config_file_sha256' not found in local vault".
+  `config_file_sha256` was marked sensitive, so swamp stored it in the vault
+  under a key derived from the resource data name, which embeds the host
+  (`user~host~port`); on a later read swamp masks an IP-shaped host to `***`, so
+  the host-derived key could not be resolved. install and reset both derive the
+  target from the method input, so the fix is to stop vaulting this field: it is
+  a drift-detection hash, not a secret, and it is now stored in state. Any
+  future sensitive resource field on this model must use a data name that cannot
+  be masked, or persist the exact vault key at write time.

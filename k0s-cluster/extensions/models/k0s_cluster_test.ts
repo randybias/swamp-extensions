@@ -1259,6 +1259,49 @@ Deno.test("reset persists the binary-removal outcome in state", async () => {
   );
 });
 
+Deno.test("reset tolerates a stored record whose host is masked", async () => {
+  const fake = makeDeps({
+    exec: (argv) => {
+      if (
+        argv[0] === "systemctl" && argv[1] === "cat" &&
+        argv[2] === "k0scontroller"
+      ) {
+        return { code: 0, stdout: "unit\n" };
+      }
+      if (argv[0] === "systemctl" && argv[1] === "is-active") {
+        return { code: 3, stdout: "inactive\n" };
+      }
+      if (argv[0] === "systemctl" && argv[1] === "cat") return ABSENT;
+      return { code: 0, stdout: "" };
+    },
+  });
+  const model = createModel(fake.deps);
+  const args = model.methods.reset.arguments.parse({
+    ssh: SSH,
+    confirm_host: HOST,
+  });
+  const { context } = createModelTestContext({
+    storedResources: {
+      [targetId({ host: HOST, port: 22, user: "root" })]: {
+        host: "***",
+        port: 22,
+        user: "root",
+        role: "single",
+        k0s_version: "v1.31.2+k0s.0",
+        binary_sha256: PAYLOAD_SHA,
+        config_sha256: "c".repeat(64),
+        config_file_sha256: "d".repeat(64),
+        service: "k0scontroller",
+        installed: true,
+        adopted: false,
+        observed_at: new Date().toISOString(),
+      },
+    },
+  });
+  const out = await model.methods.reset.execute(args, context);
+  assertEquals(out.result.reset, true);
+});
+
 Deno.test("reset refuses a confirm_host that does not match", async () => {
   const fake = makeDeps();
   const model = createModel(fake.deps);
@@ -1908,9 +1951,12 @@ Deno.test("sensitive digests are not returned by get, apply_manifests or render_
   assertEquals(JSON.stringify(applied.result).includes("sha256"), false);
   const rs = model.resources.manifests.schema.shape.files.element.shape;
   assertEquals(rs.sha256.meta()?.sensitive, true);
+  // config_file_sha256 is a drift hash, not vaulted: a sensitive field here
+  // would be keyed by the host-derived data name, which swamp masks.
   assertEquals(
-    model.resources.state.schema.shape.config_file_sha256.meta()?.sensitive,
-    true,
+    model.resources.state.schema.shape.config_file_sha256.meta()?.sensitive ??
+      false,
+    false,
   );
 });
 

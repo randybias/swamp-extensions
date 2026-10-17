@@ -365,7 +365,9 @@ const StateSchema = z.strictObject({
   k0s_version: z.string().nullable(),
   binary_sha256: z.string().nullable(),
   config_sha256: z.string().nullable(),
-  config_file_sha256: z.string().nullable().meta({ sensitive: true }),
+  config_file_sha256: z.string().nullable().describe(
+    "Hash of the installed k0s.yaml, for drift detection. Not vaulted: a sensitive field here is keyed by the host-derived data name, which swamp masks when the host looks like an IP, so the key cannot be resolved on a later read.",
+  ),
   service: z.string().nullable(),
   installed: z.boolean(),
   adopted: z.boolean(),
@@ -459,7 +461,9 @@ const StatusSchema = z.strictObject({
   node: NodeViewSchema.nullable(),
   nodes: z.array(NodeViewSchema),
   system_pods: z.array(PodViewSchema),
-  config_file_sha256: z.string().nullable().meta({ sensitive: true }),
+  config_file_sha256: z.string().nullable().describe(
+    "Hash of the installed k0s.yaml, for drift detection. Not vaulted: a sensitive field here is keyed by the host-derived data name, which swamp masks when the host looks like an IP, so the key cannot be resolved on a later read.",
+  ),
   stacks: z.array(z.string()),
   helm_releases: z.array(
     z.strictObject({

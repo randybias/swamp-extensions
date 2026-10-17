@@ -4,17 +4,21 @@ import {
   assertCacheDir,
   assertPassthroughHost,
   escapeRegex,
+  expectedProxyKeys,
   isBackendUrl,
+  isWildcardAddress,
+  parseAptCacherLog,
   parseCacheBytes,
   parseFsFree,
   parseProxyUrl,
-  parseReportPage,
+  proxyValuesOf,
   renderBackendFile,
   renderClientSnippet,
   renderDetectScript,
   renderPassthroughPattern,
   renderSecurityConf,
   renderServerFragment,
+  windowToSeconds,
 } from "./apt.ts";
 
 async function golden(name: string): Promise<string> {
@@ -23,7 +27,30 @@ async function golden(name: string): Promise<string> {
   );
 }
 
-Deno.test("parseProxyUrl accepts http host:port and rejects the rest", () => {
+async function hasTool(name: string): Promise<boolean> {
+  try {
+    const out = await new Deno.Command("sh", {
+      args: ["-c", `command -v ${name}`],
+      stdout: "null",
+      stderr: "null",
+    }).output();
+    return out.code === 0;
+  } catch {
+    return false;
+  }
+}
+
+/** Parses `apt-config dump` lines into a flat `Key "value";` record. */
+function dumpToRecord(text: string): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const raw of text.split(/\r?\n/)) {
+    const match = /^([A-Za-z0-9_:.-]+)\s+"(.*)";\s*$/.exec(raw.trim());
+    if (match) out[match[1]] = match[2];
+  }
+  return out;
+}
+
+Deno.test("parseProxyUrl enforces the raw grammar before URL parsing", () => {
   assertEquals(
     parseProxyUrl("http://192.0.2.10:3142").url,
     "http://192.0.2.10:3142",
@@ -43,6 +70,14 @@ Deno.test("parseProxyUrl accepts http host:port and rejects the rest", () => {
       "http://192.0.2.10",
       "http://192.0.2.10:3142/path",
       "http://192.0.2.10:3142?x=1",
+      "http://x$({touch,pwned})y:3142",
+      'http://x"y:3142',
+      "http://x{y}:3142",
+      "http://x,y:3142",
+      "http://x&y:3142",
+      "http://x`y:3142",
+      "http://Upper.Example.test:3142",
+      "http://[not-an-ip]:3142",
     ]
   ) {
     assertThrows(() => parseProxyUrl(bad), AptConfigError, undefined, bad);
@@ -70,17 +105,27 @@ Deno.test("passthrough hosts reject wildcards, IP literals and case", () => {
   }
 });
 
-Deno.test("backend URLs reject credentials, query and a wrong scheme", () => {
+Deno.test("backend URLs are an exact grammar, not WHATWG leniency", () => {
   assertEquals(isBackendUrl("http://deb.debian.org/debian/", "http"), true);
   assertEquals(isBackendUrl("https://deb.debian.org/debian/", "https"), true);
+  assertEquals(isBackendUrl("http://deb.debian.org", "http"), true);
+  assertEquals(isBackendUrl("http://127.0.0.1/debian/", "http"), true);
   assertEquals(isBackendUrl("https://deb.debian.org/debian/", "http"), false);
-  assertEquals(
-    isBackendUrl("http://user:pass@mirror.test/debian/", "http"),
-    false,
-  );
-  assertEquals(isBackendUrl("http://mirror.test/debian/?x=1", "http"), false);
-  assertEquals(isBackendUrl("http://mirror.test/debian/#frag", "http"), false);
-  assertEquals(isBackendUrl("http://mirror.test:8080/debian/", "http"), false);
+  for (
+    const bad of [
+      "http://user:pass@mirror.test/debian/",
+      "http://mirror.test/debian/?x=1",
+      "http://mirror.test/debian/#frag",
+      "http://mirror.test/debian/#",
+      "http://mirror.test/debian/;rm",
+      "http://mirror.test:8080/debian/",
+      "http://mirror.test:80/debian/",
+      "http://Upper.test/debian/",
+      "http://mirror.test/debian/ extra",
+    ]
+  ) {
+    assertEquals(isBackendUrl(bad, "http"), false, bad);
+  }
 });
 
 Deno.test("escapeRegex neutralizes metacharacters", () => {
@@ -104,20 +149,33 @@ Deno.test("passthrough pattern is anchored, escaped and never .*", () => {
 });
 
 Deno.test("server fragment goldens per HTTPS policy", async () => {
+  const direct = renderServerFragment({
+    listen: ["192.0.2.10"],
+    port: 3142,
+    https_policy: "direct",
+    passthrough_hosts: [],
+    backends: {
+      debian: ["http://deb.debian.org/debian/"],
+      ubuntu: ["http://archive.ubuntu.com/ubuntu/"],
+    },
+    expire_days: 4,
+    cache_dir: "/var/cache/apt-cacher-ng",
+  });
+  assertEquals(direct, await golden("server-direct.golden.txt"));
+  // The URL pattern comes first and the file backend after the `;`. Verified
+  // against real apt-cacher-ng 3.7.4: the buggy order returns 503 for
+  // /ubuntu-ports/dists/.../Release, this order returns 200.
   assertEquals(
-    renderServerFragment({
-      listen: ["192.0.2.10"],
-      port: 3142,
-      https_policy: "direct",
-      passthrough_hosts: [],
-      backends: {
-        debian: ["http://deb.debian.org/debian/"],
-        ubuntu: ["http://archive.ubuntu.com/ubuntu/"],
-      },
-      expire_days: 4,
-      cache_dir: "/var/cache/apt-cacher-ng",
-    }),
-    await golden("server-direct.golden.txt"),
+    direct.includes(
+      "Remap-debian: /debian ; file:zzzz-apt-cache-backend-debian",
+    ),
+    true,
+  );
+  assertEquals(
+    direct.includes(
+      "Remap-ubuntu: /ubuntu ; file:zzzz-apt-cache-backend-ubuntu",
+    ),
+    true,
   );
   assertEquals(
     renderServerFragment({
@@ -181,6 +239,24 @@ Deno.test("client snippet goldens per policy", async () => {
   );
 });
 
+Deno.test("expectedProxyKeys mirrors the snippet", () => {
+  assertEquals(
+    expectedProxyKeys({
+      proxy_url: "http://192.0.2.10:3142",
+      https_policy: "passthrough",
+      bypass_hosts: ["archive.example.test"],
+      fallback_direct: true,
+    }),
+    {
+      "Acquire::http::Proxy": "http://192.0.2.10:3142",
+      "Acquire::https::Proxy": "http://192.0.2.10:3142",
+      "Acquire::http::Proxy::archive.example.test": "DIRECT",
+      "Acquire::http::Proxy-Auto-Detect":
+        "/usr/local/lib/apt-cache/proxy-detect",
+    },
+  );
+});
+
 Deno.test("detect script golden is valid sh and falls back per connect", async () => {
   const script = renderDetectScript("http://192.0.2.10:3142");
   assertEquals(script, await golden("detect.golden.sh"));
@@ -188,15 +264,18 @@ Deno.test("detect script golden is valid sh and falls back per connect", async (
   try {
     const path = `${dir}/detect.sh`;
     await Deno.writeTextFile(path, script);
-    const syntax = await new Deno.Command("sh", { args: ["-n", path] })
-      .output();
-    assertEquals(syntax.code, 0);
+    // `-eu` catches unbound variables an `-n` syntax check misses.
+    for (const flags of [["-n"], ["-eu"]]) {
+      const syntax = await new Deno.Command("sh", { args: [...flags, path] })
+        .output();
+      assertEquals(syntax.code, 0, flags.join(" "));
+    }
     const run = async (exit: number): Promise<string> => {
       const stub = `${dir}/timeout`;
       await Deno.writeTextFile(stub, `#!/bin/sh\nexit ${exit}\n`);
       await Deno.chmod(stub, 0o755);
       const out = await new Deno.Command("sh", {
-        args: [path],
+        args: ["-eu", path],
         env: { PATH: `${dir}:${Deno.env.get("PATH") ?? ""}` },
         stdout: "piped",
         stderr: "piped",
@@ -216,20 +295,67 @@ Deno.test("security.conf renders only a valid user:password", () => {
   assertThrows(() => renderSecurityConf("a:b\ninjected"), AptConfigError);
 });
 
-Deno.test("report page parser reads the requested window and fails closed", async () => {
-  const html = await Deno.readTextFile(
-    new URL("./testdata/report-page.txt", import.meta.url),
+Deno.test("apt-config accepts the rendered snippet and reports every key", async () => {
+  if (!(await hasTool("apt-config"))) {
+    console.warn("apt-config not present; skipping the real-tool check");
+    return;
+  }
+  const dir = await Deno.makeTempDir({ prefix: "apt-cache-aptconfig-" });
+  try {
+    const input = {
+      proxy_url: "http://192.0.2.20:3142",
+      https_policy: "passthrough" as const,
+      bypass_hosts: ["archive.example.test"],
+      fallback_direct: true,
+    };
+    const file = `${dir}/snippet.conf`;
+    await Deno.writeTextFile(file, renderClientSnippet(input));
+    const out = await new Deno.Command("apt-config", {
+      args: ["-c", file, "dump"],
+      stdout: "piped",
+      stderr: "piped",
+    }).output();
+    assertEquals(out.code, 0);
+    const values = dumpToRecord(new TextDecoder().decode(out.stdout));
+    for (const [key, value] of Object.entries(expectedProxyKeys(input))) {
+      assertEquals(values[key], value, key);
+    }
+  } finally {
+    await Deno.remove(dir, { recursive: true });
+  }
+});
+
+Deno.test("apt-cacher log parser matches the report's log analysis", async () => {
+  const log = await Deno.readTextFile(
+    new URL("./testdata/apt-cacher.log.txt", import.meta.url),
   );
-  assertEquals(parseReportPage(html, "today"), {
-    requests: 15,
-    hits: 12,
-    misses: 3,
-    bytes_from_cache: 1048576,
-    bytes_upstream: 2097152,
+  assertEquals(parseAptCacherLog(log, 1792252100, 1792252300), {
+    requests: 2,
+    hits: 1,
+    misses: 1,
+    bytes_from_cache: 100,
+    bytes_upstream: 100,
   });
-  assertEquals(parseReportPage(html, "7 days").requests, 50);
-  assertThrows(() => parseReportPage(html, "last year"), AptConfigError);
-  assertThrows(() => parseReportPage("", "today"), AptConfigError);
+  assertEquals(parseAptCacherLog("", 0, 1), {
+    requests: 0,
+    hits: 0,
+    misses: 0,
+    bytes_from_cache: 0,
+    bytes_upstream: 0,
+  });
+  assertThrows(
+    () => parseAptCacherLog("garbage\nmore garbage\n1|I|2", 0, 10),
+    AptConfigError,
+    "unrecognised",
+  );
+});
+
+Deno.test("windowToSeconds accepts today and <n> days", () => {
+  assertEquals(windowToSeconds("today"), 86400);
+  assertEquals(windowToSeconds("7 days"), 604800);
+  assertEquals(windowToSeconds("3 days"), 259200);
+  assertThrows(() => windowToSeconds("last year"), AptConfigError);
+  assertThrows(() => windowToSeconds("0 days"), AptConfigError);
 });
 
 Deno.test("cache size and free space parsers", () => {
@@ -238,9 +364,41 @@ Deno.test("cache size and free space parsers", () => {
   assertThrows(() => parseCacheBytes("nope"), AptConfigError);
 });
 
-Deno.test("cache directory grammar rejects traversal and relative paths", () => {
+Deno.test("cache directory grammar rejects traversal, shallow and relative paths", () => {
   assertCacheDir("/var/cache/apt-cacher-ng");
+  assertCacheDir("/srv/cache");
   assertThrows(() => assertCacheDir("relative/dir"), AptConfigError);
   assertThrows(() => assertCacheDir("/var/../etc"), AptConfigError);
   assertThrows(() => assertCacheDir("/var/cache/"), AptConfigError);
+  assertThrows(() => assertCacheDir("/var"), AptConfigError);
+  assertThrows(() => assertCacheDir("/"), AptConfigError);
+});
+
+Deno.test("wildcard bind detection normalizes every IPv6 spelling", () => {
+  // spellings of the unspecified address under test
+  for (const wild of ["0.0.0.0", "::", "::0", "0:0:0:0:0:0:0:0", "[::]"]) { // leak-allow(unspecified-address spellings under test)
+    assertEquals(isWildcardAddress(wild), true, wild);
+  }
+  for (const not of ["192.0.2.1", "::1", "2001:db8::1", "127.0.0.1"]) {
+    assertEquals(isWildcardAddress(not), false, not);
+  }
+});
+
+Deno.test("proxyValuesOf keeps proxy keys and strips userinfo", () => {
+  assertEquals(
+    proxyValuesOf({
+      "Acquire::http::Proxy": "http://user:pw@192.0.2.10:3142",
+      "Acquire::https::Proxy": "DIRECT",
+      "Acquire::http::Proxy::archive.example.test": "DIRECT",
+      "Acquire::http::Proxy-Auto-Detect":
+        "/usr/local/lib/apt-cache/proxy-detect",
+      "APT::Install-Recommends": "1",
+      "APT::Acquire::http::Proxy": "ignored",
+    }),
+    {
+      "Acquire::http::Proxy": "http://192.0.2.10:3142",
+      "Acquire::https::Proxy": "DIRECT",
+      "Acquire::http::Proxy::archive.example.test": "DIRECT",
+    },
+  );
 });

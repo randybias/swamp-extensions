@@ -81,26 +81,90 @@ choices made, each with the reason.
    looks up a recorded server whose `host` or `listen` covers the proxy host and
    refuses a client policy that disagrees, so a client cannot be pointed at a
    server that cannot serve its HTTPS mode.
-9. **`stats` reads the report over loopback** (`http://127.0.0.1:<port>`) using
-   the port from the recorded server state, so it never depends on the public
-   listen address.
+9. **`stats` reads the request log.** The log directory is the package default
+   (`/var/log/apt-cacher-ng`); the model does not set `LogDir`. See the round-1
+   fix below for why the report page is not used.
 10. **`ci:false` and no `published` entry.** This is the first commit of the
     version; it has not been pushed, so the release stanza records only
     `channel: beta` and `ci: false`.
+
+## Round 1 review fixes (2026-10-17)
+
+Every item from the round-1 review is fixed and covered by a test. The two
+behavioural regressions that motivated the review were reproduced live first.
+
+- **Remap syntax (HIGH).** apt-cacher-ng reads
+  `Remap-<key>: <url-pattern> ;
+  <target>`; the pre-fix line put the backend
+  file in the pattern slot, so a `/ubuntu-ports` request never reached a mirror.
+  Live against apt-cacher-ng 3.7.4 (`acng-d5` image): the pre-fix fragment
+  returns 503 for `/ubuntu-ports/dists/noble/Release`; the fixed
+  `Remap-<key>: /<key> ;
+  file:<backend>` returns 200 with a real proxied body.
+  Golden updated.
+- **Cache deleted without ack (HIGH).** `apt-get purge` runs the package's
+  `postrm`, which `rm -rf`s `/var/cache/apt-cacher-ng`. `remove_server` now runs
+  `apt-get remove` unless `purge_cache_ack` is set, honours a `cache_dir`
+  argument, and deletes the cache only with the ack, only when it is a real
+  directory (a symlink is refused). Exit codes are checked; state is written
+  last.
+- **Proxy URL grammar (HIGH).** `new URL` accepts host characters such as
+  `$ ( ) { } , ; & \`
+  "`; a`http://x$({touch,pwned})y:3142`proxy rendered an
+  auto-detect script that ran the command as root.`parseProxyUrl`now checks
+  the raw string against`http://<ipv4|[ipv6]|dns-1123
+  fqdn>:<port>`before any
+  URL parsing, the address is passed to`bash -c` as an
+  argv word rather than interpolated, and both payloads are regression tests.
+- **Fallback dir and rollback (HIGH).** `configure_client` now creates the
+  auto-detect directory (`0755`), uploads the script before the snippet, and
+  rolls both back on any failure.
+- **Client credential leak (HIGH).** `client_get` stores only
+  `Acquire::(http|https)::Proxy*` keys with userinfo stripped, never the whole
+  apt config.
+- **`stats` on a real page (HIGH).** The report page's log-analysis table is
+  empty until an operator clicks `Count Data`, so parsing it never worked live.
+  `stats` now reads `apt-cacher.log` directly and derives the report's totals
+  (`reqMax = max(I, O)`, `dataMax = max(byteIn, byteOut)`), matching upstream
+  `GetStats`, and fails closed on an unrecognised log. The fixture is a real log
+  sample.
+- **Listen verify (MEDIUM).** `apply_server` requires the exact parsed
+  `address:port` pair from `ss -ltn`; the port-only fallback is gone.
+- **Wildcard normalisation (MEDIUM).** IPv6 spellings (`::0`, `0:0:0:0:0:0:0:0`,
+  `[::]`) are normalised, so `listen_any_ack` is required.
+- **Resource names and render record (MEDIUM).** Records are named from the
+  target `{user, host, port}`, not the host alone; `render_server` writes its
+  own `render` spec and never clobbers the `server` record.
+- **Policy check (MEDIUM).** The `queryData` predicate is scoped to
+  `modelType == "@randybias/apt-cache" && specName == "server"`; a missing or
+  failing query API now refuses unless `policy_check_ack=true`.
+- **Full client verify (MEDIUM).** `configure_client` verifies every managed key
+  (`Acquire::http::Proxy`, `Acquire::https::Proxy`, each bypass and
+  `Proxy-Auto-Detect`) from `apt-config dump`, not just the HTTP proxy.
+- **Tests (MEDIUM).** Added a plain-object `context.vaultService` test, a real
+  `apt-config` check of the rendered snippet, real-tool log-sample tests, and
+  the injection payloads.
+- **Backend URL grammar (LOW).** `isBackendUrl` is a raw-string allowlist, so a
+  trailing `#`, `;` or an explicit `:80` is refused.
 
 ## Fixtures
 
 - All addresses are RFC 5737 (`192.0.2.0/24`, `198.51.100.0/24`) or the IPv6
   documentation prefix `2001:db8::/32`; names are `example.com` or `.test`; the
   key and password are placeholder strings.
-- Report-page fixture `_lib/testdata/report-page.txt` reproduces the real
-  template's log-analysis table shape with synthetic counts. The server and
-  client goldens are produced by the renderers themselves.
+- `_lib/testdata/apt-cacher.log.txt` is the real log shape (`<time>|I|<bytes>`
+  and `<time>|O|<bytes>`, with optional `|client|path` fields, plus a `misc`
+  row) with synthetic values. The server and client goldens are produced by the
+  renderers and the Remap shape is checked against real apt-cacher-ng.
 
 ## Live end-to-end status
 
-- Offline gates only so far; no live pass yet, so this version is `beta` and
-  `ci: false`. Planned live run on one Debian/Ubuntu host: install and adopt,
-  apply with each policy, verify with `get`/`sync`/`stats`, point a second host
-  at it and check a real package fetch, then `remove_server` with and without
-  `purge_cache_ack`.
+- Offline gates plus targeted real-tool checks, no full end-to-end run yet, so
+  this version is `beta` and `ci: false`. Beyond the unit tests: the fragment
+  served a real `/ubuntu-ports` request through apt-cacher-ng 3.7.4 (200 vs the
+  pre-fix 503), `apt-config` accepted the snippet and reported every key, the
+  auto-detect script ran under `sh -eu` and printed the proxy URL or `DIRECT`,
+  and the log parser read a real request log. Planned live run on one
+  Debian/Ubuntu host: install and adopt, apply with each policy, verify with
+  `get`/`sync`/`stats`, point a second host at it and check a real package
+  fetch, then `remove_server` with and without `purge_cache_ack`.

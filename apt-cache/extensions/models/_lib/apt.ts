@@ -1,7 +1,7 @@
 /**
  * Pure Apt-Cacher NG helpers: input grammars, deterministic renderers for the
  * managed server fragment, backend files and client apt snippet, and parsers
- * for the report page the model reads over the server's loopback.
+ * for the request log the model reads over SSH.
  *
  * Nothing here spawns a process or opens a socket, so the module is exercised
  * offline. The model in `apt_cache.ts` is a thin orchestration layer over these
@@ -54,10 +54,14 @@ export const FRAGMENT_PATH = "/etc/apt-cacher-ng/zzzz-apt-cache.conf";
 export const ACNG_CONF_DIR = "/etc/apt-cacher-ng";
 /** Absolute path of the client apt snippet. */
 export const CLIENT_SNIPPET_PATH = "/etc/apt/apt.conf.d/90apt-cache-proxy";
+/** Directory holding the client auto-detect script. */
+export const DETECT_DIR = "/usr/local/lib/apt-cache";
 /** Absolute path of the client auto-detect script. */
-export const DETECT_PATH = "/usr/local/lib/apt-cache/proxy-detect";
+export const DETECT_PATH = `${DETECT_DIR}/proxy-detect`;
 /** Absolute path of the server's admin credential file. */
 export const SECURITY_CONF_PATH = "/etc/apt-cacher-ng/security.conf";
+/** Absolute path of the request log `stats` reads. */
+export const APT_CACHER_LOG_PATH = "/var/log/apt-cacher-ng/apt-cacher.log";
 /** Default cache directory (the package default). */
 export const DEFAULT_CACHE_DIR = "/var/cache/apt-cacher-ng";
 /** Default listen port. */
@@ -80,7 +84,7 @@ export const PASSTHROUGH_HOST_RE =
 const IPV4_RE =
   /^(?:(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)\.){3}(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)$/;
 
-/** Absolute cache directory path. */
+/** Absolute cache directory path; at least two components. */
 const CACHE_DIR_RE = /^\/[A-Za-z0-9._/-]{1,255}$/;
 
 /** True for a dotted-quad IPv4 literal. */
@@ -100,6 +104,24 @@ export function isIpv6(s: string): boolean {
   }
 }
 
+/**
+ * True when `address` is a wildcard bind: IPv4 `0.0.0.0` or the IPv6
+ * unspecified address in any spelling (`::`, `::0`, `0:0:0:0:0:0:0:0`,
+ * bracketed or bare).
+ */
+export function isWildcardAddress(address: string): boolean {
+  const v = address.startsWith("[") && address.endsWith("]")
+    ? address.slice(1, -1)
+    : address;
+  if (v === "0.0.0.0") return true;
+  if (!v.includes(":")) return false;
+  try {
+    return new URL(`http://[${v}]/`).hostname === "[::]";
+  } catch {
+    return false;
+  }
+}
+
 /** Throws unless `host` is a lower-case DNS name and not an IP literal. */
 export function assertPassthroughHost(host: string): void {
   if (
@@ -112,11 +134,16 @@ export function assertPassthroughHost(host: string): void {
   }
 }
 
-/** Throws unless `path` is an absolute cache directory with no `..`. */
+/**
+ * Throws unless `path` is an absolute cache directory with at least two
+ * components, no `..` and no trailing slash. The two-component floor keeps a
+ * later `rm -rf` from ever naming a top-level directory.
+ */
 export function assertCacheDir(path: string): void {
+  const components = path.split("/").filter((part) => part !== "");
   if (
     !CACHE_DIR_RE.test(path) || path.endsWith("/") ||
-    path.split("/").includes("..")
+    path.split("/").includes("..") || components.length < 2
   ) {
     throw new AptConfigError(`Not a valid cache directory: ${path}`);
   }
@@ -134,60 +161,70 @@ export interface ProxyUrl {
   url: string;
 }
 
-/** Parses a proxy URL: `http://` only, no userinfo, explicit port. */
+/** Bracketed IPv6 or a DNS/IPv4 label, followed by an explicit port. */
+const PROXY_URL_RE =
+  /^http:\/\/(\[[0-9A-Fa-f:.]+\]|[A-Za-z0-9.-]+):([0-9]{1,5})$/;
+
+/**
+ * Parses a proxy URL with the spec grammar
+ * `http://<ipv4|[ipv6]|dns-1123 fqdn>:<port>` against the raw string, before
+ * any WHATWG leniency. `new URL` alone accepts host characters such as
+ * `$ ( ) { } , ; & \` "`, which would reach the auto-detect script and the apt
+ * snippet.
+ */
 export function parseProxyUrl(url: string): ProxyUrl {
-  let parsed: URL;
-  try {
-    parsed = new URL(url);
-  } catch {
+  const match = PROXY_URL_RE.exec(url);
+  if (!match) {
     throw new AptConfigError(`Not a valid proxy URL: ${url}`);
   }
-  if (parsed.protocol !== "http:") {
-    throw new AptConfigError("The proxy URL must use http://");
-  }
-  if (parsed.username !== "" || parsed.password !== "") {
-    throw new AptConfigError("The proxy URL must not carry credentials");
-  }
-  if (parsed.port === "") {
-    throw new AptConfigError("The proxy URL must name a port");
-  }
-  const port = Number(parsed.port);
+  const port = Number(match[2]);
   if (!Number.isInteger(port) || port < 1 || port > 65535) {
-    throw new AptConfigError(`Not a valid proxy port: ${parsed.port}`);
+    throw new AptConfigError(`Not a valid proxy port: ${match[2]}`);
   }
-  if (parsed.pathname !== "/" || parsed.search !== "" || parsed.hash !== "") {
-    throw new AptConfigError("The proxy URL must be a bare host and port");
+  const rawHost = match[1];
+  let address: string;
+  if (rawHost.startsWith("[")) {
+    address = rawHost.slice(1, -1);
+    if (!isIpv6(address)) {
+      throw new AptConfigError(`Not a valid proxy host: ${rawHost}`);
+    }
+  } else if (isIpv4(rawHost)) {
+    address = rawHost;
+  } else if (PASSTHROUGH_HOST_RE.test(rawHost) && !rawHost.includes("*")) {
+    address = rawHost;
+  } else {
+    throw new AptConfigError(`Not a valid proxy host: ${rawHost}`);
   }
-  const rawHost = parsed.hostname;
-  const host = rawHost.startsWith("[") && rawHost.endsWith("]")
-    ? rawHost.slice(1, -1)
-    : rawHost;
-  const hostField = isIpv6(host) ? `[${host}]` : host;
+  const hostField = isIpv6(address) ? `[${address}]` : address;
   return {
-    address: host,
+    address,
     host: hostField,
     port,
     url: `http://${hostField}:${port}`,
   };
 }
 
-/** True when `s` is an accepted backend mirror base URL. */
+/** A DNS-1123 host label sequence, lower case. */
+const BACKEND_HOST_RE = PASSTHROUGH_HOST_RE;
+/** A mirror path: `/`-separated segments from a conservative allowlist. */
+const BACKEND_PATH_RE = /^(?:\/[A-Za-z0-9._~+@:%-]*)*$/;
+
+/**
+ * True when `s` is an accepted backend mirror base URL: the exact `scheme`,
+ * a lower-case DNS name or IPv4 literal (no userinfo, no port, no wildcard)
+ * and a conservative path. `new URL` alone accepts a trailing `#`, `;` or an
+ * explicit `:80`, so the raw string is checked instead.
+ */
 export function isBackendUrl(s: string, scheme: "http" | "https"): boolean {
-  let parsed: URL;
-  try {
-    parsed = new URL(s);
-  } catch {
-    return false;
-  }
-  if (`${scheme}:` !== parsed.protocol) return false;
-  if (parsed.username !== "" || parsed.password !== "") return false;
-  if (parsed.search !== "" || parsed.hash !== "" || parsed.host === "") {
-    return false;
-  }
-  if (parsed.hostname.includes("*") || parsed.port !== "") {
-    return false;
-  }
-  if (!parsed.pathname.startsWith("/")) return false;
+  const prefix = `${scheme}://`;
+  if (!s.startsWith(prefix)) return false;
+  const rest = s.slice(prefix.length);
+  const slash = rest.indexOf("/");
+  const host = slash === -1 ? rest : rest.slice(0, slash);
+  const path = slash === -1 ? "" : rest.slice(slash);
+  if (host === "" || (host.includes(":") && !isIpv4(host))) return false;
+  if (!isIpv4(host) && !BACKEND_HOST_RE.test(host)) return false;
+  if (path !== "" && !BACKEND_PATH_RE.test(path)) return false;
   return !/\s/.test(s);
 }
 
@@ -276,7 +313,10 @@ export function renderServerFragment(input: ServerRenderInput): string {
       throw new AptConfigError(`Backend ${key} names no mirror`);
     }
     for (const url of urls) assertBackendUrl(url, scheme);
-    lines.push(`Remap-${key}: file:${managedBackendName(key)} /${key}`);
+    // The URL pattern comes first and the `file:` backend second, after the
+    // `;` separator. Putting the backend in the pattern slot makes acng never
+    // match the mirror (a `/ubuntu-ports` request then returns 503).
+    lines.push(`Remap-${key}: /${key} ; file:${managedBackendName(key)}`);
   }
   return lines.join("\n") + "\n";
 }
@@ -304,6 +344,30 @@ export interface ClientRenderInput {
 }
 
 /**
+ * The `Acquire::*` keys and exact values the snippet sets, for a read-back
+ * check. Derived from the same inputs as the snippet.
+ */
+export function expectedProxyKeys(
+  input: ClientRenderInput,
+): Record<string, string> {
+  const proxy = parseProxyUrl(input.proxy_url);
+  const keys: Record<string, string> = {
+    "Acquire::http::Proxy": proxy.url,
+    "Acquire::https::Proxy": input.https_policy === "passthrough"
+      ? proxy.url
+      : "DIRECT",
+  };
+  for (const host of [...new Set(input.bypass_hosts)].sort()) {
+    assertPassthroughHost(host);
+    keys[`Acquire::http::Proxy::${host}`] = "DIRECT";
+  }
+  if (input.fallback_direct) {
+    keys["Acquire::http::Proxy-Auto-Detect"] = DETECT_PATH;
+  }
+  return keys;
+}
+
+/**
  * Renders the client apt snippet. `passthrough` points HTTPS at the cache;
  * `direct` and `https_backends` send HTTPS DIRECT and proxy only HTTP.
  */
@@ -327,11 +391,18 @@ export function renderClientSnippet(input: ClientRenderInput): string {
   return lines.join("\n") + "\n";
 }
 
+/** Single-quotes `value` as one POSIX shell word. */
+function shQuote(value: string): string {
+  if (value === "") return "''";
+  return `'${value.replace(/'/g, "'\\''")}'`;
+}
+
 /**
  * Renders the static auto-detect script. It is tiny and runs as root on every
  * apt invocation, so it contains only a fixed `timeout`/`bash` probe and the
- * validated URL. A successful TCP connect prints the proxy; anything else
- * prints DIRECT.
+ * validated URL. The address is passed as an argv word to `bash -c`, never
+ * interpolated into the command text, and the printed URL is quoted as data.
+ * A successful TCP connect prints the proxy; anything else prints DIRECT.
  */
 export function renderDetectScript(proxy_url: string): string {
   const proxy = parseProxyUrl(proxy_url);
@@ -339,8 +410,10 @@ export function renderDetectScript(proxy_url: string): string {
     "#!/bin/sh",
     "# Managed by @randybias/apt-cache. Static and tiny; runs as root.",
     "# Prints the proxy URL when a TCP connect succeeds within 2s, else DIRECT.",
-    `if timeout 2 bash -c 'exec 3<>/dev/tcp/${proxy.address}/${proxy.port}' 2>/dev/null; then`,
-    `  printf '%s\\n' '${proxy.url}'`,
+    `if timeout 2 bash -c 'exec 3<>/dev/tcp/"$1"/"$2"' _ ${
+      shQuote(proxy.address)
+    } ${shQuote(String(proxy.port))} 2>/dev/null; then`,
+    `  printf '%s\\n' ${shQuote(proxy.url)}`,
     "else",
     "  printf '%s\\n' 'DIRECT'",
     "fi",
@@ -361,103 +434,126 @@ export function renderSecurityConf(auth: string): string {
 
 /** The summary `stats` returns. */
 export interface StatsTotals {
-  /** Request hits. */
+  /** Total requests (`max(I, O)`), the report's "Total". */
   requests: number;
-  /** Request hits. */
+  /** Requests served without going upstream (`max(I, O) - I`). */
   hits: number;
-  /** Request misses. */
+  /** Requests that fetched upstream (`I` lines). */
   misses: number;
-  /** Bytes served from cache. */
+  /** Bytes served from cache (`max(byteIn, byteOut) - byteIn`). */
   bytes_from_cache: number;
-  /** Bytes fetched upstream. */
+  /** Bytes fetched upstream (`I` lines). */
   bytes_upstream: number;
 }
 
-function decodeEntities(text: string): string {
-  return text
-    .replace(/&amp;/g, "&")
-    .replace(/&lt;/g, "<")
-    .replace(/&gt;/g, ">")
-    .replace(/&quot;/g, '"')
-    .replace(/&#39;/g, "'")
-    .replace(/&nbsp;/g, " ");
-}
+/** Seconds in a day. */
+const DAY_SECONDS = 86400;
 
-/** Splits an HTML table into rows of cell text, with tags removed. */
-export function parseHtmlRows(html: string): string[][] {
-  const rows: string[][] = [];
-  for (const rowMatch of html.matchAll(/<tr\b[^>]*>([\s\S]*?)<\/tr>/gi)) {
-    const cells: string[] = [];
-    for (
-      const cellMatch of rowMatch[1].matchAll(
-        /<t[dh]\b[^>]*>([\s\S]*?)<\/t[dh]>/gi,
-      )
-    ) {
-      cells.push(
-        decodeEntities(cellMatch[1].replace(/<[^>]*>/g, " ")).replace(
-          /\s+/g,
-          " ",
-        ).trim(),
-      );
-    }
-    if (cells.length > 0) rows.push(cells);
+/**
+ * Converts a `stats` window label to a duration in seconds. Accepts `today`
+ * (24 h) and `<n> days` (1–90); throws otherwise.
+ */
+export function windowToSeconds(window: string): number {
+  const w = window.trim().toLowerCase();
+  if (w === "today" || w === "day" || w === "1 day") return DAY_SECONDS;
+  if (w === "week" || w === "7 days") return 7 * DAY_SECONDS;
+  const match = /^(\d{1,3})\s*days?$/.exec(w);
+  if (match) {
+    const n = Number(match[1]);
+    if (n >= 1 && n <= 90) return n * DAY_SECONDS;
   }
-  return rows;
-}
-
-function firstInteger(text: string): number | undefined {
-  const match = /(\d[\d,]*)/.exec(text);
-  if (!match) return undefined;
-  const n = Number(match[1].replaceAll(",", ""));
-  return Number.isFinite(n) ? n : undefined;
+  throw new AptConfigError(
+    `Unrecognised window ${JSON.stringify(window)}; use "today" or "<n> days"`,
+  );
 }
 
 /**
- * Parses the Apt-Cacher NG report page's log-analysis row whose period label
- * contains `window` (case-insensitive). Throws rather than guessing when no
- * row matches, so `stats` fails closed on an unrecognised page.
+ * Parses rows of the apt-cacher request log (`<time>|I|<bytes>`,
+ * `<time>|O|<bytes>`, `<time>|E|<bytes>`, and free-form `misc` rows) and
+ * returns the report-equivalent totals for `[since, until]` (unix seconds).
+ * The mapping is `reqMax = max(I, O)` / `dataMax = max(byteIn, byteOut)` from
+ * upstream `GetStats`, so it matches the maintenance page without invoking the
+ * page's `Count Data` action. Fails closed when more than half the rows are
+ * unrecognisable.
  */
-export function parseReportPage(html: string, window: string): StatsTotals {
-  const rows = parseHtmlRows(html);
-  if (rows.length === 0) {
-    throw new AptConfigError("the report page held no tables");
-  }
-  const wanted = window.trim().toLowerCase();
-  for (const row of rows) {
-    const label = row[0].trim().toLowerCase();
-    if (
-      label === "" || label === "period" ||
-      label.includes("cache efficiency") || label === "requests" ||
-      label === "hits" || label === "misses" || label === "total" ||
-      label === "data"
-    ) {
+export function parseAptCacherLog(
+  text: string,
+  since: number,
+  until: number,
+): StatsTotals {
+  let reqIn = 0, reqOut = 0, byteIn = 0, byteOut = 0;
+  let recognised = 0, total = 0;
+  for (const raw of text.split(/\r?\n/)) {
+    if (raw === "") continue;
+    total++;
+    const tokens = raw.split("|");
+    if (tokens.length < 3 || !/^\d+$/.test(tokens[0])) continue;
+    const type = tokens[1];
+    if (type !== "I" && type !== "O" && type !== "E") {
+      recognised++;
       continue;
     }
-    const numbers = row.slice(1).map(firstInteger).filter(
-      (n): n is number => n !== undefined,
-    );
-    if (numbers.length < 6) continue;
-    if (wanted === "" || label.includes(wanted)) {
-      return {
-        requests: numbers[2],
-        hits: numbers[0],
-        misses: numbers[1],
-        bytes_from_cache: numbers[3],
-        bytes_upstream: numbers[4],
-      };
+    if (!/^\d+$/.test(tokens[2])) continue;
+    recognised++;
+    const when = Number(tokens[0]);
+    if (when < since || when > until) continue;
+    const bytes = Number(tokens[2]);
+    if (type === "I") {
+      byteIn += bytes;
+      reqIn++;
+    } else if (type === "O") {
+      byteOut += bytes;
+      reqOut++;
     }
   }
-  throw new AptConfigError(
-    `the report page had no log-analysis row for window ${
-      JSON.stringify(window)
-    }`,
-  );
+  if (total > 0 && (total - recognised) * 2 > total) {
+    throw new AptConfigError(
+      "the apt-cacher log had too many unrecognised lines; refusing to guess",
+    );
+  }
+  const reqMax = Math.max(reqIn, reqOut);
+  const dataMax = Math.max(byteIn, byteOut);
+  return {
+    requests: reqMax,
+    hits: reqMax - reqIn,
+    misses: reqIn,
+    bytes_from_cache: dataMax - byteIn,
+    bytes_upstream: byteIn,
+  };
+}
+
+/** Removes any `user:password@` userinfo from a proxy URL value. */
+function stripUserinfo(value: string): string {
+  const match = /^(https?:\/\/)[^/@\s]*@(.*)$/i.exec(value);
+  return match ? `${match[1]}${match[2]}` : value;
+}
+
+/**
+ * Keeps only the effective `Acquire::(http|https)::Proxy` and
+ * `...::Proxy::<host>` keys from an `apt-config dump`, and strips any userinfo
+ * so a pre-existing credential is never persisted. Auto-detect and unrelated
+ * apt keys are dropped.
+ */
+export function proxyValuesOf(
+  values: Record<string, string>,
+): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const [key, value] of Object.entries(values)) {
+    if (/^Acquire::(http|https)::Proxy(::[A-Za-z0-9._-]+)?$/.test(key)) {
+      out[key] = stripUserinfo(value);
+    }
+  }
+  return out;
 }
 
 /** Parses the byte count from `du -sb <dir>`. */
 export function parseCacheBytes(stdout: string): number {
-  const n = firstInteger(stdout);
-  if (n === undefined) {
+  const match = /(\d[\d,]*)/.exec(stdout);
+  if (!match) {
+    throw new AptConfigError("could not read the cache directory size");
+  }
+  const n = Number(match[1].replaceAll(",", ""));
+  if (!Number.isFinite(n)) {
     throw new AptConfigError("could not read the cache directory size");
   }
   return n;
@@ -472,8 +568,12 @@ export function parseFsFree(stdout: string): number {
   if (last === undefined) {
     throw new AptConfigError("could not read filesystem free space");
   }
-  const n = firstInteger(last);
-  if (n === undefined) {
+  const match = /(\d[\d,]*)/.exec(last);
+  if (!match) {
+    throw new AptConfigError("could not parse filesystem free space");
+  }
+  const n = Number(match[1].replaceAll(",", ""));
+  if (!Number.isFinite(n)) {
     throw new AptConfigError("could not parse filesystem free space");
   }
   return n;

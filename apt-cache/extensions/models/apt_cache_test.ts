@@ -10,7 +10,6 @@ import {
   parseAptConfigDump,
   parseSsListen,
   setDeps,
-  targetKey,
 } from "./apt_cache.ts";
 
 const NOW = 1_700_000_000_000;
@@ -23,7 +22,6 @@ const SSH = {
   ssh_key_ref: { vault: "default", key: "APT_SSH" },
   connect_timeout_s: 15,
 };
-const TARGET = targetKey(SSH);
 
 const SERVER = {
   listen: ["192.0.2.20"],
@@ -52,6 +50,7 @@ interface Fake {
   run: CommandRunner;
   commands: string[];
   uploads: { path: string; content: string }[];
+  removed: string[];
 }
 
 function parseUploadPath(command: string): string {
@@ -62,6 +61,7 @@ function parseUploadPath(command: string): string {
 function fakeApt(respond: Respond): Fake {
   const commands: string[] = [];
   const uploads: { path: string; content: string }[] = [];
+  const removed: string[] = [];
   const run: CommandRunner = async (cmd, args, options = {}) => {
     if (cmd === "ssh-agent") {
       return args[0] === "-s"
@@ -77,6 +77,11 @@ function fakeApt(respond: Respond): Fake {
     if (cmd !== "ssh") return { code: 0, stdout: "", stderr: "" };
     const command = args[args.length - 1];
     commands.push(command);
+    // Record real `rm` invocations (not the upload script's own trap).
+    if (/^'rm' /.test(command)) {
+      const m = /'([^']+)'\s*$/.exec(command);
+      if (m) removed.push(m[1]);
+    }
     if (command.includes(".ssh-host-upload")) {
       const bytes = options.stdin === undefined
         ? new Uint8Array()
@@ -98,7 +103,7 @@ function fakeApt(respond: Respond): Fake {
       stderr: r.stderr ?? "",
     };
   };
-  return { run, commands, uploads };
+  return { run, commands, uploads, removed };
 }
 
 async function sha256HexLocal(bytes: Uint8Array): Promise<string> {
@@ -109,10 +114,10 @@ async function sha256HexLocal(bytes: Uint8Array): Promise<string> {
 }
 
 /** Installs a fake transport plus a resolved vault secret. */
-function useFake(fake: Fake): void {
+function useFake(fake: Fake, now = NOW): void {
   setDeps({
     run: fake.run,
-    now: () => NOW,
+    now: () => now,
     sleep: () => Promise.resolve(),
     resolveSecret: () => Promise.resolve("PLACEHOLDER-KEY"),
   });
@@ -132,7 +137,16 @@ function ctx(
   extraContext: Record<string, unknown> = {},
 ) {
   const base = createModelTestContext({ globalArgs: {}, ...options });
-  return { ...base, context: { ...base.context, ...extraContext } };
+  return {
+    ...base,
+    context: {
+      // A default query API so configure_client's policy check runs; tests that
+      // exercise the failure path override it.
+      queryData: () => Promise.resolve([]),
+      ...base.context,
+      ...extraContext,
+    },
+  };
 }
 
 /** SERVER with overrides; avoids duplicate-key literals under strict TS. */
@@ -211,18 +225,20 @@ Deno.test("schema: strict host keys, required policy, sensitive refs", () => {
 
 Deno.test("in-method: wildcard listen and passthrough hosts are refused", async () => {
   useFake(fakeApt(() => ({})));
-  await assertRejects(
-    () =>
-      model.methods.apply_server.execute(
-        model.methods.apply_server.arguments.parse({
-          ssh: SSH,
-          ...serverArgs({ listen: ["0.0.0.0"] }),
-        }),
-        ctx().context,
-      ),
-    Error,
-    "listen_any_ack",
-  );
+  for (const wild of ["0.0.0.0", "::", "::0", "[::]"]) { // leak-allow(unspecified-address spellings under test)
+    await assertRejects(
+      () =>
+        model.methods.apply_server.execute(
+          model.methods.apply_server.arguments.parse({
+            ssh: SSH,
+            ...serverArgs({ listen: [wild] }),
+          }),
+          ctx().context,
+        ),
+      Error,
+      "listen_any_ack",
+    );
+  }
   await assertRejects(
     () =>
       model.methods.apply_server.execute(
@@ -262,10 +278,13 @@ Deno.test("grammar: injection in names, URLs and paths is refused", () => {
       { ssh: { ...SSH, user: "root$(id)" } },
       { proxy_url: "http://192.0.2.20:3142/; id" },
       { proxy_url: "http://user:pass@192.0.2.20:3142" },
+      { proxy_url: "http://x$({touch,pwned})y:3142" },
+      { proxy_url: 'http://x"y:3142' },
       { ...CLIENT, proxy_url: "https://192.0.2.20:3142" },
       { ...CLIENT, bypass_hosts: ["*.example.test"] },
       { listen: ["192.0.2.20\n0.0.0.0"] },
       { cache_dir: "/var/../etc" },
+      { cache_dir: "/var" },
     ]
   ) {
     const merged = Object.assign({}, SERVER, CLIENT, bad) as Record<
@@ -307,6 +326,11 @@ Deno.test("render_server returns the fragment and backends with sha256", async (
   );
   assertEquals(out.result.fragment.sha256.length, 64);
   assertEquals(c.getWrittenResources().length, 1);
+  // The render record must not clobber the `server` spec.
+  const written = c.getWrittenResources()[0].data as Record<string, unknown>;
+  assertEquals("installed" in written, false);
+  assertEquals(typeof written.fragment_sha256, "string");
+  assertEquals(written.listen, ["192.0.2.20"]);
 });
 
 // --- install_server ---------------------------------------------------------
@@ -435,13 +459,40 @@ Deno.test("remove_server no-op when absent; purges when present", async () => {
   assertEquals(a.result.removed, false);
   assertEquals(has(absent, "apt-get purge"), false);
 
-  const present = fakeApt((command) => {
+  const installed = (command: string): Resp | undefined => {
     if (command.includes("-f=${Status}")) {
       return { code: 0, stdout: "install ok installed\n" };
     }
-    if (command.includes("apt-get purge")) return { code: 0 };
-    return { code: 0 };
+    if (command.startsWith("'test' '-L'")) return { code: 1 }; // not a symlink
+    if (command.startsWith("'test' '-d'")) return { code: 0 }; // present
+    return undefined;
+  };
+
+  // No ack: apt-get remove, managed files removed, cache left in place.
+  const noAck = fakeApt((command) => installed(command) ?? { code: 0 });
+  useFake(noAck);
+  const n = await model.methods.remove_server.execute(
+    model.methods.remove_server.arguments.parse({
+      ssh: SSH,
+      confirm_host: "192.0.2.20",
+    }),
+    ctx().context,
+  );
+  assertEquals(n.result, {
+    host: "192.0.2.20",
+    removed: true,
+    cache_purged: false,
   });
+  assertEquals(has(noAck, "apt-get remove"), true);
+  assertEquals(has(noAck, "apt-get purge"), false);
+  assertEquals(noAck.removed.includes("/var/cache/apt-cacher-ng"), false);
+  assertEquals(
+    noAck.removed.includes("/etc/apt-cacher-ng/zzzz-apt-cache.conf"),
+    true,
+  );
+
+  // With ack: apt-get purge and the cache directory is deleted.
+  const present = fakeApt((command) => installed(command) ?? { code: 0 });
   useFake(present);
   const p = await model.methods.remove_server.execute(
     model.methods.remove_server.arguments.parse({
@@ -457,7 +508,32 @@ Deno.test("remove_server no-op when absent; purges when present", async () => {
     cache_purged: true,
   });
   assertEquals(has(present, "apt-get purge"), true);
-  assertEquals(hasTok(present, "rm", "-rf"), true);
+  assertEquals(present.removed.includes("/var/cache/apt-cacher-ng"), true);
+});
+
+Deno.test("remove_server refuses a symlinked cache directory", async () => {
+  const fake = fakeApt((command) => {
+    if (command.includes("-f=${Status}")) {
+      return { code: 0, stdout: "install ok installed\n" };
+    }
+    if (command.startsWith("'test' '-L'")) return { code: 0 }; // it IS a symlink
+    return { code: 0 };
+  });
+  useFake(fake);
+  await assertRejects(
+    () =>
+      model.methods.remove_server.execute(
+        model.methods.remove_server.arguments.parse({
+          ssh: SSH,
+          confirm_host: "192.0.2.20",
+          purge_cache_ack: true,
+        }),
+        ctx().context,
+      ),
+    Error,
+    "symlink",
+  );
+  assertEquals(fake.removed.includes("/var/cache/apt-cacher-ng"), false);
 });
 
 Deno.test("remove_server refuses a mismatched confirm_host", async () => {
@@ -509,41 +585,37 @@ Deno.test("sync reports a widened passthrough and a missing fragment", async () 
 
 // --- stats ------------------------------------------------------------------
 
-Deno.test("stats parses the report page and fails closed on a bad page", async () => {
-  const page = await Deno.readTextFile(
-    new URL("./_lib/testdata/report-page.txt", import.meta.url),
+Deno.test("stats reads the request log and fails closed on a bad log", async () => {
+  const log = await Deno.readTextFile(
+    new URL("./_lib/testdata/apt-cacher.log.txt", import.meta.url),
   );
   const fake = fakeApt((command) => {
-    if (command.includes("curl")) return { code: 0, stdout: page };
-    if (command.includes("du")) {
+    if (command.includes("cat")) return { code: 0, stdout: log };
+    if (command.includes("-sb")) {
       return { code: 0, stdout: "3145728\t/var/cache/apt-cacher-ng\n" };
     }
-    if (command.includes("df")) return { code: 0, stdout: "Avail\n10485760\n" };
+    if (command.includes("--output=avail")) {
+      return { code: 0, stdout: "Avail\n10485760\n" };
+    }
     return { code: 0 };
   });
-  useFake(fake);
-  const c = ctx({
-    storedResources: {
-      [`server-192.0.2.20`]: {
-        target: TARGET,
-        host: "192.0.2.20",
-        installed: true,
-        port: 3142,
-        observed_at: new Date(NOW).toISOString(),
-      },
-    },
-  });
+  // `today` = last 24h; pick now so since=1792252100 and until=1792338500.
+  useFake(fake, (1792252100 + 86400) * 1000);
+  const c = ctx();
   const out = await model.methods.stats.execute(
     model.methods.stats.arguments.parse({ ssh: SSH, window: "today" }),
     c.context,
   );
-  assertEquals(out.result.hits, 12);
-  assertEquals(out.result.misses, 3);
-  assertEquals(out.result.bytes_from_cache, 1048576);
+  assertEquals(out.result.hits, 1);
+  assertEquals(out.result.misses, 1);
+  assertEquals(out.result.requests, 2);
+  assertEquals(out.result.bytes_from_cache, 100);
+  assertEquals(out.result.bytes_upstream, 100);
   assertEquals(out.result.cache_bytes, 3145728);
+  assertEquals(c.getWrittenResources().length, 1);
 
   const bad = fakeApt((command) => {
-    if (command.includes("curl")) return { code: 0, stdout: "<html></html>" };
+    if (command.includes("cat")) return { code: 0, stdout: "garbage\nmore" };
     return { code: 0 };
   });
   useFake(bad);
@@ -555,7 +627,7 @@ Deno.test("stats parses the report page and fails closed on a bad page", async (
         c2.context,
       ),
     Error,
-    "no tables",
+    "unrecognised",
   );
   assertEquals(c2.getWrittenResources().length, 0);
 });
@@ -570,7 +642,8 @@ Deno.test("configure_client writes and verifies the snippet", async () => {
     if (command.includes("apt-config")) {
       return {
         code: 0,
-        stdout: `Acquire::http::Proxy "http://192.0.2.20:3142";\n`,
+        stdout:
+          `Acquire::http::Proxy "http://192.0.2.20:3142";\nAcquire::https::Proxy "DIRECT";\n`,
       };
     }
     return { code: 0 };
@@ -659,8 +732,86 @@ Deno.test("configure_client rolls the snippet back on a failed verify", async ()
     Error,
     "not the proxy",
   );
-  assertEquals(has(fake, "rm -f"), true);
+  assertEquals(
+    fake.removed.includes("/etc/apt/apt.conf.d/90apt-cache-proxy"),
+    true,
+  );
   assertEquals(c.getWrittenResources().length, 0);
+});
+
+Deno.test("configure_client requires an ack when the policy cannot be checked", async () => {
+  const fake = fakeApt((command) => {
+    if (command.includes("sha256sum")) return { code: 1 };
+    if (command.includes("grep -lE")) return { code: 0, stdout: "" };
+    if (command.includes("apt-config")) {
+      return {
+        code: 0,
+        stdout:
+          `Acquire::http::Proxy "http://192.0.2.20:3142";\nAcquire::https::Proxy "DIRECT";\n`,
+      };
+    }
+    return { code: 0 };
+  });
+  useFake(fake);
+  await assertRejects(
+    () =>
+      model.methods.configure_client.execute(
+        model.methods.configure_client.arguments.parse({ ssh: SSH, ...CLIENT }),
+        ctx({}, { queryData: undefined }).context,
+      ),
+    Error,
+    "policy_check_ack",
+  );
+  const out = await model.methods.configure_client.execute(
+    model.methods.configure_client.arguments.parse({
+      ssh: SSH,
+      ...CLIENT,
+      policy_check_ack: true,
+    }),
+    ctx({}, { queryData: undefined }).context,
+  );
+  assertEquals(out.result.verified, true);
+});
+
+Deno.test("configure_client refuses when the policy query throws", async () => {
+  useFake(fakeApt(() => ({})));
+  await assertRejects(
+    () =>
+      model.methods.configure_client.execute(
+        model.methods.configure_client.arguments.parse({ ssh: SSH, ...CLIENT }),
+        ctx({}, {
+          queryData: () => Promise.reject(new Error("query backend down")),
+        }).context,
+      ),
+    Error,
+    "could not query recorded servers",
+  );
+});
+
+Deno.test("a plain-object vaultService resolves the key when none is injected", async () => {
+  const fake = fakeApt((command) => {
+    if (command.includes("dpkg-query") && command.includes("-f=${Status}")) {
+      return { code: 1, stdout: "" };
+    }
+    if (command.includes("-f=${Version}")) {
+      return { code: 0, stdout: "3.7.4-1\n" };
+    }
+    return { code: 0 };
+  });
+  setDeps({
+    run: fake.run,
+    now: () => NOW,
+    sleep: () => Promise.resolve(),
+    resolveSecret: undefined,
+  });
+  const service = {
+    get: (_vault: string, _key: string) => Promise.resolve("PLACEHOLDER-KEY"),
+  };
+  const out = await model.methods.install_server.execute(
+    model.methods.install_server.arguments.parse({ ssh: SSH }),
+    ctx({}, { vaultService: service }).context,
+  );
+  assertEquals(out.result.version, "3.7.4-1");
 });
 
 Deno.test("client_get reports effective proxies, conflicts and force", async () => {
@@ -708,7 +859,10 @@ Deno.test("unconfigure_client removes once then no-ops", async () => {
     ctx().context,
   );
   assertEquals(out.result.removed, true);
-  assertEquals(hasTok(present, "rm", "-f"), true);
+  assertEquals(
+    present.removed.includes("/etc/apt/apt.conf.d/90apt-cache-proxy"),
+    true,
+  );
 
   const absent = fakeApt((command) => {
     if (command.includes("90apt-cache-proxy")) return { code: 1 };
@@ -747,7 +901,14 @@ Deno.test("parseSsListen and parseAptConfigDump read real tool shapes", () => {
     parseSsListen(
       "State Recv-Q Send-Q Local Address:Port Peer Address:Port\nLISTEN 0 4096 192.0.2.20:3142 0.0.0.0:*\nLISTEN 0 4096 [::1]:3142 [::]:*\n",
     ),
-    { listen: ["192.0.2.20", "::1"], ports: [3142] },
+    {
+      listen: ["192.0.2.20", "::1"],
+      ports: [3142],
+      pairs: [
+        { address: "192.0.2.20", port: 3142 },
+        { address: "::1", port: 3142 },
+      ],
+    },
   );
   assertEquals(
     parseAptConfigDump(`Acquire::http::Proxy "http://192.0.2.20:3142";\n`),

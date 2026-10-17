@@ -1,0 +1,6 @@
+1792251000|I|999|127.0.0.1|debian/dists/bookworm/InRelease
+1792252181|I|100|127.0.0.1|ubuntu-ports/dists/noble/Release
+1792252181|O|100|127.0.0.1|ubuntu-ports/dists/noble/Release
+1792252200|O|100|127.0.0.1|ubuntu-ports/dists/noble/Release
+1792252210|E|50|127.0.0.1|debian/dists/missing/Release [HTTP error, code: 503]
+1792252230|W|maintenance run started

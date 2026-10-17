@@ -26,27 +26,33 @@ import {
 } from "./_lib/ssh.ts";
 import {
   ACNG_CONF_DIR,
+  APT_CACHER_LOG_PATH,
   AptConfigError,
   assertCacheDir,
   assertPassthroughHost,
   CLIENT_SNIPPET_PATH,
+  type ClientRenderInput,
   DEFAULT_CACHE_DIR,
   DEFAULT_PORT,
+  DETECT_DIR,
   DETECT_PATH,
   DISTRO_KEY_RE,
   DISTRO_KEYS,
+  expectedProxyKeys,
   FRAGMENT_PATH,
   HTTPS_POLICIES,
   type HttpsPolicy,
   isBackendUrl,
   isIpv4,
   isIpv6,
+  isWildcardAddress,
   managedBackendName,
   managedBackendPath,
+  parseAptCacherLog,
   parseCacheBytes,
   parseFsFree,
   parseProxyUrl,
-  parseReportPage,
+  proxyValuesOf,
   renderBackendFile,
   renderClientSnippet,
   renderDetectScript,
@@ -54,6 +60,7 @@ import {
   renderServerFragment,
   SECURITY_CONF_PATH,
   type ServerRenderInput,
+  windowToSeconds,
 } from "./_lib/apt.ts";
 
 /** A typed model failure with a stable code. */
@@ -181,6 +188,9 @@ const ClientFields = {
   override_existing_ack: z.boolean().default(false).describe(
     "Acknowledge a conflicting proxy setting in another apt.conf.d file.",
   ),
+  policy_check_ack: z.boolean().default(false).describe(
+    "Acknowledge proceeding when the client HTTPS policy cannot be checked against a recorded server (no query API, or the query failed).",
+  ),
 };
 
 const InstallServerArgs = z.strictObject({ ssh: SSH });
@@ -192,7 +202,10 @@ const RemoveServerArgs = z.strictObject({
     "Must equal the SSH host; guards against removing the wrong server.",
   ),
   purge_cache_ack: z.boolean().default(false).describe(
-    "Acknowledge deleting the cache directory.",
+    "Acknowledge deleting the cache directory. Without it, apt-get remove runs and the cache is left in place.",
+  ),
+  cache_dir: z.string().max(255).default(DEFAULT_CACHE_DIR).describe(
+    "Cache directory; deleted only with purge_cache_ack.",
   ),
 });
 const GetArgs = z.strictObject({
@@ -266,6 +279,20 @@ const ObservationSchema = z.strictObject({
   conflicts: z.array(z.string()).optional(),
 });
 
+const RenderSchema = z.strictObject({
+  listen: z.array(z.string()),
+  port: z.number().int(),
+  https_policy: z.enum(HTTPS_POLICIES),
+  fragment_path: z.string(),
+  fragment_sha256: z.string(),
+  backends: z.array(z.strictObject({
+    key: z.string(),
+    path: z.string(),
+    sha256: z.string(),
+  })),
+  observed_at: z.string(),
+});
+
 /** Stored server state. */
 export type ServerState = z.infer<typeof ServerStateSchema>;
 /** Stored client state. */
@@ -294,16 +321,27 @@ export function targetKey(a: {
   return `${a.user}@${a.host}:${a.port}`;
 }
 
-function serverName(host: string): string {
-  return `server-${hostInstance(host)}`;
+/** The three fields that key a record: `{user, host, port}`. */
+interface NamedTarget {
+  host: string;
+  port: number;
+  user: string;
 }
 
-function clientName(host: string): string {
-  return `client-${hostInstance(host)}`;
+function targetInstance(t: NamedTarget): string {
+  return `${hostInstance(t.user)}-${hostInstance(t.host)}-${t.port}`;
 }
 
-function observationName(kind: string, host: string): string {
-  return `observation-${kind}-${hostInstance(host)}`;
+function serverName(t: NamedTarget): string {
+  return `server-${targetInstance(t)}`;
+}
+
+function clientName(t: NamedTarget): string {
+  return `client-${targetInstance(t)}`;
+}
+
+function observationName(kind: string, t: NamedTarget): string {
+  return `observation-${kind}-${targetInstance(t)}`;
 }
 
 async function resolveKey(
@@ -451,7 +489,7 @@ function assertServerArgs(args: {
   cache_dir: string;
 }): void {
   for (const address of args.listen) {
-    if ((address === "0.0.0.0" || address === "::") && !args.listen_any_ack) {
+    if (isWildcardAddress(address) && !args.listen_any_ack) {
       throw new AptCacheError(
         "wildcard_listen",
         `listen ${address} binds every interface; set listen_any_ack=true to accept that`,
@@ -546,13 +584,23 @@ function parseNameListOf(stdout: string): string[] {
   return stdout.split(/\r?\n/).map((l) => l.trim()).filter((l) => l !== "");
 }
 
+/** A listening address and port pair parsed from `ss -ltn`. */
+export interface ListenPair {
+  /** Bare address, without IPv6 brackets. */
+  address: string;
+  /** TCP port. */
+  port: number;
+}
+
 /** Extracts the listening address and port pairs from `ss -ltn` output. */
 export function parseSsListen(stdout: string): {
   listen: string[];
   ports: number[];
+  pairs: ListenPair[];
 } {
   const listen: string[] = [];
   const ports: number[] = [];
+  const pairs: ListenPair[] = [];
   for (const raw of stdout.split(/\r?\n/)) {
     const parts = raw.trim().split(/\s+/);
     if (parts[0] !== "LISTEN" || parts.length < 4) continue;
@@ -563,8 +611,11 @@ export function parseSsListen(stdout: string): {
     if (!listen.includes(address)) listen.push(address);
     const port = Number(match[2]);
     if (!ports.includes(port)) ports.push(port);
+    if (!pairs.some((p) => p.address === address && p.port === port)) {
+      pairs.push({ address, port });
+    }
   }
-  return { listen, ports };
+  return { listen, ports, pairs };
 }
 
 type Ctx = {
@@ -614,6 +665,12 @@ export const model = {
       lifetime: "7d" as const,
       garbageCollection: 20,
     },
+    render: {
+      description: "Last rendered server configuration for one input set",
+      schema: RenderSchema,
+      lifetime: "7d" as const,
+      garbageCollection: 20,
+    },
   },
   methods: {
     install_server: {
@@ -660,7 +717,7 @@ export const model = {
         const now = deps.now();
         const handle = await context.writeResource(
           "server",
-          serverName(t.host),
+          serverName(t),
           ServerStateSchema.parse({
             target: targetKey(t),
             host: t.host,
@@ -705,16 +762,15 @@ export const model = {
           })),
         );
         const handle = await context.writeResource(
-          "server",
-          serverName(args.listen[0]),
-          ServerStateSchema.parse({
-            target: "",
-            host: args.listen[0],
-            installed: false,
+          "render",
+          `render-${fragmentSha.slice(0, 16)}`,
+          RenderSchema.parse({
             listen: args.listen,
             port: args.port,
             https_policy: args.https_policy,
-            config_sha256: fragmentSha,
+            fragment_path: FRAGMENT_PATH,
+            fragment_sha256: fragmentSha,
+            backends: backendOut,
             observed_at: iso(deps.now()),
           }),
         );
@@ -814,11 +870,14 @@ export const model = {
           await exec(deps, t, ["ss", "-ltn"]),
           "ss -ltn",
         ).stdout;
+        const listening = parseSsListen(listenOut);
         for (const address of args.listen) {
-          const port = `:${args.port}\\b`;
+          // Exact parsed address:port pair; no port-only fallback, which would
+          // accept any listener on the port.
           if (
-            !listenOut.includes(`${address}:${args.port}`) &&
-            !new RegExp(port).test(listenOut)
+            !listening.pairs.some((p) =>
+              p.address === address && p.port === args.port
+            )
           ) {
             throw new AptCacheError(
               "verify_failed",
@@ -845,7 +904,7 @@ export const model = {
         const fragmentSha = await sha256Hex(new TextEncoder().encode(fragment));
         const handle = await context.writeResource(
           "server",
-          serverName(t.host),
+          serverName(t),
           ServerStateSchema.parse({
             target: targetKey(t),
             host: t.host,
@@ -874,7 +933,7 @@ export const model = {
     remove_server: {
       kind: "action" as const,
       description:
-        "DESTRUCTIVE. Stop and disable apt-cacher-ng, remove the managed fragment and backend files, and purge the package; the cache directory is deleted only with purge_cache_ack. Re-running on a host with nothing installed is a clean no-op.",
+        "DESTRUCTIVE. Stop and disable apt-cacher-ng, remove the managed fragment and backend files, and remove the package (purge only with purge_cache_ack, which also deletes the cache directory). Re-running on a host with nothing installed is a clean no-op.",
       arguments: RemoveServerArgs,
       execute: async (args: z.infer<typeof RemoveServerArgs>, context: Ctx) => {
         if (args.confirm_host !== args.ssh.host) {
@@ -883,6 +942,7 @@ export const model = {
             `confirm_host ${args.confirm_host} does not match the SSH host ${args.ssh.host}`,
           );
         }
+        assertCacheDir(args.cache_dir);
         const key = await resolveKey(context, args.ssh.ssh_key_ref);
         const t = targetOf(args.ssh, key);
         const status = await exec(deps, t, [
@@ -899,7 +959,7 @@ export const model = {
           );
           const handle = await context.writeResource(
             "server",
-            serverName(t.host),
+            serverName(t),
             ServerStateSchema.parse({
               target: targetKey(t),
               host: t.host,
@@ -912,26 +972,38 @@ export const model = {
             result: { host: t.host, removed: false, cache_purged: false },
           };
         }
-        await exec(deps, t, ["systemctl", "stop", "apt-cacher-ng"]);
-        await exec(deps, t, ["systemctl", "disable", "apt-cacher-ng"]);
+        requireOk(
+          await exec(deps, t, ["systemctl", "stop", "apt-cacher-ng"]),
+          "systemctl stop apt-cacher-ng",
+        );
+        requireOk(
+          await exec(deps, t, ["systemctl", "disable", "apt-cacher-ng"]),
+          "systemctl disable apt-cacher-ng",
+        );
+        // `purge` deletes the cache directory; `remove` does not. Without the
+        // ack the cache is data we must not touch, so use remove and leave it.
+        const subcommand = args.purge_cache_ack ? "purge" : "remove";
         requireOk(
           await exec(deps, t, [
             "sh",
             "-c",
-            "DEBIAN_FRONTEND=noninteractive apt-get purge -y apt-cacher-ng",
+            `DEBIAN_FRONTEND=noninteractive apt-get ${subcommand} -y apt-cacher-ng`,
           ]),
-          "apt-get purge apt-cacher-ng",
+          `apt-get ${subcommand} apt-cacher-ng`,
         );
         for (const name of listManagedConfNames()) {
-          await exec(deps, t, ["rm", "-f", "--", `${ACNG_CONF_DIR}/${name}`]);
+          requireOk(
+            await exec(deps, t, ["rm", "-f", "--", `${ACNG_CONF_DIR}/${name}`]),
+            `rm ${name}`,
+          );
         }
-        await exec(deps, t, ["rm", "-f", "--", SECURITY_CONF_PATH]);
+        requireOk(
+          await exec(deps, t, ["rm", "-f", "--", SECURITY_CONF_PATH]),
+          "rm security.conf",
+        );
         let cachePurged = false;
         if (args.purge_cache_ack) {
-          requireOk(
-            await exec(deps, t, ["rm", "-rf", "--", DEFAULT_CACHE_DIR]),
-            "rm -rf cache",
-          );
+          await removeCacheDir(deps, t, args.cache_dir);
           cachePurged = true;
         }
         context.logger.info("Removed apt-cacher-ng from {host}", {
@@ -939,7 +1011,7 @@ export const model = {
         });
         const handle = await context.writeResource(
           "server",
-          serverName(t.host),
+          serverName(t),
           ServerStateSchema.parse({
             target: targetKey(t),
             host: t.host,
@@ -972,7 +1044,7 @@ export const model = {
         });
         const handle = await context.writeResource(
           "observation",
-          observationName("get", t.host),
+          observationName("get", t),
           observation,
         );
         return { dataHandles: [handle], result: observation };
@@ -1017,7 +1089,7 @@ export const model = {
         });
         const handle = await context.writeResource(
           "observation",
-          observationName("sync", t.host),
+          observationName("sync", t),
           observation,
         );
         return {
@@ -1029,35 +1101,30 @@ export const model = {
 
     stats: {
       description:
-        "READ-ONLY. Read the report page over the server's loopback for hit/miss counts and bytes over a window, plus cache size and free space, and persist the observation. Fails closed on an unrecognised report page.",
+        "READ-ONLY. Read the apt-cacher request log over SSH for hit/miss counts and bytes over a window, plus cache size and free space, and persist the observation. Matches the maintenance page's log analysis without invoking Count Data; fails closed on an unrecognised log.",
       arguments: StatsArgs,
       execute: async (args: z.infer<typeof StatsArgs>, context: Ctx) => {
         const key = await resolveKey(context, args.ssh.ssh_key_ref);
         const t = targetOf(args.ssh, key);
         const now = deps.now();
-        const record = await context.readResource(serverName(t.host)) as
-          | ServerState
-          | null;
-        const port = record?.port ?? DEFAULT_PORT;
-        const report = requireOk(
-          await exec(deps, t, [
-            "curl",
-            "-fsS",
-            "--max-time",
-            "15",
-            `http://127.0.0.1:${port}/acng-report.html`,
-          ]),
-          "curl acng-report.html",
-        );
+        const until = Math.floor(now / 1000);
+        const since = until - windowToSeconds(args.window);
+        const log = await exec(deps, t, ["cat", "--", APT_CACHER_LOG_PATH]);
+        if (log.exit_code !== 0) {
+          throw new AptCacheError(
+            "log_missing",
+            `could not read ${APT_CACHER_LOG_PATH} (exit ${log.exit_code})`,
+          );
+        }
         let totals;
         try {
-          totals = parseReportPage(report.stdout, args.window);
+          totals = parseAptCacherLog(log.stdout, since, until);
         } catch (e) {
           throw new AptCacheError(
             "parse_failed",
             e instanceof AptConfigError
               ? e.message
-              : "could not parse the report page",
+              : "could not parse the apt-cacher log",
           );
         }
         const cacheOut = await exec(deps, t, [
@@ -1077,14 +1144,15 @@ export const model = {
           ? parseCacheBytes(cacheOut.stdout)
           : 0;
         const fsFree = dfOut.exit_code === 0 ? parseFsFree(dfOut.stdout) : 0;
-        const totalReq = totals.hits + totals.misses;
-        const hitRatio = totalReq > 0 ? totals.hits / totalReq : 0;
+        const hitRatio = totals.requests > 0
+          ? totals.hits / totals.requests
+          : 0;
         const observation = ObservationSchema.parse({
           target: targetKey(t),
           kind: "stats",
           host: t.host,
           window: args.window,
-          requests: totalReq,
+          requests: totals.requests,
           hits: totals.hits,
           misses: totals.misses,
           bytes_from_cache: totals.bytes_from_cache,
@@ -1096,7 +1164,7 @@ export const model = {
         });
         const handle = await context.writeResource(
           "observation",
-          observationName("stats", t.host),
+          observationName("stats", t),
           observation,
         );
         return { dataHandles: [handle], result: observation };
@@ -1119,6 +1187,7 @@ export const model = {
         const recordedPolicy = await serverPolicyForHost(
           context,
           proxy.address,
+          args.policy_check_ack,
         );
         if (
           recordedPolicy !== undefined && recordedPolicy !== args.https_policy
@@ -1137,60 +1206,82 @@ export const model = {
             }; pass override_existing_ack=true`,
           );
         }
-        const snippet = renderClientSnippet({
+        const renderInput: ClientRenderInput = {
           proxy_url: proxy.url,
           https_policy: args.https_policy,
           bypass_hosts: args.bypass_hosts,
           fallback_direct: args.fallback_direct,
-        });
+        };
+        const snippet = renderClientSnippet(renderInput);
         let changed = false;
-        if (
-          await uploadIfChanged(
-            deps,
-            t,
-            CLIENT_SNIPPET_PATH,
-            snippet,
-            "0644",
-          )
-        ) {
-          changed = true;
-        }
-        if (args.fallback_direct) {
+        let verified = false;
+        try {
+          // The auto-detect script lives in a directory that may not exist on a
+          // fresh host, and the snippet references it, so create the directory
+          // and write the script before the snippet.
+          if (args.fallback_direct) {
+            requireOk(
+              await exec(deps, t, ["mkdir", "-p", "--", DETECT_DIR]),
+              "mkdir auto-detect dir",
+            );
+            requireOk(
+              await exec(deps, t, ["chmod", "0755", "--", DETECT_DIR]),
+              "chmod auto-detect dir",
+            );
+            if (
+              await uploadIfChanged(
+                deps,
+                t,
+                DETECT_PATH,
+                renderDetectScript(proxy.url),
+                "0755",
+              )
+            ) {
+              changed = true;
+            }
+          }
           if (
             await uploadIfChanged(
               deps,
               t,
-              DETECT_PATH,
-              renderDetectScript(proxy.url),
-              "0755",
+              CLIENT_SNIPPET_PATH,
+              snippet,
+              "0644",
             )
           ) {
             changed = true;
           }
-        }
-        let verified = await verifyClientProxy(deps, t, proxy.url);
-        if (verified && args.verify_update) {
-          const update = await exec(deps, t, ["apt-get", "update"]);
-          verified = update.exit_code === 0;
+          verified = await verifyClientProxy(
+            deps,
+            t,
+            expectedProxyKeys(renderInput),
+          );
+          if (verified && args.verify_update) {
+            const update = await exec(deps, t, ["apt-get", "update"]);
+            verified = update.exit_code === 0;
+            if (!verified && !args.fallback_direct) {
+              throw new AptCacheError(
+                "verify_failed",
+                `apt-get update failed after writing the snippet (exit ${update.exit_code})`,
+              );
+            }
+          }
           if (!verified && !args.fallback_direct) {
-            await rollbackClient(deps, t);
             throw new AptCacheError(
               "verify_failed",
-              `apt-get update failed after writing the snippet (exit ${update.exit_code})`,
+              "the managed snippet is not the proxy apt-config reports",
             );
           }
-        }
-        if (!verified && !args.fallback_direct) {
+        } catch (error) {
+          // Any failure leaves no partial state: the snippet must never point
+          // at a missing auto-detect script or an unverified proxy.
           await rollbackClient(deps, t);
-          throw new AptCacheError(
-            "verify_failed",
-            "the managed snippet is not the proxy apt-config reports",
-          );
+          throw error;
         }
         const now = deps.now();
         const handle = await context.writeResource(
           "client",
-          clientName(t.host),
+          clientName(t),
           ClientStateSchema.parse({
             target: targetKey(t),
             host: t.host,
@@ -1229,8 +1320,10 @@ export const model = {
           await exec(deps, t, ["apt-config", "dump"]),
           "apt-config dump",
         ).stdout;
-        const proxyValues = parseAptConfigDump(dump);
-        const record = await context.readResource(clientName(t.host)) as
+        // Keep only Acquire proxy keys and strip any userinfo: never persist a
+        // credential that a pre-existing proxy file may carry.
+        const proxyValues = proxyValuesOf(parseAptConfigDump(dump));
+        const record = await context.readResource(clientName(t)) as
           | ClientState
           | null;
         const liveSha = await remoteSha(deps, t, CLIENT_SNIPPET_PATH);
@@ -1248,7 +1341,7 @@ export const model = {
         });
         const handle = await context.writeResource(
           "observation",
-          observationName("client_get", t.host),
+          observationName("client_get", t),
           observation,
         );
         return { dataHandles: [handle], result: observation };
@@ -1271,7 +1364,7 @@ export const model = {
         if (!present) {
           const handle = await context.writeResource(
             "client",
-            clientName(t.host),
+            clientName(t),
             ClientStateSchema.parse({
               target: targetKey(t),
               host: t.host,
@@ -1300,7 +1393,7 @@ export const model = {
         }
         const handle = await context.writeResource(
           "client",
-          clientName(t.host),
+          clientName(t),
           ClientStateSchema.parse({
             target: targetKey(t),
             host: t.host,
@@ -1330,17 +1423,36 @@ function listManagedConfNames(): string[] {
   ];
 }
 
-/** Finds a recorded server record whose host or listen covers `host`. */
+/**
+ * Finds a recorded server record whose host or listen covers `host`, scoped to
+ * this model type. Refuses (unless `ack`) when there is no query API or the
+ * query fails, rather than silently skipping the check.
+ */
 async function serverPolicyForHost(
   context: Ctx,
   host: string,
+  ack: boolean,
 ): Promise<HttpsPolicy | undefined> {
-  if (!context.queryData) return undefined;
+  if (!context.queryData) {
+    if (ack) return undefined;
+    throw new AptCacheError(
+      "policy_unverifiable",
+      "cannot verify the client HTTPS policy against a recorded server (no query API); pass policy_check_ack=true to proceed",
+    );
+  }
   let records: unknown[];
   try {
-    records = await context.queryData('specName == "server"');
-  } catch {
-    return undefined;
+    records = await context.queryData(
+      'modelType == "@randybias/apt-cache" && specName == "server"',
+    );
+  } catch (error) {
+    if (ack) return undefined;
+    throw new AptCacheError(
+      "policy_unverifiable",
+      `could not query recorded servers to verify the HTTPS policy: ${
+        error instanceof Error ? error.message : "unknown error"
+      }; pass policy_check_ack=true to proceed`,
+    );
   }
   for (const raw of records) {
     const record = raw as {
@@ -1369,21 +1481,46 @@ async function proxyConflicts(
   return parseNameListOf(res.stdout);
 }
 
-/** True when apt-config dump reports our proxy as effective. */
+/** True when apt-config dump reports every managed key at its expected value. */
 async function verifyClientProxy(
   run: SshDeps,
   t: SshTarget,
-  proxyUrl: string,
+  expected: Record<string, string>,
 ): Promise<boolean> {
   const res = await exec(run, t, ["apt-config", "dump"]);
   if (res.exit_code !== 0) return false;
   const values = parseAptConfigDump(res.stdout);
-  return values["Acquire::http::Proxy"] === proxyUrl;
+  return Object.entries(expected).every(([key, value]) =>
+    values[key] === value
+  );
 }
 
 async function rollbackClient(run: SshDeps, t: SshTarget): Promise<void> {
   await exec(run, t, ["rm", "-f", "--", CLIENT_SNIPPET_PATH]);
   await exec(run, t, ["rm", "-f", "--", DETECT_PATH]);
+}
+
+/**
+ * Deletes a validated cache directory when it still exists. Refuses a symlink
+ * (never follow it) and never names a shallow path. `apt-get purge` already
+ * removes the package default, so this covers a custom `cache_dir`.
+ */
+async function removeCacheDir(
+  run: SshDeps,
+  t: SshTarget,
+  dir: string,
+): Promise<void> {
+  assertCacheDir(dir);
+  const link = await exec(run, t, ["test", "-L", dir]);
+  if (link.exit_code === 0) {
+    throw new AptCacheError(
+      "unsafe_cache_dir",
+      `refusing to delete ${dir}: it is a symlink`,
+    );
+  }
+  const present = await exec(run, t, ["test", "-d", dir]);
+  if (present.exit_code !== 0) return;
+  requireOk(await exec(run, t, ["rm", "-rf", "--", dir]), "rm -rf cache");
 }
 
 /** Parses `apt-config dump` lines into a flat `Key "value";` record. */

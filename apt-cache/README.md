@@ -28,7 +28,7 @@ because swamp does not persist a method's `result`.
 | `remove_server`      | action    | **DESTRUCTIVE.** Stop, disable and purge apt-cacher-ng and remove the managed files; cache only with an ack |
 | `get`                | read-only | Read service state, listen sockets, config digest, cache size and filesystem free space                     |
 | `sync`               | read-only | Re-render and compare with the live fragment; flag an edited file or a widened `PassThroughPattern`         |
-| `stats`              | read-only | Read the report page over loopback for hit/miss counts and bytes over a window, plus cache size             |
+| `stats`              | read-only | Read the request log for hit/miss counts and bytes over a window, plus cache size and free space            |
 | `configure_client`   | action    | Write the managed apt snippet (and optional auto-detect script) on a client and verify it                   |
 | `client_get`         | read-only | Report the effective `Acquire::*::Proxy` values, whether the managed snippet is in force, and conflicts     |
 | `unconfigure_client` | action    | Remove the managed snippet and auto-detect script and verify apt no longer uses the managed proxy           |
@@ -142,9 +142,36 @@ fragment.
   snippet back when the managed proxy is not the one in force, and refuses to
   overwrite a conflicting proxy file without `override_existing_ack`.
 
+## Behaviour notes
+
+- `stats` reads `/var/log/apt-cacher-ng/apt-cacher.log` directly and derives the
+  same hit/miss and byte totals the maintenance page shows, without invoking its
+  `Count Data` action (which is off by default, so the page's log-analysis table
+  is usually empty). It fails closed if too many rows are unrecognisable.
+- `remove_server` uses `apt-get remove` unless `purge_cache_ack` is set: the
+  package's `purge` deletes the cache directory, `remove` does not. The cache is
+  deleted only with the ack, only when it is a real directory (a symlink is
+  refused), and the recorded `cache_dir` is honoured.
+- The managed fragment and backend files use the
+  `Remap-<key>: /<key> ;
+  file:<backend>` form, with the URL pattern before the
+  `;` and the mirror file after it.
+
 ## Live testing
 
-Offline gates only so far. The model's unit and integration tests run against a
-fake transport with real tool output shapes; no server or client has been
-touched live yet. This is recorded in `LOGBOOK.md`, and the extension stays on
-the beta channel until a live run passes.
+Offline gates plus targeted real-tool checks so far; no full end-to-end run
+against a managed host yet. The rendered server fragment, client snippet and
+request-log parser were validated against real tools:
+
+- apt-cacher-ng 3.7.4: the fragment with
+  `Remap-ubuntu-ports: /ubuntu-ports ;
+  file:...` serves a real
+  `/ubuntu-ports/dists/.../Release` request (200); the pre-fix order
+  (`file:... /ubuntu-ports`) returns 503.
+- `apt-config` accepts the rendered snippet and reports every managed key.
+- The rendered auto-detect script runs under `sh -eu` and prints the proxy URL
+  or `DIRECT` as intended.
+- The log parser reads a real apt-cacher request log.
+
+This is recorded in `LOGBOOK.md`, and the extension stays on the beta channel
+until a full live run passes.

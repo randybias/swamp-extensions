@@ -1,7 +1,10 @@
 kea-dhcp:
   channel: beta
-  ci: false
-  published: {}
+  ci: true
+  published:
+    2026.10.17.1: c6e3b02ddac539ee6e10ad4b85e4ec87577e24c276821dcca5b934ce8eeae517
+  notes:
+    2026.10.17.1: 'First release, beta. Install and configure an ISC Kea DHCPv4 server (distro Kea 2.4) on one Linux host over SSH as root, with subnets, pools, reservations and typed options; every change is checked by kea-dhcp4 -t, written atomically and applied with config-set under an armed host-side revert that restores the previous config unless commit is called, and remove runs the same arm/verify/commit protocol. Leases come from the memfile CSV by default (lease_cmds hook opt-in); classless-static-route is out of scope. Live end to end on a throwaway VPS inside a veth lab with 0 DHCP packets on the real NICs: 11 of 11 cells pass (install, render, apply and commit with a client lease, leases, an uncommitted apply reverting, no-op re-apply, Kea-invalid config refused, SSH interface refused, get/sync without false drift, remove and commit, no private key on any argv). Residuals are in the LOGBOOK: a malformed active.json reads as no revert armed, commit''s failure gates lack unit tests, a no-op apply records an empty token, the timer fires about 35 s late, the restored stock config is root:_kea 0640, and a restore lock wait over about 35 s clears the revert without reverting (fails loud).'
 
 # Release policy per extension. Lives outside every extension dir so it never
 # changes an archive's contentHash.

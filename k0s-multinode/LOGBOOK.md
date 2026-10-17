@@ -37,7 +37,11 @@ only.
   `network.nodeLocalLoadBalancing` and `network.controlPlaneLoadBalancing`. The
   join/drain/detach/upgrade methods and workflows here cannot be wired until
   those land. This first commit ships the pure planner and the state it writes;
-  the action methods follow the `k0s-cluster` MICRO bump.
+  the action methods follow the `k0s-cluster` MICRO bump. **Update (merge
+  2026.10.17.1):** resolved. `k0s-cluster` 2026.10.17.3 supplied every per-node
+  feature, and the token, wait, drain, uncordon, detach, get and sync methods
+  plus the create-cluster and join-node workflows are wired. The `upgrade`
+  method/workflow is still deferred (see "Untested and residuals").
 - **HA endpoint on VPS.** The spec's open question: default `node_local_lb` plus
   an admin kubeconfig pointed at one controller or a DNS name over all three,
   versus requiring an external TCP load balancer. `plan` currently only requires
@@ -144,6 +148,22 @@ No prior k0s/k0sctl/etcd/multinode swamp extension found on stable or beta; the
 only near neighbour is `@dataverket/talosctl`, which targets Talos, a different
 distribution.
 
+Re-checked at merge (2026-10-17, `swamp extension search` on stable and beta for
+k0s, multinode, k3s, talos, etcd, kubeadm, rke2):
+
+- k0s: only our own `@randybias/k0s-cluster` (per-node, which this extension
+  drives) and `@randybias/server-stack` (beta).
+- Talos: `@dataverket/talosctl`, `@dataverket/omni`, `@dataverket/omnictl`,
+  `@magistr/talm-cluster`, `@magistr/talos-node`, `@mccormick/omni` (stable).
+  Talos has its own machine API and bootstrap; none of them drives k0s.
+- k3s: `@shelson/k3s`, `@rjeschmi/vm` (stable), single-distribution k3s
+  installers with no k0s join-token or etcd-leave handling.
+- multinode, kubeadm, rke2: no hits on either channel; etcd: only
+  `@dataverket/talosctl`.
+
+Verdict: NONE. No package covers multi-node k0s, so there is nothing to file
+upstream.
+
 ## Review round 2 (HEAD 4982ce9) — fixed
 
 - `plan_remove` now destructures `node` before `PlanInputSchema.parse` (it was
@@ -240,3 +260,107 @@ distribution.
   than behaviour.
 - `render_config`, the add/remove/upgrade/reset workflows, `sync` config-sha
   drift and `get` etcd health are still to add.
+
+## Live fixes (f94659f)
+
+- `sync` now persists its drift: the `status` resource gains `in_sync` and
+  `diffs` (`get` writes `in_sync: null`, since it does not judge drift). swamp
+  never shows or stores a method result, so before this the drift was invisible
+  (live cell 3b).
+- A Node's role comes from the cluster, not the Node label: a member of etcd or
+  a ControlNode is a controller, anything else is a worker. k0s 1.36.4 puts no
+  `node.k0sproject.io/role` or `node.k0sproject.io/version` label on worker
+  Nodes, so workers had shown role `unknown` (live cell 3a). `k0s_version` falls
+  back to the Node's kubelet version.
+
+## 2026-10-17 live e2e (2026.10.17.1): 11 of 12 on 3c8afc1, then 5 of 5 on f94659f
+
+Run sp-20261017, from a scratch repo with `swamp extension source add`. Three
+throwaway Ubuntu VPS: `<vps7>` (2 GB) a dedicated controller, `<vps5>` and
+`<vps6>` (1 GB) workers. Cluster `e2emn`, etcd, k0s v1.36.4+k0s.1 (amd64 binary
+pinned by its official sha256). Per-node model: the PUBLISHED
+`@randybias/k0s-cluster` 2026.10.17.3. Strict host-key pins only; the SSH key is
+a vault reference (compared by sha256 only). The nested `cluster`/`controller`
+fields were passed explicitly (nested-default residual).
+
+On 3c8afc1 (the controllers/workers job split; same model code as the reviewed
+6b8a0c0):
+
+| Cell                               | Result | Detail                                                                                                                                                                                                                                    |
+| ---------------------------------- | ------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 1 plan, 1 controller + 2 workers   | PASS   | operation create; install and wait the first controller, then per worker mint -> install -> wait -> invalidate; every mint paired with an invalidate                                                                                      |
+| 2 create-cluster workflow          | PASS   | bootstrapped from nothing in 3m7s; workers joined one at a time; afterwards no join tokens for either role, 0 bootstrap-token secrets, both workers Ready, etcd = `<vps7>`; both token records invalidated, vault keys hold the tombstone |
+| 3a get                             | PASS   | membership correct; residual: workers showed role `unknown` and no version (fixed in f94659f)                                                                                                                                             |
+| 3b sync                            | FAIL   | sync's `{in_sync, diffs}` was visible nowhere (not console, `--json`, outputs or data); fixed in f94659f                                                                                                                                  |
+| 4 mint, then invalidate by key     | PASS   | token listed after mint (value not printed); invalidate emptied both role lists, tombstoned the key, set `invalidated_at`; a re-run is a no-op with no remote call                                                                        |
+| 5 drain under a PDB, then uncordon | PASS   | PDB minAvailable 2: typed "blocked by a PodDisruptionBudget" error, node stays cordoned, nothing evicted; at minAvailable 1 the drain succeeded; uncordon restored scheduling                                                             |
+| 6 detach a worker, then reset      | PASS   | detach before drain refused "not drained"; after drain, detach removed the Node, etcd unchanged; k0s-cluster reset left no k0s units, binary or state, and the node did not re-register                                                   |
+| 7a detach the only controller      | PASS   | with confirm: "cannot remove the last controller; use reset-cluster"; etcd member and ControlNode kept                                                                                                                                    |
+| 7b node-name injection `-l x=y`    | PASS   | wait_joined, uncordon_node, detach_node, drain_node all refused "not a DNS-1123 subdomain"; 0 remote calls (sshd accept count)                                                                                                            |
+| 8 join with a bad binary pin       | PASS   | the join-node workflow minted, the install refused the sha256 mismatch, wait skipped, invalidate-failed ran; no tokens left, key tombstoned, nothing installed                                                                            |
+| 9 ps/argv scan during joins        | PASS   | `ps -eww` every 0.2 s on all three nodes and locally across cells 2 to 8; needles per token (raw value, bearer, secret half, their sha256): 0 hits anywhere, 0 `H4sI` strings                                                             |
+| 10 teardown                        | PASS   | k0s-cluster reset on all three: no k0s units, binaries, state dirs, processes or kube/cni/vxlan interfaces                                                                                                                                |
+
+On f94659f (the live fixes; the published code is this plus the gate-7 export
+commit):
+
+| Cell               | Result | Detail                                                                                                                                                                                                    |
+| ------------------ | ------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| R1 create-cluster  | PASS   | from three clean hosts in 3m7s; afterwards no join tokens for either role, both workers Ready, vault keys tombstoned                                                                                      |
+| R2 get             | PASS   | `swamp data get`: both workers role `worker`, `k0s_version` `v1.36.4+k0s` (the kubelet string); etcd = `<vps7>`; tokens []; `in_sync` null                                                                |
+| R3 sync, no change | PASS   | persisted `in_sync` true, `diffs` []                                                                                                                                                                      |
+| R4 drift           | PASS   | a hand cordon is not drift (`in_sync` true, the record shows cordoned); stopping the worker and deleting its Node outside the model gave `in_sync` false, `diffs` ["recorded worker `<vps6>` is missing"] |
+| R5 teardown        | PASS   | k0s-cluster reset on all three, every node clean                                                                                                                                                          |
+
+## Untested and residuals (not failures, do not block beta)
+
+- **HA with 3 controllers is NOT live-tested.** Every live cell used one
+  controller; quorum refusals (3->2, 2->1) are unit-tested only, and so is the
+  `ha_mode`/`external_address` endpoint choice.
+- The add-node, remove-node, upgrade-cluster and reset-cluster workflows, the
+  `upgrade` method and `render_config` are deferred (review round 1). `sync` has
+  no config-sha drift check and `get` has no etcd health.
+- `sync` compares membership only: a cordoned or NotReady node is not drift
+  (live R4a).
+- A worker's `k0s_version` is the kubelet string (`v1.36.4+k0s`), not the full
+  k0s build (`v1.36.4+k0s.1`), because k0s labels no version on worker Nodes.
+- swamp does not apply nested input defaults, so the workflow callers must pass
+  the nested `cluster`/`controller` fields (`ssh_port`, `api_address`,
+  `api_port`, `external_address`, `etcd_peer_address`, `api_sans`,
+  `node_local_load_balancing`) explicitly.
+- swamp forEach has no early stop: after one controller join fails, the later
+  controllers in the same job still run; only the workers job is gated on the
+  whole controllers job.
+- `k0s reset` (through k0s-cluster) leaves the `/opt/cni/bin` plugins, an empty
+  `/etc/cni/net.d` and a stale `/var/lib/kubelet/device-plugins/kubelet.sock` on
+  workers.
+- The detach self-host refusal compares the etcd peer with the `ssh.host` string
+  only, so a hostname or another interface of the leaving controller is not
+  caught (the quorum and last-controller refusals still apply).
+- `mint_join_token` invalidates the minted token on every failure after the
+  list/vault steps, but not when the create output cannot be parsed into an ID
+  or when the final `tokens` record write fails: that token stays live on the
+  controller until it expires (`token_expiry`, default 1h), held nowhere else.
+- An explicit `invalidate_join_token` with an already-invalidated `token_id`
+  re-runs `k0s token invalidate` and fails if k0s reports it unknown; the by-key
+  path (used by the workflows) is a no-op.
+- `transport.ts` keeps the vendored upload/learn-key adapters unused;
+  `fakeJoinToken` is duplicated in two test files (tightness: COULD-BE-TIGHTER).
+
+## Merge prep (2026-10-17, main)
+
+- Reviews: round 1 (8f531eb, 9 High) and round 2 (4982ce9, 6 High) fixed in the
+  lane; round 3 (6b8a0c0) CLEAN after triage, with 13 mock workflow cases in
+  which every minted token was invalidated. The branch was rebased; the reviewed
+  commits map tree-for-tree onto bee9b18, 2c17c45, 1326a2f and f97f0b7 (=
+  3c8afc1).
+- Self-review of 6b8a0c0..f94659f: the controllers/workers job split (the verify
+  job is a read and runs after either), metadata, and the two live fixes above
+  with tests that drive the real worker Node shape and assert the persisted
+  status.
+- Gate 7 mechanics only, no behaviour change: the plain `export const model`
+  literal and `swamp-quality-ignore` comments on `token_expiry`, `TOKEN_EXPIRY`
+  and `TokensStateSchema` (a lifetime and token IDs, not secrets).
+- `_lib/ssh.ts` (blob `fe0139f0`) and `_lib/transport.ts` are byte-identical to
+  `k0s-cluster`'s. Branch history carries only RFC 5737 addresses and lockfile
+  integrity hashes.

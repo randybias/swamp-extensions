@@ -486,14 +486,6 @@ export function createModel(deps: SshDeps = denoDeps): SshHostModel {
     description:
       "Run one argv vector, push bytes atomically, and wait for SSH host keys on any host. One generic definition with no host or credential in it; every method takes its target as arguments and stores evidence keyed by host, port and user.",
     globalArguments: z.strictObject({}),
-    upgrades: [
-      {
-        toVersion: "2026.10.17.3",
-        description:
-          "Additive transport exec options (stdin, timeout, truncation); no model schema or method change",
-        upgradeAttributes: (old: Record<string, unknown>) => old,
-      },
-    ],
     resources: {
       execution: {
         description:
@@ -673,4 +665,12 @@ export const model = {
   ...createModel(),
   type: "@randybias/ssh-host",
   version: "2026.10.17.3",
+  upgrades: [
+    {
+      toVersion: "2026.10.17.3",
+      description:
+        "Additive transport exec options (stdin, timeout, truncation); no model schema or method change",
+      upgradeAttributes: (old: Record<string, unknown>) => old,
+    },
+  ],
 } satisfies SshHostModel;

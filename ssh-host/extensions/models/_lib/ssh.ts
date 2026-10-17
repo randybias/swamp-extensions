@@ -28,6 +28,11 @@ export interface CommandResult {
   stderr: string;
   /** Set when the output cap was reached in truncate mode. */
   truncated?: boolean;
+  /**
+   * Set when the runner killed the command because its stdout hit the capture
+   * cap, so the exit code is a consequence of that kill, not the command.
+   */
+  killedForCap?: boolean;
   /** Set when the command was killed for exceeding its timeout. */
   timedOut?: boolean;
 }
@@ -40,6 +45,12 @@ export interface RunOptions {
   env?: Record<string, string>;
   /** Cap in bytes on each captured stream; the runner throws when exceeded. */
   maxOutputBytes?: number;
+  /**
+   * Cap on captured stderr only; exceeding it throws. Defaults to
+   * `maxOutputBytes`. Lets stdout be truncated while ssh's own diagnostics are
+   * still captured whole.
+   */
+  stderrMaxOutputBytes?: number;
   /** Stop at `maxOutputBytes` and mark the result truncated instead of throwing. */
   truncate?: boolean;
   /** Kill the command after this many milliseconds and mark it timed out. */
@@ -526,8 +537,10 @@ async function readCappedStream(
       let read: ReadableStreamReadResult<Uint8Array>;
       try {
         read = await reader.read();
-      } catch {
-        break;
+      } catch (e) {
+        // Only the cancel that our own abort started ends the read quietly.
+        if (signal?.aborted) break;
+        throw e;
       }
       if (read.done) break;
       const value = read.value;
@@ -642,6 +655,9 @@ export const denoRunner: CommandRunner = async (cmd, args, options = {}) => {
       };
     }
     const truncate = options.truncate ?? false;
+    const stderrCap = options.stderrMaxOutputBytes ?? cap;
+    // stdin is in the same all() so a non-broken-pipe failure is handled the
+    // moment it happens instead of becoming an unhandled rejection.
     const [stdout, stderr] = await Promise.all([
       readCappedStream(
         child.stdout,
@@ -651,42 +667,44 @@ export const denoRunner: CommandRunner = async (cmd, args, options = {}) => {
         kill,
         signal,
       ),
+      // stderr is never truncated: ssh's own diagnostics decide the failure.
       readCappedStream(
         child.stderr,
-        cap,
+        stderrCap,
         `${cmd} stderr`,
-        truncate,
+        false,
         kill,
         signal,
       ),
+      stdin,
     ]);
-    await stdin;
     const status = await child.status;
     return {
       code: status.code,
       stdout: decode(stdout.bytes),
       stderr: decode(stderr.bytes),
-      truncated: stdout.truncated || stderr.truncated,
+      truncated: stdout.truncated,
+      killedForCap: stdout.truncated,
     };
   };
   try {
     const work = run();
-    // The result is discarded on abort, so a late rejection is not unhandled.
-    work.catch(() => undefined);
     if (signal === undefined) return await work;
-    const outcome = await Promise.race([
-      work,
-      new Promise<"aborted">((resolve) => {
-        signal.addEventListener("abort", () => resolve("aborted"), {
-          once: true,
-        });
-      }),
-    ]);
-    if (outcome === "aborted") {
-      kill();
-      return timedOut();
+    let onAbort: (() => void) | undefined;
+    const aborted = new Promise<"aborted">((resolve) => {
+      onAbort = () => resolve("aborted");
+      signal.addEventListener("abort", onAbort, { once: true });
+    });
+    try {
+      const outcome = await Promise.race([work, aborted]);
+      if (outcome === "aborted") {
+        kill();
+        return timedOut();
+      }
+      return outcome;
+    } finally {
+      if (onAbort) signal.removeEventListener("abort", onAbort);
     }
-    return outcome;
   } catch (e) {
     kill();
     await child.status.catch(() => undefined);
@@ -932,7 +950,12 @@ async function runRemote(
 
     args.push("-p", String(t.port), "-l", t.user, t.host, remoteCommand);
     const cap = limits?.maxOutputBytes ?? t.max_output_bytes;
-    const runOptions: RunOptions = { env, maxOutputBytes: cap };
+    const runOptions: RunOptions = {
+      env,
+      maxOutputBytes: cap,
+      // ssh's own diagnostics are never cut to the caller's stdout cap.
+      stderrMaxOutputBytes: t.max_output_bytes,
+    };
     if (limits?.stdin !== undefined) runOptions.stdin = limits.stdin;
     if (limits?.truncate) runOptions.truncate = true;
     if (limits?.timeoutMs !== undefined) {
@@ -943,16 +966,20 @@ async function runRemote(
       throw new SshError(`ssh to ${t.host}:${t.port} timed out`, "timeout");
     }
     const truncated = res.truncated ?? false;
-    // A truncated result killed ssh to stop the flood, so its exit code is not
-    // meaningful and must not be classified as a transport failure.
-    if (!truncated) {
+    // Only a stdout-cap kill makes the exit code unclassifiable. ssh's own
+    // diagnostics on stderr are captured whole (to the target cap), so a real
+    // transport failure still throws.
+    if (!res.killedForCap) {
       const failure = transportFailure(t, res);
       if (failure) throw failure;
       // Defense in depth for an injected runner: a production runner enforces
-      // the cap while streaming, so this only fires for one that does not.
-      if (utf8Length(res.stdout) > cap || utf8Length(res.stderr) > cap) {
+      // the caps while streaming, so this only fires for one that does not.
+      if (
+        utf8Length(res.stdout) > cap ||
+        utf8Length(res.stderr) > t.max_output_bytes
+      ) {
         throw new SshError(
-          `output from ${t.host}:${t.port} exceeded the ${cap}-byte capture limit`,
+          `output from ${t.host}:${t.port} exceeded its capture limit`,
         );
       }
     }
@@ -968,11 +995,6 @@ async function runRemote(
   }
 }
 
-/**
- * Runs one argv vector on the target. Each element is quoted as one literal
- * word before the vector is joined, so `;`, `$()`, backticks, newlines and
- * quotes inside an element can never split into a second command.
- */
 /** Ceiling for a per-call timeout: 24 hours. */
 export const MAX_EXEC_TIMEOUT_MS = 24 * 60 * 60 * 1000;
 
@@ -1001,6 +1023,13 @@ function assertExecOptions(
     );
   }
 }
+
+/**
+ * Runs one argv vector on the target. Each element is quoted as one literal
+ * word before the vector is joined, so `;`, `$()`, backticks, newlines and
+ * quotes inside an element can never split into a second command. Optional
+ * `stdin`, `timeoutMs` and `maxOutputBytes` are validated before connecting.
+ */
 
 export async function exec(
   deps: SshDeps,

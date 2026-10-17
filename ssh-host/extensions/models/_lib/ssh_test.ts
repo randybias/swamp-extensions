@@ -554,7 +554,13 @@ Deno.test("exec timeout kills ssh and raises a typed timeout", async () => {
 Deno.test("exec truncates and flags instead of throwing when maxOutputBytes is set", async () => {
   const calls: Call[] = [];
   const deps = fakeDeps(fakeRun(calls, {
-    ssh: () => ({ code: 0, stdout: "0123", stderr: "", truncated: true }),
+    ssh: () => ({
+      code: 0,
+      stdout: "0123",
+      stderr: "",
+      truncated: true,
+      killedForCap: true,
+    }),
   }));
   const result = await exec(deps, STRICT_TARGET, ["true"], {
     maxOutputBytes: 4,
@@ -659,6 +665,66 @@ Deno.test("denoRunner times out a large stdin write and leaves no child", async 
   const elapsed = Date.now() - started;
   assertEquals(res.timedOut, true);
   assert(elapsed < 5000, `timeout took ${elapsed}ms`);
+});
+
+Deno.test("exec still throws on a transport 255 whose stderr exceeds a small cap", async () => {
+  const calls: Call[] = [];
+  const deps = fakeDeps(fakeRun(calls, {
+    ssh: () => ({
+      code: 255,
+      stdout: "",
+      stderr: "Connection closed by remote host " + "x".repeat(200),
+    }),
+  }));
+  await assertRejects(
+    () => exec(deps, STRICT_TARGET, ["true"], { maxOutputBytes: 16 }),
+    SshError,
+    "could not connect",
+  );
+});
+
+Deno.test("a long stderr warning does not fail a successful command", async () => {
+  const calls: Call[] = [];
+  const deps = fakeDeps(fakeRun(calls, {
+    ssh: () => ({ code: 0, stdout: "ok\n", stderr: "w".repeat(500) }),
+  }));
+  const res = await exec(deps, STRICT_TARGET, ["true"], {
+    maxOutputBytes: 1000,
+  });
+  assertEquals(res.exit_code, 0);
+  assertEquals(res.stderr.length, 500);
+  assertEquals(res.truncated, false);
+});
+
+Deno.test("denoRunner keeps a stderr warning whole under a small stdout cap", async () => {
+  const res = await denoRunner(
+    "sh",
+    [
+      "-c",
+      "i=0; while [ $i -lt 50 ]; do echo warn >&2; i=$((i+1)); done; echo hi",
+    ],
+    { maxOutputBytes: 4, truncate: true, stderrMaxOutputBytes: 4096 },
+  );
+  assertEquals(res.code, 0);
+  assertEquals(res.stdout, "hi\n");
+  assertEquals(res.stderr.split("\n").filter((l) => l !== "").length, 50);
+  assertEquals(res.truncated, false);
+});
+
+Deno.test("denoRunner throws when stderr exceeds its own cap", async () => {
+  await assertRejects(
+    () =>
+      denoRunner(
+        "sh",
+        [
+          "-c",
+          "i=0; while [ $i -lt 50 ]; do echo warn >&2; i=$((i+1)); done",
+        ],
+        { maxOutputBytes: 4, truncate: true, stderrMaxOutputBytes: 16 },
+      ),
+    SshError,
+    "capture limit",
+  );
 });
 
 Deno.test("strict needs pinned keys and rejects two credentials at once", async () => {

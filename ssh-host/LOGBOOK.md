@@ -367,3 +367,25 @@ commits as deletions and was discarded):
   on `seq 1 100000` returned 128 bytes with `truncated: true` and exit 0;
   `sleep 30` with `timeoutMs: 1500` raised `SshError` kind `timeout`.
 - This becomes the new canonical transport; vendors re-vendor it one by one.
+
+### Review round 2 dispositions (3cda9da)
+
+- HIGH: stderr is never truncated. `RunOptions.stderrMaxOutputBytes` bounds it
+  at the target's `max_output_bytes` and over that throws, so ssh's own
+  diagnostics ("Host key verification failed", "Permission denied", "Connection
+  closed") are captured whole and still classify a transport failure; only a
+  stdout-cap kill sets `killedForCap`, which is what exempts exit 255. This also
+  fixes the `insecure_tofu` first-use case where the "Permanently added" warning
+  filled a small cap and killed ssh before the command ran. Verified live: a
+  wrong pin with cap 64 and a bad credential with cap 16 throw, and a tofu first
+  use with cap 64 runs the command with the 85-byte warning intact.
+- MEDIUM: `readCappedStream` rethrows a real read error; only the abort-sourced
+  cancel breaks quietly.
+- MEDIUM: `upgrades` is a shared `UPGRADES` const referenced literally on the
+  exported `model`, so the registry check sees it (dry run free of the
+  version-bump warning).
+- MEDIUM: stdin is read in the same `Promise.all` as the readers, so a real
+  stdin failure is handled immediately rather than becoming an unhandled
+  rejection; the race's abort listener is removed in a `finally`.
+- LOW: `MAX_EXEC_TIMEOUT_MS`/`assertExecOptions` moved above `exec`'s doc; the
+  readers are one `Promise.all` and the redundant `work.catch` is gone.

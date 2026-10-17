@@ -698,8 +698,8 @@ jobs:
               type: succeeded
         guard: >-
           ${{ data.latest("server-host", "revert-" + inputs.mesh_node.address.split("/")[0]) == null ||
-              has(data.latest("server-host", "revert-" + inputs.mesh_node.address.split("/")[0]).attributes.committed_at) ||
-              has(data.latest("server-host", "revert-" + inputs.mesh_node.address.split("/")[0]).attributes.cancelled_at) }}
+              "committed_at" in data.latest("server-host", "revert-" + inputs.mesh_node.address.split("/")[0]).attributes ||
+              "cancelled_at" in data.latest("server-host", "revert-" + inputs.mesh_node.address.split("/")[0]).attributes }}
         task:
           type: model_method
           modelType: "@randybias/server-host"
@@ -808,8 +808,8 @@ jobs:
               type: succeeded
         guard: >-
           ${{ data.latest("server-host", "revert-" + inputs.mesh_node.address.split("/")[0]) == null ||
-              has(data.latest("server-host", "revert-" + inputs.mesh_node.address.split("/")[0]).attributes.committed_at) ||
-              has(data.latest("server-host", "revert-" + inputs.mesh_node.address.split("/")[0]).attributes.cancelled_at) }}
+              "committed_at" in data.latest("server-host", "revert-" + inputs.mesh_node.address.split("/")[0]).attributes ||
+              "cancelled_at" in data.latest("server-host", "revert-" + inputs.mesh_node.address.split("/")[0]).attributes }}
         task:
           type: model_method
           modelType: "@randybias/server-host"

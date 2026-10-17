@@ -160,6 +160,9 @@ jobs:
       - name: dns-safety-ok
         description: Assert the DNS safety gate passed when DNS is enabled
         dependsOn:
+          - step: check-ownership
+            condition:
+              type: succeeded
           - step: find-record
             condition:
               type: or
@@ -235,6 +238,9 @@ jobs:
       - name: delete-server
         description: Delete the server after hostname and project checks
         dependsOn:
+          - step: check-ownership
+            condition:
+              type: succeeded
           - step: dns-safety-ok
             condition:
               type: succeeded

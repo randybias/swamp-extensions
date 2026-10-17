@@ -70,6 +70,7 @@ host_key_policy: strict
 known_hosts: ["192.0.2.10 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIEXAMPLE"]
 admin_user: ops
 management_cidrs: ["192.0.2.0/24"]
+allow_udp: [51820]
 verify_timeout_s: 120
 mesh_node: { name: host-1, address: 192.0.2.10/32, listen_port: 51820 }
 mesh_peers: []
@@ -85,7 +86,7 @@ nats_chart: {
   version: 1.0.0,
   namespace: nats,
 }
-cloudflare_zone_id: 00000000000000000000000000000000
+cloudflare_zone_id: "00000000000000000000000000000000"
 dns_record_name: host-1.example.com
 dns_record_target: public
 ```

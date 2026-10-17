@@ -68,6 +68,8 @@ export const PlanInputSchema = z.strictObject({
   external_address: z.string().max(253).nullish(),
   observed: z.array(ObservedNodeSchema).default([]),
   allow_even_controllers: z.boolean().default(false),
+  // A token lifetime such as "1h", not a credential.
+  // swamp-quality-ignore credentials-sensitive-field
   token_expiry: z.string().regex(DURATION_RE, "not a Go duration").default(
     "1h",
   ),

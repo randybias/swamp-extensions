@@ -105,6 +105,8 @@ const TOKEN_ID = z.string().regex(/^[a-z0-9]{6}$/, "not a k0s token id")
   .describe(
     "Public token ID returned by mint_join_token.",
   );
+// A token lifetime such as "15m", not a credential.
+// swamp-quality-ignore credentials-sensitive-field
 const TOKEN_EXPIRY = z.string().regex(/^\d{1,3}(m|h)$/, "not a Go duration")
   .refine((value) => {
     const minutes = value.endsWith("h")
@@ -211,6 +213,8 @@ const StatusSchema = z.strictObject({
   observed_at: z.string(),
 });
 
+// Token IDs, roles and expiry only; the token values live in the vault.
+// swamp-quality-ignore credentials-sensitive-field
 const TokensStateSchema = z.strictObject({
   cluster_name: z.string(),
   tokens: z.array(
@@ -978,4 +982,8 @@ export function createModel(deps: Partial<Deps> = {}) {
 }
 
 /** Model definition for `@randybias/k0s-multinode`. */
-export const model = createModel();
+export const model = {
+  ...createModel(),
+  type: "@randybias/k0s-multinode",
+  version: "2026.10.17.1",
+} satisfies ReturnType<typeof createModel>;

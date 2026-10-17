@@ -200,3 +200,9 @@ Residuals on 2026.10.17.3 (beta):
 - DNS checks read only `records[0]`; with two A records for the name the second
   is not checked.
 - A wedged NATS Helm release needs the manual recovery above.
+- Review residuals (filed High on e8aad54, downgraded at triage): teardown's
+  `project_id` input is declared but unused (the server definition carries its
+  own project and the ownership tag is checked before delete); `mesh_address`
+  for the k0s reset is operator input not bound to the owned server (strict pins
+  and `confirm_host` still apply); `cluster_secrets` must be empty, so its
+  forwarding branch is dormant; `nats_chart.values` is unconstrained.

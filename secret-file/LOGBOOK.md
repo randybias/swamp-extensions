@@ -67,3 +67,58 @@ reviewed once and shared.
   (`test -L`, then `test -d`) before staging and again immediately before the
   rename, refusing a symlink or directory with a typed `SshError`. Tests cover
   both. The rest of the live matrix passed 12/13; the process scan was clean.
+
+## 2026-10-17 live e2e
+
+Run sp-20261017. Target `<vps3>` (one Linux VPS), user root, strict host-key
+pins, key from the vault; every run was `swamp model method run ... --log`
+(never `--json`) with vault references only. Content checks compared a SHA-256
+computed from the vault value with one computed on the target; only MATCH or
+MISMATCH was printed.
+
+First pass on 770114a (model 2026.10.17.1):
+
+| Cell                       | Result | Detail                                                                                                                                                                           |
+| -------------------------- | ------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 1 write single value       | PASS   | changed=true; `600 root root`, 32 bytes, sha256 MATCH                                                                                                                            |
+| 2 identical re-write       | PASS   | changed=false; inode and mtime unchanged                                                                                                                                         |
+| 3 value change             | PASS   | changed=true, new inode, sha256 MATCH; no stage file left                                                                                                                        |
+| 4 mode change only         | PASS   | 0600 to 0640 changed=true, content MATCH; re-run changed=false                                                                                                                   |
+| 5 owner/group              | PASS   | named and numeric owner/group (throwaway uid/gid 4711) converge and re-runs are no-ops; unknown user gives a typed `chown` error with no stage file left                         |
+| 6 dotenv hostile value     | PASS   | value holding `'`, `\`, `$`, backtick, `#`, spaces; sourcing with sh and bash yields MATCH, prints nothing; re-run changed=false                                                 |
+| 7 verify read-only         | PASS   | match, wrong content/mode/owner and absent path reported correctly; file inode and mtime unchanged                                                                               |
+| 8 destination is a symlink | FAIL   | symlink replaced by a regular file (no write-through); the destination guard only saw the stage path. Fixed in 34dd922                                                           |
+| 9 destination is a dir     | PASS   | refused (incidentally, via the sha256sum probe); nothing written                                                                                                                 |
+| 10 remove, remove again    | PASS   | removed; second run `already absent` (removed=false)                                                                                                                             |
+| 11 wrong host-key pin      | PASS   | `host key verification failed ...; refusing to connect`; nothing written                                                                                                         |
+| 12 unreachable host        | PASS   | 192.0.2.1, connect_timeout_s 5: `could not connect` in about 7 s                                                                                                                 |
+| 13 ps scan during writes   | PASS   | `ps -efww` every 50 ms on the control host and `<vps3>` during a single-value and a dotenv write; 16 in-memory patterns (values, substrings, hashes): 0 hits; positive control 1 |
+
+Result 12/13. Re-run on 34dd922 (cells touched by the fix plus the regression
+set):
+
+| Cell                       | Result | Detail                                                                                                                        |
+| -------------------------- | ------ | ----------------------------------------------------------------------------------------------------------------------------- |
+| 1 normal write             | PASS   | changed=true; `600 root root`, sha256 MATCH                                                                                   |
+| 2 idempotent re-write      | PASS   | changed=false; inode and mtime identical                                                                                      |
+| 8 destination is a symlink | PASS   | typed refusal `... is a symlink; refusing to replace it`; link and its target unchanged, no stage file; dangling link too     |
+| 9 destination is a dir     | PASS   | empty and non-empty dir: typed `... is a directory` refusal from the dedicated check; contents intact, no stage file          |
+| 13 ps/argv scan            | PASS   | about 780 samples per host over three writes; 10 patterns, 0 hits; no 64-hex string in target samples; positive control 1 hit |
+
+Result 5/5. Cleanup: work dir and throwaway user removed on `<vps3>`, test vault
+keys deleted, no cloud resource ordered or changed.
+
+## 2026-10-17 merge review (34dd922)
+
+Delta review of 34dd922 over 770114a: 0 Critical/High. Residuals carried:
+
+- MEDIUM/LOW (astra, terra): the destination checks and `mv -T` are separate
+  operations, so a symlink planted between the second check and the rename is
+  replaced (rename does not follow it, so no write-through). Closing the race
+  needs a parent directory the attacker cannot write.
+- LOW: a symlinked parent directory is not detected; same precondition (a
+  writable parent).
+- LOW (astra): no test drives the second (pre-rename) check with a destination
+  that changes during staging.
+- LOW (astra): the symlink test's fake runner returns the same result on both
+  branches of its condition (dead code).

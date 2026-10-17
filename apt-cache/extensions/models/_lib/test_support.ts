@@ -175,10 +175,9 @@ export function boxFake(
   const commands: string[] = [];
   const uploads: { path: string; content: string }[] = [];
   const removed: string[] = [];
-  const ok = OK;
   const run: CommandRunner = async (cmd, args, options = {}) => {
     if (cmd === "ssh-agent") return agentReply(args);
-    if (cmd !== "ssh") return ok;
+    if (cmd !== "ssh") return OK;
     const command = args[args.length - 1];
     commands.push(command);
     if (command.includes(".ssh-host-upload")) {
@@ -214,36 +213,36 @@ export function boxFake(
       case "test": {
         const file = target(argv[2]);
         if (argv[1] === "-e") {
-          return file ? ok : { code: 1, stdout: "", stderr: "" };
+          return file ? OK : { code: 1, stdout: "", stderr: "" };
         }
         if (argv[1] === "-L" || argv[1] === "-d") {
           return { code: 1, stdout: "", stderr: "" };
         }
-        return ok;
+        return OK;
       }
       case "cp": {
         const file = target(argv[3]);
         if (!file) return { code: 1, stdout: "", stderr: "No such file" };
         files.set(argv[4], { ...file });
-        return ok;
+        return OK;
       }
       case "rm": {
         for (const path of argv.slice(3)) {
           if (files.delete(path)) removed.push(path);
         }
-        return ok;
+        return OK;
       }
       case "mv": {
         const file = target(argv[3]);
         if (!file) return { code: 1, stdout: "", stderr: "No such file" };
         files.delete(argv[3]);
         files.set(argv[4], file);
-        return ok;
+        return OK;
       }
       case "chmod": {
         const file = target(argv[3]);
         if (file) file.mode = argv[1];
-        return ok;
+        return OK;
       }
       default:
         return reply(respond(command));

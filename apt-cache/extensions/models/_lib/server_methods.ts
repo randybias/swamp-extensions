@@ -378,6 +378,8 @@ async function verifyApplied(
   const fetch = await exec(deps, t, [
     "curl",
     "-fsS",
+    "--noproxy",
+    "*",
     "--max-time",
     "15",
     "-o",
@@ -395,8 +397,8 @@ async function verifyApplied(
 
 /**
  * Asks the live daemon for a read-only administrative action without a
- * credential: 401 proves AdminAuth is enforced, anything else proves it is
- * not (the report page itself is not gated, an action URL is).
+ * credential: 401 proves AdminAuth is enforced and 200 proves it is not (the
+ * report page itself is not gated, an action URL is). Any other status fails.
  */
 async function verifyAdminAuth(
   t: SshTarget,
@@ -407,6 +409,8 @@ async function verifyAdminAuth(
     await exec(deps, t, [
       "curl",
       "-s",
+      "--noproxy",
+      "*",
       "-o",
       "/dev/null",
       "-w",
@@ -417,17 +421,18 @@ async function verifyAdminAuth(
     ]),
     "curl admin probe",
   ).stdout.trim();
-  const enforced = probe === "401";
-  if (expected === "enforced" && !enforced) {
+  if (expected === "enforced" && probe !== "401") {
     throw new AptCacheError(
       "verify_failed",
       `the admin credential is not enforced by the running daemon (HTTP ${probe})`,
     );
   }
-  if (expected === "open" && enforced) {
+  if (expected === "open" && probe !== "200") {
     throw new AptCacheError(
       "verify_failed",
-      "the running daemon still enforces the dropped admin credential",
+      probe === "401"
+        ? "the running daemon still enforces the dropped admin credential"
+        : `the admin page did not answer after dropping the credential (HTTP ${probe})`,
     );
   }
 }

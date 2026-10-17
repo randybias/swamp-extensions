@@ -34,9 +34,10 @@ function serverResponder(command: string): Resp {
  * A box whose daemon only picks up security.conf when it is restarted, like
  * apt-cacher-ng: an unauthenticated administrative request gets 401 while the
  * LOADED configuration holds an AdminAuth line. A change that is not followed
- * by a restart therefore leaves the old credential enforced.
+ * by a restart therefore leaves the old credential enforced. `openStatus` is
+ * what the page answers when no credential is loaded.
  */
-function daemonBox(initial: Record<string, string> = {}) {
+function daemonBox(initial: Record<string, string> = {}, openStatus = "200") {
   let loadedAuth = false;
   const restarts: number[] = [];
   const box: Box = boxFake(initial, (command) => {
@@ -48,7 +49,7 @@ function daemonBox(initial: Record<string, string> = {}) {
       return {};
     }
     if (command.includes("Count+Data")) {
-      return { code: 0, stdout: loadedAuth ? "401" : "200" };
+      return { code: 0, stdout: loadedAuth ? "401" : openStatus };
     }
     return serverResponder(command);
   });
@@ -56,6 +57,11 @@ function daemonBox(initial: Record<string, string> = {}) {
 }
 
 const FRAGMENT = "/etc/apt-cacher-ng/zzzz-apt-cache.conf";
+const applyArgsOf = (overrides: Record<string, unknown> = {}) =>
+  model.methods.apply_server.arguments.parse({
+    ssh: SSH,
+    ...serverArgs({ listen: ["192.0.2.20"], ...overrides }),
+  });
 const BACKENDS_DEBIAN = "/etc/apt-cacher-ng/backends_debian";
 const BACKUP_DEBIAN = `${BACKENDS_DEBIAN}.apt-cache.bak`;
 
@@ -66,10 +72,7 @@ Deno.test("apply twice then remove deletes the model's files and restores the or
   );
   useFake(box.fake);
   const c = ctx();
-  const args = model.methods.apply_server.arguments.parse({
-    ssh: SSH,
-    ...serverArgs({ listen: ["192.0.2.20"] }),
-  });
+  const args = applyArgsOf();
   await model.methods.apply_server.execute(args, c.context);
   await model.methods.apply_server.execute(args, c.context);
   // The original was saved once, on the first apply; the second must not back
@@ -97,11 +100,6 @@ Deno.test("apply twice then remove deletes the model's files and restores the or
   assertEquals(box.files.has(BACKUP_DEBIAN), false);
 });
 
-const applyArgsOf = (overrides: Record<string, unknown> = {}) =>
-  model.methods.apply_server.arguments.parse({
-    ssh: SSH,
-    ...serverArgs({ listen: ["192.0.2.20"], ...overrides }),
-  });
 const ADMIN_REF = { vault: "default", key: "ADMIN" };
 
 Deno.test("dropping admin_auth_ref removes the file, restarts the daemon and the old credential is refused", async () => {
@@ -137,17 +135,13 @@ Deno.test("dropping admin_auth_ref removes the file, restarts the daemon and the
 
 Deno.test("a missing restart after dropping the credential fails the apply", async () => {
   // A daemon that never reloads: the old credential stays enforced.
-  let enforced = false;
   const box = boxFake({}, (command) => {
-    if (command.includes("Count+Data")) {
-      return { code: 0, stdout: enforced ? "401" : "200" };
-    }
+    if (command.includes("Count+Data")) return { code: 0, stdout: "401" };
     return serverResponder(command);
   });
   useFake(box.fake);
   setDeps({ resolveSecret: () => Promise.resolve("admin:s3cret") });
   const c = ctx();
-  enforced = true;
   await model.methods.apply_server.execute(
     applyArgsOf({ admin_auth_ref: ADMIN_REF }),
     c.context,
@@ -158,6 +152,31 @@ Deno.test("a missing restart after dropping the credential fails the apply", asy
     "still enforces the dropped admin credential",
   ) as { code?: string };
   assertEquals(e.code, "verify_failed");
+});
+
+Deno.test("after dropping the credential, only HTTP 200 proves the admin page is open", async () => {
+  // The restart unloads the credential, but the admin page then answers 500.
+  const { box } = daemonBox({}, "500");
+  useFake(box.fake);
+  setDeps({ resolveSecret: () => Promise.resolve("admin:s3cret") });
+  const c = ctx();
+  await model.methods.apply_server.execute(
+    applyArgsOf({ admin_auth_ref: ADMIN_REF }),
+    c.context,
+  );
+  const e = await assertRejects(
+    () => model.methods.apply_server.execute(applyArgsOf(), c.context),
+    Error,
+    "HTTP 500",
+  ) as { code?: string };
+  assertEquals(e.code, "verify_failed");
+  // The probe must reach the local daemon, never an environment proxy.
+  assertEquals(
+    box.fake.commands.some((cmd) =>
+      cmd.includes("Count+Data") && cmd.includes("'--noproxy' '*'")
+    ),
+    true,
+  );
 });
 
 Deno.test("dropping only a backend key restarts the daemon", async () => {

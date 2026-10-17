@@ -794,3 +794,26 @@ Deno.test("host-state records carry sectionFailures in both strict schemas", () 
     );
   }
 });
+
+Deno.test("the raw-disk gate accepts the wipe's boot-partition acknowledgement and ignores it", () => {
+  // deno-lint-ignore no-explicit-any
+  const gate = (model.methods as any).cephVerifyDisksRaw.arguments;
+  const base = {
+    host: "192.0.2.10",
+    sshUser: "admin",
+    strictHostKeyChecking: "yes",
+    port: 22,
+  };
+  const withAck = gate.safeParse({
+    ...base,
+    dataDevices: [{ serial: "SN0001", acknowledgeBootPartitions: true }],
+  });
+  assertEquals(withAck.success, true, JSON.stringify(withAck.error?.issues));
+  assertEquals(
+    gate.safeParse({
+      ...base,
+      dataDevices: [{ serial: "SN0001", somethingElse: 1 }],
+    }).success,
+    false,
+  );
+});

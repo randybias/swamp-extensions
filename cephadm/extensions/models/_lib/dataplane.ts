@@ -870,6 +870,39 @@ export async function removeOsds(
   if (presentIds.length === 0) {
     return { requested, removed: [], skippedAbsent, zap };
   }
+  // In-method safety. The workflow gate is not the only protection: a plain
+  // resume with overridden inputs can run this method on a new target with the
+  // gate skipped, so the method must refuse an unsafe cluster itself.
+  const health = await readJson(deps, session, "health detail", {
+    phase: "cephRemoveOsds.health",
+  }, log) as { status?: unknown } | null;
+  const healthStatus = typeof health?.status === "string"
+    ? health.status.toUpperCase()
+    : "";
+  if (healthStatus !== "HEALTH_OK" && healthStatus !== "HEALTH_WARN") {
+    fail(
+      "cephRemoveOsds",
+      "refusing to remove OSDs: cluster health was not HEALTH_OK or HEALTH_WARN",
+      { status: healthStatus === "" ? "missing" : healthStatus },
+    );
+  }
+  // One joint ok-to-stop for the whole set. `osd safe-to-destroy` would reject
+  // any OSD with PGs still mapped (EBUSY), which is every in-service OSD, so it
+  // cannot gate a normal removal; `orch osd rm` performs the drain itself.
+  const okToStop = await runMut(
+    deps,
+    session,
+    `osd ok-to-stop ${presentIds.join(" ")}`,
+    { phase: "cephRemoveOsds.ok-to-stop", allowNonZero: true },
+    log,
+  );
+  if (okToStop.code !== 0) {
+    fail(
+      "cephRemoveOsds",
+      "the orchestrator refuses to stop these OSDs together",
+      { osdIds: presentIds, stderr: okToStop.stderr.slice(0, 300) },
+    );
+  }
   await runMut(deps, session, `osd out ${presentIds.join(" ")}`, {
     phase: "cephRemoveOsds.out",
   }, log);
@@ -991,6 +1024,48 @@ export async function deleteFs(
   }
   const backing = [entry.metadata_pool ?? "", ...(entry.data_pools ?? [])]
     .filter((p) => p !== "");
+  // In-method safety. The workflow confirmation gate can be skipped by a
+  // resume with overridden inputs, so the method refuses a filesystem still in
+  // use by clients on its own.
+  const fsStatus = await readJson(
+    deps,
+    session,
+    `fs status ${quote(args.fsName)}`,
+    { phase: "cephDeleteFs.in-use" },
+    log,
+  ) as { clients?: unknown } | null;
+  // `ceph fs status -f json` reports {"clients":[{"fs":"<name>","clients":N}]}.
+  // The array is never empty, so count the matching entry and fail closed when
+  // it or its count is missing or non-numeric.
+  const entries = Array.isArray(fsStatus?.clients)
+    ? fsStatus.clients as Record<string, unknown>[]
+    : null;
+  const match = entries?.find((e) =>
+    e !== null && typeof e === "object" &&
+    (e as Record<string, unknown>).fs === args.fsName
+  ) as
+    | Record<string, unknown>
+    | undefined;
+  // A non-negative integer only: -1, 1.5 and a numeric string all mean the
+  // count could not be read, and the method must refuse rather than delete.
+  const clientCount = match && typeof match.clients === "number" &&
+      Number.isInteger(match.clients) && match.clients >= 0
+    ? match.clients
+    : null;
+  if (entries === null || clientCount === null) {
+    fail(
+      "cephDeleteFs",
+      "could not read the filesystem client count; refusing to delete",
+      { fsName: args.fsName },
+    );
+  }
+  if (clientCount > 0) {
+    fail(
+      "cephDeleteFs",
+      "refusing to delete a filesystem still in use by clients",
+      { fsName: args.fsName, clients: clientCount },
+    );
+  }
   const before = new Set(
     ((await readJson(deps, session, "osd pool ls", {
       phase: "cephDeleteFs.pools-before",

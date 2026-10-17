@@ -24,13 +24,19 @@ import {
   assess,
   BLKID_COMMAND,
   type CommandProbe,
+  EFI_COMMAND,
+  EFIBOOTMGR_COMMAND,
   examineTargets,
   type FileProbe,
   FINDMNT_COMMAND,
+  isDevicePath,
   LINKS_COMMAND,
   LSBLK_COMMAND,
+  mbrReadCommand,
+  mbrTargets,
   mdExamineCommand,
   parseExamineUuid,
+  parseMbrSector,
   type ProbeInputs,
   type ProtectedSet,
   PVS_COMMAND,
@@ -45,6 +51,14 @@ export interface DataDevice {
   sizeBytes?: number;
   /** Informational kernel-name hint; never used for selection. */
   devHint?: string;
+  /**
+   * DESTRUCTIVE. Acknowledge that this disk's boot partitions (BIOS boot, EFI
+   * System, and similar) may be wiped, which can leave the host unbootable. By
+   * default a disk holding one is refused: the firmware's boot device cannot be
+   * found from the root topology. It never lifts a protection that comes from
+   * the root, /boot, fstab, swap or an md/LVM/ZFS stack.
+   */
+  acknowledgeBootPartitions?: boolean;
 }
 
 /** One disk that must never be touched. */
@@ -284,6 +298,10 @@ async function collectProbes(
   ) {
     mdExamine[path] = await command(mdExamineCommand(path), true);
   }
+  const mbr: Record<string, CommandProbe> = {};
+  for (const path of mbrTargets({ lsblk, links, blkid }, candidates)) {
+    mbr[path] = await command(mbrReadCommand(path), true);
+  }
   return {
     lsblk,
     findmnt: await command(FINDMNT_COMMAND, false),
@@ -294,7 +312,10 @@ async function collectProbes(
     blkid,
     zpool: await command(ZPOOL_COMMAND, true),
     pvs: await command(PVS_COMMAND, true),
+    efi: await command(EFI_COMMAND, false),
+    efibootmgr: await command(EFIBOOTMGR_COMMAND, true),
     mdExamine,
+    mbr,
   };
 }
 
@@ -308,11 +329,13 @@ async function guardBootAndRoot(
   devices: string[],
   serials: Map<string, string>,
   previous?: ProtectedSet,
+  bootAcknowledged: string[] = [],
 ): Promise<ProtectedSet> {
   const result = assess(
     await collectProbes(session, devices),
     devices,
     previous,
+    { bootAcknowledged },
   );
   if (result.ok) return result.set;
   const { refusal } = result;
@@ -327,6 +350,8 @@ async function guardBootAndRoot(
   fail(
     refusal.code === "protected"
       ? "wipe.boot-protected"
+      : refusal.code === "boot-partition"
+      ? "wipe.boot-partition"
       : "wipe.boot-unverifiable",
     refusal.message,
     detail,
@@ -375,14 +400,36 @@ async function pvsVg(session: SshSession, device: string): Promise<string> {
   return r.stdout.trim();
 }
 
+/**
+ * A device path for an mdadm argument. mdadm 4.3 reads `--` as "no devices
+ * given" (so `--stop --` and `--zero-superblock --` silently did nothing), so
+ * its paths are passed bare; the grammar check is what keeps that safe.
+ */
+function devicePath(path: string): string {
+  if (!isDevicePath(path)) {
+    fail("wipe.step", "a device path failed the mdadm argument grammar", {});
+  }
+  return `'${path}'`;
+}
+
+/** An md array path for an mdadm argument; see {@link devicePath}. */
+function arrayPathArg(path: string): string {
+  assertMdArrayPath("array", path);
+  return devicePath(path);
+}
+
 /** The md array a device belongs to, or null. */
 async function examineArray(
   session: SshSession,
   device: string,
 ): Promise<string | null> {
-  const r = await root(session, `mdadm --examine --scan -- ${quote(device)}`, {
-    allowNonZero: true,
-  });
+  const r = await root(
+    session,
+    `mdadm --examine --scan ${devicePath(device)}`,
+    {
+      allowNonZero: true,
+    },
+  );
   return firstArrayPath(r.stdout);
 }
 
@@ -450,7 +497,32 @@ async function readLsblk(session: SshSession): Promise<LsblkNode[]> {
   return parseLsblk(r.stdout);
 }
 
-/** True when one device is already raw: no signature, no children, no array, no PV. */
+/**
+ * Whether a whole disk's first sector and signatures say "raw": sector 0 is
+ * readable with every byte of the boot code area (0-439) zero and no 55 AA
+ * signature (a dos or protective-MBR table), and wipefs finds no signature. An
+ * unreadable sector or a failing wipefs is "not raw", never "raw".
+ */
+async function sectorAndSignaturesAreRaw(
+  session: SshSession,
+  device: string,
+): Promise<boolean> {
+  if (!isDevicePath(device)) return false;
+  const sector = parseMbrSector(
+    await root(session, mbrReadCommand(device), { allowNonZero: true }),
+  );
+  if (sector === null) return false;
+  if (sector.slice(0, 440).some((b) => b !== 0)) return false;
+  if (sector[510] === 0x55 && sector[511] === 0xaa) return false;
+  const sigs = await root(
+    session,
+    `wipefs --noheadings --output TYPE -- ${quote(device)}`,
+    { allowNonZero: true },
+  );
+  return sigs.code === 0 && sigs.stdout.trim() === "";
+}
+
+/** True when one device is already raw: no signature, no children, no array, no PV, an empty sector 0. */
 async function deviceIsRaw(
   session: SshSession,
   tree: LsblkNode[],
@@ -463,7 +535,9 @@ async function deviceIsRaw(
   if (subtreeMounts(node).length > 0) return false;
   if ((await pvsVg(session, device)) !== "") return false;
   if ((await examineArray(session, device)) !== null) return false;
-  return true;
+  // The partitionless disk that still carries boot code or a dos signature in
+  // sector 0 is not raw, whatever lsblk says about its (absent) children.
+  return await sectorAndSignaturesAreRaw(session, device);
 }
 
 /** SHA-256 hex of a string. */
@@ -505,6 +579,14 @@ export async function wipeDiskToRaw(
         },
       );
     }
+  }
+
+  // A serial listed twice could carry different acknowledgements.
+  if (
+    new Set(args.dataDevices.map((d) => d.serial)).size !==
+      args.dataDevices.length
+  ) {
+    fail("wipe.conflict", "a serial appears twice in dataDevices", {});
   }
 
   // Gate 2: resolve every serial.
@@ -565,10 +647,17 @@ export async function wipeDiskToRaw(
   const candidatePaths = args.dataDevices.map((d) =>
     resolved.get(d.serial)!.device
   );
+  // Disks whose boot partitions the caller named by serial; resolved paths,
+  // never anything the caller typed as a path.
+  const bootAcknowledged = args.dataDevices
+    .filter((d) => d.acknowledgeBootPartitions === true)
+    .map((d) => resolved.get(d.serial)!.device);
   let protectedSet = await guardBootAndRoot(
     session,
     candidatePaths,
     serialOf,
+    undefined,
+    bootAcknowledged,
   );
 
   // Gate 4: a data device aliasing an excluded disk.
@@ -646,6 +735,7 @@ export async function wipeDiskToRaw(
     candidatePaths,
     serialOf,
     protectedSet,
+    bootAcknowledged,
   );
 
   // Step 0: recovery capture and one stable, idempotent backup.
@@ -763,7 +853,7 @@ export async function wipeDiskToRaw(
       arrayPath,
       "an array about to be stopped backs the root or boot filesystem",
     );
-    await root(session, `mdadm --stop -- ${quote(arrayPath)}`, {
+    await root(session, `mdadm --stop ${arrayPathArg(arrayPath)}`, {
       allowNonZero: true,
     });
     if (await arrayStillPresent(deps, arrayBasename(arrayPath))) {
@@ -788,7 +878,7 @@ export async function wipeDiskToRaw(
       try {
         result = await root(
           session,
-          `mdadm --zero-superblock -- ${quote(device.device)}`,
+          `mdadm --zero-superblock ${devicePath(device.device)}`,
           {
             allowNonZero: true,
           },
@@ -835,7 +925,7 @@ export async function wipeDiskToRaw(
           rebuilt,
           "an array about to be re-stopped backs the root or boot filesystem",
         );
-        await root(session, `mdadm --stop -- ${quote(rebuilt)}`, {
+        await root(session, `mdadm --stop ${arrayPathArg(rebuilt)}`, {
           allowNonZero: true,
         });
       }
@@ -878,6 +968,22 @@ export async function wipeDiskToRaw(
     await root(session, `sgdisk --zap-all -- ${quote(device.device)}`, {
       allowNonZero: true,
     });
+    // wipefs removes only the two signature bytes of a dos table, and the
+    // zap leaves a dos disk's boot code: zero sector 0 itself.
+    const zeroed = await root(
+      session,
+      `dd if=/dev/zero of=${
+        quote(device.device)
+      } bs=512 count=1 conv=fsync status=none`,
+      { allowNonZero: true },
+    );
+    if (zeroed.code !== 0) {
+      fail("wipe.sector-zero", "could not zero the first sector", {
+        host,
+        device: device.device,
+        stderr: zeroed.stderr.slice(0, 300),
+      });
+    }
     const probed = await root(session, `partprobe -- ${quote(device.device)}`, {
       allowNonZero: true,
     });
@@ -994,6 +1100,16 @@ export async function wipeDiskToRaw(
       fail(
         "wipe.raw-unobservable",
         "the wiped device is absent from the final lsblk",
+        {
+          host,
+          device: device.device,
+        },
+      );
+    }
+    if (!(await sectorAndSignaturesAreRaw(session, device.device))) {
+      fail(
+        "wipe.raw-signatures",
+        "the wiped device still has boot code, a table signature or a filesystem signature",
         {
           host,
           device: device.device,

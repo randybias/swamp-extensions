@@ -237,17 +237,40 @@ export const SOCKET_PATH_LIMIT = 103;
 /** Namespace subdirectory, so sockets never collide with other ssh tooling. */
 export const SOCKET_NAMESPACE = "swamp-cephadm-ssh";
 
+/**
+ * A per-process map from inline key content to a fresh random nonce. Distinct
+ * keys get distinct nonces, and the same key reuses its nonce so a master can
+ * be reused within one process. The key bytes themselves never reach a socket
+ * name or any argv element; the nonce is random, not derived from the key.
+ */
+const inlineKeyNonces = new Map<string, string>();
+
+/** A stable random nonce for one inline key, distinct per key. */
+function inlineKeyNonce(keyContent: string): string {
+  let nonce = inlineKeyNonces.get(keyContent);
+  if (nonce === undefined) {
+    const bytes = crypto.getRandomValues(new Uint8Array(8));
+    nonce = Array.from(bytes).map((b) => b.toString(16).padStart(2, "0")).join(
+      "",
+    );
+    inlineKeyNonces.set(keyContent, nonce);
+  }
+  return nonce;
+}
+
 /** Resolves the control-socket path for a target, falling back under /tmp if too long. */
 export async function controlSocketPath(
   target: Target,
   env: (key: string) => string | undefined = (k) => Deno.env.get(k),
 ): Promise<ControlSocket> {
-  // A master is reusable only within one trust and one credential identity,
-  // so a strict connection can never ride a master opened with checking off.
+  // A master is reusable only within one trust, so a strict connection can
+  // never ride a master opened with checking off. The identity never contains
+  // private-key bytes: a key path is not secret, and inline key content is
+  // represented only by the per-process nonce.
   const identity = target.keyPath !== undefined
     ? `path:${target.keyPath}`
     : target.privateKey !== undefined
-    ? `inline:${target.privateKey}`
+    ? `inline:${inlineKeyNonce(target.privateKey)}`
     : "agent";
   const name = `${
     (await shortHash(

@@ -93,7 +93,7 @@ jobs:
             data.latest("cephadm", "cephVerifyHealth-" + inputs.host).attributes.pass == true
           message: >-
             Expected HEALTH_OK or only allowlisted warnings, observed
-            detail=${{ data.latest("cephadm", "cephVerifyHealth-" + inputs.host).attributes.detail }}
+            status=${{ data.latest("cephadm", "cephVerifyHealth-" + inputs.host).attributes.detail.status }}
           severity: high
       - name: approve
         description: Approve removing the listed OSD ids
@@ -108,10 +108,49 @@ jobs:
             ${{ inputs.host }}. The pre-check record is
             cephVerifyHealth-${{ inputs.host }}. Removal cannot be undone.
           timeout: 3600
+      - name: recheck-health
+        description: Re-check cluster health after approval
+        dependsOn:
+          - step: approve
+            condition:
+              type: succeeded
+        task:
+          type: model_method
+          modelIdOrName: cephadm
+          methodName: cephVerifyHealth
+          inputs:
+            host: ${{ inputs.host }}
+            port: ${{ inputs.port }}
+            sshUser: ${{ inputs.sshUser }}
+            keyPath: '${{ inputs.keyPath == "" ? dyn(null) : dyn(inputs.keyPath) }}'
+            strictHostKeyChecking: ${{ inputs.strictHostKeyChecking }}
+            wantOk: true
+            allowedWarnings: ${{ inputs.allowedWarnings }}
+            throwOnFail: false
+      - name: assert-recheck-health
+        description: Assert the post-approval health re-check passed
+        dependsOn:
+          - step: recheck-health
+            condition:
+              type: succeeded
+        task:
+          type: assert
+          expr: >-
+            data.latest("cephadm", "cephVerifyHealth-" + inputs.host).attributes.pass == true
+          message: >-
+            Expected HEALTH_OK or only allowlisted warnings, observed
+            status=${{ data.latest("cephadm", "cephVerifyHealth-" + inputs.host).attributes.detail.status }}
+          severity: high
       - name: remove-osds
         description: Drain, remove and optionally zap the OSDs via the orchestrator
         dependsOn:
           - step: approve
+            condition:
+              type: succeeded
+          - step: assert-health
+            condition:
+              type: succeeded
+          - step: assert-recheck-health
             condition:
               type: succeeded
         task:

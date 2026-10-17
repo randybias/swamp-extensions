@@ -370,6 +370,107 @@ a secret. Fixtures are synthetic only (RFC 5737 addresses, `.test` names).
   protected volume group needs a pvs row. Accepted limits: external fs
   journal/log devices and `resume=` (the kernel's exclusive open refuses a write
   to a mounted, swapped or claimed device).
+- 2026-10-17 live fix of the wipe guard, from a run on a real two-disk host
+  (mdadm 4.3, util-linux 2.39): (A) mdadm 4.3 reads `--` as "no devices given",
+  so `--examine --`, `--stop --` and `--zero-superblock --` all did nothing and
+  the guard refused every candidate; mdadm is now given bare, grammar-checked
+  `/dev` paths (`--examine --scan --` happened to work and was changed too for
+  uniformity; LVM tools and wipefs accept `--` and were left alone). The wipe's
+  own array stop and superblock zero were affected the same way. (B) a BIOS-boot
+  (EF02) or EFI System partition has no filesystem or mount, so nothing
+  protected it; the lsblk probe now reads PARTTYPE/PARTTYPENAME and every
+  boot-type partition of a disk that holds a protected device is protected, and
+  an unreadable partition type on such a disk refuses. Tests use the real
+  captured shapes (`protected_devices_real_test.ts`).
+- 2026-10-17 guard r7: boot-type partitions (BIOS boot, EFI System, extended
+  boot, PReP, MBR 0xef/0x41) are now refused on ANY disk, not only disks that
+  hold a protected device: legacy-BIOS GRUB can live on a SATA disk with / on
+  NVMe, and a fallback ESP is never in fstab. A new `boot-partition` refusal
+  (`wipe.boot-partition`) is lifted only by `acknowledgeBootPartitions` on that
+  data device's serial, and never lifts a protection. On an EFI host
+  `efibootmgr -v` adds hard evidence (partitions named by BootCurrent/BootOrder
+  are protected even when acknowledged) but a missing efibootmgr does not block
+  the host. Rule 3a now covers the partitions of any protected node (a multipath
+  device), `PARTTYPENAME` is dropped (util-linux 2.34 lacks it), and the GUID
+  lowercasing is pinned by a test. Left as is: a foreign array named
+  `/dev/md/<host>:0` fails the array-path grammar in `validate.ts` and aborts
+  the wipe (fail-closed).
+- 2026-10-17 guard r8: EFI entries in `HD(n,MBR,0x<sig>,...)` form map to the
+  dos PARTUUID (`<sig padded to 8>-<n as 2 hex>`) and BootNext counts, so an
+  acknowledged msdos ESP, or a booted 0x0c partition, is protected. Sector 0 of
+  every candidate disk is read (`dd bs=512 count=1 | od`, exactly 512 bytes or
+  unverifiable); a non-zero code area with 55 AA refuses as `boot-partition`
+  (`mbr-boot-code`), lifted only by that disk's acknowledgement. A partition
+  with no readable type is a `boot-partition` refusal too. A serial listed twice
+  in `dataDevices` is refused. New tests pin the `some` and `continue` mutants.
+- 2026-10-17 guard r9: the sector-0 rule also covers every disk behind a
+  non-partition candidate (a multipath device is wiped through its paths); a
+  missing or short read of any of them is unverifiable. The boundary is pinned
+  (bytes 0-439 are boot code, 440-445 are not).
+- 2026-10-17 wipe alreadyRaw (live finding): a partitionless disk with MBR boot
+  code was judged already raw. `deviceIsRaw` now also needs a readable sector 0
+  with zero bytes 0-439, no 55 AA, and no wipefs signature; otherwise the wipe
+  runs (wipefs -a, sgdisk --zap-all, then a zeroed sector 0) and the raw check
+  re-probes sector 0 and signatures, failing `wipe.raw-signatures` if they
+  survive. protected_devices.ts is untouched.
+
+## 2026-10-17: catalog A fixes (lane/d6-catfix)
+
+- Catalog keeps lane/cephadm-int's workflows (catalog A); lane/d6's catalog was
+  retired.
+- HIGH: every gated destructive step now depends directly, succeeded-only, on
+  every safety-gate assert and on the approval step (TRIAGE 4d). catalog_test.ts
+  asserts the direct edges for every gated mutating step.
+- MEDIUM (swamp lab 3583): a plain `resume --input` can run the mutation on a
+  new target with the pre-gate reused. Every gated workflow now re-runs its gate
+  after approval (a second gate step depending on approve) and the mutation
+  depends on both gates and approve. Applied to wipe-disks, remove-osds,
+  delete-fs, apply-mgr, apply-mon, apply-osds, create-pool and distribute-key.
+- HIGH (4h): the control-socket name no longer contains private-key bytes. It is
+  derived from host/port/user, the host-key policy, a non-secret key path, and a
+  per-process random nonce; a test proves the key content cannot influence the
+  socket name or the ssh argv.
+- In-method destructive safety (lab 3583: workflow gates cannot be the only
+  protection):
+  - cephRemoveOsds refuses when cluster health is HEALTH_ERR and refuses any
+    requested OSD that `osd safe-to-destroy` does not accept, before any
+    mutation.
+  - cephDeleteFs refuses while `fs status` reports connected clients, before any
+    mutation.
+  - wipeDiskToRaw already gates on the protected-device set and mount state (its
+    module is untouched).
+  - cephApplyOsd already enforces the D19 exclude list against the orchestrator
+    device inventory before applying.
+  - cephRmCluster already refuses a foreign or unobserved fsid before purging.
+- LOW: the remove-osds health assert message and the distribute-key check-host
+  assert message no longer interpolate a map; they name scalar observations.
+
+## 2026-10-17: catalog A fixes, round 2
+
+- ssh: an inline privateKey no longer shares one process-wide nonce. A process
+  map keeps a fresh random nonce per distinct key, so different keys cannot ride
+  one ControlMaster; key bytes and key hashes never reach a socket name or argv.
+  Tests require different keys to get different socket names and the same key to
+  reuse one, with no key text in argv.
+- cephDeleteFs: `ceph fs status -f json` reports
+  `{"clients":[{"fs":"<name>","clients":N}]}`; the method now finds the entry
+  whose `fs` equals the volume and refuses when its numeric `clients` > 0, and
+  fails closed when the entry or the count is missing or non-numeric. Tests
+  cover 0 clients (proceeds), N clients, missing entry and malformed count.
+- cephRemoveOsds: the per-OSD `osd safe-to-destroy` gate was wrong (EBUSY for
+  any OSD with PGs mapped, i.e. every in-service OSD). It is replaced by ONE
+  joint `osd ok-to-stop <all present ids>` before any mutation, failing closed
+  on a non-zero exit; `orch osd rm` performs the drain. Tests cover a jointly
+  unsafe set and an in-service OSD that proceeds.
+- cephRemoveOsds health precondition now fails closed: it refuses unless the
+  status is HEALTH_OK or HEALTH_WARN, so a missing or malformed status refuses.
+- catalog_test: the direct-edge test now identifies pre-gate and post-approval
+  re-gate asserts structurally, requires a re-gate assert whenever a job has a
+  pre-gate, and requires a direct succeeded-only edge from every mutating step
+  to it. Proven: deleting the re-gate edge fails the test.
+
+- 2026-10-17: cephDeleteFs requires the reported client count to be a
+  non-negative integer; -1, 1.5 and a numeric string all refuse. Tests added.
 
 ## 2026-10-17 live e2e: blocked
 

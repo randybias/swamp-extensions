@@ -70,10 +70,31 @@ jobs:
             ${{ inputs.hosts }} using ${{ inputs.sshUser }}. This changes each
             host's authorized_keys and a real run cannot be undone.
           timeout: 3600
+      - name: assert-recheck-port
+        description: Re-check the single-port input after approval
+        dependsOn:
+          - step: approve
+            condition:
+              type: succeeded
+        task:
+          type: assert
+          expr: >-
+            size(inputs.hosts) > 0 && inputs.hosts.all(h, h.port == inputs.port)
+          message: >-
+            Expected every hosts[].port to equal the single port input
+            ${{ inputs.port }} so the key read-back can use one port, observed
+            hosts=${{ inputs.hosts }}
+          severity: high
       - name: distribute-key
         description: Append the cluster public key on each host via SSH
         dependsOn:
           - step: approve
+            condition:
+              type: succeeded
+          - step: assert-single-port
+            condition:
+              type: succeeded
+          - step: assert-recheck-port
             condition:
               type: succeeded
         task:
@@ -164,7 +185,7 @@ jobs:
             "cephCephadmCheckHost-" + inputs.adminHost + "-" + self.hostItem.host).attributes.ok == true
           message: >-
             Expected cephadm check-host to succeed for ${{ self.hostItem.host }},
-            observed detail=${{ data.latest("cephadm-checkhost-" + self.hostItem.host, "cephCephadmCheckHost-" + inputs.adminHost + "-" + self.hostItem.host).attributes.detail }}
+            observed ok=${{ data.latest("cephadm-checkhost-" + self.hostItem.host, "cephCephadmCheckHost-" + inputs.adminHost + "-" + self.hostItem.host).attributes.ok }}
           severity: high
   - name: report-failure
     description: Report that nothing was rolled back or retried

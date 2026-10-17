@@ -1,0 +1,90 @@
+{
+  "extension": "@randybias/kea-dhcp",
+  "version": "2026.10.17.1",
+  "reviewedAt": "2026-10-17T16:52:13Z",
+  "dimensions": [
+    {
+      "id": "credentials-secrets",
+      "verdict": "pass",
+      "note": "ssh_key_ref is a sensitive-marked vault reference resolved through the plain-object context.vaultService; the key reaches ssh-agent over stdin, never argv, a resource or a log. Vendored _lib/ssh.ts is the canonical ssh-host blob fe0139f0: no content-derived hash on any local argv or remote script text. The revert token is a random correlation id, not a credential (sensitive-field warning accepted with the host-net/server-host comment). Live cell 11: 0 private-key hits in about 2,500 sampled argv lines on both sides, the run log and .swamp/."
+    },
+    {
+      "id": "logging-quality",
+      "verdict": "pass",
+      "note": "Each method logs the host and outcome once; no key material, config text or host keys in log fields. Residual LOW: a no-op apply logs '(token )'."
+    },
+    {
+      "id": "error-handling",
+      "verdict": "pass",
+      "note": "kea-dhcp4 -t rejection, a busy revert claim, a failed timer arm, a failed config-set and a failed restore are typed SshErrors; a failure after the claim runs the same restore.sh the timer would and disarms only on a pass, otherwise it surfaces recovery.txt. commit refuses after expiry, after a fired revert, on hash drift, on an inactive service and on an unreachable canary. Residual MEDIUMs (r3): the restore lock timeout clears active.json without reverting (fails loud), commit stops the timer before the drift check, commit's enable runs before the lock, and the failed-restore message says 'timer left armed' after active.json is cleared."
+    },
+    {
+      "id": "testing-completeness",
+      "verdict": "pass",
+      "note": "73 unit/contract tests: grammar, deterministic render goldens checked by kea-dhcp4 -t when installed, memfile/lease_cmds parsing, the vendored transport, the plain-object context (vaultService object, readResource/writeResource store), arm-before-write ordering, no-op and refusal paths, distinct resource names across apply/leases/get/commit, and a fired revert discarding the pending apply. Host scripts were run under sh -eu in a real Kea container. Residual MEDIUM: no unit test drives commit through a failing gate. Live: 11/11 on <vps1> at fddc66d."
+    },
+    {
+      "id": "idempotency-resilience",
+      "verdict": "pass",
+      "note": "An apply whose rendered sha equals the live file with the service active is a no-op that arms nothing (live 6: no revert dir, no timer, same mtime and MainPID); a second remove is a no-op (live 10). Every change runs under an armed host-side revert that restores the previous config unless committed (live 5: an uncommitted apply reverted after 120 s, client lease back on the original pool). Residuals: the timer fires about 35 s after the recorded expiry; a malformed active.json reads as no revert armed."
+    },
+    {
+      "id": "api-contracts",
+      "verdict": "pass",
+      "note": "ISC Kea 2.4 (distro kea-dhcp4-server 2.4.1, Ubuntu 24.04): config-set with the whole {\"Dhcp4\": ...} object over the control socket, config-hash-get for verification, kea-dhcp4 -t before any change, memfile CSV leases by default and the lease_cmds hook opt-in. Drift compares the tool's read-back (file sha and Kea's config hash), not the render text. classless-static-route is out of scope for the stock 2.4 option set."
+    },
+    {
+      "id": "resource-management",
+      "verdict": "pass",
+      "note": "One flock serializes commit and restore; staged files are moved atomically and removed on failure; each revert directory is cleaned on commit or after firing. Residual LOW/MEDIUM: restore.sh copies over the live file non-atomically, prior.json is written but unused, and remove leaves the stock config as root:_kea 0640."
+    },
+    {
+      "id": "published-surface-hygiene",
+      "verdict": "pass",
+      "note": "Manifest @randybias/kea-dhcp 2026.10.17.1, two-sentence description, Apache-2.0, additionalFiles README.md and LICENSE.txt. install, apply, commit and remove are actions; render, get, sync and leases are read-only. Leak scan, gitleaks and fixture guard pass; fixtures use RFC 5737 addresses; live receipts in the LOGBOOK redact the host as <vps1>."
+    },
+    {
+      "id": "schema-strictness",
+      "verdict": "pass",
+      "note": "Every argument and resource schema is a strictObject; IPv4, CIDR, MAC, interface, FQDN, pools and typed DHCP options carry grammars and bounds, overlapping pools are refused at validation, and an interface carrying the SSH session is refused before staging (live 8). host_keys are required: the transport is strict-only, no insecure_tofu."
+    },
+    {
+      "id": "lifetime-gc",
+      "verdict": "pass",
+      "note": "config, pending, revert, observation, render and action infinite/10; leases 7d/5."
+    },
+    {
+      "id": "crud-completeness",
+      "verdict": "pass",
+      "note": "install, render, apply (create or converge), commit, get, sync, leases and remove. remove is an action that restores the captured stock config under the same arm/verify/commit protocol, so no method tombstones the definition."
+    },
+    {
+      "id": "preflight-checks",
+      "verdict": "pass",
+      "note": "Inputs, pools, options and the SSH-interface guard are validated before any change; the rendered config is checked by kea-dhcp4 -t on the host before it is installed (live 7: a Kea-invalid config left file, timers and MainPID unchanged); a lease_cmds hook must live in the discovered hooks dir, root-owned and not writable by others. Host keys are pinned by the canonical transport. The remote user must be root (documented)."
+    },
+    {
+      "id": "instance-names",
+      "verdict": "pass",
+      "note": "Records are keyed by host, port and user: config-<key>, pending-<key>, observation-<key>, leases-<key>, revert-<key>-<token>, <method>-<key> for action outcomes, and render-<sha256>; live round F1 (one name shared by config, observation and leases) is fixed and confirmed live."
+    },
+    {
+      "id": "data-access",
+      "verdict": "pass",
+      "note": "Targets, keys and DHCP inputs arrive as method arguments; the model reads back only its own pending, config and revert records."
+    },
+    {
+      "id": "version-upgrades",
+      "verdict": "pass",
+      "note": "First publish: no prior stored attributes, so no upgrade entries are needed."
+    }
+  ],
+  "panel": {
+    "codex-astra": "codex gpt-6-astra conformance seat, rounds r1 27960f3, r2 4f15006, r3 540be3c and the refactor a3c1c2b: final verdict CLEAN after triage; earlier Highs (revert/commit race, expiry check, verify gate, enabled state, token grammar) were fixed in r1-r2 or refuted. Residual Mediums recorded in the LOGBOOK.",
+    "codex-terra": "codex gpt-5.6-terra adversarial seat, same rounds: CLEAN after triage at 540be3c and a3c1c2b (behaviour-preserving over 61 scenarios); r3 Mediums (restore lock timeout, commit ordering, abortClaim cleanup, non-atomic restore copy) recorded as LOGBOOK residuals.",
+    "tightness-astra": "COULD-BE-TIGHTER at a3c1c2b, about 23 removable lines; all five suggestions applied at merge-prep (36e8081: recordCancelled helper, spread armRevert opts, inlined deps, one test matcher loop, stale duplicate doc comment dropped).",
+    "merge-prep": "Self-review of the live-fix delta a3c1c2b..fddc66d against TRIAGE 4b-4h: no Critical/High (plain-object context drives the new pending/config/action records; no hash on argv; ss field 4 and bare-version parse unit-tested). Two code commits at merge-prep: the 36e8081 quality pass and ebf2c0c (gate 7: swamp-quality-ignore on the revert-token fields). Vendored _lib/ssh.ts is the canonical blob fe0139f0. 73 tests pass, gates 0 to 6 pass.",
+    "live-e2e": "One throwaway VPS (<vps1>), Kea 2.4.1, contained in a veth lab: 10/11 at 540be3c (render not visible; F1-F4 found), then 11 pass, 0 fail, 0 blocked at fddc66d, with 0 DHCP packets on the real NICs throughout.",
+    "ocr-llm": "advisory adversarial-glm seat timed out (rc=124) in the final round; not blocking"
+  }
+}

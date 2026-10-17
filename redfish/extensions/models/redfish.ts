@@ -22,6 +22,7 @@ import {
   BOOT_ENABLED,
   BOOT_TARGETS,
   desiredPowerState,
+  isFireAndForget,
   isPowerNoop,
   isRestartAction,
   isSystemId,
@@ -66,8 +67,8 @@ const TargetShape = {
   auth_mode: z.enum(["session", "basic"]).default("session").describe(
     "session: open and delete a Redfish SessionService session; basic: send Basic auth. Falls back to basic when the BMC has no SessionService.",
   ),
-  allow_insecure_basic: z.boolean().default(false).describe(
-    "Permit Basic auth (the password on every request) when tls_verify=insecure_skip_verify. Default false; strict TLS always allows Basic.",
+  allow_insecure_credentials: z.boolean().default(false).describe(
+    "Permit credentials (session or Basic) to be sent when tls_verify=insecure_skip_verify. Default false; a self-signed BMC should use ca_pem with tls_verify=strict instead.",
   ),
 };
 
@@ -146,7 +147,7 @@ function target(a: z.infer<typeof TargetArgs>) {
     password: a.password,
     tls,
     authMode: a.auth_mode,
-    allowInsecureBasic: a.allow_insecure_basic,
+    allowInsecureCredentials: a.allow_insecure_credentials,
   };
 }
 
@@ -273,61 +274,87 @@ export const model = {
         const action = a.action as ResetType;
         const deadline = deps.now().getTime() + a.timeout_seconds * 1000;
         const pollMs = a.poll_interval_seconds * 1000;
-        const state = await withRedfish(deps, t, async (api, origin) => {
-          const found = await api.findSystem(a.system_id);
-          let current = parseSystem(
-            found.raw,
-            origin,
-            deps.now().toISOString(),
-            "present",
-            found.etag,
-          );
-          if (isPowerNoop(action, current.power_state)) {
-            context.logger.info("System {id} already {state}", {
-              id: current.system_id,
-              state: current.power_state,
-            });
-            return current;
-          }
-          const allowable = current.allowable_reset_types;
-          if (allowable && !allowable.includes(action)) {
-            throw new RedfishError(
-              "invalid_input",
-              `BMC does not allow ${action}; allowed: ${allowable.join(", ")}`,
-            );
-          }
-          const initial = current.power_state;
-          const restart = isRestartAction(action);
-          const desired = desiredPowerState(action, initial);
-          const reset = await api.resetSystem(found.raw, action);
-          if (reset.taskLocation) {
-            await api.awaitTask(reset.taskLocation, pollMs);
-          }
-          let sawTransition = false;
-          while (deps.now().getTime() < deadline) {
-            await deps.sleep(pollMs);
-            const again = await api.readSystem();
-            current = parseSystem(
-              again.raw,
+        const state = await withRedfish(
+          deps,
+          t,
+          async (api, origin) => {
+            const found = await api.findSystem(a.system_id);
+            let current = parseSystem(
+              found.raw,
               origin,
               deps.now().toISOString(),
               "present",
-              again.etag,
+              found.etag,
             );
-            if (restart) {
-              if (current.power_state !== initial) sawTransition = true;
-              if (sawTransition && current.power_state === desired) {
-                return current;
-              }
-            } else if (current.power_state === desired) {
+            if (isPowerNoop(action, current.power_state)) {
+              context.logger.info("System {id} already {state}", {
+                id: current.system_id,
+                state: current.power_state,
+              });
               return current;
             }
-          }
-          throw new RedfishError(
-            "timeout",
-            `System ${current.system_id} did not reach ${desired} within ${a.timeout_seconds}s`,
-          );
-        }, deadline);
+            const allowable = current.allowable_reset_types;
+            if (allowable && !allowable.includes(action)) {
+              throw new RedfishError(
+                "invalid_input",
+                `BMC does not allow ${action}; allowed: ${
+                  allowable.join(", ")
+                }`,
+              );
+            }
+            const initial = current.power_state;
+            const restart = isRestartAction(action);
+            const desired = desiredPowerState(action, initial);
+            const reset = await api.resetSystem(found.raw, action);
+            if (reset.warning) context.logger.warn(reset.warning);
+            const readNow = async () => {
+              const again = await api.readSystem();
+              return parseSystem(
+                again.raw,
+                origin,
+                deps.now().toISOString(),
+                "present",
+                again.etag,
+              );
+            };
+            if (reset.taskLocation) {
+              // A completed task monitor is success; the state need not change
+              // again before we read it.
+              await api.awaitTask(reset.taskLocation, pollMs);
+              return await readNow();
+            }
+            if (isFireAndForget(action)) {
+              // Nmi injects an event; the 2xx response is the whole result.
+              return await readNow();
+            }
+            let transitions = 0;
+            let last = initial;
+            for (let first = true;; first = false) {
+              if (!first) {
+                if (deps.now().getTime() >= deadline) break;
+                await deps.sleep(pollMs);
+              }
+              current = await readNow();
+              if (current.power_state !== last) transitions++;
+              last = current.power_state;
+              if (current.power_state === desired) {
+                if (restart && transitions === 0) {
+                  context.logger.info(
+                    "System {id} restart accepted without an observed transition",
+                    { id: current.system_id },
+                  );
+                }
+                return current;
+              }
+            }
+            throw new RedfishError(
+              "timeout",
+              `System ${current.system_id} did not reach ${desired} within ${a.timeout_seconds}s`,
+            );
+          },
+          deadline,
+          (m) => context.logger.warn(m),
+        );
         const handle = await persist(context, state);
         return { dataHandles: [handle], result: summary(state) };
       },

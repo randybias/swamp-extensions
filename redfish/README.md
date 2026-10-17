@@ -76,14 +76,16 @@ Pass `username` and `password` only as vault references; never as literal
 allowlist of metadata; no credential is ever written to state or output. By
 default a Redfish SessionService session is opened and deleted in a `finally`,
 falling back to Basic auth when the BMC has no SessionService; `auth_mode`
-forces one or the other. Basic auth sends the password on every request, so it
-is refused over an unverified TLS connection unless `allow_insecure_basic` is
-set. `power` validates the requested `ResetType` against the system's advertised
-allowables (only values this model knows are echoed back), is a no-op when the
-system is already in the target state, follows a returned Redfish task monitor,
-and requires an observed state change before accepting a restart. `set_boot`
-patches the override, sending `If-Match` when the BMC provides an ETag, and
-reads it back to confirm.
+forces one or the other. Over `insecure_skip_verify` no credential is sent at
+all — session or Basic — unless `allow_insecure_credentials` is set; the
+recommended path for a self-signed BMC is to put its certificate in `ca_pem` and
+keep `strict` verification. `power` validates the requested `ResetType` against
+the system's advertised allowables (only values this model knows are echoed
+back), is a no-op when the system is already in the target state, follows a
+returned Redfish task monitor, and accepts a restart once the system is back at
+the desired state (polling immediately, so a fast restart is not missed); `Nmi`
+is fire-and-forget. `set_boot` patches the override, sending `If-Match` when the
+BMC provides an ETag, and reads it back to confirm.
 
 The endpoint must be an https origin: no path, query, fragment or embedded
 credentials, and every `@odata.id` is resolved back onto that origin. The TLS

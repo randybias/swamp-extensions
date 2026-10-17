@@ -122,7 +122,8 @@ async function readWithSignal(
       },
       (e) => {
         signal.removeEventListener("abort", onAbort);
-        reject(e);
+        // A stream aborted by the signal reports a DOMException; map it.
+        reject(signal.aborted ? timeoutError() : e);
       },
     );
   });

@@ -50,3 +50,19 @@ Not packaged. Notes for whoever maintains this extension.
   - MEDIUM: `set_boot` is now prefixed `DESTRUCTIVE.`.
   - MEDIUM: a `null`/non-object JSON body is refused, and a ComputerSystem
     without a usable `Id` is refused before it can be persisted.
+- 2026-10-17 (lane/d2-redfish): review round 2 (e1ecad1). Dispositions:
+  - RULING: `allow_insecure_basic` became `allow_insecure_credentials`. Over
+    `insecure_skip_verify` no credential is sent at all (session POST or Basic)
+    unless it is true; the recommended path for a self-signed BMC is `ca_pem`
+    with `tls_verify=strict`.
+  - MEDIUM: a completed Task monitor (TaskState Completed) is success without
+    requiring a power-state transition; a 204/empty/404 task read means
+    completed; restart polling starts immediately and counts transitions, so a
+    fast restart is accepted; `Nmi` is fire-and-forget (removed from
+    RESTART_TYPES).
+  - MEDIUM: an aborted body read is mapped to the typed `timeout`.
+  - MEDIUM: logout is bounded by min(requestTimeoutMs, remaining deadline).
+  - MEDIUM: a cross-origin session URI or task monitor is skipped with a warning
+    instead of throwing.
+  - TEST: stalled DELETE, cross-origin session URI and cross-origin task monitor
+    added.

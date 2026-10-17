@@ -49,9 +49,13 @@ function makeBmc() {
   let systemStatus = 200;
   let ignoreReset = false;
   let sessionBodyLocation = false;
+  let sessionLocationOverride: string | undefined;
   let taskOnReset = false;
   let taskState = "Completed";
+  let taskEmpty = false;
+  let taskLocationOverride: string | undefined;
   let restartTransition = true;
+  let restartStuck = false;
   let restartCounter = 0;
   let systemBodyOverride: unknown = undefined;
   const fetchImpl: FetchFn = (url, init) => {
@@ -64,15 +68,16 @@ function makeBmc() {
       if (sessionStatus !== 201) {
         return Promise.resolve(new Response("x", { status: sessionStatus }));
       }
+      const sessionLocation = sessionLocationOverride ?? SESSION_LOCATION;
       const sessionBody = sessionBodyLocation
-        ? JSON.stringify({ "@odata.id": SESSION_LOCATION })
+        ? JSON.stringify({ "@odata.id": sessionLocation })
         : "{}";
       return Promise.resolve(
         new Response(sessionBody, {
           status: 201,
           headers: sessionBodyLocation
             ? { "x-auth-token": TOKEN }
-            : { "x-auth-token": TOKEN, location: SESSION_LOCATION },
+            : { "x-auth-token": TOKEN, location: sessionLocation },
         }),
       );
     }
@@ -80,6 +85,9 @@ function makeBmc() {
       return Promise.resolve(new Response(null, { status: 204 }));
     }
     if (method === "GET" && path === "/redfish/v1/TaskService/Tasks/1") {
+      if (taskEmpty) {
+        return Promise.resolve(new Response(null, { status: 204 }));
+      }
       return Promise.resolve(json({ TaskState: taskState }));
     }
     if (method === "GET" && path === "/redfish/v1/Systems") {
@@ -121,7 +129,9 @@ function makeBmc() {
           resetType === "ForceRestart" || resetType === "GracefulRestart" ||
           resetType === "PowerCycle" || resetType === "Nmi"
         ) {
-          if (restartTransition) {
+          if (restartStuck) {
+            system.PowerState = "Off";
+          } else if (restartTransition) {
             restartCounter = 1;
             system.PowerState = "Off";
           } else {
@@ -133,7 +143,10 @@ function makeBmc() {
         return Promise.resolve(
           new Response(null, {
             status: 202,
-            headers: { location: "/redfish/v1/TaskService/Tasks/1" },
+            headers: {
+              location: taskLocationOverride ??
+                "/redfish/v1/TaskService/Tasks/1",
+            },
           }),
         );
       }
@@ -179,6 +192,18 @@ function makeBmc() {
     },
     setRestartTransition: (v: boolean) => {
       restartTransition = v;
+    },
+    setRestartStuck: (v: boolean) => {
+      restartStuck = v;
+    },
+    setSessionLocation: (v: string) => {
+      sessionLocationOverride = v;
+    },
+    setTaskLocation: (v: string) => {
+      taskLocationOverride = v;
+    },
+    setTaskEmpty: (v: boolean) => {
+      taskEmpty = v;
     },
     setSystemBody: (v: unknown) => {
       systemBodyOverride = v;
@@ -253,7 +278,8 @@ Deno.test("schema: username and password are sensitive and tls_verify is require
   assertEquals(withTls.success, true);
   if (withTls.success) {
     assertEquals(
-      (withTls.data as { allow_insecure_basic: boolean }).allow_insecure_basic,
+      (withTls.data as { allow_insecure_credentials: boolean })
+        .allow_insecure_credentials,
       false,
     );
   }
@@ -328,7 +354,11 @@ Deno.test("tls policy is passed to the client factory, with no default", async (
     await model.methods.get.execute(BASE, context);
     assertEquals(lastTls, { mode: "strict" });
     await model.methods.get.execute(
-      { ...BASE, tls_verify: "insecure_skip_verify" },
+      {
+        ...BASE,
+        tls_verify: "insecure_skip_verify",
+        allow_insecure_credentials: true,
+      },
       context,
     );
     assertEquals(lastTls, { mode: "insecure_skip_verify" });
@@ -684,25 +714,27 @@ Deno.test("injection in endpoint and system_id is rejected before any request", 
   }
 });
 
-Deno.test("Basic auth over insecure TLS is refused unless explicitly allowed", async () => {
+Deno.test("credentials over insecure TLS are refused unless explicitly allowed", async () => {
   const bmc = makeBmc();
   const u = useBmc(bmc);
   try {
     const { context } = createModelTestContext(ctxOptions);
-    const e = await assertRejects(() =>
-      model.methods.get.execute({
-        ...BASE,
-        auth_mode: "basic",
-        tls_verify: "insecure_skip_verify",
-      }, context)
-    ) as RedfishError;
-    assertEquals(e.code, "invalid_input");
+    for (const auth_mode of ["session", "basic"] as const) {
+      const e = await assertRejects(() =>
+        model.methods.get.execute({
+          ...BASE,
+          auth_mode,
+          tls_verify: "insecure_skip_verify",
+        }, context)
+      ) as RedfishError;
+      assertEquals(e.code, "invalid_input", auth_mode);
+    }
     assertEquals(bmc.calls.length, 0);
     await model.methods.get.execute({
       ...BASE,
-      auth_mode: "basic",
+      auth_mode: "session",
       tls_verify: "insecure_skip_verify",
-      allow_insecure_basic: true,
+      allow_insecure_credentials: true,
     }, context);
     assert(bmc.calls.some((c) => c.method === "GET"));
   } finally {
@@ -800,9 +832,9 @@ Deno.test("power restart waits for an observed transition before accepting On", 
   }
 });
 
-Deno.test("power restart times out when no transition is observed", async () => {
+Deno.test("power restart times out when the system never returns to desired", async () => {
   const bmc = makeBmc();
-  bmc.setRestartTransition(false);
+  bmc.setRestartStuck(true);
   const u = useBmc(bmc);
   try {
     const { context } = createModelTestContext(ctxOptions);
@@ -859,6 +891,144 @@ Deno.test("set_boot is described as destructive", () => {
   assert(
     String(model.methods.set_boot.description).startsWith("DESTRUCTIVE."),
   );
+});
+
+Deno.test("a restart already at desired on the immediate poll is accepted", async () => {
+  const bmc = makeBmc();
+  bmc.setRestartTransition(false);
+  const u = useBmc(bmc);
+  try {
+    const { context } = createModelTestContext(ctxOptions);
+    const out = await model.methods.power.execute(
+      { ...BASE, action: "ForceRestart", timeout_seconds: 5 },
+      context,
+    ) as { result: Record<string, unknown> };
+    assertEquals(out.result.power_state, "On");
+  } finally {
+    u.restore();
+  }
+});
+
+Deno.test("Nmi is fire-and-forget: a 2xx is the result", async () => {
+  const bmc = makeBmc();
+  const u = useBmc(bmc);
+  try {
+    const { context } = createModelTestContext(ctxOptions);
+    await model.methods.power.execute(
+      { ...BASE, action: "Nmi", timeout_seconds: 5 },
+      context,
+    );
+    assert(
+      bmc.calls.some((c) =>
+        c.method === "POST" && c.url.includes("ComputerSystem.Reset")
+      ),
+    );
+  } finally {
+    u.restore();
+  }
+});
+
+Deno.test("a completed task monitor is success without a transition", async () => {
+  const bmc = makeBmc();
+  bmc.setTaskOnReset(true);
+  bmc.setTaskState("Completed");
+  bmc.setRestartTransition(false);
+  const u = useBmc(bmc);
+  try {
+    const { context } = createModelTestContext(ctxOptions);
+    const out = await model.methods.power.execute(
+      { ...BASE, action: "ForceRestart", timeout_seconds: 30 },
+      context,
+    ) as { result: Record<string, unknown> };
+    assertEquals(out.result.power_state, "On");
+  } finally {
+    u.restore();
+  }
+});
+
+Deno.test("a 204 task monitor means completed", async () => {
+  const bmc = makeBmc();
+  bmc.setTaskOnReset(true);
+  bmc.setTaskEmpty(true);
+  bmc.setRestartTransition(false);
+  const u = useBmc(bmc);
+  try {
+    const { context } = createModelTestContext(ctxOptions);
+    const out = await model.methods.power.execute(
+      { ...BASE, action: "ForceRestart", timeout_seconds: 30 },
+      context,
+    ) as { result: Record<string, unknown> };
+    assertEquals(out.result.power_state, "On");
+  } finally {
+    u.restore();
+  }
+});
+
+Deno.test("a stalled session DELETE does not hang the method", async () => {
+  const bmc = makeBmc();
+  const baseFetch = bmc.fetch;
+  const stalled: Bmc = {
+    ...bmc,
+    fetch: (url, init) => {
+      if ((init?.method ?? "GET") === "DELETE") {
+        return new Promise<Response>((_resolve, reject) => {
+          const signal = (init as { signal?: AbortSignal } | undefined)?.signal;
+          if (!signal) return;
+          if (signal.aborted) return reject(signal.reason);
+          signal.addEventListener("abort", () => reject(signal.reason), {
+            once: true,
+          });
+        });
+      }
+      return baseFetch(url, init);
+    },
+  };
+  const u = useBmc(stalled, 20);
+  try {
+    const { context } = createModelTestContext(ctxOptions);
+    const out = await model.methods.get.execute(BASE, context) as {
+      result: Record<string, unknown>;
+    };
+    assertEquals(out.result.system_id, ID);
+  } finally {
+    u.restore();
+  }
+});
+
+Deno.test("a cross-origin session URI skips logout without throwing", async () => {
+  const bmc = makeBmc();
+  bmc.setSessionLocation(["https://evil.example.com", "/session"].join(""));
+  bmc.setSessionBodyLocation(true);
+  const u = useBmc(bmc);
+  try {
+    const { context } = createModelTestContext(ctxOptions);
+    const out = await model.methods.get.execute(BASE, context) as {
+      result: Record<string, unknown>;
+    };
+    assertEquals(out.result.system_id, ID);
+    assert(!bmc.calls.some((c) => c.url.includes("evil.example.com")));
+  } finally {
+    u.restore();
+  }
+});
+
+Deno.test("a cross-origin task monitor is not followed", async () => {
+  const bmc = makeBmc();
+  bmc.setTaskOnReset(true);
+  bmc.setTaskLocation(["https://evil.example.com", "/task"].join(""));
+  bmc.setRestartTransition(false);
+  const u = useBmc(bmc);
+  try {
+    const { context } = createModelTestContext(ctxOptions);
+    const out = await model.methods.power.execute(
+      { ...BASE, action: "ForceRestart", timeout_seconds: 5 },
+      context,
+    ) as { result: Record<string, unknown> };
+    assertEquals(out.result.power_state, "On");
+    assert(!bmc.calls.some((c) => c.url.includes("evil.example.com")));
+  } finally {
+    u.restore();
+  }
 });
 
 Deno.test("no fixture, source or doc carries real-looking secret material", async () => {

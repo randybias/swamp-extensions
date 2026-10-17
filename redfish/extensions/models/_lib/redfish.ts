@@ -49,8 +49,13 @@ export const RESTART_TYPES = [
   "GracefulRestart",
   "ForceRestart",
   "PowerCycle",
-  "Nmi",
 ] as const;
+
+/**
+ * Actions that only inject an event; no power-state change is guaranteed, so
+ * the 2xx response is the whole result.
+ */
+export const FIRE_AND_FORGET = ["Nmi"] as const;
 
 /** Standard boot override targets this model exposes. */
 export const BOOT_TARGETS = [
@@ -157,6 +162,15 @@ export function resolveOdata(origin: string, id: string): string {
   return url.toString();
 }
 
+/** Like {@link resolveOdata} but returns undefined instead of throwing. */
+export function trySameOrigin(origin: string, id: string): string | undefined {
+  try {
+    return resolveOdata(origin, id);
+  } catch {
+    return undefined;
+  }
+}
+
 // The `@Redfish.*` annotation names are built from parts so no source line
 // looks like an email address to the leak scanner.
 const RESET_ALLOWABLE_KEY = ["ResetType", "@", "Redfish.AllowableValues"].join(
@@ -257,10 +271,16 @@ export function parseSystem(
 
 const OFF_ACTIONS = new Set(["ForceOff", "GracefulShutdown"]);
 const RESTART_ACTION_SET = new Set<string>(RESTART_TYPES);
+const FIRE_AND_FORGET_SET = new Set<string>(FIRE_AND_FORGET);
 
 /** True when the action restarts the system (an intervening state is needed). */
 export function isRestartAction(action: string): boolean {
   return RESTART_ACTION_SET.has(action);
+}
+
+/** True when the action is fire-and-forget (success is the 2xx response). */
+export function isFireAndForget(action: string): boolean {
+  return FIRE_AND_FORGET_SET.has(action);
 }
 
 /** The final power state a reset action should reach. */
@@ -314,13 +334,14 @@ export interface RedfishTarget {
   password: string;
   tls: TlsPolicy;
   authMode: "session" | "basic";
-  /** Permit Basic auth over an unverified TLS connection. */
-  allowInsecureBasic: boolean;
+  /** Permit credentials to be sent over an unverified TLS connection. */
+  allowInsecureCredentials: boolean;
 }
 
 interface Auth {
   headers: Record<string, string>;
   logout(): Promise<void>;
+  warning?: string;
 }
 
 interface RawResult {
@@ -338,15 +359,18 @@ function authHeader(
 }
 
 /**
- * Refuses Basic auth over an unverified TLS connection unless the caller
- * explicitly allowed it. Basic sends the password on every request, so a
- * spoofed BMC would learn it.
+ * Refuses to send credentials over a TLS connection that is not verified
+ * unless the caller explicitly allowed it. Both Basic auth and the session
+ * POST hand the password to the (unverified) peer.
  */
-function assertBasicAllowed(tls: TlsPolicy, allowInsecureBasic: boolean): void {
-  if (tls.mode === "strict" || allowInsecureBasic) return;
+function assertCredentialsAllowed(
+  tls: TlsPolicy,
+  allowInsecureCredentials: boolean,
+): void {
+  if (tls.mode === "strict" || allowInsecureCredentials) return;
   throw new RedfishError(
     "invalid_input",
-    "Basic auth sends the password on every request and is not allowed over an unverified TLS connection; use tls_verify=strict or set allow_insecure_basic=true",
+    "credentials are not sent over a TLS connection with verification disabled; pin the BMC certificate with ca_pem (recommended) or set allow_insecure_credentials=true",
   );
 }
 
@@ -370,8 +394,8 @@ async function openAuth(
   client: unknown,
   deadline?: number,
 ): Promise<Auth> {
+  assertCredentialsAllowed(target.tls, target.allowInsecureCredentials);
   if (target.authMode === "basic") {
-    assertBasicAllowed(target.tls, target.allowInsecureBasic);
     return {
       headers: authHeader(target.username, target.password),
       logout: () => Promise.resolve(),
@@ -402,7 +426,6 @@ async function openAuth(
   }
   if (resp.status === 404 || resp.status === 405) {
     await drain(resp);
-    assertBasicAllowed(target.tls, target.allowInsecureBasic);
     return {
       headers: authHeader(target.username, target.password),
       logout: () => Promise.resolve(),
@@ -414,14 +437,14 @@ async function openAuth(
   }
   const token = resp.headers.get("x-auth-token");
   const text = await readBounded(resp, MAX_BODY_BYTES, signal);
-  let location = resp.headers.get("location") ?? undefined;
-  if (!location) {
+  let rawLocation = resp.headers.get("location") ?? undefined;
+  if (!rawLocation) {
     // Some BMCs return the session URI only in the body.
     try {
       const body = JSON.parse(text) as unknown;
-      location = str(asRecord(body)?.["@odata.id"]);
+      rawLocation = str(asRecord(body)?.["@odata.id"]);
     } catch {
-      location = undefined;
+      rawLocation = undefined;
     }
   }
   if (!token) {
@@ -431,11 +454,18 @@ async function openAuth(
     );
   }
   const headers = { "X-Auth-Token": token };
-  const sessionUrl = location
-    ? resolveOdata(target.endpoint, location)
-    : undefined;
+  let sessionUrl: string | undefined;
+  let warning: string | undefined;
+  if (rawLocation) {
+    sessionUrl = trySameOrigin(target.endpoint, rawLocation);
+    if (!sessionUrl) {
+      warning =
+        "BMC session URI points outside the endpoint origin; skipping session logout";
+    }
+  }
   return {
     headers,
+    ...(warning ? { warning } : {}),
     logout: async () => {
       if (!sessionUrl) return;
       try {
@@ -443,7 +473,8 @@ async function openAuth(
           method: "DELETE",
           redirect: "error",
           headers,
-          signal: AbortSignal.timeout(deps.requestTimeoutMs),
+          // Bound by the caller deadline when there is one.
+          signal: requestSignal(deps, deadline),
           client,
         });
         await drain(r);
@@ -543,11 +574,16 @@ export class RedfishApi {
     } catch (e) {
       throw classifyFetch(e);
     }
-    const text = await readBounded(
-      resp,
-      MAX_BODY_BYTES,
-      requestSignal(this.#deps, this.#deadline),
-    );
+    let text: string;
+    try {
+      text = await readBounded(
+        resp,
+        MAX_BODY_BYTES,
+        requestSignal(this.#deps, this.#deadline),
+      );
+    } catch (e) {
+      throw e instanceof RedfishError ? e : classifyFetch(e);
+    }
     return {
       status: resp.status,
       etag: resp.headers.get("etag") ?? undefined,
@@ -603,24 +639,33 @@ export class RedfishApi {
   async resetSystem(
     raw: Record<string, unknown>,
     type: ResetType | string,
-  ): Promise<{ taskLocation?: string }> {
+  ): Promise<{ taskLocation?: string; warning?: string }> {
     const target = resetAction(raw).target ??
       `${this.systemPath}/Actions/ComputerSystem.Reset`;
     const r = await this.#send("POST", target, resetBody(type));
     if (r.status < 200 || r.status >= 300) throw statusError(r.status);
-    return r.location
-      ? { taskLocation: resolveOdata(this.#origin, r.location) }
-      : {};
+    if (!r.location) return {};
+    const taskLocation = trySameOrigin(this.#origin, r.location);
+    if (!taskLocation) {
+      return {
+        warning:
+          "BMC task monitor points outside the endpoint origin; not followed",
+      };
+    }
+    return { taskLocation };
   }
 
-  /** Waits for a Redfish task to reach a terminal state. */
-  async awaitTask(
-    location: string,
-    pollMs: number,
-  ): Promise<void> {
+  /**
+   * Waits for a Redfish task to reach a terminal state. A 204, an empty body
+   * after the 202, or a 404 (the task was purged once done) means completed.
+   */
+  async awaitTask(location: string, pollMs: number): Promise<void> {
     for (;;) {
-      const r = await this.#getRaw(location);
-      const taskState = str(r.raw.TaskState);
+      const r = await this.#send("GET", location);
+      if (r.status === 204 || r.status === 404 || !r.text.trim()) return;
+      if (r.status < 200 || r.status >= 300) throw statusError(r.status);
+      const raw = parseJson(r.text);
+      const taskState = str(raw.TaskState);
       if (taskState && TERMINAL_TASK.has(taskState)) {
         if (FAILED_TASK.has(taskState)) {
           throw new RedfishError(
@@ -686,12 +731,14 @@ export async function withRedfish<T>(
   target: RedfishTarget,
   fn: (api: RedfishApi, origin: string) => Promise<T>,
   deadline?: number,
+  warn?: (message: string) => void,
 ): Promise<T> {
   const handle = deps.makeClient(target.tls);
   let auth: Auth | undefined;
   try {
     const api = new RedfishApi(deps, target.endpoint, handle.client, deadline);
     auth = await openAuth(deps, target, handle.client, deadline);
+    if (auth.warning) warn?.(auth.warning);
     api.setAuth(auth.headers);
     return await fn(api, target.endpoint);
   } finally {

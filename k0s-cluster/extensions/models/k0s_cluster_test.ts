@@ -61,6 +61,8 @@ function makeDeps(
       argv: string[],
     ) => { code?: number; stdout?: string; stderr?: string } | undefined;
     fetch?: (url: string) => Promise<Uint8Array>;
+    /** Whether an upload changed the remote file; defaults to true. */
+    uploadChanged?: (path: string) => boolean;
   } = {},
 ): Fake {
   const execs: string[][] = [];
@@ -90,7 +92,7 @@ function makeDeps(
         path: file.path,
         bytes: file.content.length,
         sha256: "0".repeat(64),
-        changed: true,
+        changed: options.uploadChanged?.(file.path) ?? true,
       });
     },
     learnHostKeys: (target) => {
@@ -325,6 +327,7 @@ Deno.test("install adopts an active service without re-fetching", async () => {
   const configSha = await sha256Hex(encoder.encode(yaml));
   const fake = makeDeps({
     exec: adoptRouter(configSha),
+    uploadChanged: () => false,
     fetch: () => {
       throw new Error("fetch must not run on adopt");
     },
@@ -333,7 +336,15 @@ Deno.test("install adopts an active service without re-fetching", async () => {
   const { context } = createModelTestContext();
   const out = await model.methods.install.execute(installArgs(), context);
   assertEquals(out.result.config_sha256, configSha);
-  assertEquals(fake.uploads.length, 0);
+  // The config goes through upload even when unchanged, so its mode is
+  // converged to 0600; unchanged bytes and mode mean no restart.
+  assertEquals(fake.uploads.map((u) => [u.path, u.mode]), [
+    [K0S_CONFIG_PATH, "0600"],
+  ]);
+  assertEquals(
+    fake.execs.some((argv) => argv[0] === "systemctl" && argv[1] === "restart"),
+    false,
+  );
   assertEquals(fake.fetches.length, 0);
 });
 
@@ -475,16 +486,15 @@ Deno.test("no production source embeds kubeconfig or key material", async () => 
 Deno.test("apply_manifests is a no-op when the stack is unchanged", async () => {
   const content = "kind: ConfigMap\nmetadata:\n  name: example\n";
   const digest = await sha256Hex(encoder.encode(content));
+  void digest;
   const fake = makeDeps({
+    uploadChanged: () => false,
     exec: (argv) => {
       if (argv[0] === "find") {
         return {
           code: 0,
           stdout: `${K0S_MANIFEST_DIR}/example/configmap.yaml\n`,
         };
-      }
-      if (argv[0] === "sha256sum") {
-        return { code: 0, stdout: `${digest}  ${argv[1]}\n` };
       }
       return { code: 0, stdout: "" };
     },
@@ -497,7 +507,8 @@ Deno.test("apply_manifests is a no-op when the stack is unchanged", async () => 
   const { context } = createModelTestContext();
   const out = await model.methods.apply_manifests.execute(args, context);
   assertEquals(out.result.applied, false);
-  assertEquals(fake.uploads.length, 0);
+  // Even an unchanged file is pushed through upload, which converges its mode.
+  assertEquals(fake.uploads.map((u) => u.mode), ["0600"]);
 });
 
 Deno.test("apply_manifests uploads changed files and removes stale ones", async () => {
@@ -553,11 +564,10 @@ Deno.test("apply_helm reconciles a declared chart", async () => {
   }];
   const yaml = renderK0sConfig({ ...CLUSTER, helm });
   const configSha = await sha256Hex(encoder.encode(yaml));
+  void configSha;
   const fake = makeDeps({
+    uploadChanged: () => false,
     exec: (argv) => {
-      if (argv[0] === "sha256sum") {
-        return { code: 0, stdout: `${configSha}  ${K0S_CONFIG_PATH}\n` };
-      }
       if (argv.includes("secrets")) return { code: 0, stdout: HELM_SECRETS };
       return { code: 0, stdout: "" };
     },
@@ -572,7 +582,11 @@ Deno.test("apply_helm reconciles a declared chart", async () => {
   const out = await model.methods.apply_helm.execute(args, context);
   assertEquals(out.result.reconciled, true);
   assertEquals(out.result.charts[0].status, "deployed");
-  assertEquals(fake.uploads.length, 0);
+  assertEquals(fake.uploads.map((u) => u.mode), ["0600"]);
+  assertEquals(
+    fake.execs.some((argv) => argv[0] === "systemctl" && argv[1] === "restart"),
+    false,
+  );
 });
 
 Deno.test("apply_helm fails when a chart never reconciles", async () => {
@@ -956,7 +970,7 @@ Deno.test("install refuses to turn an installed controller into a worker", async
         context,
       ),
     Error,
-    "allow_role_change",
+    "confirm_role_change",
   );
   assertEquals(fake.uploads.length, 0, "no token or config was sent");
   assertEquals(
@@ -987,7 +1001,7 @@ Deno.test("allow_role_change stops and resets the old role before installing", a
     installArgs({
       role: "worker",
       join_token: "PLACEHOLDER-JOIN-TOKEN",
-      allow_role_change: true,
+      confirm_role_change: HOST,
     }),
     context,
   );
@@ -1328,4 +1342,103 @@ Deno.test("sensitive digests are not returned by get, apply_manifests or render_
     model.resources.state.schema.shape.config_file_sha256.meta()?.sensitive,
     true,
   );
+});
+
+Deno.test("a role change downloads and verifies before it tears anything down", async () => {
+  for (
+    const failure of [
+      () => Promise.reject(new Error("download failed")),
+      () => Promise.resolve(new TextEncoder().encode("not the pinned binary")),
+    ]
+  ) {
+    const fake = makeDeps({ exec: ACTIVE_CONTROLLER, fetch: failure });
+    const model = createModel(fake.deps);
+    const { context, getWrittenResources } = createModelTestContext();
+    await assertRejects(() =>
+      model.methods.install.execute(
+        installArgs({
+          role: "worker",
+          join_token: "PLACEHOLDER-JOIN-TOKEN",
+          confirm_role_change: HOST,
+        }),
+        context,
+      )
+    );
+    assertEquals(
+      fake.execs.some((argv) => argv[1] === "stop" || argv[1] === "reset"),
+      false,
+      "the running controller was not touched",
+    );
+    assertEquals(fake.uploads.length, 0);
+    assertEquals(primary(getWrittenResources(), true).length, 0);
+  }
+});
+
+Deno.test("a role change needs the host named as confirmation", async () => {
+  for (const confirm of [undefined, "wrong.example.com"]) {
+    const fake = makeDeps({ exec: ACTIVE_CONTROLLER });
+    const model = createModel(fake.deps);
+    const { context } = createModelTestContext();
+    await assertRejects(
+      () =>
+        model.methods.install.execute(
+          installArgs({
+            role: "worker",
+            join_token: "PLACEHOLDER-JOIN-TOKEN",
+            confirm_role_change: confirm,
+          }),
+          context,
+        ),
+      Error,
+      "confirm_role_change",
+    );
+    assertEquals(fake.fetches.length, 0);
+  }
+});
+
+Deno.test("a failure after the old role is reset is reported and recorded", async () => {
+  const fake = makeDeps({
+    exec: (argv) => {
+      const base = ACTIVE_CONTROLLER(argv);
+      if (argv[0] === "uname") return { code: 0, stdout: "x86_64\n" };
+      if (argv[1] === "install") return { code: 1 };
+      return base;
+    },
+    fetch: () => Promise.resolve(PAYLOAD),
+  });
+  const model = createModel(fake.deps);
+  const { context, getWrittenResources } = createModelTestContext();
+  await assertRejects(
+    () =>
+      model.methods.install.execute(
+        installArgs({
+          role: "worker",
+          join_token: "PLACEHOLDER-JOIN-TOKEN",
+          confirm_role_change: HOST,
+        }),
+        context,
+      ),
+    Error,
+    "could not be restored",
+  );
+  const state = primary(getWrittenResources()).data as { installed: boolean };
+  assertEquals(state.installed, false);
+});
+
+Deno.test("an existing looser mode is tightened even when the bytes match", async () => {
+  const fake = makeDeps({ uploadChanged: () => true });
+  const model = createModel(fake.deps);
+  const { context } = createModelTestContext();
+  const out = await model.methods.apply_manifests.execute(
+    model.methods.apply_manifests.arguments.parse({
+      ssh: SSH,
+      stack: {
+        name: "s",
+        files: [{ path: "a.yaml", content: "kind: Secret\n" }],
+      },
+    }),
+    context,
+  );
+  assertEquals(out.result.applied, true);
+  assertEquals(fake.uploads.every((u) => u.mode === "0600"), true);
 });

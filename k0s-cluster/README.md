@@ -145,8 +145,10 @@ manifest where possible.
   re-run re-verifies the installed binary digest and version, then adopts the
   active service and never installs a second node. Role `worker` requires a
   `join_token`, written to a root-only token file. An installed role is never
-  replaced by another: set `allow_role_change` to stop and reset the old role
-  first. Config, token and manifest uploads are mode 0600.
+  replaced by another: set `confirm_role_change` to the host name to stop and
+  reset the old role, which is irreversible and happens only after the
+  replacement binary has been downloaded and verified. Config, token and
+  manifest uploads are mode 0600.
 - `wait_ready` returns `ready: false` after `ready_timeout_s`; a connection,
   authentication or host-key failure is raised instead, because it is not the
   same as a cluster that has not finished starting. `get` and `sync` reflect

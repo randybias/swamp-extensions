@@ -205,8 +205,8 @@ const InstallArgs = z.strictObject({
   force_reinstall: z.boolean().default(false).describe(
     "Reinstall over an existing service of the same role rather than adopting it.",
   ),
-  allow_role_change: z.boolean().default(false).describe(
-    "Permit replacing an installed role with a different one. DESTRUCTIVE: the other role is stopped and reset first. Without it a role change is refused.",
+  confirm_role_change: z.string().optional().describe(
+    "Set to the SSH host to replace an installed role with a different one. IRREVERSIBLE: the old role is stopped and reset, destroying its data, only after the replacement binary is downloaded and verified. Without it a role change is refused.",
   ),
   ...clusterFields,
   helm: z.array(HELM_CHART).max(64).default([]).describe(
@@ -789,7 +789,7 @@ function buildK0sModel(deps: K0sDeps) {
       install: {
         kind: "action" as const,
         description:
-          "DESTRUCTIVE. Fetch the pinned k0s binary, verify its SHA-256, upload it with k0s.yaml and install the role, then start the service. Idempotent: a re-run adopts the running service and never installs a second node. Refuses to change an installed role unless allow_role_change is set.",
+          "DESTRUCTIVE. Fetch the pinned k0s binary, verify its SHA-256, upload it with k0s.yaml and install the role, then start the service. Idempotent: a re-run adopts the running service and never installs a second node. Refuses to change an installed role unless confirm_role_change names the host; the replacement is downloaded and verified before the old role is torn down.",
         arguments: InstallArgs,
         execute: async (args: z.infer<typeof InstallArgs>, context: Ctx) => {
           const { target, handles } = await resolveTarget(
@@ -817,39 +817,14 @@ function buildK0sModel(deps: K0sDeps) {
           );
           let migrating = false;
           if (otherInstalled) {
-            if (!args.allow_role_change) {
+            if (
+              args.confirm_role_change?.toLowerCase() !== target.host
+            ) {
               throw new Error(
-                `${target.host} already has ${otherService} installed; refusing to install ${service} beside it. Set allow_role_change to replace it (this resets the existing role).`,
+                `${target.host} already has ${otherService} installed; refusing to install ${service} beside it. Set confirm_role_change to ${target.host} to replace it (IRREVERSIBLE: this resets the existing role).`,
               );
             }
             migrating = true;
-            const otherActive = ok(
-              await deps.ssh.exec(target, [
-                "systemctl",
-                "is-active",
-                otherService,
-              ]),
-            );
-            if (otherActive) {
-              const stopped = await deps.ssh.exec(target, [
-                K0S_BINARY_PATH,
-                "stop",
-              ]);
-              if (!ok(stopped)) {
-                throw new Error(
-                  `k0s stop failed on ${target.host} (exit ${stopped.exit_code}); the old role was left in place`,
-                );
-              }
-            }
-            const wiped = await deps.ssh.exec(target, [
-              K0S_BINARY_PATH,
-              "reset",
-            ]);
-            if (!ok(wiped)) {
-              throw new Error(
-                `k0s reset failed on ${target.host} (exit ${wiped.exit_code}); the old role was left in place`,
-              );
-            }
           }
 
           const yaml = renderK0sConfig(renderInput(args));
@@ -898,15 +873,14 @@ function buildK0sModel(deps: K0sDeps) {
                 }, not ${args.k0s_version}`,
               );
             }
-            const remoteSha = await remoteConfigSha(deps, target);
             let adopted = true;
-            if (remoteSha !== configFileSha) {
-              await ensurePrivateDir(deps, target, K0S_CONFIG_DIR);
-              await deps.ssh.upload(target, {
-                path: K0S_CONFIG_PATH,
-                content: encoder.encode(yaml),
-                mode: SECRET_MODE,
-              });
+            await ensurePrivateDir(deps, target, K0S_CONFIG_DIR);
+            const put = await deps.ssh.upload(target, {
+              path: K0S_CONFIG_PATH,
+              content: encoder.encode(yaml),
+              mode: SECRET_MODE,
+            });
+            if (put.changed) {
               // A failed restart means the new config never loaded: fail
               // here, before any state claims it did.
               await restartAndVerify(deps, target, service);
@@ -961,7 +935,38 @@ function buildK0sModel(deps: K0sDeps) {
             url,
           );
 
-          if (args.force_reinstall && alreadyActive) {
+          // Everything that can fail without touching the host is done: the
+          // artifact is downloaded and verified. Only now is anything torn
+          // down.
+          if (migrating) {
+            const otherActive = ok(
+              await deps.ssh.exec(target, [
+                "systemctl",
+                "is-active",
+                otherService,
+              ]),
+            );
+            if (otherActive) {
+              const stopped = await deps.ssh.exec(target, [
+                K0S_BINARY_PATH,
+                "stop",
+              ]);
+              if (!ok(stopped)) {
+                throw new Error(
+                  `k0s stop failed on ${target.host} (exit ${stopped.exit_code}); the old role was left in place`,
+                );
+              }
+            }
+            const wiped = await deps.ssh.exec(target, [
+              K0S_BINARY_PATH,
+              "reset",
+            ]);
+            if (!ok(wiped)) {
+              throw new Error(
+                `k0s reset failed on ${target.host} (exit ${wiped.exit_code}); the old role may be partly removed`,
+              );
+            }
+          } else if (args.force_reinstall && alreadyActive) {
             const stopped = await deps.ssh.exec(target, [
               K0S_BINARY_PATH,
               "stop",
@@ -972,52 +977,80 @@ function buildK0sModel(deps: K0sDeps) {
               );
             }
           }
-          await deps.ssh.upload(target, {
-            path: K0S_BINARY_PATH,
-            content: bytes,
-            mode: "0755",
-          });
-          await ensurePrivateDir(deps, target, K0S_CONFIG_DIR);
-          await deps.ssh.upload(target, {
-            path: K0S_CONFIG_PATH,
-            content: encoder.encode(yaml),
-            mode: SECRET_MODE,
-          });
-          if (args.role === "worker") {
-            // Sent only once the install is certain to proceed, never to a
-            // host that is about to be adopted or refused.
+          try {
             await deps.ssh.upload(target, {
-              path: K0S_WORKER_TOKEN_PATH,
-              content: encoder.encode(
-                args.join_token!.endsWith("\n")
-                  ? args.join_token!
-                  : `${args.join_token}\n`,
-              ),
+              path: K0S_BINARY_PATH,
+              content: bytes,
+              mode: "0755",
+            });
+            await ensurePrivateDir(deps, target, K0S_CONFIG_DIR);
+            await deps.ssh.upload(target, {
+              path: K0S_CONFIG_PATH,
+              content: encoder.encode(yaml),
               mode: SECRET_MODE,
             });
-          }
+            if (args.role === "worker") {
+              // Sent only once the install is certain to proceed, never to a
+              // host that is about to be adopted or refused.
+              await deps.ssh.upload(target, {
+                path: K0S_WORKER_TOKEN_PATH,
+                content: encoder.encode(
+                  args.join_token!.endsWith("\n")
+                    ? args.join_token!
+                    : `${args.join_token}\n`,
+                ),
+                mode: SECRET_MODE,
+              });
+            }
 
-          const installed = await deps.ssh.exec(target, [
-            K0S_BINARY_PATH,
-            ...installArgs(args.role, args.force_reinstall),
-          ]);
-          if (!ok(installed)) {
+            const installed = await deps.ssh.exec(target, [
+              K0S_BINARY_PATH,
+              ...installArgs(args.role, args.force_reinstall),
+            ]);
+            if (!ok(installed)) {
+              throw new Error(
+                `k0s install failed on ${target.host} (exit ${installed.exit_code})`,
+              );
+            }
+            const started = await deps.ssh.exec(target, [
+              "systemctl",
+              "enable",
+              "--now",
+              service,
+            ]);
+            if (!ok(started)) {
+              throw new Error(
+                `could not start ${service} on ${target.host} (exit ${started.exit_code})`,
+              );
+            }
+            await waitUnitHealthy(deps, target, service, 60);
+          } catch (error) {
+            if (!migrating) throw error;
+            // The old role is already gone and cannot be restored: say so
+            // and record that nothing is installed, rather than leaving a
+            // state that still claims the old role.
+            await context.writeResource(
+              "state",
+              targetId(target),
+              StateSchema.parse({
+                ...whoOf(target),
+                role: null,
+                k0s_version: null,
+                binary_sha256: null,
+                config_sha256: null,
+                config_file_sha256: null,
+                service: null,
+                installed: false,
+                adopted: false,
+                observed_at: iso(now),
+              }),
+            );
             throw new Error(
-              `k0s install failed on ${target.host} (exit ${installed.exit_code})`,
+              `${
+                (error as Error).message
+              }; the previous ${otherService} role had already been reset and could not be restored, so no k0s role is installed on ${target.host}. Re-run install to finish the migration.`,
             );
           }
-          const started = await deps.ssh.exec(target, [
-            "systemctl",
-            "enable",
-            "--now",
-            service,
-          ]);
-          if (!ok(started)) {
-            throw new Error(
-              `could not start ${service} on ${target.host} (exit ${started.exit_code})`,
-            );
-          }
-          await waitUnitHealthy(deps, target, service, 60);
           context.logger.info(
             "k0s {version} installed and {service} started on {host}",
             { version: args.k0s_version, service, host: target.host },
@@ -1208,13 +1241,9 @@ function buildK0sModel(deps: K0sDeps) {
             const content = encoder.encode(file.content);
             const digest = await sha256Hex(content);
             files.push({ path: relative, sha256: digest });
-            const remote = parseSha256(
-              (await deps.ssh.exec(target, [
-                "sha256sum",
-                `${dir}/${relative}`,
-              ])).stdout,
-            );
-            if (remote === digest) continue;
+            // Always go through upload: it converges bytes and mode, so a
+            // file that already holds these bytes under a looser mode is
+            // still tightened to 0600.
             await ensurePrivateDir(
               deps,
               target,
@@ -1223,12 +1252,12 @@ function buildK0sModel(deps: K0sDeps) {
                 `${dir}/${relative}`.lastIndexOf("/"),
               ),
             );
-            await deps.ssh.upload(target, {
+            const put = await deps.ssh.upload(target, {
               path: `${dir}/${relative}`,
               content,
               mode: SECRET_MODE,
             });
-            applied = true;
+            if (put.changed) applied = true;
           }
           for (const found of existing) {
             const relative = normalizeManifestPath(found);
@@ -1298,16 +1327,14 @@ function buildK0sModel(deps: K0sDeps) {
             args.ssh,
           );
           const yaml = renderK0sConfig(renderInput(args));
-          const configFileSha = await sha256Hex(encoder.encode(yaml));
-          const remoteSha = await remoteConfigSha(deps, target);
           let applied = false;
-          if (remoteSha !== configFileSha) {
-            await ensurePrivateDir(deps, target, K0S_CONFIG_DIR);
-            await deps.ssh.upload(target, {
-              path: K0S_CONFIG_PATH,
-              content: encoder.encode(yaml),
-              mode: SECRET_MODE,
-            });
+          await ensurePrivateDir(deps, target, K0S_CONFIG_DIR);
+          const put = await deps.ssh.upload(target, {
+            path: K0S_CONFIG_PATH,
+            content: encoder.encode(yaml),
+            mode: SECRET_MODE,
+          });
+          if (put.changed) {
             // A restart that failed means the chart config never loaded.
             await restartAndVerify(deps, target, "k0scontroller");
             applied = true;

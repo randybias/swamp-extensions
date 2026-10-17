@@ -133,3 +133,10 @@ Low findings fixed as noted.
     rendered YAML and Helm values (JSON); `install` and `apply_helm` start with
     `DESTRUCTIVE.`
   - Receipts: live cells still blocked until a host is provided.
+- 2026-10-17 verification round: uploads always go through the shared
+  transport's convergence (bytes and mode), so an existing file with the right
+  bytes under a looser mode is tightened to 0600 and a changed result, not a
+  digest shortcut, decides whether to restart. A role change now downloads and
+  verifies the replacement before stopping or resetting anything and needs
+  `confirm_role_change` to equal the host; a failure after the reset cannot
+  restore the old role, so it is reported and state records nothing installed.

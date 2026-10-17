@@ -1,7 +1,7 @@
 import { assertEquals, assertRejects } from "jsr:@std/assert@1.0.19";
 import { createModelTestContext } from "jsr:@swamp-club/swamp-testing@0.20261014.55";
 import { createModel, type LibvirtDeps, targetKey } from "./libvirt.ts";
-import { type CommandRunner, SshError } from "./_lib/ssh.ts";
+import { type CommandRunner, sha256Hex, SshError } from "./_lib/ssh.ts";
 import { renderNetworkXml } from "./_lib/xml.ts";
 
 const NOW = 1_700_000_000_000;
@@ -67,14 +67,16 @@ function fakeLibvirt(respond: Respond): Fake {
       return { code: 0, stdout: "MISSING\n", stderr: "" };
     }
     if (command.includes(".ssh-host-upload")) {
-      if (options.stdin !== undefined) {
-        uploads.push(
-          typeof options.stdin === "string"
-            ? options.stdin
-            : new TextDecoder().decode(options.stdin),
-        );
-      }
-      return { code: 0, stdout: "", stderr: "" };
+      const bytes = options.stdin === undefined
+        ? new Uint8Array()
+        : typeof options.stdin === "string"
+        ? new TextEncoder().encode(options.stdin)
+        : options.stdin;
+      uploads.push(new TextDecoder().decode(bytes));
+      // The new transport reads the destination's own hash and mode back from
+      // the remote and compares them locally; return what the write produced.
+      const digest = await sha256Hex(bytes);
+      return { code: 0, stdout: `${digest} 0600\n`, stderr: "" };
     }
     const r = respond(command);
     return { code: r.code, stdout: r.stdout ?? "", stderr: r.stderr ?? "" };

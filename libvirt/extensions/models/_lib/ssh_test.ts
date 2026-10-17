@@ -473,12 +473,19 @@ Deno.test("password auth uses askpass, never argv", async () => {
 
 Deno.test("upload streams bytes over stdin and renames atomically", async () => {
   const calls: Call[] = [];
+  const contentSha = await sha256Hex("placeholder config\n");
   let seen: Uint8Array | undefined;
   const deps = fakeDeps(fakeRun(calls, {
-    ssh: (_args, options) => {
-      seen = typeof options.stdin === "string"
-        ? new TextEncoder().encode(options.stdin)
-        : options.stdin;
+    ssh: (args, options) => {
+      const remote = args.at(-1) ?? "";
+      if (remote.includes("mktemp")) {
+        seen = typeof options.stdin === "string"
+          ? new TextEncoder().encode(options.stdin)
+          : options.stdin;
+        // The remote prints the destination's hash and mode; the expected hash
+        // is never sent.
+        return { code: 0, stdout: `${contentSha} 640\n`, stderr: "" };
+      }
       return { code: 0, stdout: "", stderr: "" };
     },
   }));
@@ -489,10 +496,7 @@ Deno.test("upload streams bytes over stdin and renames atomically", async () => 
   });
   assertEquals(result.path, "/etc/wireguard/wg0.conf");
   assertEquals(result.bytes, 19);
-  assertEquals(
-    result.sha256,
-    await sha256Hex("placeholder config\n"),
-  );
+  assertEquals(result.sha256, contentSha);
   assertEquals(result.changed, true);
   assertEquals(new TextDecoder().decode(seen), "placeholder config\n");
   const sshCalls = calls.filter((c) => c.cmd === "ssh");
@@ -504,12 +508,42 @@ Deno.test("upload streams bytes over stdin and renames atomically", async () => 
   assertStringIncludes(remote, "mktemp");
   assertStringIncludes(remote, "chmod '0640'");
   assertStringIncludes(remote, `f='/etc/wireguard/wg0.conf'`);
-  // No-target-directory rename on Linux only, then a post-move verification.
+  // No-target-directory rename on Linux only, then a post-move printf.
   assertStringIncludes(remote, "mv -T");
-  assertStringIncludes(remote, `[ "$h" = '${result.sha256}' ]`);
+  assertStringIncludes(remote, "printf");
   assertEquals(remote.includes("mv -f "), false);
   for (const call of calls) {
     assertEquals(call.args.join(" ").includes("placeholder config"), false);
+  }
+});
+
+Deno.test("upload never puts the content hash on a spawned argv or in script text", async () => {
+  const calls: Call[] = [];
+  const contentSha = await sha256Hex("low-entropy-secret\n");
+  const deps = fakeDeps(fakeRun(calls, {
+    ssh: (args) => {
+      const remote = args.at(-1) ?? "";
+      return remote.includes("mktemp")
+        ? { code: 0, stdout: `${contentSha} 600\n`, stderr: "" }
+        : { code: 0, stdout: "", stderr: "" };
+    },
+  }));
+  await upload(deps, STRICT_TARGET, {
+    path: "/etc/wireguard/secret.key",
+    content: "low-entropy-secret\n",
+  });
+  for (const call of calls) {
+    const text = call.args.join(" ");
+    assertEquals(
+      text.includes(contentSha),
+      false,
+      `expected hash on argv: ${text}`,
+    );
+    assertEquals(
+      (text.match(/[0-9a-f]{64}/g) ?? []).length,
+      0,
+      `no 64-hex string may appear on argv or in script text: ${text}`,
+    );
   }
 });
 
@@ -535,7 +569,10 @@ Deno.test("upload replaces through the temp path on a mode-only difference", asy
   const content = "same bytes\n";
   const sha = await sha256Hex(content);
   const deps = fakeDeps(fakeRun(calls, {
-    ssh: () => ({ code: 0, stdout: `${sha} 644\n`, stderr: "" }),
+    ssh: (args) =>
+      (args.at(-1) ?? "").includes("mktemp")
+        ? { code: 0, stdout: `${sha} 600\n`, stderr: "" }
+        : { code: 0, stdout: `${sha} 644\n`, stderr: "" },
   }));
   const result = await upload(deps, STRICT_TARGET, {
     path: "/etc/x",

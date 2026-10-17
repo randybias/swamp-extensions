@@ -43,6 +43,8 @@ import {
   CDI_NAMESPACE,
   CDI_OPERATOR_ASSET,
   CDI_REPO,
+  type CrInput,
+  crSpecSatisfied,
   KUBEVIRT_CR_NAME,
   KUBEVIRT_NAMESPACE,
   KUBEVIRT_OPERATOR_ASSET,
@@ -739,13 +741,19 @@ export const model = {
                 body,
               );
             await apply(opManifest);
-            const crYaml = renderKubeVirtCr({
+            const desired: CrInput = {
               use_emulation: a.use_emulation,
               feature_gates: a.feature_gates,
               workload_update_methods: a.workload_update_methods,
               uninstall_strategy: a.uninstall_strategy,
-            });
-            await applyWhenServed(d, apply, crYaml);
+            };
+            const crYaml = renderKubeVirtCr(desired);
+            // A re-run must be a true no-op: the operator rewrites the CR
+            // after it settles, and re-applying an unchanged desired state
+            // bumped the generation. Apply only when a managed field differs.
+            if (!crSpecSatisfied(await readCr(kubectl), desired)) {
+              await applyWhenServed(d, apply, crYaml);
+            }
             const cr = await readCr(kubectl);
             const nodes = await readNodes(kubectl);
             context.logger.info("KubeVirt {version} installed", {

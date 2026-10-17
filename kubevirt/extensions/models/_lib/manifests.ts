@@ -59,6 +59,37 @@ export interface CrInput {
   uninstall_strategy: typeof UNINSTALL_STRATEGIES[number];
 }
 
+/** The sorted copy of a list a live object may omit. */
+const sortedOrEmpty = (list: unknown): string[] =>
+  Array.isArray(list) ? list.map(String).sort() : [];
+
+/**
+ * True when a live `KubeVirt` custom resource already holds every field
+ * {@link renderKubeVirtCr} manages. The operator adds and rewrites other spec
+ * fields of its own, which are ignored: only the managed ones are projected and
+ * compared (an omitted list or flag counts as empty or false). Applying an
+ * unchanged desired state would still bump the CR generation on some operator
+ * versions, so a re-run skips the apply when this holds.
+ */
+export function crSpecSatisfied(live: unknown, i: CrInput): boolean {
+  const spec = (live as { spec?: Record<string, unknown> } | null)?.spec;
+  if (spec === undefined || spec === null) return false;
+  const developer = (spec.configuration as
+    | { developerConfiguration?: Record<string, unknown> }
+    | undefined)?.developerConfiguration;
+  const methods = (spec.workloadUpdateStrategy as
+    | { workloadUpdateMethods?: unknown }
+    | undefined)?.workloadUpdateMethods;
+  const same = (a: string[], b: string[]) => a.join("\0") === b.join("\0");
+  return (developer?.useEmulation === true) === i.use_emulation &&
+    same(sortedOrEmpty(developer?.featureGates), [...i.feature_gates].sort()) &&
+    spec.uninstallStrategy === i.uninstall_strategy &&
+    same(
+      sortedOrEmpty(methods),
+      [...i.workload_update_methods].sort(),
+    );
+}
+
 /**
  * Renders the minimal `CDI` custom resource. The CDI operator manifest ships
  * the operator and CRDs but not the CR, so install applies this after it.

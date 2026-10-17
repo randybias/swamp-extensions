@@ -221,3 +221,12 @@ schema/secret checks, and the failure-mode table above.
   validation failure is `invalid_response` naming issue paths and codes only,
   anything else its error name; only the vendored wrapper's own failures are
   rewrapped. Fixtures now carry real condition shapes.
+- Live fix 4: an `install` re-run right after Available bumped the KubeVirt CR
+  generation (2 to 3); later re-runs were clean. The operator rewrites the CR
+  spec after it settles and a re-apply of an unchanged desired state bumped it
+  again. The CR is applied only when a managed field (emulation, feature gates,
+  uninstall strategy, workload update methods) differs from the live spec;
+  fields the operator adds are ignored (`crSpecSatisfied`). The root cause was
+  not reproduced here (no cluster); the skip makes a re-run a no-op whatever the
+  operator does to unmanaged fields. README documents the live node
+  prerequisites (/dev/kvm mode, k0s kubelet directory, no default StorageClass).

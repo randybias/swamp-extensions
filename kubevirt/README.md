@@ -67,6 +67,37 @@ VMs) CDI are installed by this extension from their public release assets, each
 verified against a required SHA-256; the CDI operator manifest ships no custom
 resource, so a minimal `CDI` object is applied after it.
 
+## Node prerequisites
+
+Found on a live single-node k0s cluster; this extension does not change nodes.
+
+- **`/dev/kvm` permissions.** On stock Ubuntu with libvirt installed, `/dev/kvm`
+  is `root:kvm 0660`, and `virt-launcher` (which does not run as that group)
+  crash-loops with "Unable to open /dev/kvm". Make the device world read-write
+  with a udev rule, for example in `/etc/udev/rules.d/99-kvm.rules`:
+
+  ```
+  KERNEL=="kvm", GROUP="kvm", MODE="0666"
+  ```
+
+  then `udevadm control --reload && udevadm trigger --name-match=kvm` and check
+  `ls -l /dev/kvm`. Another package may reset the mode, so check it again after
+  a reboot. Without KVM at all, `use_emulation: true` runs VMs in software.
+- **Kubelet pod directory (k0s).** k0s keeps the kubelet's state under
+  `/var/lib/k0s/kubelet` (pods in `/var/lib/k0s/kubelet/pods`), while KubeVirt's
+  `virt-handler` mounts the upstream default `/var/lib/kubelet/pods`; VMIs then
+  fail with "Domain does not exist". KubeVirt's resource does not expose the
+  kubelet directory as a setting that this extension could pass through, so fix
+  the node. Either start the k0s worker with the kubelet root directory at the
+  upstream default (kubelet's `--root-dir`; k0s documents a worker option for
+  it, see `k0s worker --help` on your version), or make the upstream path point
+  at k0s's with a symlink or bind mount of `/var/lib/kubelet` onto
+  `/var/lib/k0s/kubelet`. This lane did not verify either option; test it on a
+  throwaway node first.
+- **Storage.** A VM with a `data_volume` source needs a default StorageClass (or
+  `storage_class`) and CDI. The live run had no default StorageClass, so the
+  DataVolume cell was not run; container-disk VMs need no storage class.
+
 ## Install
 
 ```sh

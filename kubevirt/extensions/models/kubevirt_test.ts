@@ -1467,3 +1467,65 @@ Deno.test("an error from a method body is not flattened into 'kubectl failed'", 
     h.restore();
   }
 });
+
+Deno.test("install re-run applies the CR only when a managed field differs from the live spec", async () => {
+  const liveWith = (spec: Record<string, unknown>) =>
+    JSON.stringify({ ...JSON.parse(crJson()), spec });
+  const managed = {
+    configuration: {
+      developerConfiguration: {
+        useEmulation: false,
+        featureGates: ["LiveMigration"],
+      },
+    },
+    uninstallStrategy: "BlockUninstallIfWorkloadsExist",
+  };
+  const run = async (live: string, args: Record<string, unknown>) => {
+    const h = harness(getRoute(live), { fetch: kvFetch() });
+    try {
+      await model.methods.install.execute(
+        { ...INSTALL, ...args },
+        testCtx().context,
+      );
+      return h.calls.filter((c) => verb(c) === "apply").map((c) => c.stdin!);
+    } finally {
+      h.restore();
+    }
+  };
+  const gate = { feature_gates: ["LiveMigration"] };
+  // Equal, with fields the operator added to the spec: the manifest is applied
+  // (unchanged operator manifest), the CR is not.
+  const extras = {
+    ...managed,
+    certificateRotateStrategy: {},
+    imagePullPolicy: "IfNotPresent",
+    workloadUpdateStrategy: { workloadUpdateMethods: [] },
+  };
+  assertEquals(await run(liveWith(extras), gate), [MANIFEST]);
+  // An omitted flag and omitted lists count as false and empty.
+  assertEquals(
+    await run(
+      liveWith({ uninstallStrategy: "BlockUninstallIfWorkloadsExist" }),
+      {},
+    ),
+    [MANIFEST],
+  );
+  // Any managed field that differs is applied.
+  for (
+    const [args, why] of [
+      [{ ...gate, use_emulation: true }, "emulation"],
+      [{ feature_gates: [] }, "feature gates"],
+      [
+        { ...gate, uninstall_strategy: "RemoveWorkloads" },
+        "uninstall strategy",
+      ],
+      [{ ...gate, workload_update_methods: ["LiveMigrate"] }, "update methods"],
+    ] as const
+  ) {
+    const applied = await run(liveWith(managed), args);
+    assertEquals(applied.length, 2, why);
+    assert(applied[1].includes("kind: KubeVirt"), why);
+  }
+  // Nothing live yet: the CR is applied.
+  assertEquals((await run("", {})).length, 2);
+});

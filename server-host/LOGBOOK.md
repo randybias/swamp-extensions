@@ -401,3 +401,29 @@ blocking beta:
   lookup and the marker removal keeps a sudo membership with no marker.
   Downgraded under the run rulings: concurrent account management on the target
   is outside the single-orchestrator model.
+
+2026.10.17.2: found by the first end-to-end run of the server stack on a fresh
+host. With the table's `input` and `forward` policies at `drop`, a k0s node came
+up Ready but its pods never did: a trace showed pod traffic from `kube-bridge`
+to the node (apiserver, konnectivity) dropped by `inet server_host input` and
+pod egress dropped by `inet server_host forward`, although kube-router's own
+`ip filter FORWARD` accepted it. An accept in another table cannot override a
+drop, so the table itself had to grow.
+
+- New optional input `trusted_interfaces` (up to 16 names or `prefix*` patterns,
+  one wildcard at the end, at least one literal character, 15 characters at
+  most). Each renders as `iifname` in input and `iifname` plus `oifname` in
+  forward; sorted and deduplicated. Unset or empty renders byte-identically to
+  17.1, so the hash and the goldens are unchanged.
+- The expected structure, the verify read-back and the drift hash include the
+  forward rules. New real-nft fixtures (single interface; wildcards and dotted
+  names) are listings of nftables 1.0.9 after applying the rendered script
+  twice.
+- `nft_real_test.ts` feeds every shape to a real `nft -c`, applies it twice and
+  compares the table's JSON read-back with the rendered rules. It runs `nft`
+  when present, else the container `nft-check:local` (ubuntu:24.04 plus nftables
+  and netbase; without netbase `ip6 nexthdr ipv6-icmp` does not resolve), else
+  it is skipped. It ran in this round.
+- No forward_policy input: trusting the CNI interfaces in both directions covers
+  pod to node and pod egress (checked live with the equivalent hand-added
+  rules), so the forward policy stays `drop`.

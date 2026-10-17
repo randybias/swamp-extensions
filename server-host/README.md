@@ -38,6 +38,17 @@ reads other tables: the snapshot and the restore cover only that table, so rules
 added by other software (a Kubernetes distribution, Docker) survive both an
 apply and a revert.
 
+The table drops everything it does not allow, including traffic from and through
+a container network. A host that runs Kubernetes or Docker therefore needs
+`trusted_interfaces`: names or `prefix*` patterns (for example `kube-bridge`,
+`cali*`) whose traffic is accepted into the host and through it in both
+directions. Each name renders as `iifname` in the input chain and as `iifname`
+plus `oifname` in the forward chain; the default policies stay `drop`. The
+masquerade for pod egress is the cluster's own. Leave it empty and the ruleset
+is byte-for-byte what earlier versions rendered, so an existing host sees no
+drift. Trust only interfaces you control: everything arriving on one is
+accepted.
+
 The host is the source of truth. The apply runs under the same lock as the
 restore and is refused once its revert has expired, fired or been superseded, so
 the two never interleave. A new change is refused while an earlier revert's

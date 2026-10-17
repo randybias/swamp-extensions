@@ -125,6 +125,7 @@ Deno.test("sha256: deterministic and content-addressed", async () => {
 });
 
 interface Sample {
+  trusted_interfaces?: string[];
   management_cidrs: string[];
   allow_tcp: number[];
   allow_udp: number[] | null;
@@ -143,6 +144,7 @@ const rulesOf = (x: Sample): FirewallRules => ({
   defaultPolicy: "drop",
   sshPort: 22,
   allowSshFromAnywhere: false,
+  ...(x.trusted_interfaces ? { trustedInterfaces: x.trusted_interfaces } : {}),
 });
 
 Deno.test("real nft output differs from the rendered text, yet matches the rendered rules", async () => {
@@ -396,5 +398,137 @@ Deno.test("table flags and extra sets are part of the structure", async () => {
     () => assertListingMatches(rules, withSet),
     HostConfigError,
     "sets or other",
+  );
+});
+
+const TRUSTED_BASE: FirewallRules = {
+  managementCidrs: ["198.51.100.0/24"],
+  allowTcp: [4222],
+  allowUdp: [],
+  defaultPolicy: "drop",
+  sshPort: 22,
+  allowSshFromAnywhere: false,
+};
+
+Deno.test("trusted_interfaces: unset or empty renders exactly the earlier ruleset", () => {
+  const plain = renderRuleset(TRUSTED_BASE);
+  assertEquals(
+    renderRuleset({ ...TRUSTED_BASE, trustedInterfaces: [] }),
+    plain,
+  );
+  assertEquals(plain.includes('iifname "kube'), false);
+  assertEquals(plain.includes("oifname"), false);
+});
+
+Deno.test("trusted_interfaces: input accepts the interface, forward accepts both directions, sorted and deduped", () => {
+  const text = renderRuleset({
+    ...TRUSTED_BASE,
+    trustedInterfaces: ["tunl0", "kube-bridge", "cali*", "kube-bridge"],
+  });
+  const input = text.slice(
+    text.indexOf("chain input"),
+    text.indexOf("chain forward"),
+  );
+  const forward = text.slice(
+    text.indexOf("chain forward"),
+    text.indexOf("chain output"),
+  );
+  assertEquals(
+    input.match(/iifname "[^"]+" accept/g),
+    [
+      'iifname "lo" accept',
+      'iifname "cali*" accept',
+      'iifname "kube-bridge" accept',
+      'iifname "tunl0" accept',
+    ],
+  );
+  assertEquals(
+    forward.match(/[io]ifname "[^"]+" accept/g),
+    [
+      'iifname "cali*" accept',
+      'oifname "cali*" accept',
+      'iifname "kube-bridge" accept',
+      'oifname "kube-bridge" accept',
+      'iifname "tunl0" accept',
+      'oifname "tunl0" accept',
+    ],
+  );
+  // The default policy of both chains is untouched.
+  assertEquals(forward.includes("policy drop;"), true);
+});
+
+Deno.test("trusted_interfaces: a good pattern passes, a bad one is refused before anything is rendered", () => {
+  for (
+    const ok of [
+      "kube-bridge",
+      "cali*",
+      "tunl0",
+      "vxlan.calico",
+      "a",
+      "abcdefghijklmno",
+      "abcdefghijklmn*",
+    ]
+  ) {
+    assertFirewallRules({ ...TRUSTED_BASE, trustedInterfaces: [ok] });
+  }
+  for (
+    const bad of [
+      "*",
+      "",
+      "a b",
+      'a"b',
+      "x;y",
+      "a\nb",
+      "-x",
+      "abcdefghijklmnop",
+      "a*b",
+      "cali**",
+      "*cali",
+      "a{b}",
+    ]
+  ) {
+    assertThrows(
+      () => assertFirewallRules({ ...TRUSTED_BASE, trustedInterfaces: [bad] }),
+      HostConfigError,
+      "interface",
+    );
+  }
+});
+
+Deno.test("trusted_interfaces: the real nft listing matches the rendered rules and hashes the same", async () => {
+  for (const name of ["trusted_one", "trusted_wildcards"]) {
+    const x = REAL[name];
+    const rules = rulesOf(x);
+    assertListingMatches(rules, JSON.stringify(x.json));
+    assertEquals(
+      await managedSha256(normalizeListing(JSON.stringify(x.json))),
+      await expectedManagedSha256(rules),
+      name,
+    );
+  }
+  // Dropping the forward return-path rule of a trusted interface is caught.
+  const x = REAL.trusted_one;
+  const d = JSON.parse(JSON.stringify(x.json)) as {
+    nftables: Record<string, Record<string, unknown>>[];
+  };
+  d.nftables = d.nftables.filter((o) =>
+    !(o.rule && o.rule.chain === "forward" &&
+      JSON.stringify(o.rule.expr).includes("oifname"))
+  );
+  assertThrows(
+    () => assertListingMatches(rulesOf(x), JSON.stringify(d)),
+    HostConfigError,
+    "forward",
+  );
+});
+
+Deno.test("trusted_interfaces: the hash differs from the plain ruleset's", async () => {
+  assertEquals(
+    await expectedManagedSha256(TRUSTED_BASE) ===
+      await expectedManagedSha256({
+        ...TRUSTED_BASE,
+        trustedInterfaces: ["kube-bridge"],
+      }),
+    false,
   );
 });

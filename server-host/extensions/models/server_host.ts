@@ -27,6 +27,7 @@ import {
   assertUser,
   AUTHORIZED_KEY_RE,
   HostConfigError,
+  IFACE_PATTERN_RE,
   isCidr,
   PACKAGE_RE,
   SYSCTL_KEY_RE,
@@ -135,6 +136,12 @@ const FirewallFields = {
   allow_ssh_from_anywhere: z.boolean().default(false).describe(
     "Acknowledge that the SSH port is reachable from any source",
   ),
+  trusted_interfaces: z.array(z.string().max(15).regex(IFACE_PATTERN_RE)).max(
+    16,
+  )
+    .default([]).describe(
+      "Interface names or prefix* patterns whose traffic is accepted into and through the host, such as a Kubernetes CNI bridge; empty renders the same ruleset as earlier versions",
+    ),
 };
 
 const BaseFields = {
@@ -381,6 +388,7 @@ function rulesFrom(a: {
   default_policy: "drop";
   ssh_port: number;
   allow_ssh_from_anywhere: boolean;
+  trusted_interfaces?: string[];
 }): FirewallRules {
   const rules: FirewallRules = {
     managementCidrs: a.management_cidrs,
@@ -389,6 +397,9 @@ function rulesFrom(a: {
     defaultPolicy: a.default_policy,
     sshPort: a.ssh_port,
     allowSshFromAnywhere: a.allow_ssh_from_anywhere,
+    ...(a.trusted_interfaces?.length
+      ? { trustedInterfaces: a.trusted_interfaces }
+      : {}),
   };
   assertFirewallRules(rules);
   return rules;
@@ -666,10 +677,17 @@ export function createModel(overrides: Partial<HostDeps> = {}) {
   }
   return {
     type: "@randybias/server-host",
-    version: "2026.10.17.1",
+    version: "2026.10.17.2",
     description:
       "Harden a Linux host over SSH in three phases: base packages and users, an nftables firewall rendered from inputs, and an SSH lockdown. The SSH key is named by a vault reference and the firewall and lockdown phases arm a host-side revert timer before they change anything.",
-    upgrades: [],
+    upgrades: [
+      {
+        toVersion: "2026.10.17.2",
+        description:
+          "Adds the optional trusted_interfaces input; stored attributes are unchanged",
+        upgradeAttributes: (old: Record<string, unknown>) => old,
+      },
+    ],
     globalArguments: GlobalArgsSchema,
     resources: {
       host_state: {
@@ -1101,5 +1119,5 @@ async function writeFirewallState(
 export const model = {
   ...createModel(),
   type: "@randybias/server-host",
-  version: "2026.10.17.1",
+  version: "2026.10.17.2",
 };

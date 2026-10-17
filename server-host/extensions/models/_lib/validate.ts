@@ -36,6 +36,14 @@ const KEY_TYPE =
 export const AUTHORIZED_KEY_RE = new RegExp(
   `^${KEY_TYPE} [A-Za-z0-9+/]{16,}={0,3}(?: [^\\r\\n]{0,255})?$`,
 );
+/**
+ * Grammar for a trusted interface pattern: an interface name of up to 15
+ * characters, optionally ending in one `*` wildcard (nft's `iifname "cali*"`).
+ * At least one literal character must precede the wildcard, so `*` alone,
+ * which would trust every interface, is not accepted.
+ */
+export const IFACE_PATTERN_RE =
+  /^[A-Za-z0-9_.-]{1,14}\*$|^[A-Za-z0-9_.-]{1,15}$/;
 const MAX_TEXT = 4096;
 
 /** A parsed CIDR: family, prefix length and the masked network address. */
@@ -209,4 +217,11 @@ export function dedupeSorted(values: readonly string[]): string[] {
 /** Returns `values` with duplicates removed and a stable numeric sort applied. */
 export function dedupeSortedNumbers(values: readonly number[]): number[] {
   return [...new Set(values)].sort((a, b) => a - b);
+}
+
+/** Throws unless `s` is a valid trusted interface pattern. */
+export function assertIfacePattern(s: string): void {
+  if (!IFACE_PATTERN_RE.test(s) || s.startsWith("-")) {
+    throw new HostConfigError(`Not an interface name or pattern: ${s}`);
+  }
 }

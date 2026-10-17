@@ -1306,6 +1306,7 @@ Deno.test("real nft output: apply verifies, then commit and an identical re-appl
     {
       management_cidrs: string[];
       allow_tcp: number[];
+      trusted_interfaces?: string[];
       json: unknown;
     }
   >;
@@ -1331,6 +1332,7 @@ Deno.test("real nft output: apply verifies, then commit and an identical re-appl
       ...FIREWALL_ARGS,
       management_cidrs: x.management_cidrs,
       allow_tcp: x.allow_tcp,
+      trusted_interfaces: x.trusted_interfaces ?? [],
       allow_udp: [],
     });
     const ctx = createModelTestContext({ globalArgs: {} });

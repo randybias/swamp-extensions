@@ -12,6 +12,7 @@
 
 import { IFACE_RE } from "./render.ts";
 import {
+  buildKnownHosts,
   exec,
   type ExecResult,
   type HostKeyInfo,
@@ -114,38 +115,28 @@ function toTransportError(e: unknown): TransportError {
   return new TransportError("remote", (e as Error).message);
 }
 
-let tokenCounter = 0;
-
-function tempToken(): string {
-  tokenCounter += 1;
-  const bytes = new Uint8Array(8);
-  crypto.getRandomValues(bytes);
-  return [...bytes].map((b) => b.toString(16).padStart(2, "0")).join("") +
-    tokenCounter.toString(16);
-}
-
-/** ssh-keyscan-format lines for the keys learned on a first contact. */
-function knownHostsLines(host: string, keys: HostKeyInfo[]): string {
-  return keys.map((k) => `${host} ${k.type} ${k.key}`).join("\n") + "\n";
+/** ssh-keyscan-format lines for learned keys, with a port-aware host field. */
+function knownHostsLines(
+  host: string,
+  port: number,
+  keys: HostKeyInfo[],
+): string {
+  return buildKnownHosts(host, port, keys);
 }
 
 /**
  * Builds the ssh-backed transport on the canonical `_lib/ssh.ts`. A first
  * `insecure_tofu` call with no pins learns the host keys (returned in
- * `known_hosts`) and pins them for the rest of the operation; `stdin` is
- * delivered through an atomically uploaded temp file piped into the script, so
- * no config, key or digest ever reaches argv. An ssh exit 255 is the canonical
+ * `known_hosts`, `[host]:port` for a non-default port) and pins them for the
+ * rest of the operation; `stdin` is written to a private `mktemp -d` directory
+ * and the script unlinks it as soon as it is opened on fd 3, so the key and
+ * config are never at rest and never on argv. An ssh exit 255 is the canonical
  * typed `SshError`, rethrown here as a `TransportError`.
  */
-export function sshTransport(
-  t: SshTarget,
-  deps: SshDeps,
-  opts: { token?: () => string } = {},
-): Transport {
+export function sshTransport(t: SshTarget, deps: SshDeps): Transport {
   const target = canonicalTarget(t);
-  const token = opts.token ?? tempToken;
   return async (script, stdin) => {
-    let learned: HostKeyInfo[] | undefined;
+    let learnedLines: string | undefined;
     if (
       target.host_key_policy === "insecure_tofu" &&
       (target.host_keys?.length ?? 0) === 0
@@ -161,44 +152,98 @@ export function sshTransport(
       if (!waited.reachable || waited.host_keys.length === 0) {
         throw new TransportError("unreachable", "the node did not answer SSH");
       }
-      learned = waited.host_keys;
-      // Pin exactly what was learned for the rest of this operation.
-      target.host_keys = learned.map((k) => `${t.host} ${k.type} ${k.key}`);
+      learnedLines = knownHostsLines(t.host, t.port, waited.host_keys);
+      target.host_keys = learnedLines.split("\n").filter((l) => l !== "");
     }
+    let dir: string | undefined;
     let tmp: string | undefined;
-    if (stdin !== undefined) {
-      tmp = `/tmp/wgmesh-stdin-${token()}`;
-      try {
-        await upload(deps, target, { path: tmp, content: stdin, mode: "0600" });
-      } catch (e) {
-        throw toTransportError(e);
-      }
-    }
+    let result: TransportResult | undefined;
+    let failure: TransportError | undefined;
     try {
-      const body = tmp === undefined
-        ? script
-        : `cat -- '${tmp}' | {\n${script}\n}`;
+      if (stdin !== undefined) {
+        let made: ExecResult;
+        try {
+          made = await exec(deps, target, [
+            "mktemp",
+            "-d",
+            "-p",
+            "/tmp",
+            "wgmesh.XXXXXXXX",
+          ]);
+        } catch (e) {
+          throw toTransportError(e);
+        }
+        if (made.exit_code !== 0) {
+          throw new TransportError(
+            "remote",
+            "could not create a private temp directory on the node",
+          );
+        }
+        dir = made.stdout.trim();
+        if (!/^\/tmp\/wgmesh\.[A-Za-z0-9]{6,}$/.test(dir)) {
+          throw new TransportError(
+            "remote",
+            "mktemp returned an unexpected path",
+          );
+        }
+        tmp = `${dir}/stdin`;
+        try {
+          await upload(deps, target, {
+            path: tmp,
+            content: stdin,
+            mode: "0600",
+          });
+        } catch (e) {
+          throw toTransportError(e);
+        }
+      }
+      const body = tmp === undefined || dir === undefined ? script : [
+        "umask 077",
+        // Open the file, then unlink it before the script runs, so the key is
+        // never at rest even if the script cuts the SSH path.
+        `exec 3<'${tmp}' && rm -f -- '${tmp}'`,
+        `trap 'rm -f -- "${tmp}"; rmdir -- "${dir}" 2>/dev/null || true' EXIT HUP INT TERM`,
+        "{",
+        script,
+        "} <&3",
+      ].join("\n");
       let res: ExecResult;
       try {
         res = await exec(deps, target, ["sh", "-c", body]);
       } catch (e) {
         throw toTransportError(e);
       }
-      return {
+      result = {
         code: res.exit_code,
         stdout: res.stdout,
         stderr: res.stderr,
-        ...(learned !== undefined
-          ? { known_hosts: knownHostsLines(t.host, learned) }
-          : {}),
+        ...(learnedLines !== undefined ? { known_hosts: learnedLines } : {}),
       };
-    } finally {
-      if (tmp !== undefined) {
-        await exec(deps, target, ["rm", "-f", "--", tmp]).catch(
-          () => undefined,
+    } catch (e) {
+      failure = e instanceof TransportError ? e : toTransportError(e);
+    }
+    let cleanupFailure: TransportError | undefined;
+    if (tmp !== undefined) {
+      let cleaned: ExecResult | undefined;
+      try {
+        cleaned = await exec(deps, target, [
+          "sh",
+          "-c",
+          `rm -f -- '${tmp}'; rmdir -- '${dir}' 2>/dev/null || true`,
+        ]);
+      } catch {
+        cleaned = undefined;
+      }
+      if (cleaned === undefined || cleaned.exit_code !== 0) {
+        cleanupFailure = new TransportError(
+          "remote",
+          `the remote temp file ${tmp} may still hold the key; remove it by hand`,
         );
       }
     }
+    if (cleanupFailure !== undefined) throw cleanupFailure;
+    if (failure !== undefined) throw failure;
+    return result!;
   };
 }
 
@@ -215,6 +260,27 @@ export async function sha256Hex(text: string): Promise<string> {
 /** Throws unless `name` is a valid interface name. */
 export function assertIface(name: string): void {
   if (!IFACE_RE.test(name)) throw new Error(`Invalid interface name: ${name}`);
+}
+
+const KEY_TYPE_RE = /^[a-z0-9@.-]{1,40}$/;
+const KEY_B64_RE = /^[A-Za-z0-9+/=]{1,2048}$/;
+const HOST_FIELD_RE = /^[A-Za-z0-9.,:_\[\]-]{1,512}$/;
+
+/**
+ * True for an ssh-keyscan line: an optional host field (a hostname, an IP, a
+ * comma list, or `[host]:port`), a key type and a base64 payload. Any other
+ * token count is rejected.
+ */
+export function isHostKeyLine(value: string): boolean {
+  const parts = value.trim().split(/\s+/);
+  if (parts.length === 2) {
+    return KEY_TYPE_RE.test(parts[0]) && KEY_B64_RE.test(parts[1]);
+  }
+  if (parts.length === 3) {
+    return HOST_FIELD_RE.test(parts[0]) && KEY_TYPE_RE.test(parts[1]) &&
+      KEY_B64_RE.test(parts[2]);
+  }
+  return false;
 }
 
 /** A host key parsed from a known_hosts or ssh-keyscan line. */

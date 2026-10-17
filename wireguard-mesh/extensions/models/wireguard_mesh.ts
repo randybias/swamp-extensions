@@ -15,6 +15,7 @@ import {
   confirmScript,
   deleteScript,
   getScript,
+  isHostKeyLine,
   parseDump,
   parseRollbackDir,
   sha256Hex,
@@ -36,14 +37,45 @@ import {
 
 const GlobalArgsSchema = z.strictObject({});
 
+/** The legacy `{type, key}` host-key shape accepted for backwards compat. */
+const LegacyHostKeySchema = z.strictObject({
+  type: z.string().regex(/^[a-z0-9@.-]{1,40}$/),
+  key: z.string().regex(/^[A-Za-z0-9+/=]{1,2048}$/),
+});
+
 const SshSchema = z.strictObject({
   host: z.string().min(1).max(253),
   user: z.string().regex(/^[a-z_][a-z0-9_-]{0,31}$/),
   port: z.number().int().min(1).max(65535).default(22),
-  host_key_policy: z.enum(["strict", "insecure_tofu"]).describe(
+  host_key_policy: z.enum([
+    "strict",
+    "insecure_tofu",
+    "accept-new",
+    "insecure",
+  ]).transform((v, ctx) => {
+    if (v === "accept-new") return "insecure_tofu" as const;
+    if (v === "insecure") {
+      ctx.addIssue({
+        code: "custom",
+        message:
+          "host_key_policy insecure was removed; use insecure_tofu (learns and pins the first key) or strict",
+      });
+      return z.NEVER;
+    }
+    return v;
+  }).describe(
     "How the node's SSH host key is checked; there is no default. insecure_tofu learns the first keys seen and pins them for later steps.",
   ),
-  host_keys: z.array(z.string().max(8192)).max(64).default([]).describe(
+  host_keys: z.array(
+    z.union([
+      z.string().max(8192).refine(isHostKeyLine, "an ssh-keyscan line"),
+      LegacyHostKeySchema,
+    ]),
+  ).max(64).default([]).transform((items) =>
+    items.map((item) =>
+      typeof item === "string" ? item : `${item.type} ${item.key}`
+    )
+  ).describe(
     "Pinned ssh-keyscan-format lines; required for strict.",
   ),
   private_key: z.string().max(65536).meta({ sensitive: true }).optional()
@@ -246,6 +278,34 @@ export function createModel(deps: Partial<Deps> = {}) {
   };
 
   /**
+   * Normalizes a stored host-key record to port-aware ssh-keyscan lines: a
+   * published 2026.10.17.4 record held `[{type,key}]` objects with no host
+   * field, which the canonical transport would read as `[object Object]`.
+   */
+  const normalizeStoredKeys = (
+    keys: unknown[],
+    host: string,
+    port: number,
+  ): string[] => {
+    const field = port === 22 ? host : `[${host}]:${port}`;
+    const out: string[] = [];
+    for (const key of keys) {
+      if (typeof key === "string") {
+        if (isHostKeyLine(key)) out.push(key);
+        continue;
+      }
+      if (key !== null && typeof key === "object") {
+        const type = (key as { type?: unknown }).type;
+        const blob = (key as { key?: unknown }).key;
+        if (typeof type === "string" && typeof blob === "string") {
+          out.push(`${field} ${type} ${blob}`);
+        }
+      }
+    }
+    return out;
+  };
+
+  /**
    * Resolves trust-on-first-use for `accept-new`: a key accepted on an earlier
    * run is pinned here, so a key that later changes is refused rather than
    * retrusted. Returns a target and a callback that records newly accepted
@@ -271,19 +331,34 @@ export function createModel(deps: Partial<Deps> = {}) {
       stored && stored.host === ssh.host && stored.port === ssh.port &&
       stored.host_keys.length > 0
     ) {
-      return {
-        target: {
-          ...ssh,
-          host_key_policy: "strict",
-          host_keys: stored.host_keys,
-        },
-        remember: () =>
-          Promise.resolve({
-            ...ssh,
-            host_key_policy: "strict" as const,
-            host_keys: stored.host_keys,
-          }),
-      };
+      const lines = normalizeStoredKeys(
+        stored.host_keys as unknown[],
+        stored.host,
+        stored.port,
+      );
+      if (lines.length > 0) {
+        // A published 17.4 record stored objects; rewrite it in the new shape.
+        if (
+          (stored.host_keys as unknown[]).some((k) => typeof k !== "string")
+        ) {
+          await context.writeResource("hostkeys", `${name}-hostkeys`, {
+            node: name,
+            host: stored.host,
+            port: stored.port,
+            host_keys: lines,
+            observed_at: d.now().toISOString(),
+          });
+        }
+        return {
+          target: { ...ssh, host_key_policy: "strict", host_keys: lines },
+          remember: () =>
+            Promise.resolve({
+              ...ssh,
+              host_key_policy: "strict" as const,
+              host_keys: lines,
+            }),
+        };
+      }
     }
     return {
       target: ssh,
@@ -337,7 +412,7 @@ export function createModel(deps: Partial<Deps> = {}) {
       {
         toVersion: "2026.10.17.5",
         description:
-          "Replaced the local SSH transport with the canonical vendored ssh.ts (typed exit-255 error, authoritative host-key pins, no content digest on argv); host_key_policy is strict|insecure_tofu; no stored-attribute changes",
+          "Replaced the local SSH transport with the canonical vendored ssh.ts (typed exit-255 error, authoritative host-key pins, no content digest on argv); host_key_policy is strict|insecure_tofu (accept-new maps to insecure_tofu, insecure is refused); legacy {type,key} host_keys are converted to ssh-keyscan lines on read. A <node>-hostkeys record written by 2026.10.17.4 is migrated in place on first use.",
         upgradeAttributes: (old: Record<string, unknown>) => old,
       },
     ],

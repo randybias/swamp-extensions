@@ -135,7 +135,14 @@ echoes method arguments, so pass the key as a vault reference only.
   `strict` on every later run, so a key that changes is refused rather than
   retrusted. The transport is the canonical vendored `_lib/ssh.ts`: an ssh exit
   255 is a typed error, supplied pins that apply to no host are refused, and no
-  config, key or digest is ever placed on `argv`.
+  config, key or digest is ever placed on `argv`. The key and config are written
+  to a private `mktemp -d` directory and the script unlinks the file as soon as
+  it opens it, so they are never left at rest.
+- Upgrading from 2026.10.17.4: `host_key_policy: accept-new` now maps to
+  `insecure_tofu` and `insecure` is refused (the transport cannot honour it
+  safely); `ssh.host_keys` entries that are `{type, key}` objects are accepted
+  and converted to ssh-keyscan lines; and a stored `<node>-hostkeys` record is
+  migrated to port-aware (`[host]:port`) lines on first use.
 - Data is stored under the node name, e.g.
   `data.latest("wg-node", "spoke-1").attributes.config_sha256`.
 

@@ -310,3 +310,26 @@ guards) are unchanged; only delivery changed:
   fake `CommandRunner`.
 
 99 tests pass (3 env-gated netns tests ignored).
+
+## Transport-convergence round 1 fixes
+
+- **Port-aware TOFU pins (HIGH).** Learned keys are written with the canonical
+  host field: `host` on port 22, `[host]:port` otherwise (via
+  `buildKnownHosts`), both for the in-operation pins and the returned/persisted
+  `known_hosts` lines. A non-22 first `insecure_tofu` run now pins a key the
+  next `strict` run accepts.
+- **Legacy migration (HIGH).** `SshSchema` accepts the published `accept-new`
+  (mapped to `insecure_tofu`) and rejects `insecure` with a message naming the
+  replacement; `ssh.host_keys` entries that are `{type, key}` objects are
+  transformed to ssh-keyscan lines; and a stored `<node>-hostkeys` record in the
+  old object shape is normalized to port-aware lines and rewritten in place on
+  first use, so a 2026.10.17.4 upgrade does not fail closed. Documented in the
+  README and the 2026.10.17.5 upgrade description.
+- **Private temp directory (HIGH).** `stdin` is written into a `mktemp -d`
+  directory (0700); the script opens it on fd 3 and unlinks it before running
+  the script body, with a `trap` for the directory. The upload is inside the
+  try, the final cleanup runs in all cases, and a cleanup failure is surfaced as
+  a typed error rather than swallowed.
+- **Host-key line grammar (MEDIUM).** Each `ssh.host_keys` line must be an
+  optional host field plus a key type plus a base64 payload; extra or malformed
+  tokens are rejected.

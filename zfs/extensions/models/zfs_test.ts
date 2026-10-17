@@ -108,6 +108,7 @@ const P = {
   poolExport: "'zpool' 'export'",
   poolDescendants:
     "'zfs' 'list' '-H' '-r' '-o' 'name' '-t' 'filesystem,volume,snapshot'",
+  poolVolumes: "'zfs' 'list' '-H' '-r' '-t' 'volume' '-o' 'name'",
   dsProbe: "'zfs' 'list' '-H' '-o' 'name'",
   dsCreate: "'zfs' 'create'",
   dsGet: "'zfs' 'get'",
@@ -1271,12 +1272,23 @@ Deno.test("a zpool failure surfaces the sanitized stderr reason", async () => {
   assertEquals(error.message.includes("failed (exit 1)"), true);
 });
 
-/** A route that makes `tank` look like a system pool via the given mount. */
+/** A route that makes `tank` look like a system pool via the given mounts. */
 function systemPoolRoute(
-  mount: { target: string; source: string },
-  opts: { bootfs?: string; findmntCode?: number } = {},
+  mount: { target: string; source: string } | {
+    target: string;
+    source: string;
+  }[],
+  opts: {
+    bootfs?: string;
+    findmntCode?: number;
+    zvols?: string[];
+    devices?: Record<string, string>;
+    swaps?: string[];
+    readlinkCode?: number;
+  } = {},
 ): Route {
-  const findmnt = JSON.stringify({ filesystems: [mount] });
+  const mounts = Array.isArray(mount) ? mount : [mount];
+  const findmnt = JSON.stringify({ filesystems: mounts });
   return (remote) => {
     if (has(remote, P.poolProbe)) return { code: 0, stdout: "tank\n" };
     if (has(remote, "'zpool' 'get'")) {
@@ -1286,7 +1298,24 @@ function systemPoolRoute(
       return { code: opts.findmntCode ?? 0, stdout: findmnt };
     }
     if (has(remote, "/proc/swaps")) {
-      return { code: 0, stdout: "Filename Type Size Used Priority\n" };
+      const swaps = opts.swaps ?? [];
+      const body = [
+        "Filename Type Size Used Priority",
+        ...swaps.map((d) => `${d} partition 0 0 -2`),
+      ].join("\n");
+      return { code: 0, stdout: `${body}\n` };
+    }
+    if (has(remote, P.poolVolumes)) {
+      const zvols = opts.zvols ?? [];
+      return { code: 0, stdout: zvols.length ? `${zvols.join("\n")}\n` : "" };
+    }
+    if (has(remote, "readlink")) {
+      if (opts.readlinkCode !== undefined) {
+        return { code: opts.readlinkCode, stdout: "", stderr: "no such file" };
+      }
+      const link = /'readlink' '-f' '([^']+)'/.exec(remote)?.[1] ?? "";
+      const name = link.replace("/dev/zvol/", "");
+      return { code: 0, stdout: `${opts.devices?.[name] ?? link}\n` };
     }
     if (has(remote, P.poolDescendants)) {
       return { code: 0, stdout: "tank\ntank/data\n" };
@@ -1299,12 +1328,30 @@ function systemPoolRoute(
 
 Deno.test("destroy_pool refuses a system pool regardless of recursive", async () => {
   const cases: Route[] = [
+    // A dataset at / or /boot.
     systemPoolRoute({ target: "/", source: "tank/ROOT/ubuntu" }),
     systemPoolRoute({ target: "/boot", source: "tank/BOOT/ubuntu" }),
-    systemPoolRoute({ target: "/boot/efi", source: "/dev/zvol/tank/esp" }),
-    systemPoolRoute({ target: "/var", source: "tank/var" }),
+    // A system mount backed by a zvol, as mount(8) reports it: /dev/zd0.
+    systemPoolRoute({ target: "/var", source: "/dev/zd0" }, {
+      zvols: ["tank/var"],
+      devices: { "tank/var": "/dev/zd0" },
+    }),
+    // A partitioned zvol: /dev/zd0p1.
+    systemPoolRoute({ target: "/boot", source: "/dev/zd0p1" }, {
+      zvols: ["tank/var"],
+      devices: { "tank/var": "/dev/zd0" },
+    }),
+    // A bind mount of the pool root onto /var.
+    systemPoolRoute({ target: "/var", source: "tank[/var]" }),
+    // bootfs set.
     systemPoolRoute({ target: "/", source: "/dev/sda1" }, {
       bootfs: "tank/ROOT/ubuntu",
+    }),
+    // A zvol active as swap, reported as /dev/zd16.
+    systemPoolRoute({ target: "/", source: "/dev/sda1" }, {
+      zvols: ["tank/swap"],
+      devices: { "tank/swap": "/dev/zd16" },
+      swaps: ["/dev/zd16"],
     }),
   ];
   for (const route of cases) {
@@ -1325,13 +1372,13 @@ Deno.test("destroy_pool refuses a system pool regardless of recursive", async ()
 });
 
 Deno.test("a failing system-pool probe fails closed", async () => {
-  const m = model(
+  const failingFindmnt = model(
     systemPoolRoute({ target: "/", source: "/dev/sda1" }, { findmntCode: 1 }),
   );
   await assertRejects(
     () =>
-      m.methods.destroy_pool.execute(
-        m.methods.destroy_pool.arguments.parse({
+      failingFindmnt.methods.destroy_pool.execute(
+        failingFindmnt.methods.destroy_pool.arguments.parse({
           ssh: SSH,
           pool: "tank",
           recursive: true,
@@ -1341,11 +1388,33 @@ Deno.test("a failing system-pool probe fails closed", async () => {
     SystemPoolError,
     "could not read mounts",
   );
+  // A zvol that cannot be resolved to its device also fails closed.
+  const failingReadlink = model(
+    systemPoolRoute({ target: "/", source: "/dev/sda1" }, {
+      zvols: ["tank/var"],
+      readlinkCode: 1,
+    }),
+  );
+  await assertRejects(
+    () =>
+      failingReadlink.methods.destroy_pool.execute(
+        failingReadlink.methods.destroy_pool.arguments.parse({
+          ssh: SSH,
+          pool: "tank",
+          recursive: true,
+        }),
+        createModelTestContext().context,
+      ),
+    SystemPoolError,
+    "could not resolve zvol",
+  );
 });
 
 Deno.test("export_pool refuses a system pool too", async () => {
   const m = model(
-    systemPoolRoute({ target: "/boot", source: "tank/BOOT/ubuntu" }),
+    systemPoolRoute(
+      { target: "/boot", source: "tank/BOOT/ubuntu" },
+    ),
   );
   await assertRejects(
     () =>
@@ -1358,9 +1427,7 @@ Deno.test("export_pool refuses a system pool too", async () => {
 });
 
 Deno.test("destroy_pool refuses without recursive when system checks pass", async () => {
-  const m = model(
-    systemPoolRoute({ target: "/", source: "/dev/sda1" }),
-  );
+  const m = model(systemPoolRoute({ target: "/", source: "/dev/sda1" }));
   await assertRejects(
     () =>
       m.methods.destroy_pool.execute(

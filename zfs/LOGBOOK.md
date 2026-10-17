@@ -216,3 +216,21 @@ and only the probe-running code kept. The guard was NOT rewritten here.
 - **Synthetic fixtures (MEDIUM).** The by-id test IDs are now obviously
   synthetic (`ata-ExampleDisk_SYNTHETIC0001-part3`,
   `md-uuid-00000000:11111111:22222222:33333333`).
+
+## Pool-review round 2 fixes
+
+- **Zvol-backed system mounts (HIGH).** `assertNotSystemPool` now resolves every
+  zvol of the pool to its canonical device up front (`zfs list -t volume` +
+  `readlink -f /dev/zvol/<name>`), failing closed on any readlink error or empty
+  result. A system mount whose source equals a resolved `/dev/zdN`, or a
+  `/dev/zdNpM` partition of one, is refused — as is a swap device equal to
+  either. `mount(8)` reports `/dev/zd0`, never `/dev/zvol/<pool>/...`, so the
+  old link-only check never matched a real mount. Tests use real shapes
+  (`/dev/zd0`, `/dev/zd0p1`, swap `/dev/zd16`, a failing readlink).
+- **Bind mounts (MEDIUM).** `mountFromPool` strips the `[...]` suffix findmnt
+  appends, so a bind of `tank[/var]` onto `/var` is refused.
+- **Strict findmnt parse (MEDIUM).** `parseFindmnt` throws when any node lacks a
+  string target or source, or has non-array children, instead of silently
+  skipping it — a malformed probe can no longer read as "no system mounts".
+- **Wider system-mount set (MEDIUM).** `/var/lib` and `/var/log` are refused
+  too; the remaining `/var/*` gap is documented in the README as a known limit.

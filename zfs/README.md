@@ -27,6 +27,17 @@ plus the pool or dataset name.
 | `destroy_pool`   | DESTRUCTIVE. Destroy a pool; refuses a system pool and children unless `recursive` |
 | `export_pool`    | Export a pool; absent is a no-op                                                   |
 
+## System pools
+
+`destroy_pool` and `export_pool` refuse a pool that carries the running system:
+`bootfs` set, a system mount (`/`, `/boot`, `/boot/efi`, `/usr`, `/var`,
+`/var/lib`, `/var/log`) sourced from a dataset or zvol of the pool, or a zvol of
+the pool active as swap. Zvol-backed mounts are matched by their canonical
+`/dev/zdN` (or `/dev/zdNpM`) device, because `mount(8)` reports that, not the
+`/dev/zvol/...` link. Every probe must succeed; an unreadable host refuses. A
+system mount under a _different_ `/var/*` path (for example `/var/lib/docker`)
+is a known limit — a pool dedicated to it is a legitimate target.
+
 ## Dependencies
 
 - A Linux host with OpenZFS (`zpool`, `zfs`) and `lsblk`, reachable over SSH by

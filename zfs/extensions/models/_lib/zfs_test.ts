@@ -15,6 +15,7 @@ import {
   instanceKey,
   laterSnapshots,
   parseDatasets,
+  parseFindmnt,
   parsePoolList,
   parsePoolVdevs,
   parseSize,
@@ -361,4 +362,30 @@ Deno.test("instanceKey is stable, filesystem-safe and collision-free", () => {
   const key = instanceKey(identity, "tank/data@a");
   assertEquals(/^[A-Za-z0-9._-]+$/.test(key), true);
   assertEquals(key.length <= 255, true);
+});
+
+Deno.test("parseFindmnt rejects a malformed node instead of skipping it", () => {
+  assertEquals(
+    parseFindmnt('{"filesystems":[{"target":"/","source":"/dev/sda1"}]}')
+      .length,
+    1,
+  );
+  // Nested children are flattened.
+  assertEquals(
+    parseFindmnt(
+      '{"filesystems":[{"target":"/","source":"a","children":[{"target":"/b","source":"c"}]}]}',
+    ).length,
+    2,
+  );
+  for (
+    const bad of [
+      '{"filesystems":[{"target":"/"}]}',
+      '{"filesystems":[{"source":"/dev/sda1"}]}',
+      '{"filesystems":[null]}',
+      '{"filesystems":[{"target":"/","source":"x","children":[{"target":"/b"}]}]}',
+      "not json",
+    ]
+  ) {
+    assertThrows(() => parseFindmnt(bad), Error, undefined, bad);
+  }
 });

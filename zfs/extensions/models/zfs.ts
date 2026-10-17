@@ -342,18 +342,90 @@ const SYSTEM_MOUNTS: ReadonlySet<string> = new Set([
   "/boot/efi",
   "/usr",
   "/var",
+  "/var/lib",
+  "/var/log",
 ]);
 
-function mountFromPool(source: string, pool: string): boolean {
-  return source === pool || source.startsWith(`${pool}/`) ||
-    source.startsWith(`/dev/zvol/${pool}/`);
+/** Strips the `[...]` suffix findmnt appends to a bind mount's source. */
+function canonicalMountSource(source: string): string {
+  return source.replace(/\[[^\]]*\]$/, "");
+}
+
+/** True when `source` is a partition of the zvol device `dev`. */
+function isPartitionOf(source: string, dev: string): boolean {
+  return source.startsWith(`${dev}p`) &&
+    /^[0-9]+$/.test(source.slice(dev.length + 1));
+}
+
+/**
+ * True when a mount source belongs to the pool: a dataset of the pool, a
+ * `/dev/zvol/<pool>/...` link, or the canonical `/dev/zdN` (or a `/dev/zdNpM`
+ * partition) of one of the pool's zvols.
+ */
+function mountFromPool(
+  source: string,
+  pool: string,
+  zvolDevices: ReadonlySet<string>,
+): boolean {
+  const clean = canonicalMountSource(source);
+  if (clean === pool || clean.startsWith(`${pool}/`)) return true;
+  if (clean.startsWith(`/dev/zvol/${pool}/`)) return true;
+  for (const dev of zvolDevices) {
+    if (clean === dev || isPartitionOf(clean, dev)) return true;
+  }
+  return false;
+}
+
+/** True when a device path is a zvol of the pool, or a partition of one. */
+function isZvolDevice(
+  device: string,
+  zvolDevices: ReadonlySet<string>,
+): boolean {
+  for (const dev of zvolDevices) {
+    if (device === dev || isPartitionOf(device, dev)) return true;
+  }
+  return false;
+}
+
+/**
+ * Every device path a pool's zvols can appear as: the `/dev/zvol/<name>` link
+ * and its canonical `/dev/zdN`. `mount(8)` reports the canonical form, not the
+ * link. Any readlink failure or empty result fails closed.
+ */
+async function resolvePoolZvolDevices(
+  deps: ZfsDeps,
+  target: SshTarget,
+  pool: string,
+): Promise<Set<string>> {
+  const zvols = await exec(deps.ssh, target, poolVolumesArgv(pool));
+  if (zvols.exit_code !== 0) {
+    throw new SystemPoolError(
+      `refusing to touch pool ${pool}: could not list its volumes (exit ${zvols.exit_code})`,
+    );
+  }
+  const devices = new Set<string>();
+  for (const name of nonEmptyLines(zvols.stdout)) {
+    const link = `/dev/zvol/${name}`;
+    devices.add(link);
+    const resolved = await exec(deps.ssh, target, ["readlink", "-f", link]);
+    const canonical = resolved.stdout.trim();
+    if (resolved.exit_code !== 0 || canonical === "") {
+      throw new SystemPoolError(
+        `refusing to touch pool ${pool}: could not resolve zvol ${name} to its device (exit ${resolved.exit_code})`,
+      );
+    }
+    devices.add(canonical);
+  }
+  return devices;
 }
 
 /**
  * Refuses to touch a pool that backs the running system: `bootfs` set, a
- * system mount (/, /boot, /boot/efi, /usr, /var) sourced from a dataset or zvol
- * of the pool, or a zvol of the pool active as swap. Both probes must succeed;
- * an unreadable host fails closed. `recursive` never overrides this.
+ * system mount (/, /boot, /boot/efi, /usr, /var, /var/lib, /var/log) sourced
+ * from a dataset or zvol of the pool, or a zvol of the pool active as swap.
+ * Every probe must succeed; an unreadable host fails closed. `recursive` never
+ * overrides this. A `/var/*` mount outside the listed targets is a known limit
+ * (a pool dedicated to /var/lib/docker is a legitimate target).
  */
 async function assertNotSystemPool(
   deps: ZfsDeps,
@@ -376,6 +448,7 @@ async function assertNotSystemPool(
       `refusing to touch pool ${pool}: bootfs is ${bootfsValue}; this pool boots the system`,
     );
   }
+  const zvolDevices = await resolvePoolZvolDevices(deps, target, pool);
   const findmnt = await exec(deps.ssh, target, ["sh", "-c", "findmnt -J"]);
   if (findmnt.exit_code !== 0) {
     throw new SystemPoolError(
@@ -392,7 +465,7 @@ async function assertNotSystemPool(
   }
   for (const mount of mounts) {
     if (!SYSTEM_MOUNTS.has(mount.target)) continue;
-    if (mountFromPool(mount.source, pool)) {
+    if (mountFromPool(mount.source, pool, zvolDevices)) {
       throw new SystemPoolError(
         `refusing to touch pool ${pool}: ${mount.target} is mounted from ${mount.source}`,
       );
@@ -404,25 +477,13 @@ async function assertNotSystemPool(
       `refusing to touch pool ${pool}: could not read /proc/swaps (exit ${swaps.exit_code})`,
     );
   }
-  const swapDevices = parseSwaps(swaps.stdout);
-  if (swapDevices.length === 0) return;
-  const zvols = await exec(deps.ssh, target, poolVolumesArgv(pool));
-  if (zvols.exit_code !== 0) {
-    throw new SystemPoolError(
-      `refusing to touch pool ${pool}: could not list its volumes (exit ${zvols.exit_code})`,
-    );
-  }
-  for (const name of nonEmptyLines(zvols.stdout)) {
-    const dev = `/dev/zvol/${name}`;
-    const resolved = await exec(deps.ssh, target, ["readlink", "-f", dev]);
-    const resolvedPath = resolved.exit_code === 0 ? resolved.stdout.trim() : "";
+  for (const device of parseSwaps(swaps.stdout)) {
     if (
-      swapDevices.some((d) =>
-        d === dev || (resolvedPath !== "" && d === resolvedPath)
-      )
+      isZvolDevice(device, zvolDevices) ||
+      device.startsWith(`/dev/zvol/${pool}/`)
     ) {
       throw new SystemPoolError(
-        `refusing to touch pool ${pool}: zvol ${name} is active swap`,
+        `refusing to touch pool ${pool}: ${device} is active swap backed by this pool`,
       );
     }
   }

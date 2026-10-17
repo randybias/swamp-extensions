@@ -487,16 +487,22 @@ export function parseFindmnt(text: string): MountInfo[] {
   }
   const out: MountInfo[] = [];
   const visit = (node: unknown): void => {
-    if (node === null || typeof node !== "object") return;
-    const e = node as Record<string, unknown>;
-    if (typeof e.target === "string" && typeof e.source === "string") {
-      out.push({
-        target: e.target,
-        source: e.source,
-        fstype: typeof e.fstype === "string" ? e.fstype : "",
-      });
+    if (node === null || typeof node !== "object") {
+      throw new Error("a findmnt node is not an object");
     }
-    if (Array.isArray(e.children)) {
+    const e = node as Record<string, unknown>;
+    if (typeof e.target !== "string" || typeof e.source !== "string") {
+      throw new Error("a findmnt node has no string target or source");
+    }
+    out.push({
+      target: e.target,
+      source: e.source,
+      fstype: typeof e.fstype === "string" ? e.fstype : "",
+    });
+    if (e.children !== undefined) {
+      if (!Array.isArray(e.children)) {
+        throw new Error("a findmnt node has non-array children");
+      }
       for (const child of e.children) visit(child);
     }
   };

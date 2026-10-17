@@ -121,3 +121,41 @@ Not packaged. Notes for whoever maintains this extension.
   later call. Also `__proto__` is no longer an accepted data key and the key
   maps are null-prototype objects. `insecure-skip-tls-verify` stays the caller's
   choice. Tests include a run against the real kubectl when it is available.
+
+## 2026-10-17: live e2e (supersedes the blocked matrix above)
+
+Target: a k0s single node on `<vps2>` (k0s v1.36.4+k0s.1). kubeconfig and every
+value by vault reference (`<vault>/<kubeconfig-key>`, written by k0s-cluster
+`kubeconfig` with `store_in_vault`; data keys `<vault>/<key-a>`,
+`<vault>/<key-b>`). No value was printed; value checks are boolean comparisons
+against the known test strings. Receipt = first 16 hex of sha256 of the console
+output with timestamps stripped. Cells 1-14 ran on lane/b2-k8s `073f868`; V1-V8
+on lane/d2-k8svault `7dfcd38` (adds `data_from_vault`; every other code path is
+unchanged from `073f868`).
+
+| Cell                                 | Result | Detail                                                                            | Head      | Receipt          |
+| ------------------------------------ | ------ | --------------------------------------------------------------------------------- | --------- | ---------------- |
+| 1 apply (create)                     | PASS   | Secret exists with keys alpha, beta; cluster == vault y/y; value text in output 0 | `073f868` | 62a450cf5fbe97eb |
+| 2 get                                | PASS   | metadata and key names only; value text in output 0                               | `073f868` | a1d61f4aace73b7a |
+| 3 apply (idempotent)                 | PASS   | resourceVersion unchanged                                                         | `073f868` | b02ab2f33f272015 |
+| 4 apply (update a key)               | PASS   | resourceVersion advanced; alpha equals the second vault value                     | `073f868` | c452391cef295ec3 |
+| 5 sync after external delete         | PASS   | reports not_found                                                                 | `073f868` | 141d559d3aaa113a |
+| 6 delete                             | PASS   | Secret gone (NotFound)                                                            | `073f868` | ea6dc7720264798b |
+| 7 delete again (absent)              | PASS   | clean no-op                                                                       | `073f868` | 3354063d31db58d0 |
+| 8 unreachable API (192.0.2.1)        | PASS   | typed "API server unreachable"; temp kubeconfigs left 0                           | `073f868` | c1c92fb1b6db2987 |
+| 9 bad credential                     | PASS   | typed "Not authorized"; temp kubeconfigs left 0                                   | `073f868` | 233b8f5d01bf7f11 |
+| 10 namespace absent                  | PASS   | typed "Namespace ... does not exist"                                              | `073f868` | 47e529547d54f328 |
+| 11 invalid key name                  | PASS   | rejected by schema before kubectl                                                 | `073f868` | 04c68d2911b24a97 |
+| 12 injection in name/namespace       | PASS   | 5 hostile values each in name and namespace, all rejected                         | `073f868` | 371c535439341f5d |
+| 13 unknown context                   | PASS   | typed "kubectl failed"                                                            | `073f868` | d3f3b3cb1f1d16d0 |
+| 14 residue                           | PASS   | no test Secret remains; leaked value text 0                                       | `073f868` | 99a17142bef22b8e |
+| V1 apply data_from_vault             | PASS   | keys resolved from vault; cluster == vault y/y; value text in output 0            | `7dfcd38` | e9317aff916989c3 |
+| V2 apply data_from_vault idempotent  | PASS   | resourceVersion unchanged                                                         | `7dfcd38` | 68133935eee9e043 |
+| V3 missing vault key                 | PASS   | fixed "Could not read vault ... key ..." message                                  | `7dfcd38` | a045ed498571d768 |
+| V4 missing vault                     | PASS   | fixed "Could not read vault ... key ..." message                                  | `7dfcd38` | 3f59931152523711 |
+| V5 data and data_from_vault together | PASS   | schema: exactly one of data or data_from_vault is required                        | `7dfcd38` | b836b7c497f663a3 |
+| V6 data_from_vault invalid key name  | PASS   | schema: invalid key rejected                                                      | `7dfcd38` | 1f9a14ce6fe46211 |
+| V7 empty data_from_vault             | PASS   | schema: data_from_vault must not be empty                                         | `7dfcd38` | 85bfb4b3afd06a18 |
+| V8 delete and residue                | PASS   | Secret removed; value text anywhere in receipts 0                                 | `7dfcd38` | 611496f412cac947 |
+
+22/22 pass. Released on the beta channel.

@@ -81,6 +81,7 @@ k0s-cluster:
     2026.10.17.1: 617b23132f64784a82a0abd0a75e0627eddff67b1bce7d4de8570de51c88635b
   notes:
     2026.10.17.1: 'First release, beta. Install, upgrade and reset a single-node, SHA-pinned k0s cluster on a Linux host over SSH, with a rendered k0s.yaml, readiness waits, kubeconfig capture, manifest stacks and Helm reconciliation. Every live cell passes on a throwaway host, including role migration, no control-plane taint in single mode, Helm, api_address and reset. Known residue: reset leaves /etc/k0s/containerd* and the k0s binary on the host.'
+    2026.10.17.2: 'reset now removes /etc/k0s and the k0s binary it installed (only when its fixed path and recorded SHA-256 still match), works on a unit that is already stopped after a crash or reboot, keeps cleanup pending across a failed step so a rerun finishes it, and reports binary_removed/reason in state. Stored attributes unchanged; not yet run live.'
 
 server-host:
   channel: beta

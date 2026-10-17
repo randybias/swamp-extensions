@@ -1,7 +1,7 @@
 # Spec: P2 — `@randybias/artifact-server`
 
 Status: DRAFT — awaiting Randy's approval (P2, written from public docs only; no prior implementation consulted)
-Run `sp-20261017` · Lead: swamp-lead · RFC 2119 keywords.
+RFC 2119 keywords.
 Sources: nginx docs (nginx.org/en/docs: `ngx_http_core_module`,
 `ngx_http_auth_basic_module`, `ngx_http_ssl_module`, `nginx -t`), Caddy docs
 (caddyserver.com/docs, automatic HTTPS) for the server choice, GNU coreutils
@@ -147,9 +147,9 @@ bundle file content.
 
 Fixtures synthetic: RFC 5737 addresses, `example.com`, placeholder hashes.
 
-## 7. Live e2e matrix (lead's slot)
+## 7. Live e2e matrix (maintainer-run)
 
-Target: throwaway Ubuntu 24.04 VPS tagged `swamp-e2e=sp-20261017`; the
+Target: throwaway Ubuntu 24.04 VPS tagged `swamp-e2e=<run-id>`; the
 bare-metal box for the cross-extension cell.
 
 | Cell | Expected |
@@ -171,7 +171,7 @@ Receipts into `artifact-server/LOGBOOK.md`. No `stable` while any cell `untested
 
 ## 8. Credential policy
 
-Repo-wide lead ruling applies: SSH key, TLS private key and basic-auth hashes
+Repo-wide credential policy applies: SSH key, TLS private key and basic-auth hashes
 are sensitive inputs, shown only as `${{ vault.get(...) }}`, delivered via
 stdin/upload, never argv, never in `--json` captures (lab 3555). The vault holds
 the **crypt hash**, not the password, so the model never sees a plaintext and

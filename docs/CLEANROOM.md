@@ -80,13 +80,13 @@ was consulted.
 
 | Spec | Approved sha256 | Editorial scrub sha256 (behaviour unchanged) |
 |---|---|---|
-| `docs/specs/kubevirt.md` | `07c1cdb1743178123fc3776b3d72d99b9e5052f5a6f65843dbb08a6c75663982` | — |
-| `docs/specs/k0s-multinode.md` | `6534cd73d873394725e06f72ca6d2efa65b8d7ce17f853d6aed24aba446d340d` | — |
-| `docs/specs/kea-dhcp.md` | `1bd3383b8fb51d619cf563da767fb5b15706a052fc570a2f0fb55aca497eb84d` | — |
-| `docs/specs/knot-dns.md` | `4063e65244c7279dd2dc17a579e1b62f35b74ea438786192e211c53a7fdbb1e6` | — |
-| `docs/specs/apt-cache.md` | `7c72f48649fc3b22b1abe69373a9ed5b65009a6f01a5e642599d49df27cd03e2` | — |
-| `docs/specs/artifact-server.md` | `fe7243f97cfd95a0a7a878e5777abfc01b53a318cad2f38953a10216ef735e4c` | — |
-| `docs/specs/ubuntu-autoinstall.md` | `aa444f483129ad43688cdc8e7f28948fd152aaa74c50edd82e2a18e088469a36` | — |
+| `docs/specs/kubevirt.md` | `07c1cdb1743178123fc3776b3d72d99b9e5052f5a6f65843dbb08a6c75663982` | `3fec77a4d9c9bc1ac96f38a269202d68137a6879ed0967ccb086ce6ec44f1bff` |
+| `docs/specs/k0s-multinode.md` | `6534cd73d873394725e06f72ca6d2efa65b8d7ce17f853d6aed24aba446d340d` | `8010a3fdaaa8a0cb0c523d5905a69a515912a39e61c0b5d706618acedfe627f3` |
+| `docs/specs/kea-dhcp.md` | `1bd3383b8fb51d619cf563da767fb5b15706a052fc570a2f0fb55aca497eb84d` | `a4b6adca531d04e6e5ebb86416f90678cef282003606317c4c6f189f1e434a69` |
+| `docs/specs/knot-dns.md` | `4063e65244c7279dd2dc17a579e1b62f35b74ea438786192e211c53a7fdbb1e6` | `0df62cab1620625b04768dc413900a400878462610832749946156c54b3c3cf6` |
+| `docs/specs/apt-cache.md` | `7c72f48649fc3b22b1abe69373a9ed5b65009a6f01a5e642599d49df27cd03e2` | `78f9ee84896cfbb4285ca626ebea985592a9a8cd732eec4091ecb021116ae2c3` |
+| `docs/specs/artifact-server.md` | `fe7243f97cfd95a0a7a878e5777abfc01b53a318cad2f38953a10216ef735e4c` | `e6c0808dc849f1b57fcd3427bc4a86dbee8d2057b6d7adad71a541dd1fb541d0` |
+| `docs/specs/ubuntu-autoinstall.md` | `aa444f483129ad43688cdc8e7f28948fd152aaa74c50edd82e2a18e088469a36` | `66faea8c972cc44a4d83168caf0fac42d315952cfaba8654ad828591b6dbb347` |
 
 Implementation-side rules for these specs:
 

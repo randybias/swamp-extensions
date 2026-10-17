@@ -1,7 +1,7 @@
 # Spec: P2 — `@randybias/kubevirt`
 
 Status: DRAFT — awaiting Randy's approval (P2, written from public docs only; no prior implementation consulted)
-Run `sp-20261017` · Lead: swamp-lead · RFC 2119 keywords.
+RFC 2119 keywords.
 Sources: kubevirt.io user guide + release assets, CDI (containerized-data-importer)
 public docs, kubernetes.io (kubectl, server-side apply), docs.k0sproject.io. This
 repo: CONVENTIONS.md, `k8s-secret` (kubeconfig handling), `k0s-cluster` (target).
@@ -151,7 +151,7 @@ digests, placeholder kubeconfig.
 
 ## 6. Live e2e matrix (single-node k0s, throwaway VPS)
 
-Target: an hourly x86_64 VPS (≥4 vCPU, ≥8 GB) tagged `swamp-e2e=sp-20261017`,
+Target: an hourly x86_64 VPS (≥4 vCPU, ≥8 GB) tagged `swamp-e2e=<run-id>`,
 k0s single-node from `@randybias/k0s-cluster`, kubeconfig handed over via vault.
 A default StorageClass (e.g. the OpenEBS local-PV Helm extension documented by
 k0s, applied with `k0s-cluster apply_helm`) is a prerequisite for DV cells.

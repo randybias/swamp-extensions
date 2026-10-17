@@ -1,7 +1,7 @@
 # Spec: P2 — `@randybias/knot-dns`
 
 Status: DRAFT — awaiting Randy's approval (P2, written from public docs only; no prior implementation consulted)
-Run `sp-20261017` · Lead: swamp-lead · RFC 2119 keywords.
+RFC 2119 keywords.
 Sources: Knot DNS documentation (knot-dns.cz: configuration, reference,
 operation, `knotc`/`kzonecheck`/`keymgr` man pages), Knot Resolver 6
 documentation (knot-resolver.readthedocs.io / knot-resolver.cz),
@@ -193,7 +193,7 @@ rollback as above on failure.
 
 Fixtures synthetic: `example.com`/`.test`, RFC 5737 and `2001:db8::/32`.
 
-## 9. Live e2e matrix (lead's slot; throwaway VPS tagged `swamp-e2e=sp-20261017`)
+## 9. Live e2e matrix (maintainer-run; throwaway VPS tagged `swamp-e2e=<run-id>`)
 
 Ubuntu 24.04 + Debian 13. Authoritative listens on the VPS address, resolver on
 loopback (or the reverse) so they never share a socket. No public delegation is
@@ -218,7 +218,7 @@ needed: queries go straight to the VPS with `kdig @addr`.
 
 Receipts into `knot-dns/LOGBOOK.md`; no `stable` with any `untested`/`skip`.
 
-## 10. Credential policy (repo-wide lead ruling)
+## 10. Credential policy (repo-wide policy)
 
 SSH key as in every host model (stdin only, vault reference, never `--json`).
 **TSIG secrets** are sensitive vault references, written host-side to a

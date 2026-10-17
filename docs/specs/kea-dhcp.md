@@ -1,7 +1,7 @@
 # Spec: P2 — `@randybias/kea-dhcp`
 
 Status: DRAFT — awaiting Randy's approval (P2, written from public docs only; no prior implementation consulted)
-Run `sp-20261017` · Lead: swamp-lead · RFC 2119 keywords.
+RFC 2119 keywords.
 Sources: ISC Kea Administrator Reference Manual (kea.readthedocs.io, 2.4/2.6
 lines), Debian/Ubuntu `kea` package documentation, this repo's CONVENTIONS and
 specs. Net-new; nothing outside public docs and this repo was read.
@@ -197,7 +197,7 @@ function with recorded, sanitized fixtures. Neither path ever writes.
 Fixtures synthetic: RFC 5737 subnets, placeholder MACs (`02:00:00:…`),
 `example.com`.
 
-## 10. Live e2e matrix (lead's slot; throwaway VPS tagged `swamp-e2e=sp-20261017`)
+## 10. Live e2e matrix (maintainer-run; throwaway VPS tagged `swamp-e2e=<run-id>`)
 
 **Kea MUST NOT serve the VPS's provider-facing NIC.** The target builds an
 isolated segment first: a veth pair (`kea0` in the root namespace with
@@ -226,7 +226,7 @@ Ubuntu 24.04 (distro Kea 2.4.x); a Debian 13 cell if time allows.
 Receipts into `kea-dhcp/LOGBOOK.md`. No `stable` while any cell is `untested`,
 `skip` or `blocked`.
 
-## 11. Credential policy (repo-wide lead ruling)
+## 11. Credential policy (repo-wide policy)
 
 The SSH key is sensitive, stdin-only, and shown only as a vault reference;
 never `--json` on a run carrying it (lab 3555). The model holds no other

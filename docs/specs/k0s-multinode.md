@@ -1,7 +1,7 @@
 # Spec: P2 — `@randybias/k0s-multinode`
 
 Status: DRAFT — awaiting Randy's approval (P2, written from public docs only; no prior implementation consulted)
-Run `sp-20261017` · Lead: swamp-lead · RFC 2119 keywords.
+RFC 2119 keywords.
 Sources: docs.k0sproject.io (multi-node, HA control plane, control plane load
 balancing, node-local load balancing, join tokens, upgrade, remove controller,
 etcd), the public k0sctl README/docs, kubernetes.io (drain, version skew). This
@@ -157,7 +157,7 @@ of a bootstrap token).
 
 ## 8. Live e2e matrix (3 throwaway VPS)
 
-Targets: three hourly VPS (≥2 GB) tagged `swamp-e2e=sp-20261017`, same region,
+Targets: three hourly VPS (≥2 GB) tagged `swamp-e2e=<run-id>`, same region,
 private network or `wireguard-mesh` between them; node ports (6443, 8132, 9443,
 2380, 10250, CNI) allowed between nodes only (`server-host` firewall).
 

@@ -1,7 +1,7 @@
 # Spec: P2 — `@randybias/apt-cache`
 
 Status: DRAFT — awaiting Randy's approval (P2, written from public docs only; no prior implementation consulted)
-Run `sp-20261017` · Lead: swamp-lead · RFC 2119 keywords.
+RFC 2119 keywords.
 Sources: Apt-Cacher NG user manual (server quick start, client setup,
 "SSL/TLS" and "BindAddress" how-tos), squid-deb-proxy package documentation,
 `apt.conf(5)` and `apt-transport-http(1)` from Debian/Ubuntu, this repo's
@@ -175,7 +175,7 @@ secret in any output; the snippet holds no credentials.
 
 Fixtures synthetic: RFC 5737 addresses, `example.com` mirrors.
 
-## 9. Credential policy (repo-wide lead ruling)
+## 9. Credential policy (repo-wide policy)
 
 SSH keys as in every host model. `admin_auth_ref` is sensitive, uploaded over
 stdin to `/etc/apt-cacher-ng/security.conf` (mode 0600, owner the service
@@ -185,7 +185,7 @@ triggers maintenance actions. Clients carry no credentials; authenticated
 repositories (any URL with userinfo or an `auth.conf.d` entry) must be in
 `bypass_hosts`.
 
-## 10. Live e2e matrix (lead's slot; two throwaway VPS tagged `swamp-e2e=sp-20261017`)
+## 10. Live e2e matrix (maintainer-run; two throwaway VPS tagged `swamp-e2e=<run-id>`)
 
 Server VPS + client VPS on Ubuntu 24.04, plus a Debian 13 client. Port 3142 is
 reachable **only from the client VPS** (provider firewall, or `server-host`

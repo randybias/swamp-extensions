@@ -1,7 +1,7 @@
 # Spec: P2 — `@randybias/ubuntu-autoinstall`
 
 Status: DRAFT — awaiting Randy's approval (P2, written from public docs only; no prior implementation consulted)
-Run `sp-20261017` · Lead: swamp-lead · RFC 2119 keywords.
+RFC 2119 keywords.
 Sources: Ubuntu installer (subiquity) docs at
 canonical-subiquity.readthedocs-hosted.com (autoinstall reference, autoinstall
 JSON schema, providing autoinstall, cloud-init and autoinstall interaction,
@@ -35,7 +35,7 @@ It is already adopted for NoCloud seeds. Before building, establish from
 
 Outcome: if (1) holds, the `CIDATA` path is a **workflow** wiring this model's
 `render` output into it, and this model ships no ISO builder. If not, report to
-the lead; a `build_seed` action (`xorriso`/`cloud-localds` on a host via the
+the maintainer; a `build_seed` action (`xorriso`/`cloud-localds` on a host via the
 canonical transport) is the fallback. The HTTP path (§4.1 `publish_http`) is
 ours either way.
 
@@ -185,7 +185,7 @@ output contains a password hash, LUKS passphrase or SSH private key.
 Fixtures synthetic: RFC 5737 addresses, `example.com`, placeholder serials,
 MACs, keys and hashes.
 
-## 7. Live e2e matrix (lead's slot — bare-metal box, nested KVM)
+## 7. Live e2e matrix (maintainer-run — bare-metal box, nested KVM)
 
 Target: a libvirt VM on the bare-metal box boots the Ubuntu 24.04 live-server
 ISO (fetched into artifact-server by pinned hash) with the seed; disks are
@@ -210,7 +210,7 @@ Receipts into `ubuntu-autoinstall/LOGBOOK.md`. No `stable` while any cell `untes
 
 ## 8. Credential policy
 
-Repo-wide lead ruling applies. The vault holds the **crypt hash** (SHA-512
+Repo-wide credential policy applies. The vault holds the **crypt hash** (SHA-512
 `$6$` or yescrypt `$y$`, generated off-box, e.g. `mkpasswd`), so no plaintext
 ever enters the model; examples show `${{ vault.get(...) }}` only. The rendered
 user-data still contains that hash and SSH public keys: it is a sensitive

@@ -8,8 +8,11 @@ import {
   selectCrushRule,
   settle,
   verifyCsiUsers,
+  verifyDisksRaw,
   verifyHealth,
   verifyHostNoout,
+  verifyHostPrep,
+  verifyKeyDistributed,
   verifyMgr,
   verifyMonQuorum,
   verifyOsd,
@@ -521,4 +524,196 @@ Deno.test("host-noout verifies the expectation in both directions", async () => 
     })).pass,
     false,
   );
+});
+
+/** A plain read-only session for host checks. */
+function plainSession(route: (command: string) => CommandResult): SshSession {
+  return {
+    target: { host: "192.0.2.10", user: "admin" },
+    controlPath: null,
+    run: (opts) => Promise.resolve(route(opts.command)),
+    close: () => Promise.resolve({ closed: false, detail: "not multiplexed" }),
+  };
+}
+
+Deno.test(
+  "host-prep asserts packages, the exact cephadm version and time sync", // leak-allow(decision D14)
+  async () => {
+    const good = plainSession((command) => {
+      if (command.startsWith("dpkg -s")) {
+        return { code: 0, stdout: "Version: 1.2\n", stderr: "" };
+      }
+      if (command.startsWith("test -x")) {
+        return { code: 0, stdout: "", stderr: "" };
+      }
+      if (command.includes("cephadm version")) {
+        return {
+          code: 0,
+          stdout: "cephadm version 19.2.1 (x) squid (stable)",
+          stderr: "",
+        };
+      }
+      if (command.startsWith("systemctl is-active")) {
+        return { code: 0, stdout: "active\n", stderr: "" };
+      }
+      return { code: 1, stdout: "", stderr: "unrouted" };
+    });
+    const pass = await verifyHostPrep(deps, good, {
+      expectedPackages: ["chrony"],
+      expectedCephadmVersion: "19.2.1",
+      expectedTimeSyncService: "chrony",
+    });
+    assertEquals(pass.pass, true);
+    assertEquals(
+      (pass.actual as { cephadmVersion: string }).cephadmVersion,
+      "19.2.1",
+    );
+
+    const short = plainSession((command) => {
+      if (command.startsWith("dpkg -s")) {
+        return { code: 0, stdout: "", stderr: "" };
+      }
+      if (command.startsWith("test -x")) {
+        return { code: 0, stdout: "", stderr: "" };
+      }
+      if (command.includes("cephadm version")) {
+        return { code: 0, stdout: "cephadm version 19.2.10 (x)", stderr: "" };
+      }
+      if (command.startsWith("systemctl is-active")) {
+        return { code: 0, stdout: "active\n", stderr: "" };
+      }
+      return { code: 1, stdout: "", stderr: "unrouted" };
+    });
+    assertEquals(
+      (await verifyHostPrep(deps, short, {
+        expectedPackages: ["chrony"],
+        expectedCephadmVersion: "19.2.1",
+        expectedTimeSyncService: "chrony",
+      })).pass,
+      false,
+    );
+
+    const missing = plainSession((command) =>
+      command.startsWith("systemctl is-active")
+        ? { code: 3, stdout: "inactive\n", stderr: "" }
+        : command.startsWith("dpkg -s")
+        ? { code: 1, stdout: "", stderr: "" }
+        : { code: 0, stdout: "", stderr: "" }
+    );
+    const verdict = await verifyHostPrep(deps, missing, {
+      expectedPackages: ["chrony"],
+      expectedCephadmVersion: "19.2.1",
+      expectedTimeSyncService: "chrony",
+    });
+    assertEquals(verdict.pass, false);
+    assertEquals(
+      (verdict.actual as { missingPackages: string[] }).missingPackages,
+      ["chrony"],
+    );
+    assertEquals(
+      (verdict.actual as { timeSyncActive: boolean }).timeSyncActive,
+      false,
+    );
+  },
+);
+
+Deno.test(
+  "disks-raw reports signatures, children and mounts by type", // leak-allow(decision D17)
+  async () => {
+    const tree = JSON.stringify({
+      blockdevices: [
+        {
+          name: "nvme0n1",
+          path: "/dev/nvme0n1",
+          type: "disk",
+          fstype: null,
+          mountpoint: null,
+        },
+        {
+          name: "nvme1n1",
+          path: "/dev/nvme1n1",
+          type: "disk",
+          fstype: "ext4",
+          mountpoint: null,
+          children: [{
+            name: "nvme1n1p1",
+            path: "/dev/nvme1n1p1",
+            type: "part",
+            mountpoint: "/data",
+          }],
+        },
+      ],
+    });
+    const resolver = (device: string) =>
+      plainSession((command) => {
+        if (command.startsWith("lsblk")) {
+          return { code: 0, stdout: tree, stderr: "" };
+        }
+        if (command.startsWith("readlink")) {
+          return { code: 0, stdout: `${device}\n`, stderr: "" };
+        }
+        if (command.includes("basename")) {
+          return { code: 0, stdout: "nvme-SN0001\n", stderr: "" };
+        }
+        return { code: 1, stdout: "", stderr: "unrouted" };
+      });
+    const raw = await verifyDisksRaw(deps, resolver("/dev/nvme0n1"), [{
+      serial: "SN0001",
+    }]);
+    assertEquals(raw.pass, true);
+    const dirty = await verifyDisksRaw(deps, resolver("/dev/nvme1n1"), [{
+      serial: "SN0001",
+    }]);
+    assertEquals(dirty.pass, false);
+    assertEquals(dirty.detail.mounted as string[], ["SN0001"]);
+    const observed =
+      (dirty.detail.perDevice as { children: { type: string }[] }[])[0];
+    assertEquals(observed.children[0].type, "part");
+  },
+);
+
+Deno.test("key distribution reports present, absent, unreadable and unreachable", async () => {
+  const outcomes = new Map<string, number | TransportError>([
+    ["a", 0],
+    ["b", 1],
+    ["c", 2],
+  ]);
+  const result = await verifyKeyDistributed(deps, {
+    hosts: ["a", "b", "c"],
+    port: 22,
+    cephPubKey:
+      "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIExampleExampleExampleExampleExample",
+    makeSession: (host) => {
+      const outcome = outcomes.get(host)!;
+      if (outcome instanceof TransportError) return Promise.reject(outcome);
+      return Promise.resolve(plainSession(() => ({
+        code: outcome as number,
+        stdout: "",
+        stderr: "denied",
+      })));
+    },
+  });
+  assertEquals(result.outcome.pass, false);
+  assertEquals(result.outcome.detail.absentOn as string[], ["b"]);
+  assertEquals(result.outcome.detail.unreadableOn as string[], ["c"]);
+
+  const unreachable = await verifyKeyDistributed(deps, {
+    hosts: ["x"],
+    port: 22,
+    cephPubKey:
+      "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIExampleExampleExampleExampleExample",
+    makeSession: () =>
+      Promise.reject(
+        new TransportError({
+          host: "x",
+          port: 22,
+          user: "u",
+          kind: "other",
+          cause: null,
+          message: "unreachable",
+        }),
+      ),
+  });
+  assertEquals(unreachable.unreachable.length, 1);
+  assertEquals(unreachable.outcome.detail.unreachableOn as string[], ["x"]);
 });

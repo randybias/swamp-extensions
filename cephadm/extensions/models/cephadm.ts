@@ -80,13 +80,16 @@ import {
 import {
   persistVerdict,
   verifyCsiUsers,
+  verifyDisksRaw,
   verifyHealth,
   verifyHostNoout,
+  verifyHostPrep,
+  verifyKeyDistributed,
   verifyMgr,
   verifyMonQuorum,
   verifyOsd,
 } from "./_lib/verify.ts";
-import { TransportError } from "./_lib/errors.ts";
+import { fail, TransportError } from "./_lib/errors.ts";
 import { wipeDiskToRaw, type WipeRecord } from "./_lib/wipe.ts";
 
 /** Model type version; must equal the manifest version. */
@@ -504,6 +507,38 @@ const VerifyHostNooutArgs = z.strictObject({
   expectSet: z.boolean().describe(
     "true: the flag must be set; false: it must be clear.",
   ),
+});
+
+const VerifyHostPrepArgs = z.strictObject({
+  ...VerifyCommon,
+  expectedPackages: z.array(PACKAGE_SCHEMA).min(1).max(64).describe(
+    "Packages that must be installed.",
+  ),
+  expectedCephadmVersion: CEPHADM_VERSION_SCHEMA.describe(
+    "Exact cephadm version token expected.",
+  ),
+  expectedTimeSyncService: UNIT_SCHEMA.describe(
+    "Time-sync service that must be active.",
+  ),
+});
+
+const VerifyDisksRawArgs = z.strictObject({
+  ...VerifyCommon,
+  dataDevices: z.array(z.strictObject({ serial: SERIAL_SCHEMA })).min(1).max(
+    128,
+  )
+    .describe("Devices that must be raw, selected by serial."),
+});
+
+const VerifyKeyDistributedArgs = z.strictObject({
+  ...SSH_FIELDS,
+  throwOnFail: z.boolean().nullish().describe(
+    "Throw after recording a failing verdict; defaults to true.",
+  ),
+  hosts: z.array(HOSTNAME_SCHEMA).min(1).max(512).describe(
+    "Hosts the key was distributed to.",
+  ),
+  cephPubKey: SSH_PUBKEY_SCHEMA.describe("The public key to look for."),
 });
 
 const PoolResultSchema = z.strictObject({
@@ -1714,6 +1749,150 @@ export function createCephadmModel(overrides: Partial<CephadmDeps> = {}) {
         } finally {
           await session.close();
         }
+      },
+    },
+
+    cephVerifyHostPrep: {
+      description:
+        "READ-ONLY. Assert the facts cephHostPrep establishes, without changing anything: packages installed, the pinned cephadm version present and a time-sync service active. Writes the verdict before throwing, then throws when it fails unless throwOnFail is false.",
+      arguments: VerifyHostPrepArgs,
+      execute: async (
+        args: z.infer<typeof VerifyHostPrepArgs>,
+        context: MethodContext,
+      ) => {
+        const session = await openSession(
+          deps,
+          toTarget({
+            host: args.host,
+            sshUser: args.sshUser,
+            port: args.port,
+            keyPath: args.keyPath,
+            privateKey: args.privateKey,
+            strictHostKeyChecking: args.strictHostKeyChecking,
+          }),
+          { multiplex: args.multiplex ?? false },
+        );
+        try {
+          const outcome = await verifyHostPrep(deps, session, {
+            expectedPackages: args.expectedPackages,
+            expectedCephadmVersion: args.expectedCephadmVersion,
+            expectedTimeSyncService: args.expectedTimeSyncService,
+          }, context.logger);
+          const handle = await persistVerdict(context, deps, {
+            method: "cephVerifyHostPrep",
+            host: args.host,
+            phase: "host-prep",
+            key: `cephVerifyHostPrep-${args.host}`,
+            outcome,
+            throwOnFail: args.throwOnFail ?? true,
+          });
+          return { dataHandles: [handle] };
+        } finally {
+          await session.close();
+        }
+      },
+    },
+
+    cephVerifyDisksRaw: {
+      description:
+        "READ-ONLY. Assert that each serial-resolved device is genuinely raw: no signature, no children and no mountpoint anywhere in its subtree. Writes the verdict before throwing, then throws when it fails unless throwOnFail is false.",
+      arguments: VerifyDisksRawArgs,
+      execute: async (
+        args: z.infer<typeof VerifyDisksRawArgs>,
+        context: MethodContext,
+      ) => {
+        const session = await openSession(
+          deps,
+          toTarget({
+            host: args.host,
+            sshUser: args.sshUser,
+            port: args.port,
+            keyPath: args.keyPath,
+            privateKey: args.privateKey,
+            strictHostKeyChecking: args.strictHostKeyChecking,
+          }),
+          { multiplex: args.multiplex ?? false },
+        );
+        try {
+          const outcome = await verifyDisksRaw(
+            deps,
+            session,
+            args.dataDevices,
+            context.logger,
+          );
+          const handle = await persistVerdict(context, deps, {
+            method: "cephVerifyDisksRaw",
+            host: args.host,
+            phase: "disks-raw",
+            key: `cephVerifyDisksRaw-${args.host}`,
+            outcome,
+            throwOnFail: args.throwOnFail ?? true,
+          });
+          return { dataHandles: [handle] };
+        } finally {
+          await session.close();
+        }
+      },
+    },
+
+    cephVerifyKeyDistributed: {
+      description:
+        "READ-ONLY. Re-read each host's authorized_keys on a fresh connection and report per host whether the key is present, absent, unreadable or unreachable. Writes the record, then throws a typed transport error if any host was unreachable, whatever throwOnFail says.",
+      arguments: VerifyKeyDistributedArgs,
+      execute: async (
+        args: z.infer<typeof VerifyKeyDistributedArgs>,
+        context: MethodContext,
+      ) => {
+        const port = args.port ?? 22;
+        const result = await verifyKeyDistributed(deps, {
+          hosts: args.hosts,
+          port,
+          cephPubKey: args.cephPubKey,
+          makeSession: (host) =>
+            openSession(
+              deps,
+              toTarget({
+                host,
+                sshUser: args.sshUser,
+                port,
+                keyPath: args.keyPath,
+                privateKey: args.privateKey,
+                strictHostKeyChecking: args.strictHostKeyChecking,
+              }),
+              { multiplex: false },
+            ),
+        }, context.logger);
+        const key = `cephVerifyKeyDistributed-${
+          args.hosts.map((h) => `${h}:${port}`).sort().join(",")
+        }`;
+        const handle = await persistVerdict(context, deps, {
+          method: "cephVerifyKeyDistributed",
+          host: args.hosts.map((h) => `${h}:${port}`).sort().join(","),
+          phase: "key-distributed",
+          key,
+          outcome: result.outcome,
+          throwOnFail: false,
+        });
+        if (result.unreachable.length > 0) {
+          throw new TransportError({
+            host: result.unreachable[0].host,
+            port,
+            user: args.sshUser,
+            kind: "other",
+            cause: null,
+            message: `unreachable hosts: ${
+              result.unreachable.map((e) => e.host).join(", ")
+            }`,
+          });
+        }
+        if (!result.outcome.pass && (args.throwOnFail ?? true)) {
+          fail("key-distributed", "verification failed", {
+            expected: JSON.stringify(result.outcome.expected),
+            actual: JSON.stringify(result.outcome.actual),
+            recordKey: key,
+          });
+        }
+        return { dataHandles: [handle] };
       },
     },
   };

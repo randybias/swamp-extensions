@@ -13,9 +13,17 @@
 import { cappedBackoff, type WaitDeps } from "./backoff.ts";
 import { fail, TransportError } from "./errors.ts";
 import type { SshSession } from "./ssh.ts";
-import type { PrepDeps } from "./hostprep.ts";
+import {
+  CEPHADM_PATH,
+  parseDpkgVersion,
+  type PrepDeps,
+  probeCephadmVersion,
+} from "./hostprep.ts";
 import { runCeph } from "./shell.ts";
 import { parseAuthEntities } from "./dataplane.ts";
+import { assertSshPublicKey, quote } from "./validate.ts";
+import { findNode, lsblkCommand, parseLsblk, subtreeMounts } from "./wipe.ts";
+import { resolveSerial } from "./resolve.ts";
 
 type Logger = {
   info: (m: string, p?: Record<string, unknown>) => void;
@@ -626,5 +634,290 @@ export async function verifyHealth(
       unallowedChecks,
       messages,
     },
+  };
+}
+
+// ---------------------------------------------------------------------------
+// cephVerifyHostPrep
+// ---------------------------------------------------------------------------
+
+/** Arguments for the host-prep check. */
+export interface HostPrepVerifyArgs {
+  /** Packages that must be installed. */
+  expectedPackages: string[];
+  /** Exact cephadm version token expected. */
+  expectedCephadmVersion: string;
+  /** Time-sync service that must be active. */
+  expectedTimeSyncService: string;
+}
+
+/** Assert the facts cephHostPrep establishes, without changing anything. */
+export async function verifyHostPrep(
+  _deps: PrepDeps,
+  session: SshSession,
+  args: HostPrepVerifyArgs,
+  _log?: Logger,
+): Promise<VerifyOutcome> {
+  const packages: { name: string; present: boolean; version?: string }[] = [];
+  const missingPackages: string[] = [];
+  for (const name of args.expectedPackages) {
+    const r = await session.run({
+      command: `dpkg -s ${quote(name)}`,
+      allowNonZero: true,
+    });
+    const present = r.code === 0;
+    const version = present ? parseDpkgVersion(r.stdout) : undefined;
+    packages.push({
+      name,
+      present,
+      ...(version !== undefined ? { version } : {}),
+    });
+    if (!present) missingPackages.push(name);
+  }
+  const presentResult = await session.run({
+    command: `test -x ${CEPHADM_PATH}`,
+    allowNonZero: true,
+  });
+  const cephadmPresent = presentResult.code === 0;
+  let token: string | null = null;
+  let rawOutput = "";
+  if (cephadmPresent) {
+    const probe = await probeCephadmVersion(
+      session,
+      args.expectedCephadmVersion,
+    );
+    token = probe.token;
+    rawOutput = probe.stdout;
+  }
+  const sync = await session.run({
+    command: `systemctl is-active ${quote(args.expectedTimeSyncService)}`,
+    allowNonZero: true,
+  });
+  const timeSyncActive = sync.stdout.trim() === "active";
+  const pass = missingPackages.length === 0 && cephadmPresent &&
+    token === args.expectedCephadmVersion && timeSyncActive;
+  return {
+    pass,
+    expected: {
+      packages: args.expectedPackages,
+      cephadmPresent: true,
+      cephadmVersion: args.expectedCephadmVersion,
+      timeSyncActive: true,
+    },
+    actual: {
+      missingPackages,
+      cephadmPresent,
+      cephadmVersion: token,
+      cephadmVersionOutput: rawOutput,
+      timeSyncActive,
+    },
+    detail: { packages },
+  };
+}
+
+// ---------------------------------------------------------------------------
+// cephVerifyDisksRaw
+// ---------------------------------------------------------------------------
+
+/** Assert that each serial-resolved device is genuinely raw. */
+export async function verifyDisksRaw(
+  _deps: PrepDeps,
+  session: SshSession,
+  dataDevices: { serial: string }[],
+  _log?: Logger,
+): Promise<VerifyOutcome> {
+  const read = await session.run({
+    command: lsblkCommand(),
+    allowNonZero: true,
+  });
+  const tree = parseLsblk(read.stdout);
+  const expected: Record<string, unknown> = {};
+  const actual: Record<string, unknown> = {};
+  const perDevice: unknown[] = [];
+  const mounted: string[] = [];
+  const unobserved: string[] = [];
+  for (const d of dataDevices) {
+    const resolved = await resolveSerial(session, d.serial, "disks-raw");
+    expected[d.serial] = { raw: true };
+    const node = findNode(tree, resolved.device);
+    if (!node) {
+      actual[d.serial] = "not found";
+      unobserved.push(d.serial);
+      perDevice.push({
+        serial: d.serial,
+        path: resolved.path,
+        device: resolved.device,
+        found: false,
+      });
+      continue;
+    }
+    const mounts = subtreeMounts(node);
+    const children = (node.children ?? []).map((c) => ({
+      name: c.name ?? "",
+      type: c.type ?? "",
+    }));
+    const raw = !node.fstype && (node.children ?? []).length === 0 &&
+      mounts.length === 0;
+    actual[d.serial] = raw
+      ? "raw"
+      : { fstype: node.fstype ?? null, children, mountpoints: mounts };
+    if (mounts.length > 0) mounted.push(d.serial);
+    perDevice.push({
+      serial: d.serial,
+      path: resolved.path,
+      device: resolved.device,
+      fstype: node.fstype ?? null,
+      children,
+      mountpoints: mounts,
+    });
+  }
+  const pass = Object.values(actual).every((v) => v === "raw");
+  return {
+    pass,
+    expected,
+    actual,
+    detail: { perDevice, mounted, unobserved },
+  };
+}
+
+// ---------------------------------------------------------------------------
+// cephVerifyKeyDistributed
+// ---------------------------------------------------------------------------
+
+/** One host's key read-back. */
+export interface KeyReadBack {
+  /** Target host. */
+  host: string;
+  /** `present`, `absent`, `unreadable` or `unreachable`. */
+  outcome: "present" | "absent" | "unreadable" | "unreachable";
+  /** Whether the key was found. */
+  present: boolean;
+  /** Whether `authorized_keys` was readable. */
+  readable: boolean;
+  /** Extra evidence. */
+  detail?: string;
+}
+
+/** Options for the key-distribution check. */
+export interface KeyDistributedOptions {
+  /** Hosts the key was distributed to. */
+  hosts: string[];
+  /** SSH port for every host. */
+  port: number;
+  /** The public key to look for. */
+  cephPubKey: string;
+  /** Opens a fresh, non-multiplexed session to one host. */
+  makeSession: (host: string) => Promise<SshSession>;
+}
+
+/** Reads each host's authorized_keys on a fresh connection. */
+export async function verifyKeyDistributed(
+  _deps: PrepDeps,
+  opts: KeyDistributedOptions,
+  _log?: Logger,
+): Promise<{ outcome: VerifyOutcome; unreachable: TransportError[] }> {
+  assertSshPublicKey("cephPubKey", opts.cephPubKey);
+  const readBacks: KeyReadBack[] = [];
+  const unreachable: TransportError[] = [];
+  for (const host of opts.hosts) {
+    let session: SshSession;
+    try {
+      session = await opts.makeSession(host);
+    } catch (e) {
+      if (e instanceof TransportError) {
+        unreachable.push(e);
+        readBacks.push({
+          host,
+          outcome: "unreachable",
+          present: false,
+          readable: false,
+          detail: e.message,
+        });
+        continue;
+      }
+      throw e;
+    }
+    try {
+      const r = await session.run({
+        command: `grep -qF -- ${
+          quote(opts.cephPubKey)
+        } "$HOME/.ssh/authorized_keys"`,
+        allowNonZero: true,
+      });
+      if (r.code === 0) {
+        readBacks.push({
+          host,
+          outcome: "present",
+          present: true,
+          readable: true,
+        });
+      } else if (r.code === 1) {
+        readBacks.push({
+          host,
+          outcome: "absent",
+          present: false,
+          readable: true,
+        });
+      } else {
+        readBacks.push({
+          host,
+          outcome: "unreadable",
+          present: false,
+          readable: false,
+          detail: (r.stderr || r.stdout || `grep exited ${r.code}`).slice(
+            0,
+            200,
+          ),
+        });
+      }
+    } catch (e) {
+      if (e instanceof TransportError) {
+        unreachable.push(e);
+        readBacks.push({
+          host,
+          outcome: "unreachable",
+          present: false,
+          readable: false,
+          detail: e.message,
+        });
+      } else {
+        throw e;
+      }
+    } finally {
+      await session.close();
+    }
+  }
+  const absentOn = readBacks.filter((r) => r.outcome === "absent").map((r) =>
+    r.host
+  );
+  const unreadableOn = readBacks.filter((r) => r.outcome === "unreadable").map((
+    r,
+  ) => r.host);
+  const unreachableOn = readBacks.filter((r) => r.outcome === "unreachable")
+    .map((r) => r.host);
+  const missingHosts = opts.hosts.filter((h) =>
+    !readBacks.some((r) => r.host === h)
+  );
+  const pass = missingHosts.length === 0 && absentOn.length === 0 &&
+    unreadableOn.length === 0 &&
+    unreachableOn.length === 0;
+  return {
+    outcome: {
+      pass,
+      expected: {
+        hosts: opts.hosts,
+        condition: "key present in authorized_keys on every host",
+      },
+      actual: readBacks,
+      detail: {
+        missingHosts,
+        absentOn,
+        unreadableOn,
+        unreachableOn,
+        cannotSee:
+          "this check cannot prove that sshd will accept the key (file location, ownership, mode or a non-default AuthorizedKeysFile), nor that cephadm can log in, which needs the private half",
+      },
+    },
+    unreachable,
   };
 }

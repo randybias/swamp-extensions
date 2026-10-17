@@ -114,13 +114,10 @@ Deno.test("prune refuses a symlinked hash directory and deletes nothing", async 
   // The hash directory is a symlink pointing outside the root.
   host.symlinks.add(`${ROOT}/sha256/${orphan}`);
   const { m, context } = modelFor(host);
-  const plan = (await m.methods.plan_prune.execute(base(), context)).result as {
-    planSha256: string;
-  };
   await assertRejects(
-    () =>
-      m.methods.prune.execute(base({ plan_sha256: plan.planSha256 }), context),
+    () => m.methods.plan_prune.execute(base(), context),
     Error,
+    "symlinked hash directories",
   );
   assertEquals(host.files.has(`${ROOT}/sha256/${orphan}/data`), true);
 });
@@ -315,7 +312,7 @@ Deno.test("install reports rollback failures in the error", async () => {
   host.failArgv = (argv) =>
     (argv[0] === "install" && argv[1] === "-d" &&
       argv.includes("/etc/nginx/ssl")) ||
-    argv[0] === "rm";
+    (argv[0] === "rm" && argv.includes(NGINX_SITE_PATH));
   const { m, context } = modelFor(host);
   await assertRejects(
     () =>
@@ -333,4 +330,67 @@ Deno.test("install reports rollback failures in the error", async () => {
     Error,
     "rollback errors",
   );
+});
+
+Deno.test("install fails when nginx is left on an unexpected wildcard port", async () => {
+  const host = makeFakeRemote();
+  host.ssOutputAfter =
+    'LISTEN 0 511 0.0.0.0:80 0.0.0.0:* users:(("nginx",pid=1,fd=6))\n';
+  const { m, context } = modelFor(host);
+  await assertRejects(
+    () =>
+      m.methods.install.execute(
+        base({ ...SITE_ARGS, tls: { mode: "none", plaintext_ack: true } }),
+        context,
+      ),
+    Error,
+    "unexpected wildcard ports",
+  );
+});
+
+Deno.test("install rollback removes a root it created", async () => {
+  const host = makeFakeRemote();
+  host.failNginxTest = true;
+  const { m, context } = modelFor(host);
+  await assertRejects(
+    () =>
+      m.methods.install.execute(
+        base({ ...SITE_ARGS, tls: { mode: "none", plaintext_ack: true } }),
+        context,
+      ),
+    Error,
+    "rolled back",
+  );
+  assertEquals(
+    [...host.files.keys()].some((p) => p.startsWith(`${ROOT}/`)),
+    false,
+  );
+  assertEquals(host.dirs.has(ROOT), false);
+});
+
+Deno.test("uninstall restores the default site install removed", async () => {
+  const host = makeFakeRemote();
+  host.setFile(NGINX_DEFAULT_SITE, "default site\n", "644");
+  const { m, context } = modelFor(host);
+  await m.methods.install.execute(
+    base({
+      ...SITE_ARGS,
+      tls: { mode: "none", plaintext_ack: true },
+      disable_default_site: true,
+    }),
+    context,
+  );
+  assertEquals(host.files.has(NGINX_DEFAULT_SITE), false);
+  // A later render_config must not erase the recorded removal.
+  await m.methods.render_config.execute(
+    base({ ...SITE_ARGS, tls: { mode: "none", plaintext_ack: true } }),
+    context,
+  );
+  const result = await m.methods.uninstall.execute(base(), context);
+  assertEquals(
+    (result.result as { default_site_restored: boolean })
+      .default_site_restored,
+    true,
+  );
+  assertEquals(host.files.get(NGINX_DEFAULT_SITE)?.content, "default site\n");
 });

@@ -12,7 +12,11 @@ import {
   type PrunePlan,
 } from "./layout.ts";
 import { type Layout, type ObjectEntry, readLayout } from "./observe.ts";
-import { regenerateSha256Sums, removeObjects } from "./ops.ts";
+import {
+  assertNoSymlinkedHashDirs,
+  regenerateSha256Sums,
+  removeObjects,
+} from "./ops.ts";
 import { parseVerifyOutput, verifyScript } from "./verify.ts";
 import { runScript } from "./remote.ts";
 import { activeDeps } from "./runtime.ts";
@@ -142,6 +146,7 @@ export const adminMethods: Record<string, ArtifactServerMethod> = {
       const args = PlanPruneArgs.parse(rawArgs);
       const target = toTarget(args.ssh);
       const layout = await readLayout(activeDeps, target, args.root);
+      await assertNoSymlinkedHashDirs(activeDeps, target, args.root);
       const plan = await computePlan(layout, args.keep);
       const handle = await context.writeResource(
         "prune_plan",
@@ -167,6 +172,7 @@ export const adminMethods: Record<string, ArtifactServerMethod> = {
       const args = PruneArgs.parse(rawArgs);
       const target = toTarget(args.ssh);
       const layout = await readLayout(activeDeps, target, args.root);
+      await assertNoSymlinkedHashDirs(activeDeps, target, args.root);
       const plan = await computePlan(layout, args.keep);
       if (plan.planSha256 !== args.plan_sha256) {
         throw new SshError(

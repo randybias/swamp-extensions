@@ -66,9 +66,12 @@ Deno.test("removeObjectsScript removes a real blob inside the root", async () =>
     (await sh(removeObjectsScript(root, [`sha256/${HASH}/data`]))).code,
     0,
   );
+  // The emptied hash directory is removed too.
   assertEquals(
-    [...Deno.readDirSync(`${root}/sha256/${HASH}`)].length,
-    0,
+    await Deno.stat(`${root}/sha256/${HASH}`).then(() => true).catch(
+      () => false,
+    ),
+    false,
   );
 });
 

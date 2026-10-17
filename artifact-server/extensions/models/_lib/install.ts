@@ -73,17 +73,83 @@ export async function captureInstallSnaps(
 }
 
 /** Installs the nginx package, failing closed. */
+/** Debian's service-start gate; returning 101 refuses a start. */
+const POLICY_RC_D = "/usr/sbin/policy-rc.d";
+
+/**
+ * Installs nginx without ever letting the package default site come up. The
+ * postinst would otherwise start nginx serving /var/www/html on 0.0.0.0:80; a
+ * blocking policy-rc.d and a best-effort systemd mask keep it down until the
+ * managed config and the enabled link are in place.
+ */
 export async function installNginx(
   deps: SshDeps,
   target: SshTarget,
 ): Promise<void> {
-  const result = await execSudo(deps, target, [
-    "apt-get",
-    "install",
-    "-y",
-    "nginx",
-  ]);
-  if (result.exit_code !== 0) throw new SshError("could not install nginx");
+  const policy = await snapFile(deps, target, POLICY_RC_D);
+  await putRootFile(deps, target, {
+    path: POLICY_RC_D,
+    content: "#!/bin/sh\nexit 101\n",
+    mode: "0755",
+    owner: "root",
+    group: "root",
+  });
+  await execSudo(deps, target, ["systemctl", "mask", "nginx.service"]).catch(
+    () => undefined,
+  );
+  let failure: unknown = null;
+  try {
+    const result = await execSudo(deps, target, [
+      "env",
+      "DEBIAN_FRONTEND=noninteractive",
+      "apt-get",
+      "install",
+      "-y",
+      "nginx",
+    ]);
+    if (result.exit_code !== 0) throw new SshError("could not install nginx");
+  } catch (err) {
+    failure = err;
+  }
+  await execSudo(deps, target, ["systemctl", "unmask", "nginx.service"]).catch(
+    () => undefined,
+  );
+  try {
+    await restoreFile(deps, target, policy);
+  } catch (err) {
+    if (failure === null) failure = err;
+  }
+  if (failure !== null) throw failure;
+}
+
+/**
+ * The TCP ports nginx listens on for a wildcard address, as seen by `ss`. Used
+ * to prove the package default site is not left listening after an install.
+ */
+export async function nginxWildcardPorts(
+  deps: SshDeps,
+  target: SshTarget,
+): Promise<Set<number>> {
+  const ports = new Set<number>();
+  const result = await execSudo(deps, target, ["ss", "-ltnp"]);
+  if (result.exit_code !== 0) return ports;
+  for (const line of result.stdout.split("\n")) {
+    const f = line.trim().split(/\s+/);
+    if (f[0] !== "LISTEN" || f.length < 4) continue;
+    if (!f.slice(5).join(" ").includes("nginx")) continue;
+    const local = f[3];
+    const idx = local.lastIndexOf(":");
+    if (idx < 0) continue;
+    const host = local.slice(0, idx);
+    const port = Number(local.slice(idx + 1));
+    if (!Number.isInteger(port)) continue;
+    if (
+      host === "0.0.0.0" || host === "*" || host === "[::]" || host === "::"
+    ) {
+      ports.add(port);
+    }
+  }
+  return ports;
 }
 
 /** Creates the served layout and its sentinel files. */
@@ -253,13 +319,15 @@ export async function rollbackInstall(
 }
 
 /**
- * Proves the rendered config with `nginx -t` and reloads. The reload is
- * idempotent and always runs, so a retry after a prior reload failure picks up
- * the config even when this run changed nothing.
+ * Proves the rendered config with `nginx -t`, starts nginx when it is not yet
+ * running (or reloads it), then fails if a wildcard nginx listener appeared on
+ * a port this install did not configure.
  */
 export async function verifyAndReload(
   deps: SshDeps,
   target: SshTarget,
+  before: Set<number>,
+  allowed: number[],
 ): Promise<void> {
   const test = await execSudo(deps, target, ["nginx", "-t"]);
   if (test.exit_code !== 0) {
@@ -267,10 +335,22 @@ export async function verifyAndReload(
       `nginx -t failed on the rendered config: ${test.stderr.slice(0, 300)}`,
     );
   }
-  const reload = await execSudo(deps, target, [
+  const active = await execSudo(deps, target, [
     "systemctl",
-    "reload",
+    "is-active",
+    "--quiet",
     "nginx",
   ]);
-  if (reload.exit_code !== 0) throw new SshError("nginx reload failed");
+  const action = active.exit_code === 0 ? "reload" : "start";
+  const started = await execSudo(deps, target, ["systemctl", action, "nginx"]);
+  if (started.exit_code !== 0) throw new SshError(`nginx ${action} failed`);
+  const after = await nginxWildcardPorts(deps, target);
+  const offenders = [...after].filter((p) =>
+    !before.has(p) && !allowed.includes(p)
+  );
+  if (offenders.length > 0) {
+    throw new SshError(
+      `nginx listens on unexpected wildcard ports: ${offenders.join(", ")}`,
+    );
+  }
 }

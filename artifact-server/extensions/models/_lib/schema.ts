@@ -157,6 +157,15 @@ export const ConfigSchema = z.strictObject({
   config_sha256: z.string(),
   text: z.string(),
   url_base: z.string(),
+  removed_default_site: z.boolean().describe(
+    "Whether install removed /etc/nginx/sites-enabled/default.",
+  ),
+  default_site_target: z.string().nullable().describe(
+    "The default site's symlink target before removal, if any.",
+  ),
+  default_site_content: z.string().nullable().describe(
+    "The default site's file content before removal, if it was a file.",
+  ),
   rendered_at: z.string(),
 });
 
@@ -258,22 +267,35 @@ export const InstallArgs = RenderConfigArgs.extend({
   ),
 });
 
+/**
+ * The largest inline payload the model accepts. The bytes are held in memory
+ * by swamp before the method runs, so this is bounded well below the host's
+ * RAM; larger artifacts must use the host-side pinned `fetch` instead.
+ */
+export const MAX_INLINE_BYTES = 134217728;
+
+/** The upload argument. */
 export const UploadArgsSchema = z.strictObject({
   ...CommonArgs,
   filename: z.string().regex(FILENAME_RE).refine(
     (f) => f !== SHA256SUMS_FILE,
     "filename must not be SHA256SUMS",
   ).describe("Destination file name under sha256/<hex>/."),
-  content: z.string().max(536870912).meta({ sensitive: true }).nullish()
-    .describe("UTF-8 content. Wire a vault reference or data expression."),
-  content_base64: z.string().max(715827883).meta({ sensitive: true }).nullish()
-    .describe("Base64 content, for binary payloads."),
+  content: z.string().max(MAX_INLINE_BYTES).meta({ sensitive: true })
+    .nullish().describe(
+      "UTF-8 content, held in memory by swamp. Cap 128 MiB; larger artifacts must use fetch.",
+    ),
+  content_base64: z.string().max(178956971).meta({ sensitive: true }).nullish()
+    .describe(
+      "Base64 content, for binary payloads. Cap 128 MiB decoded; larger artifacts must use fetch.",
+    ),
   sha256: z.string().regex(SHA256_RE).nullish().describe(
     "Expected content hash; the run refuses when the computed hash differs.",
   ),
   ref: z.string().regex(REF_RE).nullish().describe("Optional ref to set."),
-  max_upload_bytes: z.number().int().min(1).max(536870912).default(67108864)
-    .describe("Reject content larger than this many bytes."),
+  max_upload_bytes: z.number().int().min(1).max(MAX_INLINE_BYTES).default(
+    67108864,
+  ).describe("Reject content larger than this many bytes; cap 128 MiB."),
 });
 
 export const FetchArgsSchema = z.strictObject({

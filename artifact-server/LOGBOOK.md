@@ -169,6 +169,21 @@ After the review rounds, one deliberate simplification pass:
 - `hashCmd` callers validate a 64-hex result; comments that restated code were
   removed; the install description matches the always-reload behaviour.
 
+## Live fixes (post-deploy)
+
+- Install no longer exposes the package default site: `policy-rc.d` (and a
+  best-effort systemd mask) block the service start during the package install,
+  the managed config is written after, and a post-start `ss` check fails the
+  install if nginx left a wildcard listener on a port we did not configure.
+- Inline `upload` is capped at 128 MiB (schema and run time); larger artifacts
+  must use the host-side pinned `fetch`, which never puts the bytes on the
+  control host.
+- `uninstall` restores the package default site that `install` removed, using
+  the snapshot recorded in the `config` resource.
+- `prune` removes an emptied hash directory and refuses a symlinked hash
+  directory with a clear error instead of silently skipping it.
+- A rolled-back install removes the served root when the model created it.
+
 ## Open spec questions resolved by the simplest safe option
 
 - **Listen port vs URL** — see decision 3.

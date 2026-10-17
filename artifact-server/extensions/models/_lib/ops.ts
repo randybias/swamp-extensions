@@ -104,7 +104,36 @@ export function removeObjectsScript(root: string, paths: string[]): string {
     `  [ -L "$d" ] && { echo "refusing symlinked $d" >&2; exit 3; }`,
     `done`,
     `rm -rf -- ${list}`,
+    `find "$r/${BLOB_DIR}" -mindepth 1 -maxdepth 1 -type d -empty -delete 2>/dev/null || true`,
   ].join("\n");
+}
+
+/**
+ * Refuses when a hash directory under `sha256/` is a symlink. The layout reader
+ * and the glob loops skip such entries, so without this a planted link would be
+ * quietly ignored rather than reported.
+ */
+export async function assertNoSymlinkedHashDirs(
+  deps: SshDeps,
+  target: SshTarget,
+  root: string,
+): Promise<void> {
+  const r = posixQuote(root);
+  const result = await runScript(
+    deps,
+    target,
+    `r=${r}\nfind "$r/${BLOB_DIR}" -mindepth 1 -maxdepth 1 -type l 2>/dev/null`,
+  );
+  const offenders = result.stdout.split("\n").map((l) => l.trim()).filter(
+    Boolean,
+  );
+  if (offenders.length > 0) {
+    throw new SshError(
+      `refusing to prune: symlinked hash directories present: ${
+        offenders.join(", ")
+      }`,
+    );
+  }
 }
 
 /** Returns whether a relative path is an accepted blob or bundle path. */

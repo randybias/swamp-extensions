@@ -10,6 +10,7 @@ import { observeServer } from "./artifacts.ts";
 import { LAYOUT_VERSION_FILE, urlBase } from "./layout.ts";
 import {
   HTPASSWD_PATH,
+  NGINX_DEFAULT_SITE,
   NGINX_ENABLED_PATH,
   NGINX_SITE_PATH,
   TLS_CERT_PATH,
@@ -30,12 +31,13 @@ import {
   captureInstallSnaps,
   ensureLayout,
   installNginx,
+  nginxWildcardPorts,
   rollbackInstall,
   verifyAndReload,
   writeCredentials,
   writeSite,
 } from "./install.ts";
-import { rootState } from "./snapshots.ts";
+import { type LinkSnap, restoreLink, rootState } from "./snapshots.ts";
 import { sha256Hex, SshError } from "./ssh.ts";
 import { instanceKey, toTarget, validateCommon } from "./target.ts";
 import { validateTls } from "./tls.ts";
@@ -59,6 +61,15 @@ export const lifecycleMethods: Record<string, ArtifactServerMethod> = {
         args.listen.port,
         args.tls.mode === "provided" ? "https" : "http",
       );
+      // Carry forward any default-site removal recorded by install, so a later
+      // render does not erase the snapshot uninstall needs.
+      const prior = await context.readResource?.(
+        `config-${instanceKey(args)}`,
+      ) as {
+        removed_default_site?: boolean;
+        default_site_target?: string | null;
+        default_site_content?: string | null;
+      } | null;
       const handle = await context.writeResource(
         "config",
         `config-${instanceKey(args)}`,
@@ -66,6 +77,9 @@ export const lifecycleMethods: Record<string, ArtifactServerMethod> = {
           config_sha256: configSha,
           text,
           url_base: base,
+          removed_default_site: prior?.removed_default_site ?? false,
+          default_site_target: prior?.default_site_target ?? null,
+          default_site_content: prior?.default_site_content ?? null,
           rendered_at: new Date(activeDeps.now()).toISOString(),
         }),
       );
@@ -78,7 +92,7 @@ export const lifecycleMethods: Record<string, ArtifactServerMethod> = {
   install: {
     kind: "action",
     description:
-      "DESTRUCTIVE. Install nginx, create the served layout, write the site config, htpasswd and TLS files, prove the config with nginx -t and reload. The reload is idempotent and always runs; any failure after the host is snapshotted rolls every change back and re-tests the restored config.",
+      "DESTRUCTIVE. Install nginx without starting the package default site, create the served layout, write the site config, htpasswd and TLS files, prove the config with nginx -t and reload. The reload is idempotent and always runs; any failure after the host is snapshotted rolls every change back and re-tests the restored config.",
     arguments: InstallArgs,
     execute: async (rawArgs: unknown, context: MethodContext) => {
       const args = InstallArgs.parse(rawArgs);
@@ -93,6 +107,8 @@ export const lifecycleMethods: Record<string, ArtifactServerMethod> = {
           `refusing to install into ${args.root}: it exists but holds no regular ${LAYOUT_VERSION_FILE} sentinel`,
         );
       }
+      const createdRoot = rootKind === "missing";
+      const listenersBefore = await nginxWildcardPorts(activeDeps, target);
       await installNginx(activeDeps, target);
       const snaps = await captureInstallSnaps(activeDeps, target, args);
       let text = "";
@@ -107,11 +123,22 @@ export const lifecycleMethods: Record<string, ArtifactServerMethod> = {
         changed = await writeCredentials(activeDeps, target, args);
         changed = (await writeSite(activeDeps, target, args, text, snaps)) ||
           changed;
-        await verifyAndReload(activeDeps, target);
+        await verifyAndReload(activeDeps, target, listenersBefore, [
+          args.listen.port,
+        ]);
       } catch (err) {
         // Any throw after the snapshots — nginx -t, a failed credential write,
         // a failed remove, a lost connection — rolls the host back.
         const failures = await rollbackInstall(activeDeps, target, snaps);
+        if (createdRoot) {
+          try {
+            await removeRoot(activeDeps, target, args.root);
+          } catch (rootErr) {
+            failures.push(
+              `root: ${rootErr instanceof Error ? rootErr.message : rootErr}`,
+            );
+          }
+        }
         const reason = err instanceof Error ? err.message : String(err);
         const rolled = failures.length
           ? ` with rollback errors (${failures.join("; ")})`
@@ -131,6 +158,10 @@ export const lifecycleMethods: Record<string, ArtifactServerMethod> = {
           config_sha256: configSha,
           text,
           url_base: base,
+          removed_default_site: args.disable_default_site &&
+            snaps.default !== null && snaps.default.state !== "missing",
+          default_site_target: snaps.default?.target ?? null,
+          default_site_content: snaps.default?.content ?? null,
           rendered_at: new Date(activeDeps.now()).toISOString(),
         }),
       );
@@ -169,7 +200,7 @@ export const lifecycleMethods: Record<string, ArtifactServerMethod> = {
   uninstall: {
     kind: "action",
     description:
-      "DESTRUCTIVE. Remove the site config, its TLS files and htpasswd, and reload nginx; with remove_data also remove the served root, but only when it is a real directory holding a .layout-version sentinel. A clean no-op when absent, and it never removes the nginx package.",
+      "DESTRUCTIVE. Remove the site config, its TLS files and htpasswd, restore the package default site if install removed it, and reload nginx; with remove_data also remove the served root, but only when it is a real directory holding a .layout-version sentinel. A clean no-op when absent, and it never removes the nginx package.",
     arguments: UninstallArgs,
     execute: async (rawArgs: unknown, context: MethodContext) => {
       const args = UninstallArgs.parse(rawArgs);
@@ -189,6 +220,41 @@ export const lifecycleMethods: Record<string, ArtifactServerMethod> = {
       );
       const credentialsPresent =
         credProbes.filter((p) => p.state !== "missing").length;
+
+      // Restore the default site install removed, if it recorded doing so.
+      const stored = await context.readResource?.(
+        `config-${instanceKey(args)}`,
+      ) as {
+        removed_default_site?: boolean;
+        default_site_target?: string | null;
+        default_site_content?: string | null;
+      } | null;
+      let defaultRestored = false;
+      if (stored?.removed_default_site) {
+        const snap: LinkSnap = stored.default_site_target != null
+          ? {
+            path: NGINX_DEFAULT_SITE,
+            state: "symlink",
+            target: stored.default_site_target,
+            content: null,
+          }
+          : stored.default_site_content != null
+          ? {
+            path: NGINX_DEFAULT_SITE,
+            state: "file",
+            target: null,
+            content: stored.default_site_content,
+          }
+          : {
+            path: NGINX_DEFAULT_SITE,
+            state: "missing",
+            target: null,
+            content: null,
+          };
+        await restoreLink(activeDeps, target, snap);
+        defaultRestored = true;
+      }
+
       if (present || credentialsPresent > 0) {
         const rm = await execSudo(activeDeps, target, [
           "rm",
@@ -200,15 +266,15 @@ export const lifecycleMethods: Record<string, ArtifactServerMethod> = {
         if (rm.exit_code !== 0) {
           throw new SshError("could not remove the site files");
         }
-        if (present) {
-          const reload = await execSudo(activeDeps, target, [
-            "systemctl",
-            "reload",
-            "nginx",
-          ]);
-          if (reload.exit_code !== 0) {
-            throw new SshError("nginx reload failed");
-          }
+      }
+      if (present || credentialsPresent > 0 || defaultRestored) {
+        const reload = await execSudo(activeDeps, target, [
+          "systemctl",
+          "reload",
+          "nginx",
+        ]);
+        if (reload.exit_code !== 0) {
+          throw new SshError("nginx reload failed");
         }
       }
       let dataRemoved = false;
@@ -232,6 +298,7 @@ export const lifecycleMethods: Record<string, ArtifactServerMethod> = {
         result: {
           removed: present,
           credentials_removed: credentialsPresent,
+          default_site_restored: defaultRestored,
           data_removed: dataRemoved,
         },
       };

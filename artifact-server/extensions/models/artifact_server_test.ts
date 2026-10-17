@@ -517,6 +517,7 @@ Deno.test("uninstall is a clean no-op when the site is absent", async () => {
   assertEquals(result.result, {
     removed: false,
     credentials_removed: 0,
+    default_site_restored: false,
     data_removed: false,
   });
 });
@@ -534,6 +535,7 @@ Deno.test("uninstall removes the site and, when asked, the data root", async () 
   assertEquals(result.result, {
     removed: true,
     credentials_removed: 0,
+    default_site_restored: false,
     data_removed: true,
   });
   assertEquals(host.files.has(NGINX_SITE_PATH), false);
@@ -542,4 +544,31 @@ Deno.test("uninstall removes the site and, when asked, the data root", async () 
     [...host.files.keys()].some((p) => p.startsWith(`${ROOT}/`)),
     false,
   );
+});
+
+Deno.test("upload caps inline content at 128 MiB", () => {
+  const args = createModel().methods.upload.arguments;
+  const withMax = (n: number) =>
+    base({ filename: "a", content: "x", max_upload_bytes: n });
+  assertEquals(args.safeParse(withMax(134217728)).success, true);
+  assertEquals(args.safeParse(withMax(134217729)).success, false);
+});
+
+Deno.test("upload refuses content over max_upload_bytes at run time", async () => {
+  const host = makeFakeRemote();
+  const { m, context } = modelFor(host);
+  await assertRejects(
+    () =>
+      m.methods.upload.execute(
+        base({ filename: "a", content: "0123456789", max_upload_bytes: 9 }),
+        context,
+      ),
+    Error,
+    "over max_upload_bytes",
+  );
+  const ok = await m.methods.upload.execute(
+    base({ filename: "a", content: "0123456789", max_upload_bytes: 10 }),
+    context,
+  );
+  assertEquals((ok.result as { sha256: string }).sha256.length, 64);
 });

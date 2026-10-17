@@ -54,6 +54,10 @@ export interface FakeRemote {
   readFails: Set<string>;
   /** Forces a non-zero exit for any matching argv. */
   failArgv: (argv: string[]) => boolean;
+  /** Output of `ss -ltnp`, for the listener assertion. */
+  ssOutput: string;
+  /** `ss` output to adopt once nginx (re)starts. */
+  ssOutputAfter: string;
   /** Supplies a body for a fetched URL, or null for a 404. */
   curl: (url: string) => string | null;
   /** Certificate `notBefore` line returned by the fake openssl. */
@@ -136,6 +140,8 @@ export function makeFakeRemote(): FakeRemote {
     failNginxTest: false,
     readFails: new Set<string>(),
     failArgv: () => false,
+    ssOutput: "",
+    ssOutputAfter: "",
     curl: () => null,
     certNotBefore: "notBefore=Jan  1 00:00:00 2020 GMT",
     certNotAfter: "notAfter=Jan  1 00:00:00 2100 GMT",
@@ -217,13 +223,17 @@ async function handle(
     if (host.failArgv(argv)) {
       return { code: 1, stdout: "", stderr: "forced failure" };
     }
+    if (argv[0] === "ss") return ok(host.ssOutput);
     if (argv[0] === "nginx" && argv[1] === "-t") {
       return host.failNginxTest
         ? { code: 1, stdout: "", stderr: "nginx: configuration test failed" }
         : ok("nginx: configuration test is successful\n");
     }
-    if (argv[0] === "systemctl" && argv[1] === "reload") {
+    if (
+      argv[0] === "systemctl" && (argv[1] === "reload" || argv[1] === "start")
+    ) {
       host.nginxActive = "active";
+      host.ssOutput = host.ssOutputAfter;
       return ok();
     }
     if (argv[0] === "install" && argv[1] === "-o") {
@@ -411,6 +421,14 @@ async function handle(
     return ok(host.symlinkTarget.get(p) ?? "");
   }
   if (/^if \[ -L /.test(script)) return ok();
+  if (/maxdepth 1 -type l/.test(script)) {
+    const r = assign(script, "r")!;
+    const prefix = `${r}/sha256/`;
+    const links = [...host.symlinks].filter((p) =>
+      p.startsWith(prefix) && !p.slice(prefix.length).includes("/")
+    );
+    return ok(links.length ? `${links.join("\n")}\n` : "");
+  }
   if (/^mkdir -p /.test(script)) {
     host.dirs.add(script.replace(/^mkdir -p '?/, "").replace(/'$/, ""));
     return ok();

@@ -45,6 +45,14 @@ Read-only methods persist their observation as a resource (`config`, `server`,
 `listing`, `verification`, `prune_plan`). Mutating methods that store an object
 persist an `artifact` resource.
 
+### Inline upload size
+
+`upload` carries bytes through swamp, which holds the payload in memory before
+the method runs. Its cap is therefore **128 MiB** (`max_upload_bytes`, default
+64 MiB); a larger value is refused by the schema. Artifacts larger than that
+must use the host-side pinned **`fetch`**, which downloads on the target and
+never puts the bytes on the control host.
+
 ## Safety
 
 Every destructive method enforces its own preconditions in the method, so a
@@ -54,25 +62,34 @@ workflow resume with overridden inputs cannot skip a gate:
   directory. `install` refuses a populated root that holds no regular
   `.layout-version` sentinel, and `uninstall` only removes a root that is a real
   directory holding that sentinel.
+- `install` never lets the package default site come up: it blocks service
+  starts (`policy-rc.d` and a systemd mask) while the package is installed, and
+  only then writes the managed config and the enabled link. After starting or
+  reloading it checks with `ss` that nginx added no wildcard listener on a port
+  the install did not configure.
 - `install` snapshots the site file, the enabled link, the default site, the TLS
-  files and the htpasswd before it changes anything. A failed `nginx -t`
-  restores all of them, removes a first-install enabled link, and never reloads;
-  it then re-runs `nginx -t` to prove the restored config is clean.
+  files and the htpasswd before it changes anything. Any failure after the
+  snapshots restores all of them, removes a first-install enabled link and a
+  root the model created, checks every restore exit code, and re-runs `nginx -t`
+  to prove the restored config is clean before reporting.
 - The generated config disables autoindex and symlink following and denies
   dotfiles at the root and inside `sha256/` and `bundles/`, so in-flight upload
   temp files are never served.
 - Object paths read back from the host must match `sha256/<64-hex>/<name>` or
   `bundles/<64-hex>`; anything else is ignored. `prune` refuses to run when
   `sha256/`, `bundles/` or a hash directory is a symlink, so a planted link
-  cannot redirect `rm` outside the root.
-- `upload` refuses when the computed hash differs from a supplied `sha256`.
+  cannot redirect `rm` outside the root, and it removes a hash directory once
+  its last blob is gone.
+- `upload` refuses when the computed hash differs from a supplied `sha256`, and
+  caps inline content at 128 MiB; larger artifacts use `fetch`.
 - `fetch` is idempotent (a present object is not downloaded again), stays on
   `https` across at most five redirects, is size-bounded, and keeps the download
   in a hidden temp file until the host-side hash matches the pin.
 - `prune` recomputes the plan and refuses when it differs from `plan_sha256`; a
   change since planning deletes nothing.
 - `uninstall` is a clean no-op when the site is absent, removes the site's TLS
-  files and htpasswd, and never removes the nginx package.
+  files and htpasswd, restores the default site `install` removed, and never
+  removes the nginx package.
 
 `SHA256SUMS` is rebuilt under an exclusive `flock` from the blob paths present
 and renamed into place: each line records the content address in the path, not a

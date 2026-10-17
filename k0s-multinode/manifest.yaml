@@ -1,0 +1,11 @@
+manifestVersion: 1
+name: "@randybias/k0s-multinode"
+version: "2026.10.17.1"
+description: "Plan and operate a multi-node k0s cluster over SSH in the k0sctl style: short-lived join tokens, ordered controller and worker joins, drain and detach before reset, and safe rolling upgrades. Per-node work is delegated to @randybias/k0s-cluster, and this model needs no kubeconfig."
+license: Apache-2.0
+repository: https://github.com/randybias/swamp-extensions
+platforms: [darwin-aarch64, darwin-x86_64, linux-x86_64, linux-aarch64]
+labels: [k0s, kubernetes, multinode, ha, etcd, join-token, orchestration]
+additionalFiles: [README.md, LICENSE.txt]
+models:
+  - k0s_multinode.ts

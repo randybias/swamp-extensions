@@ -1,0 +1,88 @@
+{
+  "extension": "@randybias/syncthing-peer",
+  "version": "2026.10.17.1",
+  "reviewedAt": "2026-10-17T15:07:47Z",
+  "dimensions": [
+    {
+      "id": "credentials-secrets",
+      "verdict": "pass",
+      "note": "api_key (and private_key for the ssh transport) is sensitive-marked and travels only in the X-API-Key header: locally via fetch, remotely inside a curl config uploaded over the canonical _lib/ssh.ts stdin into a verified 0700 per-user cache directory and removed by a trap in the same remote shell (curl -q, proto =http,https). State and logs hold node, normalized api_url, ids, labels and counts, never the key. Live cell 10: ps sampled every 50 ms on the control host and both nodes found 0 hits for the keys, their substrings or SHA-256 (positive control hit); cache directories empty afterwards. Residual LOW (astra): remote curl stderr enters errors as its last line capped at 200 characters; curl does not echo header values there."
+    },
+    {
+      "id": "logging-quality",
+      "verdict": "pass",
+      "note": "Each method logs once with structured placeholders (node, device, folder, changed); no key, header, argv or response body in log fields."
+    },
+    {
+      "id": "error-handling",
+      "verdict": "pass",
+      "note": "Non-2xx responses raise a typed SyncthingError carrying the status; 401/403 now say the API key was rejected (merge-prep message fix for the live cell 7 note). sync records unreachable only for a connect, DNS or timeout failure (ssh connect failure, curl exit 6/7/28, a classified fetch TypeError) and rethrows auth, TLS, 3xx, 5xx and code errors (live cells 7, 8, 9). Every OpenSSH exit 255 is a typed SshError; a host-key mismatch refuses to connect."
+    },
+    {
+      "id": "testing-completeness",
+      "verdict": "pass",
+      "note": "65 unit tests (model, REST client and the vendored transport) with injected fetch and ssh runners and a plain-object method context. Live end to end on two VPS nodes with Syncthing 1.27.2: 10/10 applicable cells on 3f038b4, including a real file sync between the nodes, PATCH preserving unmanaged fields, a stopped and a stalled API, a wrong key, a host-key mismatch and an argv scan."
+    },
+    {
+      "id": "idempotency-resilience",
+      "verdict": "pass",
+      "note": "ensure_device and ensure_folder read first, create with PUT and update with PATCH only on a declared-field difference, so unmanaged fields survive (live cell 4); repeats report changed false. remove_* is a no-op when absent, treats a DELETE 404 as already gone and confirms absence by re-reading. Requests are bounded by timeout_s (AbortSignal.timeout; curl max-time and connect-timeout)."
+    },
+    {
+      "id": "api-contracts",
+      "verdict": "pass",
+      "note": "Syncthing REST /rest/system/status and /rest/config/{devices,folders}, live-verified against syncthing 1.27.2. The ssh transport needs curl on the node; the API is reached at a loopback or HTTPS origin only."
+    },
+    {
+      "id": "resource-management",
+      "verdict": "pass",
+      "note": "The remote curl config lives only in a 0700 directory, is swept before each upload and removed by a trap in the shell that runs curl (live: 0 leftovers). Local temp files of the vendored transport are removed in finally; remote output is capped by the transport."
+    },
+    {
+      "id": "published-surface-hygiene",
+      "verdict": "pass",
+      "note": "Manifest @randybias/syncthing-peer 2026.10.17.1 (model version literal matches), two-sentence description, Apache-2.0, additionalFiles README.md and LICENSE.txt. Fixtures use RFC 5737 addresses and synthetic keys; leak scan, gitleaks and fixture guard pass. Merge prep: plain model export so the registry catalogs the type. Residual LOW: no docs/specs spec for this extension."
+    },
+    {
+      "id": "schema-strictness",
+      "verdict": "pass",
+      "note": "Global arguments are an empty strictObject; method arguments are strict. api_url must be an origin (no userinfo, path, query or fragment; plain HTTP only on loopback) and is normalized before keying; device ids, folder ids (no . or ..), device addresses (dynamic or tcp/quic/relay host:port) and names/labels (printable-ASCII allowlist) carry grammars; api_key 8-128, timeout_s 1-600. Live cell 6: folder_id .. refused with no connection made."
+    },
+    {
+      "id": "lifetime-gc",
+      "verdict": "pass",
+      "note": "node, device and folder resources: lifetime infinite, garbageCollection 10."
+    },
+    {
+      "id": "crud-completeness",
+      "verdict": "pass",
+      "note": "get/sync (read), ensure_device/ensure_folder (create/update) and remove_device/remove_folder (delete) cover devices and folders on one node."
+    },
+    {
+      "id": "preflight-checks",
+      "verdict": "pass",
+      "note": "api_url, ids, addresses, labels and host-key policy are validated before any request or ssh spawn; the remote config directory is verified (owner, not a symlink, mode 700) before upload."
+    },
+    {
+      "id": "instance-names",
+      "verdict": "pass",
+      "note": "syncthing-<32 hex>: SHA-256 over node label and normalized api_url, truncated to 128 bits; device and folder records append a length-prefixed id, so equivalent URLs share one record and ids cannot collide."
+    },
+    {
+      "id": "data-access",
+      "verdict": "pass",
+      "note": "Methods read only this model's own records; every node, device and folder arrives as method arguments, so one definition serves any node."
+    },
+    {
+      "id": "version-upgrades",
+      "verdict": "pass",
+      "note": "First release. The vendored _lib/ssh.ts is the canonical blob fe0139f08c42e3fdae0061b9688fb5c534174957 (ssh-host 2026.10.17.2)."
+    }
+  ],
+  "panel": {
+    "codex-astra": "codex gpt-6-astra conformance seat, rounds on 7ecc8c8 and 863cdf3 routed, 9f46ceb CLEAN (0 Critical/High). Its round-3 Mediums (unbounded requests, TypeError-as-unreachable, label denylist, raw curl stderr) were fixed in the 3f038b4 polish; LOW tightness notes (per-request config upload, duplicated get/sync handling) left as design.",
+    "codex-terra": "codex gpt-5.6-terra adversarial seat, 9f46ceb: no credential leak or command injection; Mediums (DELETE 404 under a concurrent delete, trailing-slash api_url duplicating state) fixed in 3f038b4.",
+    "merge-prep": "Merged 3f038b4 as 4bd7c96; diff scope syncthing-peer/ plus its release.yaml stanza; _lib/ssh.ts blob verified canonical. 3f038b4 polish self-reviewed against TRIAGE 4b-4h: no Critical/High. Code changes at merge prep: 401/403 error wording and a plain model export (no behaviour change, 65 tests pass).",
+    "ocr-llm": "OCR sonnet5 and glm seats were not run"
+  }
+}

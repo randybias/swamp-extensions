@@ -1,19 +1,99 @@
 # LOGBOOK — @randybias/server-host
 
+visibility: public audience: general
+
+Naming answers (from the spec): Q1 public. Q2 general usage, anyone hardening a
+freshly provisioned Linux host. Q3 no: "server" and "host" are both banned nouns
+and no system is named; the naming audit proposes `linux-host-hardening`,
+pending confirmation, so the published name stays `server-host`. Q4 not
+applicable (public and general). Q5 no: a stranger cannot tell from the name
+what it does to a host.
+
 Maintainer notes. Not shipped; not listed in `additionalFiles`.
 
 ## Provenance
 
 - Net-new extension (`server-host/`). No upstream extension was generic for
   this; the closest existing package is site-specific.
-- The SSH transport in `extensions/models/_lib/ssh.ts` and its test are vendored
-  byte-identical from the reviewed `@randybias/ssh-host` transport (source
-  commit `2a9e2207f50e6d81b40b03bc5127e211a9f32714`, sha256
-  `0b75423d6bb34547db43863c483de8c267efad5b675e7076ceb8e56706263e29`). The lead
-  re-vendors the final reviewed copy; this extension imports only its public API
-  (`exec`, `upload`, `withSession`, `SshDeps`, `Target`, `SshError`).
-- Everything else is new. All remote exec and upload goes through the vendored
-  transport; no `Deno.Command` appears outside it.
+- The SSH transport in `extensions/models/_lib/ssh.ts` and its test are
+  byte-identical to the canonical `@randybias/ssh-host` copy (see "##
+  Vendored"); this extension imports its public API (`exec`, `SshDeps`,
+  `SshTarget`, `SshError`) and nothing else.
+- Everything else is new. All remote exec goes through the vendored transport;
+  no `Deno.Command` appears outside it.
+
+## Vendored
+
+| File                                                  | Blob                                       |
+| ----------------------------------------------------- | ------------------------------------------ |
+| `extensions/models/_lib/ssh.ts`                       | `8f132c4329c9e64bed686731cd5a0e02980194ea` |
+| `extensions/models/_lib/ssh_test.ts`                  | `4e8ac15fcd6bce797c523a221fe58fe9a8d9b386` |
+| `extensions/models/_lib/bogworks/recording-runner.ts` | `943857c8b6dbbc365523ee0cfafd1b0fe0c0054f` |
+| `extensions/models/_lib/bogworks/remote-script.ts`    | `fd692dfb897fadc2c3dfcbae68d11d470e2f303b` |
+| `extensions/models/_lib/bogworks/containers.ts`       | `53ebb3ab561dc6afdb9b0043522ef96015377d12` |
+| `extensions/models/_lib/bogworks/mod.ts`              | `9ae3ee762fa3f912db2bea8230c9a9b31bd6ee99` |
+
+The harness is excluded from `deno fmt` and `deno lint` (`deno.json`) so the
+copies stay byte-identical; `bogworks-harness-version` records the blobs.
+
+## Decisions
+
+- 2026-10-17 harness-gap: the lane seed names `testing/harness/`, the harness
+  README and `vendor.sh` name `extensions/models/_lib/bogworks/`. The latter is
+  used, because `remote-script.ts` is production code (the quoting helper, the
+  prologue, the remote timeout) and must sit inside the packaged tree.
+- 2026-10-17 harness-gap: `recording-runner.ts` recognises a stdin script only
+  behind a bare `sh -s`, not behind `sudo -n sh -s`. `_lib/test_support.ts`
+  mirrors every sudo-wrapped call to a second recording runner without the
+  `sudo -n`, so the scripts still reach `BOGWORKS_CAPTURE_SCRIPTS`.
+- 2026-10-17 Every remote call is one `RemoteCall` (`_lib/remote.ts`): the
+  script is streamed over the SSH session's stdin to `sh -s` (behind `sudo -n`
+  when asked), caller values are `set --` positional parameters quoted by
+  `posixQuote`, and file content is base64 text read through `bw_data`. Nothing
+  but `sh -s` is on the remote command line.
+- 2026-10-17 Remote deadlines: each call runs under `timeout -k 5 <sec>` inside
+  the surviving outer shell (30 s apply, 60 s arm/cancel/listing, 120 s base
+  steps, 900 s package installs); the local ssh deadline is 25 s later. An exit
+  of 124 or 137 is an unknown outcome: the plan throws, and a deadline on the
+  apply step leaves the revert armed and the record open (never disarmed).
+- 2026-10-17 Locks are bounded: arm and cancel wait 20 s, the guarded apply 10
+  s, then exit 75 (reported as "earlier revert still active or firing"). The
+  on-host restore script waits 120 s and then restores anyway, because every
+  other holder is bounded below that.
+- 2026-10-17 Config files the tool owns (sysctl and journald drop-ins, the
+  revert script, `authorized_keys`) are still written through a same-directory
+  `mktemp` file and an atomic `mv`, removed by the EXIT trap. They carry no
+  secret (public keys and fixed settings); the SSH key itself never touches the
+  host. This is the one place a remote file is created besides the files the
+  tool installs.
+- 2026-10-17 revoke: sudo is taken back before the keys file, and a lookup that
+  answers "no such account" (getent exit 2) counts as gone only when `id` and
+  the local passwd file agree and `nsswitch.conf` lists no network source for
+  passwd; otherwise the step fails (exit 1) and the account stays pending.
+- 2026-10-17 widening guard: any source-limited rule in the live managed input
+  chain counts as management-only SSH, whatever port it names, so changing
+  `ssh_port` cannot bypass it.
+- 2026-10-17 forget: checks the revert record's identity too, and a repeat on an
+  already-empty record writes nothing and reports `changed: false`.
+- 2026-10-17 registry-lint MEDIUM accepted: the model literal spreads
+  `createModel()` with literal `type` and `version` repeated, the repo
+  convention; the spec requires the factory with overridable dependencies.
+- 2026-10-17 Goldens moved from `fixtures/` to `goldens/` (the extension's own
+  output, validated by the real-tool gate); `nft-real-listings.json` keeps a
+  `.source` sidecar.
+
+## Residuals
+
+| Sev    | What                                                                                              | Why accepted                                                                                 |
+| ------ | ------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------- |
+| Medium | A revert records the identity only when one was given; records written before 17.3 carry none     | Identity stays optional; adopting an unstamped record is the documented first-run path       |
+| Low    | The on-host restore judges success by `nft -f` (one atomic transaction), with no post-state retry | A failed restore leaves the snapshot and the unit failed; the LOGBOOK recovery below applies |
+| Low    | An account that is gone from a host with a network passwd source stays pending                    | Fail closed; a rerun once the backend answers completes it                                   |
+
+Recovery after a failed restore: the snapshot is
+`/var/lib/server-host/revert-<token>.nft` and the script `revert-<token>.sh`;
+run the script by hand as root, or `nft delete table inet
+server_host`.
 
 ## Design decisions
 
@@ -138,6 +218,31 @@ observation resource.
 Untested live: a failing `gpasswd`, a failing `id -nG` and a failing account
 lookup on the revoke path (covered only by tests under `sh` with failing stubs).
 Not stable until those are exercised or ruled out.
+
+## Live matrix 2026.10.17.4
+
+Filled by the live lane. Result is `pass`, `fail`, `untested` or `inconclusive`;
+only `pass` counts.
+
+| method_or_workflow | scenario     | result   | run_id | test_cell | content_hash_proved | note                                                       |
+| ------------------ | ------------ | -------- | ------ | --------- | ------------------- | ---------------------------------------------------------- |
+| apply_base         | fresh        | untested |        |           |                     | packages, admin user, keys, sysctl, journald, time         |
+| apply_base         | rerun        | untested |        |           |                     | no remote command on an unchanged rerun                    |
+| apply_base         | existing     | untested |        |           |                     | admin_user change revokes the previous account, sudo first |
+| apply_base         | bad-input    | untested |        |           |                     | injection literal in package, user, key                    |
+| render_firewall    | fresh        | untested |        |           |                     | matches the golden for the live inputs                     |
+| apply_firewall     | fresh        | untested |        |           |                     | ruleset active, revert armed, scripts on stdin only        |
+| apply_firewall     | rerun        | untested |        |           |                     | identical live ruleset is a no-op                          |
+| apply_firewall     | failure-path | untested |        |           |                     | revert fires with no commit; original ruleset back         |
+| apply_firewall     | existing     | untested |        |           |                     | ssh_port change cannot widen a management-only rule        |
+| commit             | fresh        | untested |        |           |                     | timer cancelled, ruleset persists                          |
+| commit             | failure-path | untested |        |           |                     | after expiry: clean error                                  |
+| lockdown           | fresh        | untested |        |           |                     | SSH reachable only from the management CIDR                |
+| lockdown           | failure-path | untested |        |           |                     | no commit: public SSH restored automatically               |
+| get                | fresh        | untested |        |           |                     | reflects the real host                                     |
+| sync               | existing     | untested |        |           |                     | drift after a fired revert                                 |
+| forget             | existing     | untested |        |           |                     | identity-mismatch refusal (never run live)                 |
+| forget             | rerun        | untested |        |           |                     | second forget writes nothing                               |
 
 ## Review findings
 
@@ -513,7 +618,12 @@ Residuals on 2026.10.17.3 (beta):
 - Records written before 17.3 (no identity) are adopted silently and stamped.
 - Widening guard: a deliberate `ssh_port` change can bypass the management-only
   to open check.
-- `_lib/ssh.ts` is not the canonical transport (see 7860bb0); convergence debt.
+- `_lib/ssh.ts` is not the canonical transport (see 7860bb0); convergence debt
+  (closed in 2026.10.17.4).
+
+## Factory events
+
+Filled at merge from the conductor's events.
 
 ## Prior art
 

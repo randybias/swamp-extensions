@@ -273,3 +273,14 @@ this environment.
   libvirt-common + libvirt-clients 9.0 script); all renders validate.
   `virsh define --validate` is not used: it needs a connection whose driver
   accepts `type='kvm'`.
+
+## Escalation residuals (after CLEAN review of 28ccf18)
+
+- `undefine_domain` destroys whenever the state is not off (`isOffState`), so
+  `in shutdown` and `dying` domains are destroyed before undefine. Test.
+- `undefine_domain remove_volumes` refuses, before any destroy/detach/undefine,
+  when the record's uuid is missing or differs from `dominfo`. Test (other uuid
+  and no uuid).
+- README documents exactly which disks are deleted vs kept per
+  `remove_attached_media`, including that a pool-managed CD-ROM is detached and
+  kept when it is false.

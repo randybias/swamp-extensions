@@ -132,6 +132,7 @@ function domState(name: string, rootDisk: string) {
       target: TARGET,
       name,
       present: true,
+      uuid: "uuid-a",
       root_disk: rootDisk,
       observed_at: "2026-10-17T00:00:00.000Z",
     },
@@ -1769,4 +1770,75 @@ Deno.test("schema: console timeout_s has a 5 s floor", () => {
     m.methods.console.arguments.safeParse({ ...base, timeout_s: 5 }).success,
     true,
   );
+});
+
+Deno.test("undefine_domain destroys a domain in shutdown or dying before undefining", async () => {
+  for (const live of ["in shutdown", "dying"]) {
+    const f = fakeLibvirt(seq([
+      [
+        "'dominfo'",
+        () => ({
+          code: 0,
+          stdout: `Name: node-a\nUUID: uuid-a\nState: ${live}\n`,
+        }),
+      ],
+      ["'domblklist'", () => ({
+        code: 0,
+        stdout: BLK_HEADER + " file   disk     vda      /p/root.qcow2\n",
+      })],
+    ]));
+    await modelWith(f).methods.undefine_domain.execute(
+      modelWith(f).methods.undefine_domain.arguments.parse({
+        ...SSH,
+        uri: URI,
+        name: "node-a",
+        remove_volumes: true,
+      }),
+      createModelTestContext({
+        globalArgs: {},
+        storedResources: domState("node-a", "/p/root.qcow2"),
+      }).context,
+    );
+    const destroyAt = f.commands.findIndex((c) => c.includes("'destroy'"));
+    const undefineAt = f.commands.findIndex((c) => c.includes("'undefine'"));
+    assertEquals(destroyAt >= 0, true, live);
+    assertEquals(destroyAt < undefineAt, true, live);
+  }
+});
+
+Deno.test("undefine_domain refuses remove_volumes when the recorded uuid differs", async () => {
+  const key = instanceName("dom", SSH, "node-a");
+  for (
+    const uuid of ["uuid-other", undefined]
+  ) {
+    const f = statefulDomain(" file   disk     vda      /p/root.qcow2\n", {
+      exists: true,
+      running: true,
+    });
+    const record: Record<string, unknown> = {
+      ...domState("node-a", "/p/root.qcow2")[key],
+    };
+    if (uuid === undefined) delete record.uuid;
+    else record.uuid = uuid;
+    await assertRejects(
+      () =>
+        modelWith(f).methods.undefine_domain.execute(
+          modelWith(f).methods.undefine_domain.arguments.parse({
+            ...SSH,
+            uri: URI,
+            name: "node-a",
+            remove_volumes: true,
+          }),
+          createModelTestContext({
+            globalArgs: {},
+            storedResources: { [key]: record },
+          }).context,
+        ),
+      Error,
+      "recorded uuid",
+    );
+    assertEquals(has(f, "'destroy'"), false);
+    assertEquals(has(f, "'detach-disk'"), false);
+    assertEquals(has(f, "'undefine'"), false);
+  }
 });

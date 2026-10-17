@@ -1356,6 +1356,17 @@ export function createModel(overrides: Partial<LibvirtDeps> = {}) {
                 `refusing to remove volumes for ${args.name}: no recorded root disk; run define_domain first`,
               );
             }
+            // The record must describe this very domain: a same-named domain
+            // redefined out of band has another uuid, and its disks are not
+            // the ones define_domain recorded.
+            const liveUuid = info["uuid"] ?? "";
+            if (!recorded?.uuid || recorded.uuid !== liveUuid) {
+              throw new LibvirtError(
+                `refusing to remove volumes for ${args.name}: the recorded uuid ${
+                  JSON.stringify(recorded?.uuid ?? "")
+                } does not match the live domain ${JSON.stringify(liveUuid)}`,
+              );
+            }
             const blk = await virsh(deps, t, args.uri, [
               "domblklist",
               args.name,
@@ -1395,8 +1406,9 @@ export function createModel(overrides: Partial<LibvirtDeps> = {}) {
               detachTargets.push(entry.target);
             }
           }
-          const state = domainState(info);
-          if (isRunningState(state) || isPausedState(state)) {
+          // Destroy anything not fully off (running, paused, "in shutdown",
+          // "dying"), so undefine always acts on the persistent XML.
+          if (!isOffState(domainState(info))) {
             const destroy = await virshTry(deps, t, args.uri, [
               "destroy",
               args.name,

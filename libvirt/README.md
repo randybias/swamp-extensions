@@ -60,13 +60,30 @@ that boots from another disk keeps its earlier record instead. `power` refreshes
 the record and carries `root_disk` forward (unless the domain's uuid changed),
 so `undefine_domain remove_volumes=true` after `power shutdown` still finds it.
 
-`undefine_domain remove_volumes=true` keeps only the recorded root attached,
-detaches every other disk from the persistent config, then runs
-`undefine --remove-all-storage`, so only the root clone is deleted. With
-`remove_attached_media=true` it also keeps read-only media attached (a CD-ROM, a
-floppy, or a disk marked `<readonly/>`) so it is deleted too; data disks are
-still detached and kept. Every refusal (no recorded root, or none attached)
-happens before a running domain is destroyed.
+`undefine_domain` destroys the domain whenever it is not fully off (running,
+paused, `in shutdown`, `dying`), so the undefine always acts on the persistent
+XML. With `remove_volumes=true` it first checks that the `domain_state` record's
+uuid equals the live domain's uuid and that the recorded root is attached in the
+persistent config, then detaches disks and runs `undefine --remove-all-storage`.
+Every refusal happens before anything is destroyed, detached or deleted.
+
+Exactly what is deleted versus kept:
+
+| Disk                                                   | `remove_attached_media=false` | `remove_attached_media=true` |
+| ------------------------------------------------------ | ----------------------------- | ---------------------------- |
+| Recorded root (`root_disk`)                            | deleted                       | deleted                      |
+| CD-ROM or floppy with a source (seed ISO, install ISO) | detached, kept                | deleted                      |
+| Disk marked `<readonly/>` (file source)                | detached, kept                | deleted                      |
+| Any other disk (data disk, shared image)               | detached, kept                | detached, kept               |
+| Empty CD-ROM/floppy (no source)                        | nothing to delete             | nothing to delete            |
+
+"Deleted" means left attached for `--remove-all-storage`, which only deletes a
+path that libvirt manages as a storage-pool volume. So with
+`remove_attached_media=false`, a CD-ROM is never deleted, even when its source
+is a pool-managed volume, because it is detached first. A root or medium whose
+path is not in any pool is reported by virsh as "not managed by libvirt" and is
+left on disk. A read-only disk with a block-device (`dev=`) source is not
+recognised as media and is always detached and kept.
 
 ## Idempotency and safety
 

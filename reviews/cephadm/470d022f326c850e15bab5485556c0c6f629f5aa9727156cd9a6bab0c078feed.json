@@ -1,0 +1,91 @@
+{
+  "extension": "@randybias/cephadm",
+  "version": "2026.10.17.2",
+  "reviewedAt": "2026-10-17T15:40:00Z",
+  "dimensions": [
+    {
+      "id": "credentials-secrets",
+      "verdict": "pass",
+      "note": "The SSH private key is sensitive-marked on the string and its nullish wrapper and reaches ssh through a key file, never argv; the S3 accessKey/secretKey are sensitive and used only to sign SigV4 (no URL, header or signature reaches a record, log or error); RGW user keys and CSI client keys are generated or read into sensitive, vaulted resource fields (the user record's accessKey is sensitive-marked beside key). Known external issue swamp-club lab 3555: README examples pass secrets as vault references only and never show --json. 2026.10.17.2: an inline privateKey gets a fresh random per-key nonce in a process map for its ControlMaster socket name, so different keys never share a master and no key bytes or key hash reach argv. Residual MEDIUM: that map keeps every distinct inline key in memory for the process lifetime."
+    },
+    {
+      "id": "logging-quality",
+      "verdict": "pass",
+      "note": "Methods log structured, value-free summaries (host, method, verdict); remote stderr and S3 transport detail are URL-stripped and truncated before they reach logs or errors."
+    },
+    {
+      "id": "error-handling",
+      "verdict": "pass",
+      "note": "Failures are typed (validate, transport, unverifiable, protected, object-leak-*, policy rollback) with bounded detail; SSH exit 255 is a typed transport error; indeterminate S3 writes are re-read and rolled back, and RESTORED is reported only after a canonical read-back. cephDeleteFs fails closed unless the reported client count is a non-negative integer; cephRemoveOsds refuses unless health is HEALTH_OK or HEALTH_WARN."
+    },
+    {
+      "id": "testing-completeness",
+      "verdict": "pass",
+      "note": "537 unit/contract tests with scripted SSH sessions and an injected fetch (no socket), including the wipe guard's refusal matrix (guard r9 signed off, 35/35 reviewer probes), SigV4 known-answer tests, workflow catalog tests (direct succeeded-only edges from every mutation to its approval, pre-gate and post-approval re-gate; deleting a re-gate edge fails the test) and plain-object method contexts. Live: wipeDiskToRaw on a bare-metal host, 7/7 at b2b99c6 (the guard and wipe code shipped here), after a 5/6 run at a05a5b8 whose alreadyRaw finding was fixed in ecce7c6; test disks were RAM-backed scsi_debug disks and the OS disks dry-run only. The catalog workflows ran only in scratch repos against a fake cluster. Every cluster cell stays BLOCKED (needs three or more hosts with free whole disks), which is why the channel is beta. Residual LOWs: L-9a guard test gaps (mutants R8, R9 caught only by reviewer probes), the joint ok-to-stop rejection test, the wipe dry-run no-write matcher."
+    },
+    {
+      "id": "idempotency-resilience",
+      "verdict": "pass",
+      "note": "Every ensure/apply method reads first and converges or does nothing (bootstrap no-ops on an existing cluster, placement converges to an explicit list keeping quorum, pools/fs/users adopt); delete paths are double-confirmed and re-runs are clean no-ops; maintenance enter/exit prove their effect. Residual LOW: probe-cleanup fallback after an unreadable version listing reports success after a plain DELETE. wipeDiskToRaw reports alreadyRaw only for a zero sector 0 with no table signature and an empty wipefs; otherwise it wipes and zeroes sector 0."
+    },
+    {
+      "id": "api-contracts",
+      "verdict": "pass",
+      "note": "Public cephadm/ceph CLI over SSH (pinned cephadm binary from a caller-supplied URL), Ceph RGW admin via radosgw-admin, and the RGW S3 API with SigV4; PutObjectAcl (not a second PutObject) for the leak probe; versioning is the three-state model."
+    },
+    {
+      "id": "resource-management",
+      "verdict": "pass",
+      "note": "SSH sessions are closed per call (optional multiplexing is opt-in); remote temp files are removed in finally paths; S3 responses are capped at 1 MiB; every wait is bounded."
+    },
+    {
+      "id": "published-surface-hygiene",
+      "verdict": "pass",
+      "note": "Manifest @randybias/cephadm, two-sentence description, Apache-2.0, additionalFiles README.md and LICENSE.txt (LOGBOOK not packaged). Destructive methods lead with DESTRUCTIVE., read-only with READ-ONLY.; README method table regenerated from source (50 methods, 22 workflows). Fixtures are synthetic (RFC 5737, example.com/.test); leak scan, gitleaks and fixture guard pass. Clean-room provenance is logged in docs/CLEANROOM.md."
+    },
+    {
+      "id": "schema-strictness",
+      "verdict": "pass",
+      "note": "Global arguments are an empty strictObject; every method argument object is strict with grammars and bounds for hosts, devices, pool/fs/user/bucket names and URLs; strictHostKeyChecking is a required yes/no enum; bucket policy documents are parsed, validated and re-serialized from the validated structure."
+    },
+    {
+      "id": "lifetime-gc",
+      "verdict": "pass",
+      "note": "34 result resources lifetime infinite with garbageCollection 10; the CSI key resource keeps 2 versions."
+    },
+    {
+      "id": "crud-completeness",
+      "verdict": "pass",
+      "note": "Host prep, bootstrap, enrol, mon/mgr/mds/osd placement, pools, CephFS, CSI users and keys, maintenance, teardown, RGW users and buckets, plus verify methods for each; every mutator is kind action (25 methods), so no verb tombstones the definition; 22 workflows gate every mutation behind a pre-check and manual approval."
+    },
+    {
+      "id": "preflight-checks",
+      "verdict": "pass",
+      "note": "wipeDiskToRaw refuses any device that backs the running or bootable system (protected-device closure over lsblk, blkid, mdstat, mdadm --examine, pvs and ZFS; BIOS-boot/ESP partitions, EFI evidence and MBR boot code in sector 0 of every disk behind a candidate, including multipath, md, LVM and crypt stacks) unless that disk's own serial is acknowledged, and refuses when lsblk and blkid disagree; destructive teardown requires the named fsid; placement changes are judged against live quorum first. Every destructive method enforces its own precondition in-method (guard, health, in-use, joint ok-to-stop, fsid), and every destructive workflow re-gates after approval (swamp lab 3583). Residual MEDIUM: a non-ESP-typed, unmounted EFI boot partition is unprotected on an EFI host where efibootmgr is missing or fails. LOW L-9b: a dm device on a partition of a boot-code disk is refused and cannot be acknowledged (fail-closed)."
+    },
+    {
+      "id": "instance-names",
+      "verdict": "pass",
+      "note": "Workflows address the instance cephadm or cephadm-<purpose>-<item> for a fan-out, and each assert reads the record from the instance that wrote it."
+    },
+    {
+      "id": "data-access",
+      "verdict": "pass",
+      "note": "Every host, credential and target arrives as method arguments, so one generic definition serves any cluster; the model reads no other model's data."
+    },
+    {
+      "id": "version-upgrades",
+      "verdict": "pass",
+      "note": "2026.10.17.2 adds a no-op upgrade entry (no schema changes); the chain 2026.10.17.1 -> 2026.10.17.2 ends at the model version and is spelled out on the model export, with a test keeping it equal to the factory's chain."
+    }
+  ],
+  "panel": {
+    "codex-astra": "codex gpt-6-astra conformance seat on catalog round 2 (64cfc1f, base a59e5b3): High client count (fixed in c3b928e); Medium catalog_test collects gates per job, not per approval phase; Low joint ok-to-stop test. On wipe ecce7c6: Low dry-run no-write matcher omits the sector-0 dd. On guard r9: Low subtree recomputed per boot disk. All residuals in LOGBOOK.",
+    "codex-terra": "codex gpt-5.6-terra adversarial seat on catalog round 2: Medium client count (fixed in c3b928e); Medium per-key nonce map retains inline keys; Medium catalog_test does not check succeeded-only on each edge nor tie re-gate to pre-gate (residuals). On wipe ecce7c6: HIGH 4Kn dd EINVAL refuted (buffered write, no oflag=direct; EINVAL is O_DIRECT only). On guard r9: PASS, no defects.",
+    "guard-signoff": "protected_devices.ts round 9 (8729580, blob 62743884) SIGNED OFF: no Critical/High; H-8a and L-8b fixed; residual Lows L-9a, L-9b and r8 carry-overs.",
+    "catalog": "Catalog A (lane/cephadm-int) chosen over B; its HIGH-by-rule direct-dependency gap and the lab 3583 re-gate fixed in a59e5b3 and 64cfc1f, cephDeleteFs real ceph fs status shape, joint osd ok-to-stop, health fail-closed.",
+    "merge-prep": "Merged lane/d6-catfix c3b928e (on lane/cephadm-int b2b99c6). Post-review change 885c8fd: the upgrade chain is spelled out on the model export so the registry version-bump check sees it; no behaviour change, 537 tests pass.",
+    "live": "wipeDiskToRaw only: 7/7 at b2b99c6 on scsi_debug RAM disks with OS disks dry-run (earlier 5/6 at a05a5b8, alreadyRaw finding fixed). Catalog in scratch repos against a fake cluster. Cluster cells BLOCKED (need three or more hosts). Convergence debt MEDIUM: own SSH helper instead of the canonical transport.",
+    "ocr-llm": "OCR sonnet5 and glm seats were not run"
+  }
+}

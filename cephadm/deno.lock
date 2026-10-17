@@ -5,6 +5,7 @@
     "jsr:@std/internal@^1.0.12": "1.0.14",
     "jsr:@std/internal@^1.0.14": "1.0.14",
     "jsr:@std/path@^1.1.4": "1.1.6",
+    "jsr:@std/xml@0.2.0": "0.2.0",
     "jsr:@swamp-club/swamp-testing@0.20261014.55": "0.20261014.55",
     "npm:@marcbachmann/cel-js@7.6.1": "7.6.1",
     "npm:zod@4.3.6": "4.3.6",
@@ -25,6 +26,9 @@
       "dependencies": [
         "jsr:@std/internal@^1.0.14"
       ]
+    },
+    "@std/xml@0.2.0": {
+      "integrity": "e0b54ae29592bc1fc688109f78ef5c18680bf820ba8aa0a3990a115e709e58d2"
     },
     "@swamp-club/swamp-testing@0.20261014.55": {
       "integrity": "ac356efdf3827f5a7c7f62ce9befec6d76e8797541a1dfc49ac7e9b6769ba05a",

@@ -99,6 +99,18 @@ import {
 } from "./_lib/verify.ts";
 import { bucketInventory, ensureRgwUser } from "./_lib/rgw.ts";
 import {
+  bucketEnsure,
+  bucketInspect,
+  bucketPolicyEnsure,
+  bucketVersioningEnsure,
+  denoFetch,
+  type FetchFn,
+  isBucketName,
+  isCredential,
+  isEndpointOrigin,
+  isRegion,
+} from "./_lib/s3.ts";
+import {
   checkHost,
   disableOrchestration,
   enterMaintenance,
@@ -118,6 +130,17 @@ import { wipeDiskToRaw, type WipeRecord } from "./_lib/wipe.ts";
 /** Model type version; must equal the manifest version. */
 export const VERSION = "2026.10.17.1";
 
+/**
+ * The S3-plane methods: they open no SSH session, so they are excluded from
+ * the `ssh-installed` pre-flight check's applies-to list.
+ */
+export const S3_METHODS: ReadonlySet<string> = new Set([
+  "cephRgwBucketInspect",
+  "cephRgwBucketEnsure",
+  "cephRgwBucketPolicyEnsure",
+  "cephRgwBucketVersioningEnsure",
+]);
+
 /** Replaceable dependencies of the model. */
 export interface CephadmDeps {
   /** Spawns the ssh binary. */
@@ -128,6 +151,8 @@ export interface CephadmDeps {
   sleep: (ms: number) => Promise<void>;
   /** Random value in [0, 1). */
   random: () => number;
+  /** HTTP fetch, used by the S3-plane methods only. */
+  fetch: FetchFn;
 }
 
 const productionDeps: CephadmDeps = {
@@ -135,6 +160,7 @@ const productionDeps: CephadmDeps = {
   now: () => Date.now(),
   sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
   random: Math.random,
+  fetch: denoFetch,
 };
 
 /** Minimal logger shape the methods use. */
@@ -948,6 +974,158 @@ const RgwUserResultSchema = z.strictObject({
   maxBuckets: z.number(),
   suspended: z.boolean(),
   secretDelivery: z.literal("generated"),
+  capturedAt: z.string(),
+});
+
+const S3_ORIGIN_SCHEMA = (scheme: "https" | "http", what: string) =>
+  z.string().min(1).max(2048).refine(
+    (v) => isEndpointOrigin(v, scheme),
+    `an ${scheme} origin (${what}) with no path, query, fragment or userinfo`,
+  );
+
+/** The common S3-plane arguments. */
+const S3_COMMON_FIELDS = {
+  endpoint: S3_ORIGIN_SCHEMA("https", "RGW S3 endpoint").describe(
+    "RGW S3 endpoint; https origin only.",
+  ),
+  region: z.string().min(1).max(64).refine(isRegion, "a zonegroup api name")
+    .describe("Zonegroup api name; the SigV4 region."),
+  bucket: z.string().min(3).max(63).refine(isBucketName, "an S3 bucket name")
+    .describe("Bucket name."),
+  accessKey: z.string().min(1).max(512).refine(
+    isCredential,
+    "1-512 printable non-space ASCII characters",
+  ).meta({ sensitive: true }).describe(
+    "Owner's S3 access key id, from the vault.",
+  ),
+  secretKey: z.string().min(1).max(512).refine(
+    isCredential,
+    "1-512 printable non-space ASCII characters",
+  ).meta({ sensitive: true }).describe(
+    "Owner's S3 secret, from the vault; used only to sign.",
+  ),
+  requestTimeoutMs: z.number().int().min(1000).max(300000).describe(
+    "Timeout per request in milliseconds.",
+  ),
+};
+
+const BucketInspectArgs = z.strictObject({ ...S3_COMMON_FIELDS });
+
+const BucketEnsureArgs = z.strictObject({
+  ...S3_COMMON_FIELDS,
+  placementTarget: z.string().min(1).max(64).refine(
+    isRegion,
+    "a placement id",
+  ).describe("Placement id in the zonegroup; cannot change afterwards."),
+  skipObjectLeakProbe: z.boolean().nullish().describe(
+    "True skips the object-leak probe; omitted or null runs it.",
+  ),
+});
+
+const BucketPolicyArgs = z.strictObject({
+  ...S3_COMMON_FIELDS,
+  policyDocument: z.string().min(2).max(20480).describe(
+    "Bucket policy JSON text, sent verbatim.",
+  ),
+  plainHttpEndpoint: S3_ORIGIN_SCHEMA("http", "plain-HTTP endpoint").nullish()
+    .describe(
+      "http origin to probe for the TLS-only proof; omitted means not-tested.",
+    ),
+});
+
+const BucketVersioningArgs = z.strictObject({
+  ...S3_COMMON_FIELDS,
+  desired: z.enum(["Enabled", "Suspended"]).describe(
+    "Target versioning state.",
+  ),
+});
+
+const AclGrantResultSchema = z.strictObject({
+  granteeType: z.string(),
+  grantee: z.string(),
+  permission: z.string(),
+});
+
+const PabResultSchema = z.strictObject({
+  blockPublicAcls: z.boolean(),
+  ignorePublicAcls: z.boolean(),
+  blockPublicPolicy: z.boolean(),
+  restrictPublicBuckets: z.boolean(),
+});
+
+const BucketInspectResultSchema = z.strictObject({
+  method: z.string(),
+  endpoint: z.string(),
+  region: z.string(),
+  bucket: z.string(),
+  presence: z.string(),
+  ownerId: z.string(),
+  aclGrants: z.array(AclGrantResultSchema),
+  aclPrivate: z.boolean(),
+  hasPolicy: z.boolean(),
+  policy: z.string(),
+  policyCanonical: z.string(),
+  versioning: z.string(),
+  publicAccessBlock: PabResultSchema.nullable(),
+  publicAccessBlockFull: z.boolean(),
+  capturedAt: z.string(),
+});
+
+const BucketEnsureResultSchema = z.strictObject({
+  method: z.string(),
+  endpoint: z.string(),
+  region: z.string(),
+  bucket: z.string(),
+  placementRequested: z.string(),
+  existedBefore: z.boolean(),
+  created: z.boolean(),
+  ownerId: z.string(),
+  aclGrantsBefore: z.array(AclGrantResultSchema),
+  aclGrantsAfter: z.array(AclGrantResultSchema),
+  aclChanged: z.boolean(),
+  aclPrivate: z.boolean(),
+  pabBefore: PabResultSchema.nullable(),
+  pabAfter: PabResultSchema,
+  pabChanged: z.boolean(),
+  objectLeakProbe: z.string(),
+  objectLeakProbeWriter: z.string(),
+  objectLeakProbeKey: z.string(),
+  objectAclStatus: z.number(),
+  anonymousObjectStatus: z.number(),
+  grantHeaderPutStatus: z.number(),
+  grantHeaderAnonymousStatus: z.number(),
+  controlStatus: z.number(),
+  anonymousStatus: z.number(),
+  capturedAt: z.string(),
+});
+
+const BucketPolicyResultSchema = z.strictObject({
+  method: z.string(),
+  endpoint: z.string(),
+  region: z.string(),
+  bucket: z.string(),
+  hadPolicyBefore: z.boolean(),
+  changed: z.boolean(),
+  statementCount: z.number(),
+  declaresSecureTransport: z.boolean(),
+  canonicalPolicy: z.string(),
+  controlStatus: z.number(),
+  anonymousStatus: z.number(),
+  pabLiftedForWrite: z.boolean(),
+  plainHttp: z.string(),
+  plainHttpStatus: z.number(),
+  capturedAt: z.string(),
+});
+
+const BucketVersioningResultSchema = z.strictObject({
+  method: z.string(),
+  endpoint: z.string(),
+  region: z.string(),
+  bucket: z.string(),
+  before: z.string(),
+  after: z.string(),
+  changed: z.boolean(),
+  conditionalWritesUnsafe: z.boolean(),
   capturedAt: z.string(),
 });
 
@@ -3012,9 +3190,86 @@ export function createCephadmModel(overrides: Partial<CephadmDeps> = {}) {
         }
       },
     },
+    cephRgwBucketInspect: {
+      description:
+        "READ-ONLY. Classify one bucket's presence and, when owned, read its ACL, policy, versioning and Public Access Block. Records the unowned classes without throwing; an unreadable presence throws and writes no record.",
+      arguments: BucketInspectArgs,
+      execute: async (
+        args: z.infer<typeof BucketInspectArgs>,
+        context: MethodContext,
+      ) => {
+        const record = await bucketInspect(deps, args);
+        const handle = await context.writeResource(
+          "cephRgwBucketInspectResult",
+          `rgwBucketInspect-${args.region}-${args.bucket}`,
+          { ...record, capturedAt: new Date(deps.now()).toISOString() },
+        );
+        return { dataHandles: [handle] };
+      },
+    },
+    cephRgwBucketEnsure: {
+      kind: "action" as const,
+      description:
+        "Ensure the bucket exists, is owned, private and fully Public-Access-Blocked, and prove anonymous listing is refused. Iff the probe runs, it also proves that public object ACLs cannot leak through the fixed probe prefix; a leaking or unprovable bucket throws and writes no record.",
+      arguments: BucketEnsureArgs,
+      execute: async (
+        args: z.infer<typeof BucketEnsureArgs>,
+        context: MethodContext,
+      ) => {
+        const record = await bucketEnsure(deps, args, context.logger);
+        const handle = await context.writeResource(
+          "cephRgwBucketResult",
+          `rgwBucket-${args.region}-${args.bucket}`,
+          { ...record, capturedAt: new Date(deps.now()).toISOString() },
+        );
+        return { dataHandles: [handle] };
+      },
+    },
+    cephRgwBucketPolicyEnsure: {
+      kind: "action" as const,
+      description:
+        "Refuse a public or self-locking policy before any request, then write the caller's policy verbatim and prove it with a canonical read-back and an anonymous-list probe. Rolls back on failure, lifting and restoring BlockPublicPolicy when needed, and writes no record on any failure.",
+      arguments: BucketPolicyArgs,
+      execute: async (
+        args: z.infer<typeof BucketPolicyArgs>,
+        context: MethodContext,
+      ) => {
+        const record = await bucketPolicyEnsure(deps, args, context.logger);
+        const handle = await context.writeResource(
+          "cephRgwBucketPolicyResult",
+          `rgwBucketPolicy-${args.region}-${args.bucket}`,
+          { ...record, capturedAt: new Date(deps.now()).toISOString() },
+        );
+        return { dataHandles: [handle] };
+      },
+    },
+    cephRgwBucketVersioningEnsure: {
+      kind: "action" as const,
+      description:
+        "Converge a bucket's versioning to Enabled or Suspended and re-read it. When the result is Enabled it flags conditional writes as unsafe and warns that an If-None-Match lock no longer excludes anything.",
+      arguments: BucketVersioningArgs,
+      execute: async (
+        args: z.infer<typeof BucketVersioningArgs>,
+        context: MethodContext,
+      ) => {
+        const record = await bucketVersioningEnsure(
+          deps,
+          args,
+          context.logger,
+        );
+        const handle = await context.writeResource(
+          "cephRgwBucketVersioningResult",
+          `rgwBucketVersioning-${args.region}-${args.bucket}`,
+          { ...record, capturedAt: new Date(deps.now()).toISOString() },
+        );
+        return { dataHandles: [handle] };
+      },
+    },
   };
 
-  const sshMethods = Object.keys(methods);
+  // The S3 plane opens no SSH session, so those methods are not in the
+  // `ssh-installed` pre-flight check's applies-to list.
+  const sshMethods = Object.keys(methods).filter((m) => !S3_METHODS.has(m));
 
   return {
     type: "@randybias/cephadm",
@@ -3170,6 +3425,33 @@ export function createCephadmModel(overrides: Partial<CephadmDeps> = {}) {
       cephRgwUserResult: {
         description: "RGW user convergence with a generated, sensitive key",
         schema: RgwUserResultSchema,
+        lifetime: "infinite" as const,
+        garbageCollection: 10,
+      },
+      cephRgwBucketInspectResult: {
+        description:
+          "One bucket's presence, ACL, policy, versioning and Public Access Block as seen by the owner's credentials",
+        schema: BucketInspectResultSchema,
+        lifetime: "infinite" as const,
+        garbageCollection: 10,
+      },
+      cephRgwBucketResult: {
+        description:
+          "RGW bucket convergence: ownership, private ACL, full Public Access Block and live leak-probe evidence",
+        schema: BucketEnsureResultSchema,
+        lifetime: "infinite" as const,
+        garbageCollection: 10,
+      },
+      cephRgwBucketPolicyResult: {
+        description:
+          "RGW bucket policy convergence: canonical form, anonymous probe and plain-HTTP probe evidence",
+        schema: BucketPolicyResultSchema,
+        lifetime: "infinite" as const,
+        garbageCollection: 10,
+      },
+      cephRgwBucketVersioningResult: {
+        description: "RGW bucket versioning state before and after convergence",
+        schema: BucketVersioningResultSchema,
         lifetime: "infinite" as const,
         garbageCollection: 10,
       },

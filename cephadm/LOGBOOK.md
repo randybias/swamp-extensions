@@ -242,3 +242,36 @@ a secret. Fixtures are synthetic only (RFC 5737 addresses, `.test` names).
 - The SQLite `pvs`/`mdadm` discovery, the atomic mdadm.conf rewrite and the
   boot-protection gate are unit-tested with scripted sessions; the live twin
   checks in the spec's [twin] items still apply.
+- 2026-10-17: group 07 RGW S3 plane complete (lane/d4-cephs3, rebased onto d6
+  head 6807776). New module `extensions/models/_lib/s3.ts` + sibling
+  `s3_test.ts`, wired into `cephadm.ts`. The four methods are
+  `cephRgwBucketInspect` (READ-ONLY), `cephRgwBucketEnsure`,
+  `cephRgwBucketPolicyEnsure` and `cephRgwBucketVersioningEnsure` (each
+  `kind: action`). All four take the common S3 arguments and open no SSH
+  session: a new injectable `fetch: FetchFn` seam (used by these methods only)
+  carries every request on a fresh connection, and `S3_METHODS` excludes them
+  from the `ssh-installed` applies-to list. The XML reader is pinned
+  `jsr:@std/xml@0.2.0` (namespaces and entities); SigV4 (service `s3`) and MD5
+  (for the mandated `Content-MD5`) are implemented locally.
+- NOTE: the S3 handoff text said all four methods are mutating and need
+  `kind: "action"`. `00-overview.md` row 47 and `07-rgw.md` §4 both classify
+  `cephRgwBucketInspect` as READ-ONLY (it sends only HEAD/GET), so it is left
+  without `kind`, matching the other read-only methods. Flagged for the lead.
+- Behaviour: presence is the shared HEAD classifier with the ListBuckets
+  tie-break; only an explicit not-found counts as absence. `cephRgwBucketEnsure`
+  creates with `<region>:<placementTarget>` and `x-amz-acl: private`, converges
+  the ACL and the four Public Access Block flags (with `Content-MD5`), then runs
+  the signed-control/unsigned-anonymous list probe and the object-leak probe
+  under the fixed `.cephadm-pab-probe/` prefix; "the probe could not run" and "a
+  leak was detected" are distinct phases, and every stored probe object is
+  deleted (by `versionId` when returned) before the leak is judged.
+  `cephRgwBucketPolicyEnsure` refuses public and self-locking policies before
+  any request, writes the document verbatim, proves it with a canonical
+  read-back and the anonymous probe, lifts and restores `BlockPublicPolicy`, and
+  rolls back on failure. `cephRgwBucketVersioningEnsure` converges the
+  three-state versioning and warns when Enabled makes conditional writes unsafe.
+- Security: the owner's `accessKey`/`secretKey` are sensitive arguments, used
+  only to sign; no request URL, header or signature reaches a record, log or
+  error; request transport detail is URL-stripped and truncated. 49 new unit
+  tests (274 total) inject a scripted `fetch`, so no socket is opened; gates 0-6
+  pass offline.

@@ -1,0 +1,12 @@
+manifestVersion: 1
+name: "@randybias/azure-vm"
+version: "2026.10.17.1"
+description: "Create, adopt, start, deallocate, stop, inspect and delete an Azure virtual machine through the Azure Resource Manager REST API with a service principal from a vault. One generic model type, keyed by subscription, resource group and VM name, with no credential on a command line."
+license: Apache-2.0
+repository: https://github.com/randybias/swamp-extensions
+platforms: [darwin-aarch64, darwin-x86_64, linux-x86_64, linux-aarch64]
+labels: [azure, virtual-machine, compute, cloud, infrastructure, arm]
+additionalFiles: [README.md, LICENSE.txt]
+models:
+  - azure_vm.ts
+workflows: []

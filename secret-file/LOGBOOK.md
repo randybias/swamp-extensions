@@ -30,3 +30,32 @@ reviewed once and shared.
   mode, byte count and flags.
 - Live testing is pending a target host for the run; the design is exercised by
   unit/contract tests with a scripted runner (no process, no socket).
+
+## Review round 1
+
+- HIGH: `insecure_tofu` was advertised as trust-on-first-use but never recorded
+  the learned key, so every run accepted a new key and a MITM could take the
+  secret. Fixed by dropping it: `host_key_policy` now accepts only `strict`, and
+  `host_keys` is required, so the host is verified against the pinned keys on
+  every run. `_lib/ssh.ts` was resynced to the 2026.10.17.2 blob
+  (`fe0139f08c42e3fdae0061b9688fb5c534174957`), which no longer sends a content
+  hash to the remote.
+- MEDIUM: state key is now `sha256(host, port, user, path)` (`secret-<32 hex>`),
+  not a 32-bit fnv of the path, so two paths cannot collide.
+- MEDIUM: owner and group are applied to a staged file before the rename (with
+  `chown -h`), and the stage is removed on failure; a published file is never
+  briefly owned by the wrong account and a swapped symlink is not followed.
+- MEDIUM: `stat` now also reads `%u`/`%g`, so a numeric owner or group converges
+  instead of re-chowning every run.
+- MEDIUM: a `stat` failure after the file is known to exist is an error, not a
+  silent `not_found`; nothing is written to state.
+- MEDIUM: existence checks use `test -e || test -L`, so a dangling symlink is
+  removed rather than reported absent.
+- MEDIUM: `verify` rejects more than one content form instead of skipping the
+  comparison.
+- MEDIUM: `entries` is capped at 256 keys and 1 MiB rendered, values are
+  single-quoted with `'` escaped for POSIX-shell sourcing, and the dialect is
+  documented.
+- LOW: README dotenv example uses vault references only and documents the real
+  `secret-<32 hex>` key; `verify` no longer accepts `hmac_key`; the `write`
+  description is three sentences.

@@ -119,11 +119,11 @@ const SSH_FIELDS = {
   ),
   port: z.number().int().min(1).max(65535).default(22).describe("SSH port."),
   user: z.string().regex(USER_RE).describe("Remote user name."),
-  host_key_policy: z.enum(["strict", "insecure_tofu"]).describe(
-    "Required. strict verifies against host_keys; insecure_tofu records the first keys seen and pins them on later runs.",
+  host_key_policy: z.enum(["strict"]).describe(
+    "Required. Only strict is offered: the host is verified against the pinned host_keys on every run, so no key is ever accepted unseen.",
   ),
-  host_keys: z.array(z.string().max(8192)).max(64).nullish().describe(
-    "ssh-keyscan-format lines. Required for strict.",
+  host_keys: z.array(z.string().max(8192)).min(1).max(64).describe(
+    "ssh-keyscan-format lines; required, and the only accepted host keys.",
   ),
   private_key: z.string().max(65536).meta({ sensitive: true }).nullish()
     .describe(
@@ -155,7 +155,7 @@ const CONTENT_FIELDS = {
     z.string().max(128),
     z.string().max(65_536).meta({ sensitive: true }),
   ).meta({ sensitive: true }).nullish().describe(
-    "Dotenv entries rendered as KEY=VALUE lines. Values are sensitive.",
+    "Dotenv entries; each value is rendered single-quoted as KEY='value'. Up to 256 entries and 1 MiB rendered.",
   ),
   mode: z.string().regex(MODE_RE).default("0600").describe(
     "Octal file mode applied before the atomic rename.",
@@ -175,10 +175,12 @@ const WRITE_ARGS = z.strictObject({ ...SSH_FIELDS, ...CONTENT_FIELDS });
 const VERIFY_ARGS = z.strictObject({
   ...SSH_FIELDS,
   ...CONTENT_FIELDS,
-  // verify never writes, so mode/owner/group are only compared when given.
+  // verify never writes, so mode/owner/group are only compared when given,
+  // and hmac_key is not accepted because nothing is stored.
   mode: z.string().regex(MODE_RE).nullish().describe(
     "Expected mode; compared when given.",
   ),
+  hmac_key: z.never().optional(),
 });
 
 const REMOVE_ARGS = z.strictObject({
@@ -239,8 +241,14 @@ interface ContentArgs {
 
 interface WriteArgs extends TargetArgs, ContentArgs {}
 
-interface VerifyArgs extends TargetArgs, ContentArgs {
-  mode: string;
+interface VerifyArgs extends TargetArgs {
+  path: string;
+  content?: string | null;
+  content_base64?: string | null;
+  entries?: Record<string, string> | null;
+  mode?: string | null;
+  owner?: string | null;
+  group?: string | null;
 }
 
 interface RemoveArgs extends TargetArgs {
@@ -248,9 +256,18 @@ interface RemoveArgs extends TargetArgs {
 }
 
 const DOTENV_KEY_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
+const MAX_ENTRIES = 256;
 
-/** Renders dotenv entries, refusing a key or value that would break the file. */
+/**
+ * Renders dotenv entries as `KEY='value'` lines for POSIX-shell sourcing. A
+ * single quote in a value is escaped as `'\''`; a key must match the usual
+ * identifier grammar. Up to 256 entries and 1 MiB of rendered output.
+ */
 export function renderEntries(entries: Record<string, string>): string {
+  const names = Object.keys(entries);
+  if (names.length > MAX_ENTRIES) {
+    throw new SshConfigError(`entries must have at most ${MAX_ENTRIES} keys`);
+  }
   const lines: string[] = [];
   for (const [key, value] of Object.entries(entries)) {
     if (!DOTENV_KEY_RE.test(key)) {
@@ -261,13 +278,27 @@ export function renderEntries(entries: Record<string, string>): string {
         `value for ${key} must not contain a newline or NUL`,
       );
     }
-    lines.push(`${key}=${value}`);
+    lines.push(`${key}='${value.replace(/'/g, "'\\''")}'`);
   }
-  return lines.length === 0 ? "" : `${lines.join("\n")}\n`;
+  const rendered = lines.length === 0 ? "" : `${lines.join("\n")}\n`;
+  if (rendered.length > 1_048_576) {
+    throw new SshConfigError("rendered entries must be at most 1048576 bytes");
+  }
+  return rendered;
+}
+
+/** The content-bearing fields, shared by write and verify. */
+interface ContentInput {
+  /** Literal content. */
+  content?: string | null;
+  /** Base64 content. */
+  content_base64?: string | null;
+  /** Dotenv entries. */
+  entries?: Record<string, string> | null;
 }
 
 /** True when exactly one content form is present. */
-function contentCount(args: ContentArgs): number {
+function contentCount(args: ContentInput): number {
   return [
     args.content != null,
     args.entries != null,
@@ -277,7 +308,7 @@ function contentCount(args: ContentArgs): number {
 }
 
 /** Resolves the file bytes from exactly one content form. */
-export function resolveContent(args: ContentArgs): Uint8Array {
+export function resolveContent(args: ContentInput): Uint8Array {
   const count = contentCount(args);
   if (count !== 1) {
     throw new SshConfigError(
@@ -302,25 +333,20 @@ export function chownSpec(
   return `:${group}`;
 }
 
-/** An unambiguous stored-state key for host, port, user and path. */
-export function secretInstanceName(
+/**
+ * An unambiguous stored-state key for host, port, user and path: a SHA-256 of
+ * the canonical tuple, so two paths on one host can never collide.
+ */
+export async function secretInstanceName(
   host: string,
   port: number,
   user: string,
   path: string,
-): string {
-  return `h${host.length}-${host}-p${port}-u${user.length}-${user}` +
-    `-f${fnv1aHex(path)}`;
-}
-
-/** A small deterministic hash, so a path with `/` can key a record. */
-function fnv1aHex(text: string): string {
-  let hash = 0x811c9dc5;
-  for (let i = 0; i < text.length; i++) {
-    hash ^= text.charCodeAt(i);
-    hash = Math.imul(hash, 0x01000193) >>> 0;
-  }
-  return hash.toString(16).padStart(8, "0");
+): Promise<string> {
+  const digest = await sha256Hex(
+    `${host}\u0000${port}\u0000${user}\u0000${path}`,
+  );
+  return `secret-${digest.slice(0, 32)}`;
 }
 
 /** A keyed HMAC-SHA256 of `data`, lowercase hex. */
@@ -345,14 +371,16 @@ export async function hmacSha256Hex(
     .join("");
 }
 
-/** Validates the target and returns the transport target. */
+/**
+ * Validates the target and returns the transport target. Only `strict` is
+ * offered, so the host is always verified against the pinned keys and no key is
+ * ever accepted unseen.
+ */
 function toTarget(args: TargetArgs): SshTarget {
   const hostKeys = args.host_keys ?? undefined;
-  if (
-    args.host_key_policy === "strict" && (!hostKeys || hostKeys.length === 0)
-  ) {
+  if (!hostKeys || hostKeys.length === 0) {
     throw new SshConfigError(
-      "host_key_policy strict requires a non-empty host_keys list",
+      "host_keys is required: this model only offers strict host-key checking",
     );
   }
   if (args.private_key && args.password) {
@@ -362,7 +390,7 @@ function toTarget(args: TargetArgs): SshTarget {
     host: args.host,
     port: args.port,
     user: args.user,
-    host_key_policy: args.host_key_policy,
+    host_key_policy: "strict",
     host_keys: hostKeys,
     private_key: args.private_key ?? undefined,
     password: args.password ?? undefined,
@@ -394,26 +422,46 @@ function requireOk(
 interface FileStat {
   mode: string;
   owner: string;
+  ownerId: string;
   group: string;
+  groupId: string;
   bytes: number;
 }
 
-/** Stats a remote path; null when it does not exist. */
+/**
+ * Stats a remote path. The caller must have confirmed it exists first; any
+ * failure here is a real error, never silently an absent file.
+ */
 async function statFile(
   deps: SshDeps,
   target: SshTarget,
   path: string,
-): Promise<FileStat | null> {
+): Promise<FileStat> {
   const result = await sshExec(deps, target, [
     "stat",
     "-c",
-    "%a %U %G %s",
+    "%a %U %G %u %g %s",
     path,
   ]);
-  if (result.exit_code !== 0) return null;
-  const [mode, owner, group, bytes] = result.stdout.trim().split(/\s+/);
-  if (!mode || !owner || !group || bytes === undefined) return null;
-  return { mode, owner, group, bytes: Number(bytes) };
+  requireOk(result, `stat ${path}`);
+  const [mode, owner, group, ownerId, groupId, bytes] = result.stdout.trim()
+    .split(/\s+/);
+  if (
+    !mode || !owner || !ownerId || !group || !groupId || bytes === undefined
+  ) {
+    throw new SshError(`could not parse stat output for ${path}`);
+  }
+  return { mode, owner, ownerId, group, groupId, bytes: Number(bytes) };
+}
+
+/** Defines whether `value` asks for a numeric or a named owner comparison. */
+function matchesIdentity(
+  requested: string | null | undefined,
+  name: string,
+  id: string,
+): boolean {
+  if (requested == null || requested === "") return true;
+  return /^\d+$/.test(requested) ? requested === id : requested === name;
 }
 
 /** The remote file's SHA-256, lowercase hex. */
@@ -431,16 +479,26 @@ async function remoteSha256(
   return sha;
 }
 
-/** True when the path exists on the host. */
+/**
+ * True when the path exists, including a dangling symlink. Any exit other than
+ * 0 or 1 is a real error, never a silent absence.
+ */
 async function exists(
   deps: SshDeps,
   target: SshTarget,
   path: string,
 ): Promise<boolean> {
-  const result = await sshExec(deps, target, ["test", "-e", path]);
-  if (result.exit_code === 0) return true;
-  if (result.exit_code === 1) return false;
-  throw new SshError(`could not test ${path} (exit ${result.exit_code})`);
+  const entry = await sshExec(deps, target, ["test", "-e", path]);
+  if (entry.exit_code === 0) return true;
+  if (entry.exit_code !== 1) {
+    throw new SshError(`could not test ${path} (exit ${entry.exit_code})`);
+  }
+  const link = await sshExec(deps, target, ["test", "-L", path]);
+  if (link.exit_code === 0) return true;
+  if (link.exit_code !== 1) {
+    throw new SshError(`could not test ${path} (exit ${link.exit_code})`);
+  }
+  return false;
 }
 
 /** Writes one stored-state record. */
@@ -463,7 +521,7 @@ async function writeState(
   const full = SecretFileStateSchema.parse(record);
   return await context.writeResource(
     "secretFile",
-    secretInstanceName(args.host, args.port, args.user, state.path),
+    await secretInstanceName(args.host, args.port, args.user, state.path),
     full,
   );
 }
@@ -493,7 +551,7 @@ export function createModel(deps: SshDeps = denoDeps): SecretFileModel {
       write: {
         kind: "action",
         description:
-          "DESTRUCTIVE. Write the file atomically over stdin (temp file, chmod, rename) with the given mode, owner and group. Idempotent by content and mode; an unchanged file is not rewritten. The value is never returned, logged or stored; state keeps only a keyed HMAC when hmac_key is given.",
+          "DESTRUCTIVE. Write the file atomically over stdin with the given mode, owner and group, idempotently by content. The owner and group are applied to a staged file before the rename, so the published file is never briefly wrong. The value is never returned, logged or stored; state keeps only a keyed HMAC when hmac_key is given.",
         arguments: WRITE_ARGS,
         execute: async (
           rawArgs: unknown,
@@ -503,26 +561,59 @@ export function createModel(deps: SshDeps = denoDeps): SecretFileModel {
           assertRemotePath(args.path);
           const target = toTarget(args);
           const bytes = resolveContent(args);
-          const result = await sshUpload(deps, target, {
-            path: args.path,
-            content: bytes,
-            mode: args.mode,
-          });
-          let changed = result.changed;
+          const localSha = await sha256Hex(bytes);
           const spec = chownSpec(args.owner, args.group);
-          if (spec !== undefined) {
+          let changed = true;
+          if (await exists(deps, target, args.path)) {
             const stat = await statFile(deps, target, args.path);
-            const wantOwner = args.owner ?? stat?.owner;
-            const wantGroup = args.group ?? stat?.group;
+            const remote = await remoteSha256(deps, target, args.path);
             if (
-              stat === null || stat.owner !== wantOwner ||
-              stat.group !== wantGroup
+              remote === localSha &&
+              normalizeMode(stat.mode) === normalizeMode(args.mode) &&
+              matchesIdentity(args.owner, stat.owner, stat.ownerId) &&
+              matchesIdentity(args.group, stat.group, stat.groupId)
             ) {
+              changed = false;
+            }
+          }
+          if (changed) {
+            // Stage the bytes, chown the staged file, then rename it into place;
+            // the value still travels only over stdin, and the published file is
+            // never briefly owned by the wrong account.
+            const stage = `${args.path}.secret-stage-${crypto.randomUUID()}`;
+            try {
+              await sshUpload(deps, target, {
+                path: stage,
+                content: bytes,
+                mode: args.mode,
+              });
+              if (spec !== undefined) {
+                requireOk(
+                  await sshExec(deps, target, ["chown", "-h", spec, stage]),
+                  `chown ${stage}`,
+                );
+              }
               requireOk(
-                await sshExec(deps, target, ["chown", spec, args.path]),
-                `chown ${args.path}`,
+                await sshExec(deps, target, ["mv", "-T", stage, args.path]),
+                `mv ${args.path}`,
               );
-              changed = true;
+            } catch (error) {
+              await sshExec(deps, target, ["rm", "-f", stage]).catch(
+                () => undefined,
+              );
+              throw error;
+            }
+            const stat = await statFile(deps, target, args.path);
+            const remote = await remoteSha256(deps, target, args.path);
+            if (
+              remote !== localSha ||
+              normalizeMode(stat.mode) !== normalizeMode(args.mode) ||
+              !matchesIdentity(args.owner, stat.owner, stat.ownerId) ||
+              !matchesIdentity(args.group, stat.group, stat.groupId)
+            ) {
+              throw new SshError(
+                `secret file ${args.path} did not converge`,
+              );
             }
           }
           const hmac = args.hmac_key != null
@@ -564,10 +655,14 @@ export function createModel(deps: SshDeps = denoDeps): SecretFileModel {
         ): Promise<MethodResult> => {
           const args = rawArgs as VerifyArgs;
           assertRemotePath(args.path);
+          if (contentCount(args) > 1) {
+            throw new SshConfigError(
+              "pass at most one of content, entries or content_base64",
+            );
+          }
           const target = toTarget(args);
           const observedAt = new Date(deps.now()).toISOString();
-          const stat = await statFile(deps, target, args.path);
-          if (stat === null) {
+          if (!await exists(deps, target, args.path)) {
             const handle = await writeState(context, args, {
               path: args.path,
               mode: args.mode ?? "",
@@ -584,6 +679,7 @@ export function createModel(deps: SshDeps = denoDeps): SecretFileModel {
               result: { present: false, matches: false },
             };
           }
+          const stat = await statFile(deps, target, args.path);
           const expected = contentCount(args) === 1
             ? await sha256Hex(resolveContent(args))
             : undefined;
@@ -593,8 +689,8 @@ export function createModel(deps: SshDeps = denoDeps): SecretFileModel {
           const matches = (expected === undefined || expected === remote) &&
             (args.mode == null ||
               normalizeMode(stat.mode) === normalizeMode(args.mode)) &&
-            (args.owner == null || stat.owner === args.owner) &&
-            (args.group == null || stat.group === args.group);
+            matchesIdentity(args.owner, stat.owner, stat.ownerId) &&
+            matchesIdentity(args.group, stat.group, stat.groupId);
           const handle = await writeState(context, args, {
             path: args.path,
             mode: stat.mode,

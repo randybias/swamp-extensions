@@ -37,3 +37,8 @@ cherry-servers:
     2026.10.16.3: 2d64e0af158363ffb1f5adb23061fc25483add8c9de2644f2a3a33b96ce6b5b7
   notes:
     2026.10.16.3: 'Fixes: the wait-ready and delete workflows did not work in 2026.10.16.1 or 2026.10.16.2 (they read definition inputs that were never set); upgrade to this version before using them. Every delete (server, SSH key, project) is now an action, so deleting one record no longer marks every record of a shared definition as deleted. On bare metal, wait_ready now waits until the API reports the server deployed and active, because the public IP and host keys can change during deploy; read the address from state after wait_ready, never from create. New: project delete (refuses a project that still holds servers); the create workflow takes os_partition_size, spot_market, tags, and vault key names for user data and the marker-check key. Security: pass ssh_private_key and user_data as vault references only; the swamp CLI currently prints literal sensitive arguments, including from --stdin (swamp-club lab 3555). Every method and both workflows were run live end to end on VPS and bare metal; the annually billing cycle was not.'
+
+wireguard-mesh:
+  channel: beta
+  ci: false
+  published: {}

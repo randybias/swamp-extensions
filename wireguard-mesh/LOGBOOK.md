@@ -199,3 +199,47 @@ Round 6 (review r5 at 19016ab):
   verified gone.
 - LOW apply description cut to three sentences; `ssh.private_key` and CIDR
   strings are bounded.
+
+## 2026-10-17 live e2e: 19 pass, 0 fail, 2 untested
+
+Head under test: lane/b3-wireguard 588a882 (`@randybias/wireguard-mesh`
+2026.10.17.4), installed from that tree into a separate scratch repo. Targets:
+two throwaway VPS, `<vps3>` (node-a) and `<vps4>` (node-b), Ubuntu 24.04,
+kernel 6.8, wireguard-tools 1.0.20210914. Mesh 10.77.0.1/32 and 10.77.0.2/32
+over the public addresses, UDP 51820. Every apply, get and delete ran through
+`swamp model method run` (never `--json`) with strict pinned host keys and the
+SSH key and WireGuard keys as vault references. The management SSH path stayed
+on eth0, never on wg0. Cells marked (manual) ran the extension's real
+`applyScript` / `confirmScript` over SSH without the confirmation step, which is
+what a failed confirmation looks like to the node. No private key appeared in
+any run's console output.
+
+| Cell | Result | Detail |
+| --- | --- | --- |
+| 1 render | pass | config built from the live mesh inputs, no PrivateKey line, `PostUp` reads the key file |
+| 2 apply node-a | pass | interface up, 10.77.0.1/32, one peer, route to 10.77.0.2, files 0600, state recorded after confirmation |
+| 3 apply node-b | pass | interface up, 10.77.0.2/32 |
+| 4 handshake both ways | pass | ping over wg0 0% loss; `latest-handshakes` non-zero on both nodes |
+| 5 get | pass | live peers read back on both nodes |
+| 6 confirm over a fresh connection | pass | after each apply the matching rollback directory holds `disarm` |
+| 7 apply idempotent | pass | "No change" on both; generation counter unchanged; the probe's disarmed rollback directory is removed after its window |
+| 8 allowlist rejection | pass | `peer node-b is not on peers_allowlist`; nothing contacted |
+| 9 AllowedIPs change recreates | pass | ifindex 4 -> 5; `10.99.0.0/24` route and allowed-ips present |
+| 10 Address change recreates | pass | ifindex 5 -> 6; address 10.77.0.11/32 |
+| 11 restore to desired | pass | 10.77.0.1/32, route to 10.77.0.2, ping OK |
+| 12 apply rollback fires when not confirmed (manual) | pass | unconfirmed ListenPort 51821; after the 120 s window port back to 51820, config restored, peer kept, ping OK |
+| 13 retry retires the old rollback (manual) | pass | identical retry reports `changed=1` with its own rollback; old confirm refused (exit 4), new one ok; after 130 s the old rollback did not fire |
+| 14 delete without acknowledgement | pass | refused before any contact |
+| 15 delete node-a | pass | wg0 gone, config and key removed, confirmation ok |
+| 16 delete again | pass | "No change on node-a" |
+| 17 delete node-b, and again | pass | wg0 gone; second delete "No change on node-b" |
+| 18 push to unreachable | pass | 203.0.113.10 with a pinned key: typed `ssh failed (exit 255): unreachable`, nothing recorded |
+| 19 private key never in output | pass | 0 occurrences in any run's output |
+| 20 delete over the wg path (self-severing) | untested | the management path was kept off wg0 by design of this run, so delete's rollback was never exercised against a connection the delete itself severs |
+| 21 delete's own rollback firing | untested | only the apply rollback was forced to fire (cell 12); delete's rollback was never left unconfirmed |
+
+Cleanup: both nodes have no wg0, an empty /etc/wireguard and no rollback
+processes; the SSH agent was killed and the vault copies of the keys deleted.
+The VPS are left for deletion by the live lane.
+
+Cells 20 and 21 block promotion to stable; they do not block beta.

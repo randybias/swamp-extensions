@@ -5,9 +5,9 @@ import { renderConfig } from "./_lib/render.ts";
 import {
   applyArgsSchema,
   claimScript,
+  commitScript,
   configArgsSchema,
   configSetRequest,
-  disarmScript,
   groupScript,
   hookLibraryScript,
   installFileScript,
@@ -216,13 +216,46 @@ Deno.test("host scripts encode the revert and hook semantics", () => {
   assert(claim.includes("flock -w 30"), "the claim is serialized");
   assert(claim.includes("exit 9"), "an armed revert refuses a second claim");
 
-  const active = restoreScript("tok", "/run/kea/kea4-ctrl-socket", true);
+  const active = restoreScript(
+    "tok",
+    "/run/kea/kea4-ctrl-socket",
+    true,
+    true,
+  );
   assert(active.includes("result=pass"));
   assert(active.includes("previous.conf"));
   assert(active.includes('rm -f "$a"'), "the restore always clears active");
   assert(active.includes('systemctl restart "$svc"'));
-  const inactive = restoreScript("tok", "/run/kea/kea4-ctrl-socket", false);
+  // Kea answers with a space after the colon; the match must allow it.
+  assert(
+    active.includes(`grep -Eq '"result": *0'`),
+    "the socket answer match allows Kea's spacing",
+  );
+  assert(active.includes("flock -w 30 9"), "the restore takes the lock");
+  assert(
+    active.includes('-f "$d/committed"'),
+    "a committed revert is never undone",
+  );
+  assert(active.includes('systemctl enable "$svc"'));
+  assert(active.includes('systemctl is-enabled "$svc"'));
+  const inactive = restoreScript(
+    "tok",
+    "/run/kea/kea4-ctrl-socket",
+    false,
+    false,
+  );
   assert(inactive.includes('systemctl stop "$svc"'));
+  assert(inactive.includes('systemctl disable "$svc"'));
+
+  const commit = commitScript(
+    "/var/lib/kea-dhcp-revert/tok",
+    "tok",
+    "a".repeat(64),
+  );
+  assert(commit.includes("flock -w 30 9"), "the commit takes the lock");
+  assert(commit.includes("committed"));
+  assert(commit.includes("fired.json"));
+  assert(commit.includes("kea-dhcp-revert-tok.service"));
 
   const hook = hookLibraryScript("/usr/lib/kea/hooks/libdhcp_lease_cmds.so");
   assert(hook.includes("no-hooks-dir"));
@@ -238,11 +271,6 @@ Deno.test("host scripts encode the revert and hook semantics", () => {
 
   assert(managementScript().includes("ip -o route get"));
   assert(groupScript().includes("systemctl show -p User"));
-  assert(
-    disarmScript("/var/lib/kea-dhcp-revert/tok", false).includes(
-      "systemctl stop",
-    ),
-  );
 });
 
 Deno.test("configSetRequest sends the whole Dhcp4 object", async () => {
@@ -523,9 +551,15 @@ Deno.test("a rejected kea-dhcp4 -t stops before arming anything", async () => {
 });
 
 Deno.test("remove arms the revert before disabling and restoring", async () => {
-  const original = JSON.stringify({
-    Dhcp4: { "interfaces-config": { interfaces: ["*"] } },
-  });
+  // The stock Ubuntu/Debian config carries // comments, so it is not JSON.
+  const original = [
+    "// This is a stock Kea configuration file.",
+    "{",
+    "  // Listen on no interfaces by default.",
+    '  "Dhcp4": { "interfaces-config": { "interfaces": [] } }',
+    "}",
+    "",
+  ].join("\n");
   const originalSha = await sha256Hex(original);
   const calls: Call[] = [];
   let armed = false;

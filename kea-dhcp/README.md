@@ -79,9 +79,16 @@ previous config.
   `systemd-run` restore timer, then installs and pushes the file. On any later
   failure the file is restored and the revert disarmed. The restore script
   records pass/fail and a recovery note.
-- `commit` checks the fired marker and the live hash, checks the running hash
-  and canaries, then stops the timer (it must succeed), re-checks the race and
-  only then clears the marker. `sync` adopts a fired revert.
+- `commit` is a gate: it requires the service active, a running config hash
+  equal to the applied one, `systemctl enable` to succeed, the canaries to
+  answer and a fresh-connection probe with no failed check. Only then does it
+  take the shared revert lock, stop the timer, confirm the transient restore
+  unit never started and write the `committed` marker, so a restore that wins
+  the race can never undo a commit. `sync` adopts a fired revert.
+- The restore and the commit share `/run/kea-dhcp-revert.lock`; the restore
+  exits early when the `committed` marker exists. The claim records the
+  service's prior `is-active` and `is-enabled` state, and the restore returns
+  both, so a fired revert cannot leave the service disabled.
 - `remove` runs the same arm/verify protocol, converging the service disabled
   and the package's original config back regardless of its prior state.
 - `render` is deterministic: subnets sort by id, pools by start, reservations by

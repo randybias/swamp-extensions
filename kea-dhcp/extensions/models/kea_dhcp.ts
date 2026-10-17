@@ -343,6 +343,7 @@ const RevertStateSchema = z.strictObject({
   armed_sha256: z.string(),
   canaries: z.array(z.string()).optional(),
   intent: z.enum(["apply", "remove"]).optional(),
+  prior_enabled: z.boolean().optional(),
   fired_at: z.string().optional(),
   cancelled_at: z.string().optional(),
 });
@@ -630,6 +631,25 @@ async function serviceActive(target: SshTarget): Promise<boolean> {
   return result.stdout.trim() === "active";
 }
 
+/** True when the Kea service is enabled at boot. */
+async function serviceEnabled(target: SshTarget): Promise<boolean> {
+  const result = await runScript(
+    target,
+    `systemctl is-enabled ${SERVICE} 2>/dev/null || true`,
+  );
+  return result.stdout.trim() === "enabled";
+}
+
+/** Reads the `result` value from a fired.json body, or null. */
+function firedResult(text: string): string | null {
+  try {
+    const body = JSON.parse(text) as { result?: unknown };
+    return typeof body.result === "string" ? body.result : null;
+  } catch {
+    return null;
+  }
+}
+
 /**
  * Resolves the group that must own the config file so the service can read it.
  * The unit's `User=` is authoritative; `/var/lib/kea` is the fallback.
@@ -705,6 +725,8 @@ export function claimScript(dir: string, activeJson: string): string {
     `if [ -f ${posixQuote(CONFIG_PATH)} ]; then cp -a ${
       posixQuote(CONFIG_PATH)
     } ${posixQuote(`${dir}/previous.conf`)}; fi`,
+    `en=$(systemctl is-enabled ${SERVICE} 2>/dev/null || true)`,
+    `printf '{"enabled":"%s"}\\n' "$en" > ${posixQuote(`${dir}/prior.json`)}`,
     `printf '%s\\n' ${posixQuote(activeJson)} > ${
       posixQuote(`${REVERT_ROOT}/active.json`)
     }`,
@@ -769,16 +791,18 @@ async function readMarker(
 /**
  * The restore-script body written into the revert directory.
  *
- * It restores the previous file, returns the service to its prior state, then
- * decides pass/fail from the post-state (file sha, service state and a socket
- * answer) and records it in fired.json. It always clears active.json; a failed
- * restore leaves a recovery note beside it. This runs from a host timer, so it
- * must be self-contained and never depend on the runner.
+ * It restores the previous file, returns the service to its prior running and
+ * enabled state, then decides pass/fail from the post-state (file sha, service
+ * state, enabled state and a socket answer) and records it in fired.json. It
+ * takes the same flock as a commit and exits without reverting if a committed
+ * marker exists, so a commit and a revert can never both act. It always clears
+ * active.json; a failed restore leaves a recovery note beside it.
  */
 export function restoreScript(
   token: string,
   socket: string,
   priorActive: boolean,
+  priorEnabled: boolean,
 ): string {
   const dir = posixQuote(`${REVERT_ROOT}/${token}`);
   return [
@@ -791,39 +815,57 @@ export function restoreScript(
     `svc=${SERVICE}`,
     "result=pass",
     'detail=""',
+    "finish() {",
+    `  printf '{"token":"%s","fired_at":"%s","result":"%s","detail":"%s"}\\n' ${
+      posixQuote(token)
+    } "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$result" "$detail" > "$d/fired.json"`,
+    '  if [ "$result" != pass ]; then',
+    '    printf \'Restore failed (%s). The previous config is %s/previous.conf; recovery: inspect %s, restore previous.conf by hand if needed, then run systemctl restart %s.\\n\' "$detail" "$d" "$f" "$svc" > "$d/recovery.txt"',
+    "  fi",
+    '  rm -f "$a"',
+    "  exit 0",
+    "}",
+    "exec 9>/run/kea-dhcp-revert.lock",
+    "if ! flock -w 30 9; then result=fail; detail=lock; finish; fi",
+    'if [ -f "$d/committed" ] || [ ! -f "$a" ]; then exit 0; fi',
     'if [ -f "$d/previous.conf" ]; then',
     '  cp -a "$d/previous.conf" "$f" 2>/dev/null || { result=fail; detail="$detail restore-copy"; }',
     "else",
     '  rm -f "$f" 2>/dev/null || { result=fail; detail="$detail remove-config"; }',
     "fi",
     'if [ -f "$d/previous.conf" ]; then',
-    "  want=$(sha256sum \"$d/previous.conf\" 2>/dev/null | awk '{print $1}')",
-    "  got=$(sha256sum \"$f\" 2>/dev/null | awk '{print $1}')",
+    `  want=$(sha256sum "$d/previous.conf" 2>/dev/null | awk '{print $1}')`,
+    `  got=$(sha256sum "$f" 2>/dev/null | awk '{print $1}')`,
     '  [ "$want" = "$got" ] || { result=fail; detail="$detail file-sha"; }',
     "fi",
     `if [ ${priorActive ? "1" : "0"} = 1 ]; then`,
     '  if command -v socat >/dev/null 2>&1 && [ -f "$d/restore-request.json" ]; then',
-    '    socat -t 10 - UNIX-CONNECT:"$s" < "$d/restore-request.json" >/dev/null 2>&1 || systemctl restart "$svc" >/dev/null 2>&1 || true',
+    '    ans=$(socat -t 10 - UNIX-CONNECT:"$s" < "$d/restore-request.json" 2>/dev/null || true)',
+    `    printf %s "$ans" | grep -Eq '"result": *0' || systemctl restart "$svc" >/dev/null 2>&1 || true`,
     "  else",
     '    systemctl restart "$svc" >/dev/null 2>&1 || true',
     "  fi",
     '  systemctl is-active --quiet "$svc" || { result=fail; detail="$detail service-inactive"; }',
     '  if [ "$result" = pass ] && [ -f "$d/hash-request.json" ] && command -v socat >/dev/null 2>&1; then',
     '    ans=$(socat -t 10 - UNIX-CONNECT:"$s" < "$d/hash-request.json" 2>/dev/null || true)',
-    `    if ! printf %s "$ans" | grep -q '"result":0'; then result=fail; detail="$detail socket-no-answer"; fi`,
+    `    printf %s "$ans" | grep -Eq '"result": *0' || { result=fail; detail="$detail socket-no-answer"; }`,
     "  fi",
     "else",
     '  systemctl stop "$svc" >/dev/null 2>&1 || true',
     '  systemctl is-active --quiet "$svc" && { result=fail; detail="$detail service-still-active"; }',
     "fi",
-    `printf '{"token":"%s","fired_at":"%s","result":"%s","detail":"%s"}\\n' ${
-      posixQuote(token)
-    } "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$result" "$detail" > "$d/fired.json"`,
-    'if [ "$result" != pass ]; then',
-    '  printf \'Restore failed (%s). The previous config is %s/previous.conf; recovery: inspect %s and run systemctl restart %s, or restore previous.conf by hand.\\n\' "$detail" "$d" "$f" "$svc" > "$d/recovery.txt"',
+    `if [ ${priorEnabled ? "1" : "0"} = 1 ]; then`,
+    '  systemctl enable "$svc" >/dev/null 2>&1 || true',
+    "else",
+    '  systemctl disable "$svc" >/dev/null 2>&1 || true',
     "fi",
-    'rm -f "$a"',
-    "exit 0",
+    'cur=$(systemctl is-enabled "$svc" 2>/dev/null || true)',
+    `if [ ${priorEnabled ? "1" : "0"} = 1 ]; then`,
+    '  [ "$cur" = enabled ] || { result=fail; detail="$detail enable-state"; }',
+    "else",
+    '  [ "$cur" = disabled ] || { result=fail; detail="$detail disable-state"; }',
+    "fi",
+    "finish",
   ].join("\n") + "\n";
 }
 
@@ -924,6 +966,7 @@ async function doApply(
         }`,
       );
     }
+    const priorEnabled = await serviceEnabled(target);
     const revert: RevertState = {
       host: args.host,
       token,
@@ -932,6 +975,7 @@ async function doApply(
       armed_sha256: rendered.sha256,
       canaries: args.canary_hosts.length > 0 ? args.canary_hosts : undefined,
       intent: "apply",
+      prior_enabled: priorEnabled,
     };
     await context.writeResource(
       "revert",
@@ -940,40 +984,45 @@ async function doApply(
     );
 
     // 3. arm: upload the restore assets, then the host-side timer.
-    let prevRendered: RenderResult | null = null;
-    const prevFile = await readRemoteText(target, `${dir}/previous.conf`);
-    if (prevFile !== null) {
-      try {
-        prevRendered = {
-          config: JSON.parse(prevFile),
-          json: prevFile,
-          warnings: [],
-        };
-      } catch {
-        prevRendered = null;
-      }
-    }
     const scriptPath = `${dir}/restore.sh`;
-    await sshUpload(deps, target, {
-      path: scriptPath,
-      content: restoreScript(token, socket, isActive),
-      mode: "0700",
-    });
-    if (prevRendered !== null) {
+    let prevRendered: RenderResult | null = null;
+    try {
+      const prevFile = await readRemoteText(target, `${dir}/previous.conf`);
+      if (prevFile !== null) {
+        try {
+          prevRendered = {
+            config: JSON.parse(prevFile),
+            json: prevFile,
+            warnings: [],
+          };
+        } catch {
+          prevRendered = null;
+        }
+      }
       await sshUpload(deps, target, {
-        path: `${dir}/restore-request.json`,
-        content: JSON.stringify(configSetRequest(prevRendered)),
+        path: scriptPath,
+        content: restoreScript(token, socket, isActive, priorEnabled),
+        mode: "0700",
+      });
+      if (prevRendered !== null) {
+        await sshUpload(deps, target, {
+          path: `${dir}/restore-request.json`,
+          content: JSON.stringify(configSetRequest(prevRendered)),
+          mode: "0600",
+        });
+      }
+      await sshUpload(deps, target, {
+        path: `${dir}/hash-request.json`,
+        content: JSON.stringify({
+          command: "config-hash-get",
+          service: ["dhcp4"],
+        }),
         mode: "0600",
       });
+    } catch (error) {
+      await abortClaim(context, target, args, dir, token, revert);
+      throw error;
     }
-    await sshUpload(deps, target, {
-      path: `${dir}/hash-request.json`,
-      content: JSON.stringify({
-        command: "config-hash-get",
-        service: ["dhcp4"],
-      }),
-      mode: "0600",
-    });
     const armed = await runScript(
       target,
       `systemd-run --on-active=${args.revert_after_s} --unit=${
@@ -981,17 +1030,7 @@ async function doApply(
       } ${posixQuote(scriptPath)}`,
     );
     if (armed.exit_code !== 0) {
-      await sshExec(deps, target, ["rm", "-rf", dir]).catch(() => undefined);
-      await sshExec(deps, target, ["rm", "-f", `${REVERT_ROOT}/active.json`])
-        .catch(() => undefined);
-      await context.writeResource(
-        "revert",
-        `${instanceKey(args)}-${token}`,
-        RevertStateSchema.parse({
-          ...revert,
-          cancelled_at: new Date(deps.now()).toISOString(),
-        }),
-      );
+      await abortClaim(context, target, args, dir, token, revert);
       throw new SshError(
         `could not arm the revert timer: ${
           armed.stderr.trim().split("\n").at(-1) ?? ""
@@ -1006,15 +1045,7 @@ async function doApply(
       installFileScript(staged, group),
     );
     if (install.exit_code !== 0) {
-      await disarmAndRestore(
-        context,
-        target,
-        args,
-        dir,
-        token,
-        revert,
-        isActive,
-      );
+      await disarmAndRestore(context, target, args, dir, token, revert);
       throw new SshError(
         `could not install the config file: ${
           install.stderr.trim().split("\n").at(-1) ?? ""
@@ -1040,15 +1071,7 @@ async function doApply(
       }
       keaHash = await waitForHash(target, socket);
     } catch (error) {
-      await disarmAndRestore(
-        context,
-        target,
-        args,
-        dir,
-        token,
-        revert,
-        isActive,
-      );
+      await disarmAndRestore(context, target, args, dir, token, revert);
       throw error;
     }
 
@@ -1075,7 +1098,67 @@ async function doApply(
   }
 }
 
-/** Restores the live file and disarms the revert after a failed apply. */
+/** The commit critical section, serialized with the revert timer. */
+export function commitScript(
+  dir: string,
+  token: string,
+  armedSha: string,
+): string {
+  const timer = timerName(token);
+  return [
+    "set -u",
+    "lk=/run/kea-dhcp-revert.lock",
+    'exec 9>"$lk"',
+    "flock -w 30 9 || { printf %s lock-failed; exit 0; }",
+    `if [ -f ${
+      posixQuote(`${dir}/fired.json`)
+    } ]; then printf %s fired; exit 0; fi`,
+    `systemctl stop ${timer}.timer >/dev/null 2>&1 || true`,
+    `if [ -f ${
+      posixQuote(`${dir}/fired.json`)
+    } ]; then printf %s fired; exit 0; fi`,
+    `if systemctl is-active --quiet ${timer}.service; then printf %s service-active; exit 0; fi`,
+    `if systemctl is-active --quiet ${timer}.timer; then printf %s timer-active; exit 0; fi`,
+    `got=$(sha256sum ${
+      posixQuote(CONFIG_PATH)
+    } 2>/dev/null | awk '{print $1}')`,
+    `if [ "$got" != ${
+      posixQuote(armedSha)
+    } ]; then printf %s drifted; exit 0; fi`,
+    `printf committed > ${posixQuote(`${dir}/committed`)}`,
+    `rm -f ${posixQuote(`${REVERT_ROOT}/active.json`)}`,
+    "printf %s committed",
+  ].join("\n");
+}
+
+/** Removes the claim's marker and records the revert as cancelled. */
+async function abortClaim(
+  context: MethodContext,
+  target: SshTarget,
+  args: { host: string; port: number; user: string },
+  dir: string,
+  token: string,
+  revert: RevertState,
+): Promise<void> {
+  await sshExec(deps, target, ["rm", "-rf", dir]).catch(() => undefined);
+  await sshExec(deps, target, ["rm", "-f", `${REVERT_ROOT}/active.json`])
+    .catch(() => undefined);
+  await context.writeResource(
+    "revert",
+    `${instanceKey(args)}-${token}`,
+    RevertStateSchema.parse({
+      ...revert,
+      cancelled_at: new Date(deps.now()).toISOString(),
+    }),
+  );
+}
+
+/**
+ * Undoes an uncommitted apply/remove after a failure, using the same
+ * restore.sh the timer would run. It only disarms when the restore judged the
+ * post-state a pass; otherwise the timer stays armed and the recovery note is
+ * surfaced.
+ */
 async function disarmAndRestore(
   context: MethodContext,
   target: SshTarget,
@@ -1083,9 +1166,20 @@ async function disarmAndRestore(
   dir: string,
   token: string,
   revert: RevertState,
-  priorActive: boolean,
 ): Promise<void> {
-  await runScript(target, disarmScript(dir, priorActive));
+  await runScript(target, `sh ${posixQuote(`${dir}/restore.sh`)}`);
+  const fired = await readRemoteText(target, `${dir}/fired.json`);
+  const result = fired !== null ? firedResult(fired) : null;
+  if (result !== "pass") {
+    const recovery = await readRemoteText(target, `${dir}/recovery.txt`);
+    throw new SshError(
+      `the revert restore did not pass (${
+        result ?? "no marker"
+      }); the timer is left armed; recovery: ${
+        recovery?.trim() ?? `${dir}/recovery.txt`
+      }`,
+    );
+  }
   await sshExec(deps, target, [
     "systemctl",
     "stop",
@@ -1111,18 +1205,6 @@ export function installFileScript(staged: string, group: string): string {
     `chgrp ${posixQuote(group)} ${posixQuote(staged)}`,
     `chmod 0640 ${posixQuote(staged)}`,
     `mv -T ${posixQuote(staged)} ${posixQuote(CONFIG_PATH)}`,
-  ].join("\n");
-}
-
-/** The host script that restores the previous file after a failed apply. */
-export function disarmScript(dir: string, priorActive: boolean): string {
-  return [
-    `if [ -f ${posixQuote(`${dir}/previous.conf`)} ]; then cp -a ${
-      posixQuote(`${dir}/previous.conf`)
-    } ${posixQuote(CONFIG_PATH)}; else rm -f ${posixQuote(CONFIG_PATH)}; fi`,
-    priorActive
-      ? `systemctl restart ${SERVICE} >/dev/null 2>&1 || true`
-      : `systemctl stop ${SERVICE} >/dev/null 2>&1 || true`,
   ].join("\n");
 }
 
@@ -1334,7 +1416,7 @@ export const model = {
     commit: {
       kind: "action" as const,
       description:
-        "DESTRUCTIVE. Cancels the armed revert: re-verify the live config, stop the host timer and clear the marker. Refuses when the revert already fired, the timer cannot be stopped, the revert record is missing, or the live config drifted.",
+        "DESTRUCTIVE. Cancels the armed revert: gate on a passing verify, then take the revert lock, stop the host timer and clear the marker. Refuses when the revert already fired or its service started, the timer cannot be stopped, the revert record is missing, the live config drifted, or any verify check fails.",
       arguments: strictTargetArgsSchema,
       execute: async (
         rawArgs: unknown,
@@ -1371,8 +1453,6 @@ export const model = {
           );
           throw new SshError(`the revert already fired at ${firedAt}`);
         }
-
-        // The live file must still be the one we armed.
         const liveSha = await remoteFileSha(target, CONFIG_PATH);
         if (liveSha !== revert.armed_sha256) {
           throw new SshError(
@@ -1385,16 +1465,40 @@ export const model = {
           | ConfigState
           | null;
 
-        // Check the running config and the canaries before touching the timer.
+        // Require the running config to match and the service to be live, and
+        // enable it, before the commit is allowed to proceed.
         let runningHash: string | undefined;
         if (!removal) {
+          if (!(await serviceActive(target))) {
+            throw new SshError(
+              "the service is not active; refusing to commit",
+            );
+          }
+          const recorded = storedConfig?.kea_hash;
+          if (!recorded) {
+            throw new SshError(
+              "no applied config hash is recorded; refusing to commit",
+            );
+          }
           runningHash = await waitForHash(target, DEFAULT_CONTROL_SOCKET);
-          if (
-            storedConfig?.kea_hash && runningHash &&
-            storedConfig.kea_hash !== runningHash
-          ) {
+          if (runningHash === undefined) {
+            throw new SshError(
+              "the control socket did not answer a config hash; refusing to commit",
+            );
+          }
+          if (runningHash !== recorded) {
             throw new SshError(
               "the running config differs from the applied one; refusing to commit",
+            );
+          }
+          const enabled = await sshExec(deps, target, [
+            "systemctl",
+            "enable",
+            SERVICE,
+          ]);
+          if (enabled.exit_code !== 0) {
+            throw new SshError(
+              "could not enable the service; refusing to commit",
             );
           }
         }
@@ -1412,52 +1516,48 @@ export const model = {
           }
         }
 
-        // Stop the timer; it must succeed. If it already fired, adopt that.
-        const stop = await sshExec(deps, target, [
-          "systemctl",
-          "stop",
-          `${timerName(token)}.timer`,
-        ]);
-        const firedAfter = await readRemoteText(target, `${dir}/fired.json`);
-        if (stop.exit_code !== 0 || firedAfter !== null) {
-          const firedAt = firedAfter !== null
-            ? (parseFiredAt(firedAfter) ?? new Date(deps.now()).toISOString())
-            : new Date(deps.now()).toISOString();
-          await context.writeResource(
-            "revert",
-            `${key}-${token}`,
-            RevertStateSchema.parse({ ...revert, fired_at: firedAt }),
-          );
-          throw new SshError(
-            firedAfter !== null
-              ? `the revert already fired at ${firedAt}`
-              : `could not stop the revert timer (exit ${stop.exit_code}); refusing to commit`,
-          );
-        }
-        const liveSha2 = await remoteFileSha(target, CONFIG_PATH);
-        if (liveSha2 !== revert.armed_sha256) {
-          throw new SshError(
-            "the live config changed while cancelling the revert; refusing to commit",
-          );
-        }
-
-        // Make it permanent: survive a reboot (apply) or stay disabled (remove).
-        if (!removal) {
-          await sshExec(deps, target, ["systemctl", "enable", SERVICE])
-            .catch(() => undefined);
-        }
-        await sshExec(deps, target, ["rm", "-f", `${REVERT_ROOT}/active.json`])
-          .catch(() => undefined);
-
+        // Verify is a gate: any failed field refuses and leaves the revert.
         const observation = await probe(target, args, DEFAULT_CONTROL_SOCKET);
-        const fresh = await runScript(target, "printf fresh");
+        const fresh = await sshExec(deps, target, ["true"]);
         const verify = verifyOf(
           observation,
           revert,
           runningHash,
           !removal,
-          fresh.stdout === "fresh",
+          fresh.exit_code === 0,
         );
+        const failures = Object.entries(verify)
+          .filter(([, value]) => value === "fail")
+          .map(([name]) => name);
+        if (failures.length > 0) {
+          throw new SshError(
+            `verify failed (${
+              failures.join(", ")
+            }); refusing to commit and leaving the revert armed`,
+          );
+        }
+
+        // Commit critical section, serialized with the revert timer.
+        const status = await runScript(
+          target,
+          commitScript(dir, token, revert.armed_sha256),
+        );
+        const outcome = status.stdout.trim();
+        if (outcome !== "committed") {
+          if (outcome === "fired") {
+            const firedAt = new Date(deps.now()).toISOString();
+            await context.writeResource(
+              "revert",
+              `${key}-${token}`,
+              RevertStateSchema.parse({ ...revert, fired_at: firedAt }),
+            );
+            throw new SshError(`the revert already fired at ${firedAt}`);
+          }
+          throw new SshError(
+            `could not commit the revert (${outcome}); it is still armed`,
+          );
+        }
+
         await context.writeResource(
           "revert",
           `${key}-${token}`,
@@ -1633,13 +1733,8 @@ export const model = {
             "no captured original config; run install before remove",
           );
         }
-        try {
-          JSON.parse(original);
-        } catch {
-          throw new KeaInputError(
-            "the captured original config is not valid JSON",
-          );
-        }
+        // The stock config has // comments, so it is not JSON; kea-dhcp4 -t on
+        // the staged copy is the validation.
         const isActive = await serviceActive(target);
         const liveSha = await remoteFileSha(target, CONFIG_PATH);
         const marker = await readMarker(target);
@@ -1691,6 +1786,7 @@ export const model = {
               }`,
             );
           }
+          const priorEnabled = await serviceEnabled(target);
           const revert: RevertState = {
             host: args.host,
             token,
@@ -1698,6 +1794,7 @@ export const model = {
             expires_at: expiresAt,
             armed_sha256: originalSha,
             intent: "remove",
+            prior_enabled: priorEnabled,
           };
           await context.writeResource(
             "revert",
@@ -1705,39 +1802,47 @@ export const model = {
             RevertStateSchema.parse(revert),
           );
 
-          const prevFile = await readRemoteText(target, `${dir}/previous.conf`);
           let prevRendered: RenderResult | null = null;
-          if (prevFile !== null) {
-            try {
-              prevRendered = {
-                config: JSON.parse(prevFile),
-                json: prevFile,
-                warnings: [],
-              };
-            } catch {
-              prevRendered = null;
+          try {
+            const prevFile = await readRemoteText(
+              target,
+              `${dir}/previous.conf`,
+            );
+            if (prevFile !== null) {
+              try {
+                prevRendered = {
+                  config: JSON.parse(prevFile),
+                  json: prevFile,
+                  warnings: [],
+                };
+              } catch {
+                prevRendered = null;
+              }
             }
-          }
-          await sshUpload(deps, target, {
-            path: `${dir}/restore.sh`,
-            content: restoreScript(token, socket, isActive),
-            mode: "0700",
-          });
-          if (prevRendered !== null) {
             await sshUpload(deps, target, {
-              path: `${dir}/restore-request.json`,
-              content: JSON.stringify(configSetRequest(prevRendered)),
+              path: `${dir}/restore.sh`,
+              content: restoreScript(token, socket, isActive, priorEnabled),
+              mode: "0700",
+            });
+            if (prevRendered !== null) {
+              await sshUpload(deps, target, {
+                path: `${dir}/restore-request.json`,
+                content: JSON.stringify(configSetRequest(prevRendered)),
+                mode: "0600",
+              });
+            }
+            await sshUpload(deps, target, {
+              path: `${dir}/hash-request.json`,
+              content: JSON.stringify({
+                command: "config-hash-get",
+                service: ["dhcp4"],
+              }),
               mode: "0600",
             });
+          } catch (error) {
+            await abortClaim(context, target, args, dir, token, revert);
+            throw error;
           }
-          await sshUpload(deps, target, {
-            path: `${dir}/hash-request.json`,
-            content: JSON.stringify({
-              command: "config-hash-get",
-              service: ["dhcp4"],
-            }),
-            mode: "0600",
-          });
           const armed = await runScript(
             target,
             `systemd-run --on-active=600 --unit=${timerName(token)} ${
@@ -1745,23 +1850,7 @@ export const model = {
             }`,
           );
           if (armed.exit_code !== 0) {
-            await sshExec(deps, target, ["rm", "-rf", dir]).catch(() =>
-              undefined
-            );
-            await sshExec(deps, target, [
-              "rm",
-              "-f",
-              `${REVERT_ROOT}/active.json`,
-            ])
-              .catch(() => undefined);
-            await context.writeResource(
-              "revert",
-              `${key}-${token}`,
-              RevertStateSchema.parse({
-                ...revert,
-                cancelled_at: new Date(deps.now()).toISOString(),
-              }),
-            );
+            await abortClaim(context, target, args, dir, token, revert);
             throw new SshError(
               `could not arm the revert timer: ${
                 armed.stderr.trim().split("\n").at(-1) ?? ""
@@ -1775,15 +1864,7 @@ export const model = {
             installFileScript(staged, group),
           );
           if (install.exit_code !== 0) {
-            await disarmAndRestore(
-              context,
-              target,
-              args,
-              dir,
-              token,
-              revert,
-              isActive,
-            );
+            await disarmAndRestore(context, target, args, dir, token, revert);
             throw new SshError(
               `could not install the original config: ${
                 install.stderr.trim().split("\n").at(-1) ?? ""
@@ -1798,15 +1879,7 @@ export const model = {
             `systemctl disable ${SERVICE}`,
           );
           if (stop.exit_code !== 0 || disable.exit_code !== 0) {
-            await disarmAndRestore(
-              context,
-              target,
-              args,
-              dir,
-              token,
-              revert,
-              isActive,
-            );
+            await disarmAndRestore(context, target, args, dir, token, revert);
             throw new SshError(
               "could not stop and disable the Kea service; removal aborted",
             );

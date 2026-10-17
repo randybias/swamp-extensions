@@ -133,3 +133,49 @@ validated with the real tools, not just goldens:
   on arm64 vs `/usr/lib/kea/hooks` on amd64). Hook discovery reads the
   `kea-common`/`kea-dhcp4-server` package contents and falls back to
   `find /usr/lib -maxdepth 6 -path '*/kea/hooks/libdhcp_*.so'`.
+
+## Review round 2/3 (HEAD 4f15006)
+
+- **HIGH spaced result.** Real Kea answers `"result": 0`; the restore's socket
+  match is now `grep -Eq '"result": *0'`, and the restore config-set answer is
+  checked the same way with a `systemctl restart` fallback when it is not a 0.
+- **HIGH commit/revert race.** `restore.sh` and the new `commitScript` share
+  `/run/kea-dhcp-revert.lock` via `flock`. The restore exits early when a
+  `committed` marker exists; the commit critical section (stop timer, re-check
+  fired, check the transient `.service`/`.timer` are inactive, re-check the
+  armed sha, write `committed`, clear active) runs under the same lock.
+- **HIGH verify gate.** Before the commit critical section: the service must be
+  active (apply), a stored `kea_hash` must exist and equal a fresh
+  `config-hash-get`, `systemctl enable` must return 0, canaries must answer, and
+  a fresh-connection probe must yield no `fail` verify field; otherwise the
+  commit refuses and the revert stays armed.
+- **HIGH failed-apply disarm.** `disarmAndRestore` now runs the uploaded
+  `restore.sh` synchronously and only stops the timer, clears active and marks
+  the record cancelled when `fired.json` says `pass`; otherwise the timer stays
+  armed and the recovery note is surfaced.
+- **HIGH commented stock config.** `remove` no longer `JSON.parse`s the captured
+  original (the stock config has ~300 `//` lines); `kea-dhcp4 -t` on the staged
+  copy is the validation. A test uses a commented original.
+- **HIGH enabled state.** The claim records `prior.json` with
+  `systemctl is-enabled`; the revert record keeps `prior_enabled`; `restore.sh`
+  re-enables/disables to the prior state and checks it in the post-state.
+- **MEDIUM post-claim failure.** A failure between the claim and `systemd-run`
+  now removes the token dir and active.json and marks the record cancelled
+  (`abortClaim`).
+
+### Real-tool validation, rounds 2-3
+
+- **restore.sh against a RUNNING Kea** (real `socat`, Kea's spaced answer) in
+  `ubuntu:24.04` + Kea 2.4.1: `fired.json` `result: pass`, the config file
+  restored to the previous sha, the running config restored (previous pool
+  present, the bad pool gone via `config-get`), active.json cleared, no recovery
+  note.
+- **Stock config**: the packaged `/etc/kea/kea-dhcp4.conf` has 302 `//` comment
+  lines and `kea-dhcp4 -t` accepts the staged copy.
+- **Every host script** (`management`, `group`, `hook`, `claim`, `install`,
+  `restore` active/inactive, `commit`) run under `sh -eu` with fakes: claim
+  writes `prior.json`, a second claim exits 9, install is `root:_kea 640`,
+  restore pass clears active, the inactive path stops and disables, a `result:1`
+  socket answer triggers the restart fallback and a failed restore writes the
+  recovery note, commit returns `committed`/`drifted`/`fired` correctly, and a
+  restore after a commit does not revert.

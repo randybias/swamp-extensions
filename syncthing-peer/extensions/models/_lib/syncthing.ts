@@ -2,9 +2,9 @@
  * Syncthing REST transport for swamp extensions.
  *
  * The API key travels only in the `X-API-Key` header: for a local call it is an
- * in-memory request header, and for a remote call it is written into a `curl
- * --config -` file delivered over stdin, so it never reaches a URL, a process
- * argument, a log or stored state. Plain HTTP is allowed only on a loopback
+ * in-memory request header, and for a remote call it is streamed to `curl
+ * --config -` on stdin, so it never reaches a URL, a process argument, remote
+ * disk, a log or stored state. Plain HTTP is allowed only on a loopback
  * address; anything else must use HTTPS.
  *
  * @module
@@ -17,7 +17,6 @@ import {
   SshConfigError,
   SshError,
   type SshTarget,
-  upload as sshUpload,
 } from "./ssh.ts";
 
 /** Signature of the fetch implementation the local transport uses. */
@@ -306,68 +305,31 @@ export function createClient(
     }
     const url = `${base}${path}`;
     const config = curlRequestConfig(method, url, api.apiKey, body, timeoutMs);
-    // One shell resolves a 0700 per-user cache directory and sweeps configs left
-    // by an earlier interrupted call; the config is uploaded there over stdin
-    // under a random name; curl and its trap-based cleanup then run in one
-    // remote shell, so a dropped session cannot strand the key file for long.
-    const prepared = await sshExec(deps, sshTarget, [
-      "sh",
-      "-c",
-      "umask 077\n" +
-      'd="$HOME/.cache/syncthing-peer"\n' +
-      'mkdir -p "$d" && [ -d "$d" ] && [ ! -L "$d" ] && [ -O "$d" ] && ' +
-      'chmod 700 "$d" || exit 1\n' +
-      'm=$(stat -c %a "$d" 2>/dev/null || stat -f %Lp "$d" 2>/dev/null)\n' +
-      '[ "$m" = "700" ] || exit 1\n' +
-      'find "$d" -maxdepth 1 -name "*.curlrc" -type f -mmin +5 -delete ' +
-      '2>/dev/null && printf %s "$d"',
-    ]);
-    if (prepared.exit_code !== 0) {
+    // `curl --config -` reads the whole config, API key included, from stdin,
+    // so no secret reaches a remote file or a process argument. The ssh
+    // timeout is a few seconds past curl's own max-time so curl stops first.
+    const sshTimeoutMs = (Math.max(1, Math.ceil(timeoutMs / 1000)) + 5) * 1000;
+    const result = await sshExec(
+      deps,
+      sshTarget,
+      ["curl", "-q", "--config", "-"],
+      { stdin: config, timeoutMs: sshTimeoutMs },
+    );
+    if (result.exit_code !== 0) {
       throw new SshError(
-        `could not prepare the remote config directory (exit ${prepared.exit_code}): ${
-          lastLine(prepared.stderr)
+        `remote curl failed (exit ${result.exit_code}): ${
+          lastLine(result.stderr)
         }`,
       );
     }
-    const dir = prepared.stdout.trim();
-    if (!dir.endsWith("/.cache/syncthing-peer")) {
-      throw new SshError("could not resolve the remote config directory");
-    }
-    const tempPath = `${dir}/${crypto.randomUUID()}.curlrc`;
-    try {
-      await sshUpload(deps, sshTarget, {
-        path: tempPath,
-        content: config,
-        mode: "0600",
-      });
-      const result = await sshExec(deps, sshTarget, [
-        "sh",
-        "-c",
-        'trap \'rm -f "$1"\' EXIT HUP INT TERM; curl -q --config "$1"',
-        "sh",
-        tempPath,
-      ]);
-      if (result.exit_code !== 0) {
-        throw new SshError(
-          `remote curl failed (exit ${result.exit_code}): ${
-            lastLine(result.stderr)
-          }`,
-        );
-      }
-      const parsed = parseCurlOutput(result.stdout);
-      if (parsed.status >= 300 && parsed.status <= 399) {
-        throw new SyncthingError(
-          `refusing a redirect (${parsed.status}); the API key would be re-sent`,
-          parsed.status,
-        );
-      }
-      return parsed;
-    } catch (error) {
-      await sshExec(deps, sshTarget, ["rm", "-f", tempPath]).catch(
-        () => undefined,
+    const parsed = parseCurlOutput(result.stdout);
+    if (parsed.status >= 300 && parsed.status <= 399) {
+      throw new SyncthingError(
+        `refusing a redirect (${parsed.status}); the API key would be re-sent`,
+        parsed.status,
       );
-      throw error;
     }
+    return parsed;
   };
   return { request };
 }

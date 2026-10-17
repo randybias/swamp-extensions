@@ -129,3 +129,27 @@ Result 10/10 applicable cells PASS, 0 FAIL, 0 BLOCKED. Both nodes were purged
   - LOW (open): remote curl stderr is passed into errors as its last line,
     capped at 200 characters; earlier lines are dropped.
   - LOW (open): no `docs/specs/` spec exists for this extension.
+
+## 2026.10.17.2 — re-vendor transport, stream the key on stdin
+
+- Re-vendored `_lib/ssh.ts` and `_lib/ssh_test.ts` byte-identical from
+  `@randybias/ssh-host` 2026.10.17.3 (blob
+  `8f132c4329c9e64bed686731cd5a0e02980194ea`), which adds optional
+  `exec(argv, { stdin, timeoutMs, maxOutputBytes })`.
+- Dropped the remote temp-file workaround: the curl config (which carries the
+  `X-API-Key` header) is now streamed to `curl -q --config -` on stdin, so no
+  secret byte reaches remote disk. The 0700 `~/.cache/syncthing-peer/`
+  directory, the random `*.curlrc` upload, the stale sweep and the trap-based
+  cleanup are all gone. A dropped session cannot strand the key because there is
+  no file to strand.
+- The remote command text changed from
+  `sh -c 'trap ...; curl -q --config "$1"' sh <path>` to `curl -q --config -`,
+  which is the whole point: the config is stdin, not a path. Every non-secret
+  behaviour (URL/key/body config, redirect refusal, GET/PUT/PATCH, timeout,
+  status parsing) is unchanged. A recording-runner test asserts the config is on
+  stdin, the key is on no argv, and no
+  `mktemp`/`curlrc`/`umask`/cache-dir/`rm -f` command is ever issued.
+- Remote steps carry `timeoutMs` = curl's `max-time` plus 5 s, so curl is the
+  one that stops first and the local ssh does not kill a request early.
+- Inputs and the REST contract are unchanged, so the `upgrades[]` entry is a
+  no-op.

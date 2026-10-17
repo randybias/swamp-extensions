@@ -105,6 +105,18 @@ export interface PeerMethod {
   execute: (args: unknown, context: MethodContext) => Promise<MethodResult>;
 }
 
+/** A version upgrade step for model attributes. */
+export interface VersionUpgrade {
+  /** Version this step migrates to. */
+  toVersion: string;
+  /** Why the migration exists. */
+  description: string;
+  /** Returns the migrated attributes. */
+  upgradeAttributes: (
+    old: Record<string, unknown>,
+  ) => Record<string, unknown>;
+}
+
 /** The model definition returned by {@link createModel}. */
 export interface PeerModel {
   /** Model type. */
@@ -115,6 +127,8 @@ export interface PeerModel {
   description: string;
   /** Empty globals. */
   globalArguments: z.ZodType;
+  /** Attribute migrations for version bumps. */
+  upgrades?: VersionUpgrade[];
   /** Resource specs. */
   resources: Record<string, ResourceSpec>;
   /** Methods. */
@@ -600,7 +614,7 @@ export function createModel(
 ): PeerModel {
   return {
     type: "@randybias/syncthing-peer",
-    version: "2026.10.17.1",
+    version: "2026.10.17.2",
     description:
       "Ensure a peer device and a shared folder on one Syncthing node through its REST API, reached locally or over SSH, and inspect or remove them. The API key travels only in the X-API-Key header, plain HTTP is loopback-only, and state is keyed by a SHA-256 of the node label and endpoint.",
     globalArguments: z.strictObject({}),
@@ -1010,5 +1024,13 @@ export function createModel(
 export const model = {
   ...createModel(),
   type: "@randybias/syncthing-peer",
-  version: "2026.10.17.1",
+  version: "2026.10.17.2",
+  upgrades: [
+    {
+      toVersion: "2026.10.17.2",
+      description:
+        "Remote calls stream the curl config to `curl --config -` on stdin instead of a remote temp file; the method inputs are unchanged",
+      upgradeAttributes: (old: Record<string, unknown>) => old,
+    },
+  ],
 } satisfies PeerModel;

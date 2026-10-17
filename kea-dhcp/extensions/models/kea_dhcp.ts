@@ -19,25 +19,42 @@
 import { z } from "npm:zod@4.3.6";
 import { deps, type MethodContext, type MethodOutcome } from "./_lib/deps.ts";
 import {
+  ActionStateSchema,
   applyArgsSchema,
+  type ConfigArgs,
   configArgsSchema,
+  configName,
   type ConfigState,
   ConfigStateSchema,
   instanceKey,
   type LeaseArgs,
   leaseArgsSchema,
+  leasesName,
   type LeaseState,
   LeaseStateSchema,
   type Observation,
+  observationName,
   ObservationSchema,
+  pendingName,
+  type PendingState,
+  PendingStateSchema,
   probeArgsSchema,
+  renderName,
+  type RenderState,
+  RenderStateSchema,
+  revertName,
   type RevertState,
   RevertStateSchema,
   type SshArgs,
   strictTargetArgsSchema,
   targetArgsSchema,
 } from "./_lib/schemas.ts";
-import { runApply, runCommit, runRemove } from "./_lib/apply.ts";
+import {
+  discardPending,
+  runApply,
+  runCommit,
+  runRemove,
+} from "./_lib/apply.ts";
 import { runInstall } from "./_lib/install.ts";
 import { probe } from "./_lib/probe.ts";
 import {
@@ -61,17 +78,32 @@ import {
   parseLeaseJson,
 } from "./_lib/lease.ts";
 
-/** `render`: the pure, host-free config render. */
-async function runRender(rawArgs: unknown): Promise<MethodOutcome> {
-  const args = rawArgs as Parameters<typeof renderAndHash>[0];
+/** `render`: the pure, host-free config render, persisted for visibility. */
+async function runRender(
+  rawArgs: unknown,
+  context: MethodContext,
+): Promise<MethodOutcome> {
+  const args = rawArgs as ConfigArgs;
   const rendered = await renderAndHash(args);
+  const plan = [...APPLY_PLAN] as ApplyStep[];
+  const state: RenderState = {
+    sha256: rendered.sha256,
+    warnings: rendered.warnings,
+    plan,
+    config: rendered.config,
+  };
+  const handle = await context.writeResource(
+    "render",
+    renderName(rendered.sha256),
+    RenderStateSchema.parse(state),
+  );
   return {
-    dataHandles: [],
+    dataHandles: [handle],
     result: {
       config: rendered.config,
       sha256: rendered.sha256,
       warnings: rendered.warnings,
-      plan: [...APPLY_PLAN] as ApplyStep[],
+      plan,
     },
   };
 }
@@ -86,7 +118,7 @@ async function runGet(
   const observation = await probe(target, args, DEFAULT_CONTROL_SOCKET);
   const handle = await context.writeResource(
     "observation",
-    instanceKey(args),
+    observationName(instanceKey(args)),
     observation,
   );
   return { dataHandles: [handle], result: observation };
@@ -122,27 +154,34 @@ async function runSync(
   const target = await toTarget(context, args);
   const key = instanceKey(args);
   const observation = await probe(target, args, DEFAULT_CONTROL_SOCKET);
-  const stored = await context.readResource(key) as ConfigState | null;
-  const drift = driftOf(stored, observation);
+  const committed = await context.readResource(configName(key)) as
+    | ConfigState
+    | null;
+  const pending = await context.readResource(pendingName(key)) as
+    | PendingState
+    | null;
+  // An in-flight apply is expected to differ; only a settled state can drift.
+  const drift = pending !== null && pending.status === "pending"
+    ? []
+    : driftOf(committed, observation);
   for (const marker of await readFiredMarkers(target)) {
-    const record = await context.readResource(`${key}-${marker.token}`) as
-      | RevertState
-      | null;
+    const record = await context.readResource(
+      revertName(key, marker.token),
+    ) as RevertState | null;
     if (record && !record.fired_at) {
       await context.writeResource(
         "revert",
-        `${key}-${marker.token}`,
+        revertName(key, marker.token),
         RevertStateSchema.parse({ ...record, fired_at: marker.firedAt }),
       );
     }
-    drift.push(
-      `revert ${marker.token} fired at ${marker.firedAt} (${marker.result})`,
-    );
+    // A fired revert discards the pending apply; it is not reported as drift.
+    await discardPending(context, key);
   }
   const finalObservation = ObservationSchema.parse({ ...observation, drift });
   const handle = await context.writeResource(
     "observation",
-    key,
+    observationName(key),
     finalObservation,
   );
   return { dataHandles: [handle], result: finalObservation };
@@ -186,7 +225,7 @@ async function runLeases(
   };
   const handle = await context.writeResource(
     "leases",
-    instanceKey(args),
+    leasesName(instanceKey(args)),
     LeaseStateSchema.parse(state),
   );
   return { dataHandles: [handle], result: state };
@@ -208,6 +247,12 @@ export const model = {
       lifetime: "infinite" as const,
       garbageCollection: 10,
     },
+    pending: {
+      description: "The uncommitted apply: sha, Kea hash and status",
+      schema: PendingStateSchema,
+      lifetime: "infinite" as const,
+      garbageCollection: 10,
+    },
     revert: {
       description: "One armed revert: token, window and armed hash",
       schema: RevertStateSchema,
@@ -225,6 +270,18 @@ export const model = {
       schema: LeaseStateSchema,
       lifetime: "7d" as const,
       garbageCollection: 5,
+    },
+    render: {
+      description: "Last rendered config, sha256, warnings and plan",
+      schema: RenderStateSchema,
+      lifetime: "infinite" as const,
+      garbageCollection: 10,
+    },
+    action: {
+      description: "Last outcome of each action method",
+      schema: ActionStateSchema,
+      lifetime: "infinite" as const,
+      garbageCollection: 10,
     },
   },
   methods: {

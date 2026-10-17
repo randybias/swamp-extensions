@@ -207,3 +207,29 @@ Re-validated in the real container after the split: all host scripts under
 previous pool and records `result: pass`, `config-set` with `{"Dhcp4": ...}` is
 accepted while the inner body is refused, and the stock `//`-commented config
 passes `kea-dhcp4 -t`.
+
+## Live round (VPS, HEAD 540be3c): 10/11
+
+- **HIGH resource names.** Every resource was written under the same data name,
+  so `config`, `observation` and `leases` replaced one another (an apply then a
+  lease query then a commit failed with "no applied config hash is recorded").
+  Each kind now has its own instance name via `_lib/schemas.ts` helpers:
+  `config-<key>`, `pending-<key>`, `observation-<key>`, `leases-<key>`,
+  `render-<sha256>`, `revert-<key>-<token>`, and `<method>-<key>` for action
+  outcomes. A test runs apply, leases, get and commit and asserts each name.
+- **MEDIUM committed vs pending.** Apply now writes a `pending-<key>` record and
+  only `commit` writes the committed `config-<key>`; a commit (or a fired
+  revert) discards the pending record. `sync` reports drift only against the
+  committed record and not while an apply is in flight, so a fired revert is no
+  longer false drift.
+- **MEDIUM visibility.** `render` persists its output as `render-<sha256>` and
+  install/apply/commit/remove persist their outcomes as `<method>-<key>` action
+  records (RULINGS: swamp does not show method results).
+- **LOW sockets.** The probe records the local socket (`ss` field 4), not the
+  peer (`0.0.0.0:*`). Verified in the container: field 4 is the local
+  `address:port`.
+- **LOW kea_version.** Kea 2.4 `-V` prints a bare `2.4.1`; the parser now takes
+  the first `x.y.z` token and is unit-tested.
+
+Re-validated in the container after the change: the full `sh -eu` harness, the
+running-Kea restore, and the config-set shape all still pass.

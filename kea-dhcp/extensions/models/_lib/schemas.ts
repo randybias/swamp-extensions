@@ -262,6 +262,29 @@ const LeaseStateSchema = z.strictObject({
   observed_at: z.string(),
 });
 
+const PendingStateSchema = z.strictObject({
+  host: z.string(),
+  config_sha256: z.string(),
+  kea_hash: z.string().optional(),
+  applied_at: z.string(),
+  subnets: z.number().int(),
+  status: z.enum(["pending", "discarded"]),
+});
+
+const RenderStateSchema = z.strictObject({
+  sha256: z.string(),
+  warnings: z.array(z.string()),
+  plan: z.array(z.string()),
+  config: z.unknown(),
+});
+
+const ActionStateSchema = z.strictObject({
+  method: z.enum(["install", "apply", "commit", "remove"]),
+  host: z.string(),
+  at: z.string(),
+  result: z.unknown(),
+});
+
 /** A persisted config record. */
 export type ConfigState = z.infer<typeof ConfigStateSchema>;
 /** A persisted revert record. */
@@ -270,6 +293,12 @@ export type RevertState = z.infer<typeof RevertStateSchema>;
 export type Observation = z.infer<typeof ObservationSchema>;
 /** A persisted lease query record. */
 export type LeaseState = z.infer<typeof LeaseStateSchema>;
+/** A pending (uncommitted) apply record. */
+export type PendingState = z.infer<typeof PendingStateSchema>;
+/** A persisted render output. */
+export type RenderState = z.infer<typeof RenderStateSchema>;
+/** A persisted action outcome. */
+export type ActionState = z.infer<typeof ActionStateSchema>;
 /** Validated render/apply arguments. */
 export type ConfigArgs = z.infer<typeof configArgsSchema>;
 /** Validated apply arguments. */
@@ -290,6 +319,41 @@ export interface VerifyResult {
   sockets: VerifyField;
   fresh_connection: VerifyField;
   canaries: VerifyField;
+}
+
+/** The resource instance name for a target's committed config. */
+export function configName(key: string): string {
+  return `config-${key}`;
+}
+
+/** The resource instance name for a target's pending apply. */
+export function pendingName(key: string): string {
+  return `pending-${key}`;
+}
+
+/** The resource instance name for a target's observation. */
+export function observationName(key: string): string {
+  return `observation-${key}`;
+}
+
+/** The resource instance name for a target's lease query. */
+export function leasesName(key: string): string {
+  return `leases-${key}`;
+}
+
+/** The resource instance name for a rendered config, keyed by its sha256. */
+export function renderName(sha256: string): string {
+  return `render-${sha256}`;
+}
+
+/** The resource instance name for an action outcome. */
+export function actionName(method: string, key: string): string {
+  return `${method}-${key}`;
+}
+
+/** The resource instance name for one armed revert. */
+export function revertName(key: string, token: string): string {
+  return `revert-${key}-${token}`;
 }
 
 /** The stored-state key for a target: host, port and user. */
@@ -329,8 +393,11 @@ export function toRenderInput(args: DhcpInput): RenderInput {
 }
 
 export {
+  ActionStateSchema,
   ConfigStateSchema,
   LeaseStateSchema,
   ObservationSchema,
+  PendingStateSchema,
+  RenderStateSchema,
   RevertStateSchema,
 };

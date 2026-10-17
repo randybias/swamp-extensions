@@ -2,6 +2,15 @@ import { assert, assertEquals, assertRejects } from "jsr:@std/assert@1.0.19";
 import { KeaInputError } from "./_lib/grammar.ts";
 import { type CommandRunner, sha256Hex, SshConfigError } from "./_lib/ssh.ts";
 import { renderConfig } from "./_lib/render.ts";
+import { keaVersion } from "./_lib/transport.ts";
+import {
+  configName,
+  ConfigStateSchema,
+  instanceKey,
+  observationName,
+  pendingName,
+  PendingStateSchema,
+} from "./_lib/schemas.ts";
 import {
   applyArgsSchema,
   claimScript,
@@ -158,8 +167,10 @@ function fakeHost(): {
 function makeContext(vaultValue = "PLACEHOLDER-KEY"): {
   context: MethodContext;
   written: Written[];
+  store: Map<string, Record<string, unknown>>;
 } {
   const written: Written[] = [];
+  const store = new Map<string, Record<string, unknown>>();
   const context: MethodContext = {
     logger: { info: () => {}, warn: () => {} },
     writeResource: (
@@ -168,6 +179,7 @@ function makeContext(vaultValue = "PLACEHOLDER-KEY"): {
       data: Record<string, unknown>,
     ) => {
       written.push({ specName, name, data });
+      store.set(name, data);
       return Promise.resolve({
         name,
         specName,
@@ -177,12 +189,12 @@ function makeContext(vaultValue = "PLACEHOLDER-KEY"): {
         size: 0,
       });
     },
-    readResource: () => Promise.resolve(null),
+    readResource: (name: string) => Promise.resolve(store.get(name) ?? null),
     vaultService: {
       get: (_vault: string, _key: string) => Promise.resolve(vaultValue),
     },
   };
-  return { context, written };
+  return { context, written, store };
 }
 
 const depsFor = (
@@ -284,6 +296,12 @@ Deno.test("host scripts encode the revert and hook semantics", () => {
   assert(groupScript().includes("systemctl show -p User"));
 });
 
+Deno.test("keaVersion parses the bare 2.4 version string", () => {
+  assertEquals(keaVersion("2.4.1"), "2.4.1");
+  assertEquals(keaVersion("Kea 2.4.1\n"), "2.4.1");
+  assertEquals(keaVersion("no version here"), undefined);
+});
+
 Deno.test("configSetRequest sends the whole Dhcp4 object", async () => {
   const rendered = await renderAndHash(configArgsSchema.parse(DHCP));
   const request = configSetRequest(rendered);
@@ -295,7 +313,8 @@ Deno.test("configSetRequest sends the whole Dhcp4 object", async () => {
 });
 
 Deno.test("render is host-free, deterministic and exposes the plan", async () => {
-  const result = await model.methods.render.execute(DHCP);
+  const { context } = makeContext();
+  const result = await model.methods.render.execute(DHCP, context);
   const expected = await renderAndHash(configArgsSchema.parse(DHCP));
   const body =
     (result as { result: { sha256: string; plan: string[] } }).result;
@@ -329,7 +348,8 @@ Deno.test("apply arms the revert before writing and setting the config", async (
     assert(armAt < writeAt, "arm precedes the config write");
     assert(setAt > writeAt, "config write precedes config-set");
     assert(written.some((w) => w.specName === "revert"), "revert persisted");
-    assert(written.some((w) => w.specName === "config"), "config persisted");
+    assert(written.some((w) => w.specName === "pending"), "pending persisted");
+    assert(written.some((w) => w.specName === "action"), "action persisted");
   } finally {
     setDeps(prior);
   }
@@ -477,7 +497,146 @@ Deno.test("remove arms the revert before disabling and restoring", async () => {
     assert(armAt >= 0, "the arm step ran");
     assert(disableAt > armAt, "the arm precedes disable");
     assert(written.some((w) => w.specName === "revert"), "revert persisted");
-    assert(written.some((w) => w.specName === "config"), "config persisted");
+    assert(written.some((w) => w.specName === "pending"), "pending persisted");
+    assert(written.some((w) => w.specName === "action"), "action persisted");
+  } finally {
+    setDeps(prior);
+  }
+});
+
+Deno.test("each resource kind is stored under its own name", async () => {
+  const rendered = await renderAndHash(configArgsSchema.parse(DHCP));
+  const key = instanceKey(SSH);
+  const host = fakeHost();
+  let armed = false;
+  // The live file must differ before the arm and match afterwards.
+  host.when("committed", () => out("committed"));
+  host.when("fired.json", () => out("", 1));
+  host.when(
+    "active.json",
+    () =>
+      out(
+        JSON.stringify({
+          token: "token-1",
+          expires_at: "2030-01-01T00:00:00Z",
+        }),
+      ),
+  );
+  host.when("systemd-run", () => {
+    armed = true;
+    return OK;
+  });
+  host.when("ss -lunp", () => out("0.0.0.0:67\n"));
+  host.when(
+    (c) => c.includes("sha256sum") && c.includes("'/etc/kea/kea-dhcp4.conf'"),
+    () => out(armed ? `${rendered.sha256}\n` : `${"0".repeat(64)}\n`),
+  );
+  const prior = setDeps(depsFor(host.runner));
+  try {
+    const { context, store, written } = makeContext();
+    const applyResult = await model.methods.apply.execute(
+      { ...SSH, ...DHCP },
+      context,
+    );
+    const token =
+      (applyResult as { result: { revert_token: string } }).result.revert_token;
+    assertEquals(token, "token-1");
+
+    // These must not overwrite the pending apply record.
+    await model.methods.leases.execute({ ...SSH, lease_api: false }, context);
+    await model.methods.get.execute(SSH, context);
+    assertEquals(
+      (store.get(pendingName(key)) as { kea_hash?: string }).kea_hash,
+      "kea-hash",
+    );
+
+    // Commit reads the pending record and writes the committed one.
+    const commitResult = await model.methods.commit.execute(SSH, context);
+    assertEquals(
+      (commitResult as { result: { committed: boolean } }).result.committed,
+      true,
+    );
+
+    const names = (spec: string) =>
+      new Set(written.filter((w) => w.specName === spec).map((w) => w.name));
+    for (
+      const [spec, prefix] of [
+        ["config", "config-"],
+        ["pending", "pending-"],
+        ["revert", "revert-"],
+        ["observation", "observation-"],
+        ["leases", "leases-"],
+      ] as const
+    ) {
+      const set = names(spec);
+      assert(set.size >= 1, `${spec} was written`);
+      for (const name of set) assert(name.startsWith(prefix), `${name} prefix`);
+    }
+    // Action outcomes are named by method so each is separately visible.
+    const actionNames = names("action");
+    assert(actionNames.has(`apply-${key}`), "apply outcome written");
+    assert(actionNames.has(`commit-${key}`), "commit outcome written");
+    assert(store.has(configName(key)), "committed config record exists");
+  } finally {
+    setDeps(prior);
+  }
+});
+
+Deno.test("a fired revert discards the pending apply without drift", async () => {
+  const key = instanceKey(SSH);
+  const committedSha = "a".repeat(64);
+  const host = fakeHost();
+  host.when(
+    (c) => c.includes("sha256sum") && c.includes("'/etc/kea/kea-dhcp4.conf'"),
+    () => out(`${committedSha}\n`),
+  );
+  host.when(
+    "fired.json",
+    () =>
+      out(JSON.stringify({
+        token: "tok",
+        fired_at: "2030-01-01T00:00:00Z",
+        result: "pass",
+      })),
+  );
+  const prior = setDeps(depsFor(host.runner));
+  try {
+    const { context, store } = makeContext();
+    const now = new Date(1_700_000_000_000).toISOString();
+    await context.writeResource(
+      "config",
+      configName(key),
+      ConfigStateSchema.parse({
+        host: HOST,
+        config_sha256: committedSha,
+        kea_hash: "kea-committed",
+        committed_at: now,
+        applied_at: now,
+        subnets: 1,
+      }),
+    );
+    await context.writeResource(
+      "pending",
+      pendingName(key),
+      PendingStateSchema.parse({
+        host: HOST,
+        config_sha256: "b".repeat(64),
+        kea_hash: "kea-pending",
+        applied_at: now,
+        subnets: 1,
+        status: "pending",
+      }),
+    );
+    const result = await model.methods.sync.execute(SSH, context);
+    assertEquals((result as { result: { drift: string[] } }).result.drift, []);
+    assertEquals(
+      (store.get(pendingName(key)) as { status: string }).status,
+      "discarded",
+    );
+    assert(
+      (store.get(observationName(key)) as { drift: string[] }).drift.length ===
+        0,
+    );
   } finally {
     setDeps(prior);
   }

@@ -93,9 +93,9 @@ export async function renderAndHash(
   return { ...rendered, sha256: await sha256Hex(rendered.json) };
 }
 
-/** Runs `kea-dhcp4 -V` and returns the version token. */
+/** Runs `kea-dhcp4 -V` and returns the version token (2.4 prints a bare version). */
 export function keaVersion(text: string): string | undefined {
-  const match = /(?:Kea|kea)[^\d]*(\d+\.\d+\.\d+)/.exec(text);
+  const match = /(\d+\.\d+\.\d+)/.exec(text);
   return match?.[1];
 }
 

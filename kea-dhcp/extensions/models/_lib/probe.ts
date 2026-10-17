@@ -32,7 +32,7 @@ export async function probe(
   const versionText = await runScript(target, "kea-dhcp4 -V 2>&1 || true");
   const sockets = await runScript(
     target,
-    `ss -lunp 2>/dev/null | awk '/:67 /{print $5}' || true`,
+    `ss -lunp 2>/dev/null | awk '/:67 /{print $4}' || true`,
   );
   const fileSha = await remoteFileSha(target, CONFIG_PATH);
   const marker = await readMarker(target);

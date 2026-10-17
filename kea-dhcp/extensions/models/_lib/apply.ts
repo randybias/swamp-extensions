@@ -18,11 +18,18 @@ import {
 } from "./ssh.ts";
 import { deps, type MethodContext, type MethodOutcome } from "./deps.ts";
 import {
+  actionName,
+  ActionStateSchema,
   type ApplyArgs,
+  configName,
   type ConfigState,
   ConfigStateSchema,
   instanceKey,
   type Observation,
+  pendingName,
+  type PendingState,
+  PendingStateSchema,
+  revertName,
   type RevertState,
   RevertStateSchema,
   type SshArgs,
@@ -138,7 +145,7 @@ async function abortClaim(
     .catch(() => undefined);
   await context.writeResource(
     "revert",
-    `${instanceKey(args)}-${token}`,
+    revertName(instanceKey(args), token),
     RevertStateSchema.parse({
       ...revert,
       cancelled_at: new Date(deps.now()).toISOString(),
@@ -239,7 +246,7 @@ async function claimAndArm(
   };
   await context.writeResource(
     "revert",
-    `${instanceKey(args)}-${opts.token}`,
+    revertName(instanceKey(args), opts.token),
     RevertStateSchema.parse(revert),
   );
   await armRevert(context, target, args, {
@@ -288,16 +295,68 @@ async function pushConfig(
   return await waitForHash(target, socket);
 }
 
-/** Writes the config record for a target. */
-async function persistConfig(
+/** Writes the pending apply record for a target. */
+async function persistPending(
+  context: MethodContext,
+  args: { host: string; port: number; user: string },
+  state: Omit<PendingState, "host" | "status">,
+): Promise<void> {
+  await context.writeResource(
+    "pending",
+    pendingName(instanceKey(args)),
+    PendingStateSchema.parse({
+      host: args.host,
+      status: "pending",
+      ...state,
+    }),
+  );
+}
+
+/** Writes the committed config record for a target. */
+async function persistCommitted(
   context: MethodContext,
   args: { host: string; port: number; user: string },
   state: Omit<ConfigState, "host">,
 ): Promise<void> {
   await context.writeResource(
     "config",
-    instanceKey(args),
+    configName(instanceKey(args)),
     ConfigStateSchema.parse({ host: args.host, ...state }),
+  );
+}
+
+/** Discards the pending record after a commit or a fired revert. */
+export async function discardPending(
+  context: MethodContext,
+  key: string,
+): Promise<void> {
+  const pending = await context.readResource(pendingName(key)) as
+    | PendingState
+    | null;
+  if (pending === null || pending.status === "discarded") return;
+  await context.writeResource(
+    "pending",
+    pendingName(key),
+    PendingStateSchema.parse({ ...pending, status: "discarded" }),
+  );
+}
+
+/** Writes the outcome record for an action method. */
+export async function persistAction(
+  context: MethodContext,
+  method: "install" | "apply" | "commit" | "remove",
+  args: { host: string; port: number; user: string },
+  result: unknown,
+): Promise<void> {
+  await context.writeResource(
+    "action",
+    actionName(method, instanceKey(args)),
+    ActionStateSchema.parse({
+      method,
+      host: args.host,
+      at: new Date(deps.now()).toISOString(),
+      result,
+    }),
   );
 }
 
@@ -338,7 +397,7 @@ async function disarmAndRestore(
     .catch(() => undefined);
   await context.writeResource(
     "revert",
-    `${instanceKey(args)}-${token}`,
+    revertName(instanceKey(args), token),
     RevertStateSchema.parse({
       ...revert,
       cancelled_at: new Date(deps.now()).toISOString(),
@@ -362,10 +421,6 @@ async function doApply(
   if (args.lease_api && args.lease_cmds_path) {
     await assertHookLibrary(target, args.lease_cmds_path);
   }
-  const stored = await context.readResource(instanceKey(args)) as
-    | ConfigState
-    | null;
-
   const staged = await stageConfig(target, rendered.json, deps.token());
   let stagedMoved = false;
   try {
@@ -404,10 +459,9 @@ async function doApply(
       await installStaged(target, staged, await resolveServiceGroup(target));
       stagedMoved = true;
       const keaHash = await pushConfig(target, rendered, isActive, socket);
-      await persistConfig(context, args, {
+      await persistPending(context, args, {
         config_sha256: rendered.sha256,
         kea_hash: keaHash,
-        committed_at: stored?.committed_at ?? "",
         applied_at: new Date(deps.now()).toISOString(),
         subnets: args.subnets.length,
       });
@@ -445,17 +499,16 @@ export async function runApply(
     host: args.host,
     token: revert.token,
   });
-  return {
-    dataHandles: [],
-    result: {
-      host: args.host,
-      revert_token: revert.token,
-      expires_at: revert.expires_at,
-      config_sha256: rendered.sha256,
-      plan: [...APPLY_PLAN] as ApplyStep[],
-      observation,
-    },
+  const result = {
+    host: args.host,
+    revert_token: revert.token,
+    expires_at: revert.expires_at,
+    config_sha256: rendered.sha256,
+    plan: [...APPLY_PLAN] as ApplyStep[],
+    observation,
   };
+  await persistAction(context, "apply", args, result);
+  return { dataHandles: [], result };
 }
 
 /** Writes a fired marker onto its revert record. */
@@ -468,7 +521,7 @@ async function adoptFired(
 ): Promise<void> {
   await context.writeResource(
     "revert",
-    `${key}-${token}`,
+    revertName(key, token),
     RevertStateSchema.parse({ ...revert, fired_at: firedAt }),
   );
 }
@@ -477,7 +530,7 @@ async function adoptFired(
 async function commitPreflight(
   target: SshTarget,
   removal: boolean,
-  storedConfig: ConfigState | null,
+  storedConfig: PendingState | null,
 ): Promise<string | undefined> {
   if (removal) return undefined;
   if (!(await serviceActive(target))) {
@@ -540,7 +593,7 @@ async function loadArmedRevert(
   }
   const { token } = marker;
   const dir = `${REVERT_ROOT}/${token}`;
-  const revert = await context.readResource(`${key}-${token}`) as
+  const revert = await context.readResource(revertName(key, token)) as
     | RevertState
     | null;
   if (revert === null) {
@@ -622,24 +675,25 @@ async function recordCommitted(
   token: string,
   revert: RevertState,
   observation: Observation,
-  storedConfig: ConfigState | null,
+  storedConfig: PendingState | null,
   removal: boolean,
 ): Promise<void> {
   await context.writeResource(
     "revert",
-    `${key}-${token}`,
+    revertName(key, token),
     RevertStateSchema.parse({
       ...revert,
       cancelled_at: new Date(deps.now()).toISOString(),
     }),
   );
-  await persistConfig(context, args, {
+  await persistCommitted(context, args, {
     config_sha256: observation.file_sha256 ?? "",
     kea_hash: observation.kea_hash,
     committed_at: new Date(deps.now()).toISOString(),
     applied_at: new Date(deps.now()).toISOString(),
     subnets: removal ? 0 : (storedConfig?.subnets ?? 0),
   });
+  await discardPending(context, key);
 }
 
 /** `commit`: gate on verify, then take the lock and cancel the revert. */
@@ -657,7 +711,9 @@ export async function runCommit(
     );
   }
   const removal = revert.intent === "remove";
-  const storedConfig = await context.readResource(key) as ConfigState | null;
+  const storedConfig = await context.readResource(pendingName(key)) as
+    | PendingState
+    | null;
   const runningHash = await commitPreflight(target, removal, storedConfig);
   await assertCanaries(target, revert.canaries ?? []);
   const { observation, verify } = await verifyCommit(
@@ -678,10 +734,9 @@ export async function runCommit(
     storedConfig,
     removal,
   );
-  return {
-    dataHandles: [],
-    result: { host: args.host, committed: true, verify },
-  };
+  const result = { host: args.host, committed: true, verify };
+  await persistAction(context, "commit", args, result);
+  return { dataHandles: [], result };
 }
 
 /** Stops and disables the service; used when converging a removal. */
@@ -741,23 +796,21 @@ export async function runRemove(
       stagedMoved = true;
       await convergeDisabled(target);
       const observation = await probe(target, args, socket);
-      await persistConfig(context, args, {
+      await persistPending(context, args, {
         config_sha256: originalSha,
         kea_hash: observation.kea_hash,
-        committed_at: "",
         applied_at: new Date(deps.now()).toISOString(),
         subnets: 0,
       });
-      return {
-        dataHandles: [],
-        result: {
-          host: args.host,
-          removed: true,
-          revert_token: token,
-          expires_at: revert.expires_at,
-          observation,
-        },
+      const result = {
+        host: args.host,
+        removed: true,
+        revert_token: token,
+        expires_at: revert.expires_at,
+        observation,
       };
+      await persistAction(context, "remove", args, result);
+      return { dataHandles: [], result };
     } catch (error) {
       await disarmAndRestore(context, target, args, dir, token, revert);
       throw error;

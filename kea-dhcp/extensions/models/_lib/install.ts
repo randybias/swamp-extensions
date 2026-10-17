@@ -15,6 +15,7 @@ import {
   SERVICE,
 } from "./host_scripts.ts";
 import { keaVersion, runScript, toTarget } from "./transport.ts";
+import { persistAction } from "./apply.ts";
 
 /** `install`: install the packages and capture the original config once. */
 export async function runInstall(
@@ -57,12 +58,11 @@ export async function runInstall(
     () => undefined,
   );
   const versionText = await runScript(target, "kea-dhcp4 -V 2>&1 || true");
-  return {
-    dataHandles: [],
-    result: {
-      host: args.host,
-      kea_version: keaVersion(versionText.stdout),
-      installed,
-    },
+  const result = {
+    host: args.host,
+    kea_version: keaVersion(versionText.stdout),
+    installed,
   };
+  await persistAction(context, "install", args, result);
+  return { dataHandles: [], result };
 }

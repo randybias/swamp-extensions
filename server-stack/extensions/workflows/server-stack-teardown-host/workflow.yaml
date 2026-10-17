@@ -18,9 +18,6 @@ inputs:
     - ssh_user
     - host_key_policy
     - mesh_address
-    - cloudflare_zone_id
-    - dns_record_name
-    - cloudflare_token_key
   properties:
     hostname:
       type: string
@@ -74,14 +71,17 @@ inputs:
     cloudflare_zone_id:
       type: string
       description: Cloudflare zone ID
+      default: ""
       maxLength: 64
     dns_record_name:
       type: string
       description: Fully qualified A record name
+      default: ""
       maxLength: 253
     cloudflare_token_key:
       type: string
       description: Vault key of a Cloudflare DNS edit token
+      default: ""
       maxLength: 256
     publish_dns:
       type: boolean
@@ -95,8 +95,11 @@ jobs:
         description: Check the hostname confirmation before any change
         task:
           type: assert
-          expr: inputs.confirm_hostname == inputs.hostname
-          message: confirm_hostname must equal hostname
+          expr: >-
+            inputs.confirm_hostname == inputs.hostname &&
+            (inputs.publish_dns == false || (inputs.cloudflare_zone_id != "" &&
+            inputs.dns_record_name != "" && inputs.cloudflare_token_key != ""))
+          message: confirm_hostname must equal hostname, and the DNS inputs are needed when publish_dns is true
           severity: high
       - name: sync-server
         description: Refresh the recorded server via the Cherry Servers API

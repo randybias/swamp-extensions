@@ -145,3 +145,15 @@ install: `config.merge: {host: <mesh address>, http: "0.0.0.0:8222"}` with
 - Adopting still re-runs `apply-base` through the mesh address under a separate
   record from the public address used on the first run; its steps are
   idempotent.
+
+## Preparing the first long-lived host
+
+- `publish_dns: false` could not be used with the Cloudflare inputs left out:
+  `cloudflare_token_key`, `cloudflare_zone_id` and `dns_record_name` were
+  required. They are optional now (default empty) and `check-inputs` requires
+  all three when `publish_dns` is true; teardown has the same rule.
+- A `known_hosts` line without a host field worked for the Cherry readiness wait
+  but broke `join-mesh` and `verify-mesh`, which read fixed positions. They now
+  read the last two fields, so `<type> <key>` pins every address and `strict`
+  works for a host whose public address is unknown before it is ordered. Checked
+  by evaluating the expression in a workflow assert for both shapes.

@@ -107,6 +107,12 @@ swamp workflow run @randybias/server-stack-teardown-host \
 
 ## How it works
 
+- `known_hosts` lines may be `<type> <key>` or `<host> <type> <key>`. A line
+  without a host field is pinned for every address, so `host_key_policy: strict`
+  works for a fresh host whose public address is unknown before it is ordered.
+- With `publish_dns: false` the Cloudflare inputs (`cloudflare_zone_id`,
+  `dns_record_name`, `cloudflare_token_key`) may be left out; with `true` all
+  three are required.
 - Every secret is resolved inside a step with
   `vault.get("server-stack", inputs.<key>)`. Workflow inputs are recorded, so a
   value never passes through one. Do not capture `--json` of a run that resolves

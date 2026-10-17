@@ -19,7 +19,6 @@ inputs:
     - cycle
     - ssh_private_key_key
     - user_data_key
-    - cloudflare_token_key
     - wg_private_key_key
     - kubeconfig_key
     - ssh_user
@@ -36,9 +35,6 @@ inputs:
     - k0s_pod_cidr
     - k0s_service_cidr
     - nats_chart
-    - cloudflare_zone_id
-    - dns_record_name
-    - dns_record_target
   properties:
     hostname:
       type: string
@@ -108,6 +104,7 @@ inputs:
     cloudflare_token_key:
       type: string
       description: Vault key of a Cloudflare DNS edit token
+      default: ""
       maxLength: 256
     wg_private_key_key:
       type: string
@@ -391,13 +388,16 @@ inputs:
     cloudflare_zone_id:
       type: string
       description: Cloudflare zone ID
+      default: ""
       maxLength: 64
     dns_record_name:
       type: string
       description: Fully qualified A record name
+      default: ""
       maxLength: 253
     dns_record_target:
       type: string
+      default: public
       description: Which address the A record points at
       enum: [public, mesh]
     dns_ttl:
@@ -424,7 +424,9 @@ jobs:
             size(inputs.management_cidrs) > 0 &&
             (inputs.host_key_policy != "strict" || size(inputs.known_hosts) > 0) &&
             inputs.tags[inputs.ownership_tag.split("=")[0]] == inputs.ownership_tag.split("=")[1] &&
-            size(inputs.cluster_secrets) == 0
+            size(inputs.cluster_secrets) == 0 &&
+            (!inputs.publish_dns || (inputs.cloudflare_zone_id != "" &&
+            inputs.dns_record_name != "" && inputs.cloudflare_token_key != ""))
           message: Cross-input invariants failed
           severity: high
       - name: probe-server
@@ -613,7 +615,7 @@ jobs:
               port: ${{ inputs.ssh_port }}
               user: ${{ inputs.ssh_user }}
               host_key_policy: strict
-              host_keys: '${{ inputs.known_hosts.map(line, {"type": line.split(" ")[1], "key": line.split(" ")[2]}) }}'
+              host_keys: '${{ inputs.known_hosts.map(line, {"type": line.split(" ")[size(line.split(" ")) - 2], "key": line.split(" ")[size(line.split(" ")) - 1]}) }}'
               private_key: ${{ vault.get("server-stack", inputs.ssh_private_key_key) }}
       - name: verify-mesh
         description: Read the node's WireGuard peers and handshakes via SSH
@@ -637,7 +639,7 @@ jobs:
               port: ${{ inputs.ssh_port }}
               user: ${{ inputs.ssh_user }}
               host_key_policy: strict
-              host_keys: '${{ inputs.known_hosts.map(line, {"type": line.split(" ")[1], "key": line.split(" ")[2]}) }}'
+              host_keys: '${{ inputs.known_hosts.map(line, {"type": line.split(" ")[size(line.split(" ")) - 2], "key": line.split(" ")[size(line.split(" ")) - 1]}) }}'
               private_key: ${{ vault.get("server-stack", inputs.ssh_private_key_key) }}
       - name: check-mesh
         description: Check a recent mesh handshake exists before any firewall change

@@ -157,3 +157,39 @@ Deno.test("teardown forgets the server-host records, only after the server is ve
     'inputs.mesh_address.split("/")[0]',
   );
 });
+
+Deno.test("DNS inputs are optional while publish_dns is false, and required when it is true", async () => {
+  for (
+    const name of ["server-stack-provision-host", "server-stack-teardown-host"]
+  ) {
+    const s = await read(name);
+    const required = s.slice(
+      s.indexOf("  required:"),
+      s.indexOf("  properties:"),
+    );
+    for (
+      const k of [
+        "cloudflare_token_key",
+        "cloudflare_zone_id",
+        "dns_record_name",
+      ]
+    ) {
+      assertEquals(required.includes(`- ${k}`), false, `${name} ${k}`);
+    }
+    const first = stepText(s, "check-inputs");
+    assertStringIncludes(first, 'inputs.cloudflare_zone_id != ""');
+    assertStringIncludes(first, 'inputs.dns_record_name != ""');
+    assertStringIncludes(first, 'inputs.cloudflare_token_key != ""');
+  }
+});
+
+Deno.test("known_hosts lines may omit the host field: the mesh mapping reads the last two fields", async () => {
+  const s = await read("server-stack-provision-host");
+  assertEquals(s.includes('line.split(" ")[1]'), false);
+  for (const step of ["join-mesh", "verify-mesh"]) {
+    assertStringIncludes(
+      stepText(s, step),
+      'line.split(" ")[size(line.split(" ")) - 2]',
+    );
+  }
+});

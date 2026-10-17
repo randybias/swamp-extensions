@@ -2,8 +2,11 @@
 import { mbrTargets, type ProbeInputs } from "./protected_devices.ts";
 
 /** A sector 0 as `od` prints it: 512 bytes, boot code optional. */
-export function sector0(opts: { code?: boolean; sig?: boolean } = {}): string {
+export function sector0(
+  opts: { code?: boolean; sig?: boolean; bytes?: Record<number, number> } = {},
+): string {
   const b = new Array(512).fill(0);
+  for (const [i, v] of Object.entries(opts.bytes ?? {})) b[Number(i)] = v;
   if (opts.code) { for (let i = 0; i < 446; i++) b[i] = i % 251 + 1; }
   if (opts.sig ?? true) {
     b[510] = 0x55;

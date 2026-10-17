@@ -164,3 +164,7 @@ Not packaged. Notes for whoever maintains this extension.
   (`mbr-boot-code`), lifted only by that disk's acknowledgement. A partition
   with no readable type is a `boot-partition` refusal too. A serial listed twice
   in `dataDevices` is refused. New tests pin the `some` and `continue` mutants.
+- 2026-10-17 guard r9: the sector-0 rule also covers every disk behind a
+  non-partition candidate (a multipath device is wiped through its paths); a
+  missing or short read of any of them is unverifiable. The boundary is pinned
+  (bytes 0-439 are boot code, 440-445 are not).

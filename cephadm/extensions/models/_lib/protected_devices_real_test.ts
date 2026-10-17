@@ -779,3 +779,62 @@ Deno.test("an acknowledged ESP-typed partition that is a physical volume of a pr
   assert(!r.ok);
   assertEquals(r.refusal.code, "protected", JSON.stringify(r.refusal));
 });
+
+Deno.test("only bytes 0-439 count as boot code: the boundary is exact", () => {
+  const at = (bytes: Record<number, number>) =>
+    code(sdcWithSector(ok(sector0({ bytes }))), ["/dev/sdc"]);
+  assertEquals(at({ 439: 1 }), "boot-partition");
+  assertEquals(at({ 0: 0xeb }), "boot-partition");
+  assertEquals(at({ 5: 1 }), "boot-partition", "code that starts after byte 0");
+  // The disk signature and reserved bytes (440-445) are not boot code.
+  assertEquals(at({ 440: 1, 441: 2, 442: 3, 443: 4, 445: 9 }), "allowed");
+});
+
+/** A multipath LUN: mpath_member paths sdc and sdd behind mpathb (dm-3). */
+function multipathHost(): ProbeInputs {
+  const input = realHost();
+  const lsblk = JSON.parse(input.lsblk.stdout);
+  const dm: P = {
+    name: "dm-3",
+    type: "mpath",
+    parttype: null,
+    fstype: null,
+  };
+  for (const n of ["sdc", "sdd"]) {
+    lsblk.blockdevices.push(row({
+      name: n,
+      type: "disk",
+      parttype: null,
+      fstype: "mpath_member",
+      children: [dm],
+    }, null));
+  }
+  input.lsblk = ok(JSON.stringify(lsblk));
+  for (const d of ["/dev/sdc", "/dev/sdd", "/dev/dm-3"]) {
+    input.mdExamine[d] = NO_SB(d);
+  }
+  return input;
+}
+
+Deno.test("a multipath candidate is judged by the sector 0 of the disks behind it", () => {
+  // (a) boot code on the paths: refused, and the ack for one path is not enough.
+  const withCode = multipathHost();
+  for (const d of ["/dev/sdc", "/dev/sdd"]) {
+    withCode.mbr[d] = ok(sector0({ code: true }));
+  }
+  const r = assessM(withCode, ["/dev/dm-3"]);
+  assert(!r.ok);
+  assertEquals(r.refusal.code, "boot-partition", JSON.stringify(r.refusal));
+  assertEquals(r.refusal.detail.evidence, "mbr-boot-code");
+  // (b) no sector-0 probe at all: unverifiable, never allowed.
+  const none = assess(multipathHost(), ["/dev/dm-3"]);
+  assert(!none.ok);
+  assertEquals(none.refusal.code, "unverifiable");
+  // A single missing path is enough to refuse.
+  const half = multipathHost();
+  half.mbr["/dev/sdc"] = ok(sector0());
+  const h = assess(half, ["/dev/dm-3"]);
+  assert(!h.ok && h.refusal.code === "unverifiable");
+  // (c) zero boot code: allowed.
+  assertEquals(code(multipathHost(), ["/dev/dm-3"]), "allowed");
+});

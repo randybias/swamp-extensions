@@ -1317,6 +1317,24 @@ export function examineTargets(
 }
 
 /**
+ * The disks whose sector 0 decides whether a candidate may be wiped: every
+ * disk in its subtree and, unless the candidate is a partition (which does not
+ * touch the MBR), every disk above it. The latter covers a multipath device,
+ * whose own type is not "disk" but whose paths are.
+ */
+function bootDisks(graph: Graph, path: string): string[] {
+  const out = new Set<string>();
+  const nodes = [...subtree(graph, path)];
+  if (graph.nodes.get(path)?.type !== "part") {
+    nodes.push(...closure(graph, path, (n) => n.parents));
+  }
+  for (const p of nodes) {
+    if (graph.nodes.get(p)?.type === "disk") out.add(p);
+  }
+  return [...out].sort();
+}
+
+/**
  * The whole disks whose sector 0 {@link assess} needs: every disk in or above
  * a candidate. Returns an empty list when the host cannot be read.
  */
@@ -1336,13 +1354,8 @@ export function mbrTargets(
   for (const c of candidates) {
     const path = resolver.resolve(c);
     if (!path) continue;
-    for (
-      const p of [
-        ...subtree(graph, path),
-        ...closure(graph, path, (n) => n.parents),
-      ]
-    ) {
-      if (graph.nodes.get(p)?.type === "disk" && isDevicePath(p)) out.add(p);
+    for (const p of bootDisks(graph, path)) {
+      if (isDevicePath(p)) out.add(p);
     }
   }
   return [...out].sort();
@@ -1516,6 +1529,33 @@ function conflict(
           message: "the device is a member of a protected ZFS pool",
           detail: { device: path, member: p, pool: node.label },
         };
+      }
+    }
+    // A multipath (or any non-partition, non-disk) device is wiped through its
+    // paths, so the sector 0 of the disks behind it decides too.
+    if (graph.nodes.get(path)?.type !== "part") {
+      for (const d of bootDisks(graph, path)) {
+        if (subtree(graph, path).includes(d)) continue; // judged in the loop above
+        const sector = parseMbrSector(input.mbr[d]);
+        if (sector === null) {
+          return {
+            code: "unverifiable",
+            message: "the first sector of a candidate disk could not be read",
+            detail: { device: path, disk: d },
+          };
+        }
+        if (!hasMbrBootCode(sector)) continue;
+        const roots = [...closure(graph, d, (n) => n.parents)].filter((q) =>
+          (graph.nodes.get(q)?.parents.size ?? 0) === 0
+        );
+        if (!roots.every((q) => acknowledged.has(q))) {
+          return {
+            code: "boot-partition",
+            message:
+              "the device holds boot code or a boot partition (BIOS boot, EFI System, MBR boot code or similar); acknowledge its serial to wipe it",
+            detail: { device: path, disk: d, evidence: "mbr-boot-code" },
+          };
+        }
       }
     }
   }

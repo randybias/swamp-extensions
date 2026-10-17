@@ -161,7 +161,8 @@ apt-cache:
 
 kubevirt:
   channel: beta
-  ci: false
-  published: {}
+  ci: true
+  published:
+    2026.10.17.1: 274d5c5d2588eccadb6d7c97a082ec94f05755fc3170c886db1c4e4086893316
   notes:
     2026.10.17.1: 'First release, beta. Install, upgrade and uninstall KubeVirt (and optionally CDI) on an existing Kubernetes cluster from a required SHA-256-pinned operator manifest, wait for the CR to be Deployed and Available, and define, start, stop, restart, inspect and delete one VirtualMachine from a digest-pinned containerDisk image or a CDI DataVolume template. The kubeconfig is a vault reference, validated default-deny (no exec or auth-provider plugin), written to a 0600 temporary file for one kubectl call and removed in a finally; it never reaches a command line, stored state or output. An install re-run applies the CR only when a managed field differs, delete and uninstall are clean no-ops when absent, and uninstall needs the cluster fingerprint as confirm. Live end to end on a single-node k0s v1.36.4 cluster with KubeVirt v1.9.1 and CDI v1.66.1: 23 of 24 cells, then 9 of 9 on the fixes, with immediate install re-runs as true no-ops. Node prerequisites found live (the /dev/kvm mode and k0s''s kubelet root) are in the README. Residuals are in the LOGBOOK: DataVolume VMs were not run live (no default StorageClass), the cluster fingerprint is the server URL only, and CDI ownership of a partial install is inferred from field managers.'

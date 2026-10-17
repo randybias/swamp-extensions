@@ -58,15 +58,24 @@ wireguard-mesh:
 
 k8s-secret:
   channel: beta
-  ci: false
-  published: {}
+  ci: true
+  published:
+    2026.10.17.1: 7ec9b9521c2c31d070ca6991cd19eb276a3216e820624ea306bd09e345ab2d1b
+  notes:
+    2026.10.17.1: 'First release, beta. Create, read, sync and delete a Kubernetes Secret from vault references, including whole-secret data_from_vault; values reach kubectl only on stdin and are never returned, and output and stored state carry metadata and key names only. Server-side apply prunes keys this model previously owned. A YAML merge-key path that could smuggle extra keys into the manifest is closed. Live end to end on a throwaway cluster: 14 of 14 cells pass, plus the data_from_vault cells.'
 
 k0s-cluster:
   channel: beta
-  ci: false
-  published: {}
+  ci: true
+  published:
+    2026.10.17.1: 617b23132f64784a82a0abd0a75e0627eddff67b1bce7d4de8570de51c88635b
+  notes:
+    2026.10.17.1: 'First release, beta. Install, upgrade and reset a single-node, SHA-pinned k0s cluster on a Linux host over SSH, with a rendered k0s.yaml, readiness waits, kubeconfig capture, manifest stacks and Helm reconciliation. Every live cell passes on a throwaway host, including role migration, no control-plane taint in single mode, Helm, api_address and reset. Known residue: reset leaves /etc/k0s/containerd* and the k0s binary on the host.'
 
 server-host:
   channel: beta
-  ci: false
-  published: {}
+  ci: true
+  published:
+    2026.10.17.1: c83486edf44844afae336c57dc1273dc250985d352fecf82be84664e01e8894d
+  notes:
+    2026.10.17.1: 'First release, beta. Baseline hardening of a Linux server over SSH: an admin user, sshd lockdown and an nftables policy, each applied behind an armed host-side revert that fires unless a fresh management connection confirms the change. Live end to end on a throwaway VPS: 19 of 21 cells pass, then a 12 of 12 re-run on the fixes; open follow-ups are recorded in the LOGBOOK, so it stays on beta.'

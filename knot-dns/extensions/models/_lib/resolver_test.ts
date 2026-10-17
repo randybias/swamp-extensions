@@ -68,6 +68,8 @@ Deno.test("golden resolver config.yaml", () => {
       '  - subtree: "internal.example."',
       "    servers:",
       '      - address: "192.0.2.53"',
+      "    options:",
+      "      dnssec: false",
       '  - subtree: "."',
       "    servers:",
       '      - address: "203.0.113.53"',

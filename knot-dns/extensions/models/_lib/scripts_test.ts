@@ -11,9 +11,9 @@ import {
   removeZoneScript,
   resolverObserveScript,
   restoreZoneScript,
-  shq,
   zonePaths,
 } from "./scripts.ts";
+import { shq } from "./fragments.ts";
 
 /** Runs `sh -n` over a script; returns a non-zero code on a syntax error. */
 async function shSyntax(script: string): Promise<number> {
@@ -30,19 +30,27 @@ async function shSyntax(script: string): Promise<number> {
   return (await child.output()).code;
 }
 
+const APPLY = {
+  apex: "example.com.",
+  run: "r1",
+  listens: ["127.0.0.1@5353"],
+};
+const REMOVE = {
+  apex: "example.com.",
+  run: "r1",
+  purgeKeysAck: false,
+  unsigned: false,
+};
+
 const SCRIPTS: [string, string][] = [
   ["install", installScript({ resolver: true })],
   [
     "apply_zone",
-    applyZoneScript({ apex: "example.com." }),
+    applyZoneScript(APPLY),
   ],
   [
     "remove_zone",
-    removeZoneScript({
-      apex: "example.com.",
-      purgeKeysAck: false,
-      unsigned: false,
-    }),
+    removeZoneScript(REMOVE),
   ],
   ["get_ds", getDsScript("example.com.")],
   ["discover", discoverZonesScript()],
@@ -81,9 +89,7 @@ Deno.test("zone paths and quoting are stable", () => {
 });
 
 Deno.test("apply script validates before swapping and rolls back on reload failure", () => {
-  const script = applyZoneScript({
-    apex: "example.com.",
-  });
+  const script = applyZoneScript(APPLY);
   assert(script.includes("kzonecheck"));
   assert(script.includes("knotc -c"));
   assert(script.includes("conf-check"));
@@ -94,14 +100,10 @@ Deno.test("apply script validates before swapping and rolls back on reload failu
 });
 
 Deno.test("remove script refuses a signed zone without an ack", () => {
-  const script = removeZoneScript({
-    apex: "example.com.",
-    purgeKeysAck: false,
-    unsigned: false,
-  });
+  const script = removeZoneScript(REMOVE);
   assert(script.includes("[ 1 = 1 ]"));
   const acked = removeZoneScript({
-    apex: "example.com.",
+    ...REMOVE,
     purgeKeysAck: true,
     unsigned: true,
   });
@@ -124,21 +126,18 @@ Deno.test("resolver apply script validates with kresctl before swapping", () => 
   assert(script.includes("TEST_QUERY_FAILED"));
 });
 
-Deno.test("apply script blocks on reload and keeps the backup", () => {
-  const script = applyZoneScript({
-    apex: "example.com.",
-  });
-  assert(script.includes("knotc -b reload"));
-  assert(script.includes("knotc -b zone-reload"));
-  assert(script.includes("backup=$b"));
-  assert(script.includes("chown root:knot"));
-  assert(script.includes("10-managed-tsig"));
+Deno.test("apply script never uses the blocking zone-reload", () => {
+  // A blocking zone-reload waits on NOTIFY retries to an unreachable
+  // secondary; the script polls zone-status instead (see host_test.ts).
+  const script = applyZoneScript(APPLY);
+  assert(!script.includes("-b zone-reload"));
+  assert(script.includes("wait_loaded"));
 });
 
 Deno.test("restore script restores every file and reloads", () => {
   const s = restoreZoneScript({ apex: "example.com.", backup: "/tmp/b" });
   assert(s.includes("NO_BACKUP"));
-  assert(s.includes("knotc -b reload"));
+  assert(s.includes("reload_knot"));
   assert(s.includes("flock -x /run/knot-dns.lock"));
 });
 

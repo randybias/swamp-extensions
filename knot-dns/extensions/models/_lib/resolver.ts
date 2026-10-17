@@ -119,13 +119,11 @@ export function renderResolverYaml(input: ResolverInput): string {
           }
         }
       }
-      const options: string[] = [];
-      if (f.authoritative) options.push("      authoritative: true");
-      if (f.dnssec) options.push("      dnssec: true");
-      if (options.length > 0) {
-        lines.push("    options:");
-        lines.push(...options);
-      }
+      // dnssec is always written: Knot Resolver 6 validates by default, which
+      // turns a private or locally signed forward into SERVFAIL.
+      lines.push("    options:");
+      lines.push(`      dnssec: ${f.dnssec ? "true" : "false"}`);
+      if (f.authoritative) lines.push("      authoritative: true");
     }
   }
   const allow = input.allow_query_from ?? ["127.0.0.0/8", "::1/128"];

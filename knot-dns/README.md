@@ -85,6 +85,11 @@ wildcards). The SSH transport is the canonical `_lib/ssh.ts` from
 `@randybias/ssh-host`, vendored byte-identical; `host_key_policy` is `strict`
 with required pinned `host_keys`.
 
+Changing the authoritative listen addresses restarts knotd (Knot ignores listen
+changes on reload) and the apply then queries every listen address with `kdig`
+(`install` adds `knot-dnsutils`). Forwards always render an explicit `dnssec`
+setting, because Knot Resolver 6 validates by default.
+
 ## License
 
 Apache-2.0

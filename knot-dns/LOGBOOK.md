@@ -181,3 +181,50 @@ Renders were checked against the containers the lead named:
 - `applyZoneScript` under `sh -eu` (dash) in `ubuntu:24.04` with stub
   `knotc`/`kzonecheck`/`chown`/`chgrp`: **rc=0**, `backup=` and `changed=yes`
   printed, so no unbound-variable abort.
+
+## 2026.10.17.2 (lane/b3-knot, from d2 9bd91e8): r3 review round
+
+Each fix was reproduced first in the Knot 3.6.1 + Resolver 6.5 and Knot 3.3.4
+containers, and is covered by `_lib/host_test.ts`, which runs the real host
+scripts under dash `sh -eu` against real knotd, kdig, ss and kresd (skipped when
+docker or the image is absent; set `KNOT_BOX_IMAGE`, default `knot-check:b3`:
+the `local2` image plus `iproute2 psmisc procps`).
+
+- Listen changes: Knot ignores `server.listen` on reload ("changes of listen
+  require restart"), and the stock Ubuntu config has no listen, so a reload
+  bound nothing while apply reported success. A changed listen fragment now
+  restarts knotd under the lock after `conf-check`, then every host listen is
+  queried with kdig for the zone's SOA (rcode `NOERROR`); any failure restores
+  the previous files and restarts again. Wildcard listens are queried on
+  loopback.
+- `ss -lntupH` (was `-h`, which is help): a socket is the host's own only when
+  its line carries `users:(("knotd"`. An unprivileged probe cannot see owners
+  and so fails closed.
+- Probes: `kdig +retry=0 -p <port>` (`+tries` is not a kdig option), rcode
+  checked because kdig exits 0 on SERVFAIL/REFUSED; `knot-dnsutils` is
+  installed; the resolver test queries its own listen port and a forwarded
+  subtree. Apply fails with `KDIG_MISSING` rather than skipping the check.
+- Forward `dnssec` is always rendered. Knot Resolver 6 validates by default, so
+  an omitted `false` turned private or locally signed forwards into SERVFAIL.
+- Reload: `zone-reload` is no longer `-b`; the script polls `zone-status` until
+  `load: pending` clears (a blocking reload can wait on NOTIFY retries to an
+  unreachable secondary).
+- Listen union: each applied zone stores its own `requested_listen`; the host
+  fragment is the union of the other zones' requests plus this one's, so it can
+  shrink, and `remove_zone` recomputes it. An unreadable store fails the call
+  instead of falling back. State written by 2026.10.17.1 has no
+  `requested_listen`, so its listens are ignored until that zone is re-applied.
+- Rollback: an ownership failure restores before exiting; when the rollback
+  reload itself fails the backup is kept and the error says
+  `RESTORE_RELOAD_FAILED backup=<dir>` (this marker was previously shadowed by
+  `RELOAD_FAILED`). Observe captures each probe's output before filtering so a
+  failing `knotc`/`sha256sum` is `PROBE_FAILED`, not an empty serial.
+- Staging: files are uploaded under per-run names and consumed by the locked
+  script, so concurrent applies cannot swap each other's files.
+- Not changed: the resolver test query is refused when the resolver listens on a
+  non-loopback address and `allow_query_from` excludes that address; apply then
+  rolls back with `TEST_QUERY_FAILED`. Add the address to `allow_query_from`.
+- Structure: `knot_dns.ts` split into `_lib/schemas.ts`, `_lib/errors.ts` and
+  `_lib/listen.ts`; shell fragments (`shq`, lock wrapper, restart, wait, query)
+  live once in `_lib/fragments.ts`. `_lib/ssh.ts` stays at its vendored size so
+  it remains byte-identical to ssh-host.

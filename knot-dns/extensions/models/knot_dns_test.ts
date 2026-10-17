@@ -27,7 +27,7 @@ const ZONE_ARGS = {
 
 Deno.test("model is a plain object with the expected type and methods", () => {
   assertEquals(model.type, "@randybias/knot-dns");
-  assertEquals(model.version, "2026.10.17.1");
+  assertEquals(model.version, "2026.10.17.2");
   const methods = Object.keys(model.methods);
   assertEquals(
     methods.sort(),
@@ -214,6 +214,24 @@ Deno.test("apply_zone refuses to turn a recorded signed zone off without an ack"
     model.methods.apply_zone.execute(ZONE_ARGS as never, context)
   ) as Error;
   assert(e.message.includes("dnssec_unsign_ack"));
+});
+
+Deno.test("apply_zone fails closed when the recorded zones cannot be read", async () => {
+  const { context } = createModelTestContext({ globalArgs: {} });
+  Object.assign(context, {
+    vaultService: {
+      get: () => Promise.resolve("PLACEHOLDER-KEY"),
+      put: () => Promise.resolve(),
+    },
+    readModelData: () => Promise.reject(new Error("store offline")),
+  });
+  const e = await assertRejects(() =>
+    model.methods.apply_zone.execute(
+      { ...ZONE_ARGS, listen: ["192.0.2.53"] } as never,
+      context,
+    )
+  ) as Error;
+  assert(e.message.includes("could not read the recorded zones"));
 });
 
 Deno.test("the zone schema rejects a newline smuggled in domain rdata", () => {

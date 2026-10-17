@@ -263,3 +263,55 @@ unless noted:
   recorded; a differing or unrecorded binary is left in place. A host with no
   k0s unit is still a clean no-op, so a second reset does nothing. Three unit
   tests cover the matching, differing and unrecorded cases. Not yet run live.
+
+## 2026-10-17: live e2e (2026.10.17.2)
+
+Target: `<vps2>` (idle, root, strict host-key pins, SSH key from vault), the
+same k0s v1.36.4+k0s.1 amd64 binary as above. Heads: lane/d3-k0s `356bb45`
+(reset cleanup cells) and `3832bdf` (stopped-unit fix re-run). `50e2f2d` (refuse
+unknown unit states, persist the removal outcome) was not run live; it is
+reviewed against the 3832bdf diff only. Receipt = first 16 hex of sha256 of the
+console output with timestamps stripped. Addresses, node names and vault names
+are redacted.
+
+| Cell                                                           | Result           | Detail                                                                                                                                                           | Head      | Receipt          |
+| -------------------------------------------------------------- | ---------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------- | ---------------- |
+| 1 install single + wait_ready                                  | PASS             | unit active, binary digest recorded, node Ready                                                                                                                  | `356bb45` | acb13b3a7c01b0fe |
+| 2 reset                                                        | PASS             | no unit, /var/lib/k0s, /etc/k0s, binary or process; state installed=false                                                                                        | `356bb45` | 7552cfe07bdebac4 |
+| 3 reset again                                                  | PASS             | clean no-op ("No k0s service")                                                                                                                                   | `356bb45` | 8daa576ecfe25fee |
+| 4 reset with a foreign binary (copy of /bin/true, k0s stopped) | PASS             | binary left in place and logged; see residuals                                                                                                                   | `356bb45` | 1a0aee20b2b864b3 |
+| 5a reset with an immutable file in /etc/k0s                    | PASS             | "could not remove /etc/k0s"; state cleanup_pending=true, binary digest kept                                                                                      | `356bb45` | 3dae002f21f1e378 |
+| 5b chattr -i, reset again                                      | PASS             | pending cleanup finished; nothing left                                                                                                                           | `356bb45` | a08550188f1570a7 |
+| 6a failing k0s reset (wrapper exits 1)                         | PASS             | typed error; nothing removed, state unchanged                                                                                                                    | `356bb45` | b1d2f07b792f4b20 |
+| 6b k0s binary non-executable                                   | PASS             | stops at k0s stop (exit 126); host and state unchanged                                                                                                           | `356bb45` | fec28c2d41b88b80 |
+| F1 reset of an installed but stopped unit                      | FAIL             | k0s stop exits 1 "already stopped" and reset treated it as fatal; fixed in `3832bdf`                                                                             | `356bb45` | 2823f97fa0f130d2 |
+| F1 install, systemctl stop, reset                              | PASS             | nothing left; state installed=false                                                                                                                              | `3832bdf` | 8127974c093eab4c |
+| F1b install, reset while running                               | PASS             | nothing left; state installed=false                                                                                                                              | `3832bdf` | 666741df58f98132 |
+| 4' foreign binary, unit stopped, reset                         | PASS (behaviour) | binary kept and logged; the binary_removed/reason result fields were not observable (swamp prints no method result without --json, ruled out for sensitive args) | `3832bdf` | 5fd3c8ffcac917a8 |
+| 3 reset again                                                  | PASS             | clean no-op                                                                                                                                                      | `3832bdf` | 8daa576ecfe25fee |
+
+Cells 1-6 pass on `356bb45` (6 of 6); F1 failed there and passes on `3832bdf`,
+with F1b and 3. Final: `<vps2>` has no k0s unit, data, config, binary or
+process; state installed=false.
+
+## 2026-10-17: merge prep and known residuals (2026.10.17.2)
+
+Review: `c5c84ab` CLEAN after triage (astra's cleanup-retry HIGH fixed in
+`356bb45` with cleanup_pending; terra's two HIGHs downgraded below); `356bb45`
+polish (typed sha256sum error, README warning, failing-reset test); `3832bdf`
+reviewed by the live worker, no Critical/High; `50e2f2d` self-reviewed against
+the triage checks, no Critical/High. `_lib/ssh.ts` is the canonical blob
+`fe0139f0`. Residuals:
+
+- MEDIUM: `reset` still runs whatever binary is at `/usr/local/bin/k0s` for
+  `k0s stop` and `k0s reset`, even when its digest is not the installed one; it
+  trusts their exit 0, so with a foreign binary the unit and `/var/lib/k0s` can
+  remain while state records installed=false (cell 4). Check the digest before
+  running stop/reset and refuse or report.
+- MEDIUM (documented in the README): `/etc/k0s` is removed wholesale, including
+  user drop-ins such as `containerd.d` and registry credentials, notably on
+  adopted hosts (terra HIGH, downgraded: documented and the directory is
+  k0s-owned).
+- LOW: hash-then-`rm` race on the binary; a replacement written between the
+  `sha256sum` and the `rm` is removed (terra HIGH, downgraded: needs a
+  concurrent root writer on the target).

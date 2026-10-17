@@ -765,8 +765,18 @@ Deno.test("private key content cannot influence the control socket or argv", asy
     }),
     env,
   );
-  // Same process and target: the socket name must not vary with the key bytes.
-  assertEquals(a.path, b.path);
+  // Distinct inline keys must not share a master; the same key must.
+  assertEquals(a.path === b.path, false);
+  const a2 = await controlSocketPath(
+    toTarget({
+      host: "192.0.2.10",
+      sshUser: "admin",
+      strictHostKeyChecking: "yes",
+      privateKey: "KEY-A\n",
+    }),
+    env,
+  );
+  assertEquals(a2.path, a.path);
   const f = fakeSpawner(() => ({ code: 0, stdout: "", stderr: "" }));
   const session = await openSession(
     deps(f.spawn),
@@ -784,4 +794,21 @@ Deno.test("private key content cannot influence the control socket or argv", asy
   const controlPath = args.find((x) => x.startsWith("ControlPath="));
   assertEquals(controlPath !== undefined, true);
   assertEquals(controlPath?.includes("KEY-A"), false);
+  // A second inline key gets a different socket name.
+  const f2 = fakeSpawner(() => ({ code: 0, stdout: "", stderr: "" }));
+  const session2 = await openSession(
+    deps(f2.spawn),
+    toTarget({
+      host: "192.0.2.10",
+      sshUser: "admin",
+      strictHostKeyChecking: "yes",
+      privateKey: "KEY-B\n",
+    }),
+    { multiplex: true, env },
+  );
+  await session2.run({ command: "true" });
+  const controlPath2 = f2.records[0].args.find((x) =>
+    x.startsWith("ControlPath=")
+  );
+  assertEquals(controlPath2 !== controlPath, true);
 });

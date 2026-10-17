@@ -480,6 +480,12 @@ Deno.test("OSD removal outs before removing, zaps by default and skips absent id
         ? { code: 0, stdout: '{"nodes":[{"id":3,"type":"osd"}]}', stderr: "" }
         : { code: 0, stdout: '{"nodes":[]}', stderr: "" };
     }
+    if (body.includes("health detail")) {
+      return { code: 0, stdout: '{"status":"HEALTH_OK"}', stderr: "" };
+    }
+    if (body.includes("ok-to-stop")) {
+      return { code: 0, stdout: "presumed safe", stderr: "" };
+    }
     return { code: 0, stdout: "", stderr: "" };
   });
   const record = await removeOsds(deps, s.session, { osdIds: [3] });
@@ -514,6 +520,13 @@ Deno.test("deleting a filesystem confirms, polls MDS removal and restores the ga
 
   let poolReads = 0;
   const s = dpSession((body) => {
+    if (body.includes("fs status")) {
+      return {
+        code: 0,
+        stdout: '{"clients":[{"fs":"cephfs","clients":0}]}',
+        stderr: "",
+      };
+    }
     if (body.includes("fs ls")) {
       calls++;
       return {
@@ -636,6 +649,13 @@ Deno.test(
 Deno.test("the pool-delete gate is reset even when turning it on fails", async () => {
   let fsLs = 0;
   const s = dpSession((body) => {
+    if (body.includes("fs status")) {
+      return {
+        code: 0,
+        stdout: '{"clients":[{"fs":"cephfs","clients":0}]}',
+        stderr: "",
+      };
+    }
     if (body.includes("fs ls")) {
       fsLs++;
       return {
@@ -699,7 +719,67 @@ Deno.test("OSD removal refuses by itself on HEALTH_ERR", async () => {
   assertEquals(s.bodies.some((b) => b.includes("orch osd rm")), false);
 });
 
-Deno.test("OSD removal refuses by itself when an OSD is not safe to destroy", async () => {
+Deno.test("OSD removal refuses by itself when ok-to-stop rejects the set", async () => {
+  const s = dpSession((body) => {
+    if (body.includes("osd tree")) {
+      return {
+        code: 0,
+        stdout: '{"nodes":[{"id":3,"type":"osd"},{"id":5,"type":"osd"}]}',
+        stderr: "",
+      };
+    }
+    if (body.includes("health detail")) {
+      return { code: 0, stdout: '{"status":"HEALTH_OK"}', stderr: "" };
+    }
+    if (body.includes("ok-to-stop")) {
+      return {
+        code: 1,
+        stdout: "",
+        stderr: "OSDs 3,5 are not safe to stop together",
+      };
+    }
+    return { code: 0, stdout: "", stderr: "" };
+  });
+  await assertRejects(
+    () => removeOsds(deps, s.session, { osdIds: [3, 5] }),
+    PhaseError,
+    "refuses to stop",
+  );
+  assertEquals(s.bodies.some((b) => b.includes("osd out")), false);
+  assertEquals(s.bodies.some((b) => b.includes("orch osd rm")), false);
+});
+
+Deno.test("OSD removal proceeds for an in-service OSD gated only by ok-to-stop", async () => {
+  // `osd safe-to-destroy` would return EBUSY here; ok-to-stop passes and the
+  // orchestrator performs the drain.
+  let tree = 0;
+  const s = dpSession((body) => {
+    if (body.includes("osd tree")) {
+      tree++;
+      return {
+        code: 0,
+        stdout: tree === 1
+          ? '{"nodes":[{"id":3,"type":"osd"}]}'
+          : '{"nodes":[]}',
+        stderr: "",
+      };
+    }
+    if (body.includes("health detail")) {
+      return { code: 0, stdout: '{"status":"HEALTH_OK"}', stderr: "" };
+    }
+    if (body.includes("ok-to-stop")) {
+      return { code: 0, stdout: "presumed safe", stderr: "" };
+    }
+    return { code: 0, stdout: "", stderr: "" };
+  });
+  const record = await removeOsds(deps, s.session, { osdIds: [3] });
+  assertEquals(record.removed, [3]);
+  const okAt = s.bodies.findIndex((b) => b.includes("ok-to-stop 3"));
+  const outAt = s.bodies.findIndex((b) => b.includes("osd out 3"));
+  assertEquals(okAt >= 0 && okAt < outAt, true);
+});
+
+Deno.test("OSD removal fails closed when health cannot be judged", async () => {
   const s = dpSession((body) => {
     if (body.includes("osd tree")) {
       return {
@@ -708,20 +788,51 @@ Deno.test("OSD removal refuses by itself when an OSD is not safe to destroy", as
         stderr: "",
       };
     }
+    // Missing status.
     if (body.includes("health detail")) {
-      return { code: 0, stdout: '{"status":"HEALTH_OK"}', stderr: "" };
-    }
-    if (body.includes("safe-to-destroy")) {
-      return { code: 1, stdout: "", stderr: "OSD 3 is not safe to destroy" };
+      return { code: 0, stdout: "{}", stderr: "" };
     }
     return { code: 0, stdout: "", stderr: "" };
   });
   await assertRejects(
     () => removeOsds(deps, s.session, { osdIds: [3] }),
     PhaseError,
-    "not safe to destroy",
+    "not HEALTH_OK or HEALTH_WARN",
   );
   assertEquals(s.bodies.some((b) => b.includes("osd out")), false);
+});
+
+Deno.test("filesystem deletion fails closed when the client count is unreadable", async () => {
+  for (
+    const stdout of [
+      '{"clients":[{"fs":"other","clients":0}]}',
+      '{"clients":[{"fs":"cephfs","clients":"two"}]}',
+      "{}",
+    ]
+  ) {
+    const s = dpSession((body) => {
+      if (body.includes("fs status")) return { code: 0, stdout, stderr: "" };
+      if (body.includes("fs ls")) {
+        return {
+          code: 0,
+          stdout:
+            '[{"name":"cephfs","metadata_pool":"cephfs.cephfs.meta","data_pools":["cephfs.cephfs.data"]}]',
+          stderr: "",
+        };
+      }
+      return { code: 0, stdout: "", stderr: "" };
+    });
+    await assertRejects(
+      () =>
+        deleteFs(deps, s.session, {
+          fsName: "cephfs",
+          confirmFsName: "cephfs",
+        }),
+      PhaseError,
+      "could not read the filesystem client count",
+    );
+    assertEquals(s.bodies.some((b) => b.includes("orch rm")), false);
+  }
 });
 
 Deno.test("filesystem deletion refuses by itself while clients are connected", async () => {
@@ -729,7 +840,7 @@ Deno.test("filesystem deletion refuses by itself while clients are connected", a
     if (body.includes("fs status")) {
       return {
         code: 0,
-        stdout: '{"clients":[{"id":1,"hostname":"c1"}]}',
+        stdout: '{"clients":[{"fs":"cephfs","clients":2}]}',
         stderr: "",
       };
     }

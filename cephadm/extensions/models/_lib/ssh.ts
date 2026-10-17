@@ -238,13 +238,25 @@ export const SOCKET_PATH_LIMIT = 103;
 export const SOCKET_NAMESPACE = "swamp-cephadm-ssh";
 
 /**
- * A random per-process nonce. A control-socket name is derived from this,
- * never from private-key bytes, so key material can never influence argv.
+ * A per-process map from inline key content to a fresh random nonce. Distinct
+ * keys get distinct nonces, and the same key reuses its nonce so a master can
+ * be reused within one process. The key bytes themselves never reach a socket
+ * name or any argv element; the nonce is random, not derived from the key.
  */
-const PROCESS_NONCE = (() => {
-  const bytes = crypto.getRandomValues(new Uint8Array(8));
-  return Array.from(bytes).map((b) => b.toString(16).padStart(2, "0")).join("");
-})();
+const inlineKeyNonces = new Map<string, string>();
+
+/** A stable random nonce for one inline key, distinct per key. */
+function inlineKeyNonce(keyContent: string): string {
+  let nonce = inlineKeyNonces.get(keyContent);
+  if (nonce === undefined) {
+    const bytes = crypto.getRandomValues(new Uint8Array(8));
+    nonce = Array.from(bytes).map((b) => b.toString(16).padStart(2, "0")).join(
+      "",
+    );
+    inlineKeyNonces.set(keyContent, nonce);
+  }
+  return nonce;
+}
 
 /** Resolves the control-socket path for a target, falling back under /tmp if too long. */
 export async function controlSocketPath(
@@ -258,7 +270,7 @@ export async function controlSocketPath(
   const identity = target.keyPath !== undefined
     ? `path:${target.keyPath}`
     : target.privateKey !== undefined
-    ? `inline:${PROCESS_NONCE}`
+    ? `inline:${inlineKeyNonce(target.privateKey)}`
     : "agent";
   const name = `${
     (await shortHash(

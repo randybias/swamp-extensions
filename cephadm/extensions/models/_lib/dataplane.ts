@@ -879,24 +879,29 @@ export async function removeOsds(
   const healthStatus = typeof health?.status === "string"
     ? health.status.toUpperCase()
     : "";
-  if (healthStatus === "HEALTH_ERR") {
+  if (healthStatus !== "HEALTH_OK" && healthStatus !== "HEALTH_WARN") {
     fail(
       "cephRemoveOsds",
-      "refusing to remove OSDs while cluster health is HEALTH_ERR",
-      { status: healthStatus },
+      "refusing to remove OSDs: cluster health was not HEALTH_OK or HEALTH_WARN",
+      { status: healthStatus === "" ? "missing" : healthStatus },
     );
   }
-  for (const id of presentIds) {
-    const safe = await runMut(deps, session, `osd safe-to-destroy ${id}`, {
-      phase: "cephRemoveOsds.safe-to-destroy",
-      allowNonZero: true,
-    }, log);
-    if (safe.code !== 0) {
-      fail("cephRemoveOsds", "an OSD is not safe to destroy", {
-        id,
-        stderr: safe.stderr.slice(0, 300),
-      });
-    }
+  // One joint ok-to-stop for the whole set. `osd safe-to-destroy` would reject
+  // any OSD with PGs still mapped (EBUSY), which is every in-service OSD, so it
+  // cannot gate a normal removal; `orch osd rm` performs the drain itself.
+  const okToStop = await runMut(
+    deps,
+    session,
+    `osd ok-to-stop ${presentIds.join(" ")}`,
+    { phase: "cephRemoveOsds.ok-to-stop", allowNonZero: true },
+    log,
+  );
+  if (okToStop.code !== 0) {
+    fail(
+      "cephRemoveOsds",
+      "the orchestrator refuses to stop these OSDs together",
+      { osdIds: presentIds, stderr: okToStop.stderr.slice(0, 300) },
+    );
   }
   await runMut(deps, session, `osd out ${presentIds.join(" ")}`, {
     phase: "cephRemoveOsds.out",
@@ -1029,11 +1034,33 @@ export async function deleteFs(
     { phase: "cephDeleteFs.in-use" },
     log,
   ) as { clients?: unknown } | null;
-  if (Array.isArray(fsStatus?.clients) && fsStatus.clients.length > 0) {
+  // `ceph fs status -f json` reports {"clients":[{"fs":"<name>","clients":N}]}.
+  // The array is never empty, so count the matching entry and fail closed when
+  // it or its count is missing or non-numeric.
+  const entries = Array.isArray(fsStatus?.clients)
+    ? fsStatus.clients as Record<string, unknown>[]
+    : null;
+  const match = entries?.find((e) =>
+    e !== null && typeof e === "object" &&
+    (e as Record<string, unknown>).fs === args.fsName
+  ) as
+    | Record<string, unknown>
+    | undefined;
+  const clientCount = match && typeof match.clients === "number"
+    ? match.clients
+    : null;
+  if (entries === null || clientCount === null) {
+    fail(
+      "cephDeleteFs",
+      "could not read the filesystem client count; refusing to delete",
+      { fsName: args.fsName },
+    );
+  }
+  if (clientCount > 0) {
     fail(
       "cephDeleteFs",
       "refusing to delete a filesystem still in use by clients",
-      { fsName: args.fsName, clients: fsStatus.clients.length },
+      { fsName: args.fsName, clients: clientCount },
     );
   }
   const before = new Set(

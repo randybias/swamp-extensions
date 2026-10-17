@@ -444,3 +444,27 @@ a secret. Fixtures are synthetic only (RFC 5737 addresses, `.test` names).
   - cephRmCluster already refuses a foreign or unobserved fsid before purging.
 - LOW: the remove-osds health assert message and the distribute-key check-host
   assert message no longer interpolate a map; they name scalar observations.
+
+## 2026-10-17: catalog A fixes, round 2
+
+- ssh: an inline privateKey no longer shares one process-wide nonce. A process
+  map keeps a fresh random nonce per distinct key, so different keys cannot ride
+  one ControlMaster; key bytes and key hashes never reach a socket name or argv.
+  Tests require different keys to get different socket names and the same key to
+  reuse one, with no key text in argv.
+- cephDeleteFs: `ceph fs status -f json` reports
+  `{"clients":[{"fs":"<name>","clients":N}]}`; the method now finds the entry
+  whose `fs` equals the volume and refuses when its numeric `clients` > 0, and
+  fails closed when the entry or the count is missing or non-numeric. Tests
+  cover 0 clients (proceeds), N clients, missing entry and malformed count.
+- cephRemoveOsds: the per-OSD `osd safe-to-destroy` gate was wrong (EBUSY for
+  any OSD with PGs mapped, i.e. every in-service OSD). It is replaced by ONE
+  joint `osd ok-to-stop <all present ids>` before any mutation, failing closed
+  on a non-zero exit; `orch osd rm` performs the drain. Tests cover a jointly
+  unsafe set and an in-service OSD that proceeds.
+- cephRemoveOsds health precondition now fails closed: it refuses unless the
+  status is HEALTH_OK or HEALTH_WARN, so a missing or malformed status refuses.
+- catalog_test: the direct-edge test now identifies pre-gate and post-approval
+  re-gate asserts structurally, requires a re-gate assert whenever a job has a
+  pre-gate, and requires a direct succeeded-only edge from every mutating step
+  to it. Proven: deleting the re-gate edge fails the test.

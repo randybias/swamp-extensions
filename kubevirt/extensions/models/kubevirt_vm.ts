@@ -123,12 +123,15 @@ const VmFields = {
   memory: z.string().max(16).refine(isMemory, "must be 64Mi..256Gi").default(
     "2Gi",
   ).describe("Guest memory request, e.g. 2Gi."),
+  // The name of an existing Kubernetes Secret, not secret material.
+  // swamp-quality-ignore credentials-sensitive-field
   cloud_init_secret: z.string().max(253).refine(
     isDnsSubdomain,
     "not a DNS-1123 subdomain",
   ).optional().describe(
     "Existing Secret used as cloudInitNoCloud.userDataSecretRef; inline user-data is not accepted.",
   ),
+  // swamp-quality-ignore credentials-sensitive-field
   ssh_public_key_secret: z.string().max(253).refine(
     isDnsSubdomain,
     "not a DNS-1123 subdomain",

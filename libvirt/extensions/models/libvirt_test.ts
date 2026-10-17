@@ -890,7 +890,7 @@ Deno.test("console: a timed-out capture returns the text so far, never hangs", a
       ...SSH,
       uri: URI,
       name: "node-a",
-      timeout_s: 1,
+      timeout_s: 5,
     }),
     ctx.context,
   );
@@ -1086,9 +1086,13 @@ Deno.test("undefine_domain keeps a seed ISO unless asked to remove it", async ()
       remove_volumes: true,
       remove_attached_media: true,
     }),
-    createModelTestContext({ globalArgs: {} }).context,
+    createModelTestContext({
+      globalArgs: {},
+      storedResources: domState("node-a", "/p/root.qcow2"),
+    }).context,
   );
   assertEquals(has(removed, "'detach-disk'"), false);
+  assertEquals(has(removed, "--remove-all-storage"), true);
 });
 
 Deno.test("clone_volume records the qemu format from the volume XML", async () => {
@@ -1462,6 +1466,307 @@ Deno.test("schema: host_key_policy is strict-only with required host_keys", () =
   assertThrows(() => m.methods.get.arguments.parse({ ...SSH, host_keys: [] }));
   assertEquals(
     m.methods.get.arguments.safeParse({ ...SSH, uri: URI }).success,
+    true,
+  );
+});
+
+const ROOT = "/p/node-a-root.qcow2";
+const BLK_HEADER = " Type   Device   Target   Source\n----\n";
+
+/**
+ * A stateful hypervisor fake for one domain: dominfo follows define, start,
+ * shutdown, destroy and undefine, and domblklist reports `disks`.
+ */
+function statefulDomain(
+  disks: string,
+  opts: { exists?: boolean; running?: boolean; dumpxml?: string } = {},
+): Fake {
+  let state: "absent" | "off" | "running" = opts.exists
+    ? (opts.running ? "running" : "off")
+    : "absent";
+  return fakeLibvirt((command) => {
+    if (command.includes("'vol-info'")) {
+      return { code: 0, stdout: "Name: node-a-root\n" };
+    }
+    if (command.includes("'vol-path'")) return { code: 0, stdout: `${ROOT}\n` };
+    if (command.includes("'dominfo'")) {
+      if (state === "absent") {
+        return { code: 1, stderr: "error: failed to get domain 'node-a'" };
+      }
+      return { code: 0, stdout: state === "running" ? RUNNING : SHUT_OFF };
+    }
+    if (command.includes("'domblklist'")) {
+      return { code: 0, stdout: BLK_HEADER + disks };
+    }
+    if (command.includes("'dumpxml'")) {
+      return { code: 0, stdout: opts.dumpxml ?? "<domain/>" };
+    }
+    if (command.includes("'undefine'")) {
+      state = "absent";
+      return { code: 0 };
+    }
+    if (command.includes("'define'")) {
+      state = "off";
+      return { code: 0 };
+    }
+    if (command.includes("'start'")) {
+      state = "running";
+      return { code: 0 };
+    }
+    if (command.includes("'shutdown'") || command.includes("'destroy'")) {
+      state = "off";
+      return { code: 0 };
+    }
+    return { code: 0 };
+  });
+}
+
+const DEFINE_A = {
+  ...SSH,
+  uri: URI,
+  name: "node-a",
+  pool: "pool-a",
+  volume: "node-a-root",
+  vcpus: 2,
+  memory_mib: 2048,
+};
+
+Deno.test("golden-image flow: define, power shutdown, undefine removes only the root", async () => {
+  const f = statefulDomain(
+    ` file   disk     vda      ${ROOT}\n` +
+      " file   disk     vdb      /p/data.qcow2\n" +
+      " file   cdrom    sda      /p/seed.iso\n",
+  );
+  const m = modelWith(f);
+  const ctx = createModelTestContext({ globalArgs: {} });
+  const key = instanceName("dom", SSH, "node-a");
+  await m.methods.define_domain.execute(
+    m.methods.define_domain.arguments.parse({
+      ...DEFINE_A,
+      start: true,
+      extra_disks: [
+        { path: "/p/data.qcow2" },
+        { path: "/p/seed.iso", device: "cdrom" },
+      ],
+    }),
+    ctx.context,
+  );
+  assertEquals((await ctx.context.readResource(key))?.root_disk, ROOT);
+  await m.methods.power.execute(
+    m.methods.power.arguments.parse({
+      ...SSH,
+      uri: URI,
+      name: "node-a",
+      action: "shutdown",
+    }),
+    ctx.context,
+  );
+  const afterPower = await ctx.context.readResource(key);
+  assertEquals(afterPower?.root_disk, ROOT);
+  assertEquals(afterPower?.state, "shut off");
+  const out = await m.methods.undefine_domain.execute(
+    m.methods.undefine_domain.arguments.parse({
+      ...SSH,
+      uri: URI,
+      name: "node-a",
+      remove_volumes: true,
+    }),
+    ctx.context,
+  );
+  assertEquals(out.result.changed, true);
+  const detached = f.commands.filter((c) => c.includes("'detach-disk'"));
+  assertEquals(detached.length, 2);
+  assertEquals(detached.some((c) => c.includes("'vdb'")), true);
+  assertEquals(detached.some((c) => c.includes("'sda'")), true);
+  assertEquals(detached.some((c) => c.includes("'vda'")), false);
+  const undefIdx = f.commands.findIndex((c) =>
+    c.includes("'undefine'") && c.includes("--remove-all-storage")
+  );
+  assertEquals(undefIdx > 0, true);
+  // Every detach precedes the storage-removing undefine.
+  assertEquals(
+    f.commands.findLastIndex((c) => c.includes("'detach-disk'")) < undefIdx,
+    true,
+  );
+});
+
+Deno.test("power carries root_disk forward, but not across a different uuid", async () => {
+  const f = statefulDomain(` file   disk     vda      ${ROOT}\n`, {
+    exists: true,
+    running: true,
+  });
+  const m = modelWith(f);
+  const key = instanceName("dom", SSH, "node-a");
+  const same = createModelTestContext({
+    globalArgs: {},
+    storedResources: {
+      [key]: { ...domState("node-a", ROOT)[key], uuid: "uuid-a" },
+    },
+  });
+  const args = m.methods.power.arguments.parse({
+    ...SSH,
+    uri: URI,
+    name: "node-a",
+    action: "destroy",
+  });
+  await m.methods.power.execute(args, same.context);
+  assertEquals((await same.context.readResource(key))?.root_disk, ROOT);
+
+  const other = createModelTestContext({
+    globalArgs: {},
+    storedResources: {
+      [key]: { ...domState("node-a", ROOT)[key], uuid: "uuid-old" },
+    },
+  });
+  await m.methods.power.execute(args, other.context);
+  const written = await other.context.readResource(key);
+  assertEquals(written?.root_disk, undefined);
+  assertEquals(written?.uuid, "uuid-a");
+});
+
+Deno.test("undefine_domain remove_attached_media still detaches data disks", async () => {
+  const f = statefulDomain(
+    " file   disk     vda      /p/root.qcow2\n" +
+      " file   disk     vdb      /p/data.qcow2\n" +
+      " file   disk     vdc      /p/shared-ro.img\n" +
+      " file   cdrom    sda      /p/seed.iso\n" +
+      " file   floppy   fda      /p/floppy.img\n",
+    {
+      exists: true,
+      dumpxml: "<domain><devices>" +
+        "<disk type='file' device='disk'><source file='/p/root.qcow2'/></disk>" +
+        "<disk type='file' device='disk'><source file='/p/data.qcow2'/></disk>" +
+        "<disk type='file' device='disk'><source file='/p/shared-ro.img'/><readonly/></disk>" +
+        "<disk type='file' device='cdrom'><source file='/p/seed.iso'/><readonly/></disk>" +
+        "</devices></domain>",
+    },
+  );
+  await modelWith(f).methods.undefine_domain.execute(
+    modelWith(f).methods.undefine_domain.arguments.parse({
+      ...SSH,
+      uri: URI,
+      name: "node-a",
+      remove_volumes: true,
+      remove_attached_media: true,
+    }),
+    createModelTestContext({
+      globalArgs: {},
+      storedResources: domState("node-a", "/p/root.qcow2"),
+    }).context,
+  );
+  const detached = f.commands.filter((c) => c.includes("'detach-disk'"));
+  assertEquals(detached.length, 1);
+  assertEquals(detached[0].includes("'vdb'"), true);
+  assertEquals(has(f, "--remove-all-storage"), true);
+});
+
+Deno.test("undefine_domain remove_attached_media still requires a recorded root", async () => {
+  const f = statefulDomain(" file   disk     vda      /p/root.qcow2\n", {
+    exists: true,
+  });
+  await assertRejects(
+    () =>
+      modelWith(f).methods.undefine_domain.execute(
+        modelWith(f).methods.undefine_domain.arguments.parse({
+          ...SSH,
+          uri: URI,
+          name: "node-a",
+          remove_volumes: true,
+          remove_attached_media: true,
+        }),
+        createModelTestContext({ globalArgs: {} }).context,
+      ),
+    Error,
+    "no recorded root disk",
+  );
+  assertEquals(has(f, "'undefine'"), false);
+});
+
+Deno.test("undefine_domain refuses before destroying a running domain", async () => {
+  for (
+    const stored of [
+      {},
+      domState("node-a", "/p/not-attached.qcow2"),
+    ]
+  ) {
+    const f = statefulDomain(" file   disk     vda      /p/root.qcow2\n", {
+      exists: true,
+      running: true,
+    });
+    await assertRejects(
+      () =>
+        modelWith(f).methods.undefine_domain.execute(
+          modelWith(f).methods.undefine_domain.arguments.parse({
+            ...SSH,
+            uri: URI,
+            name: "node-a",
+            remove_volumes: true,
+          }),
+          createModelTestContext({ globalArgs: {}, storedResources: stored })
+            .context,
+        ),
+      Error,
+      "refusing to remove volumes",
+    );
+    assertEquals(has(f, "'destroy'"), false);
+    assertEquals(has(f, "'undefine'"), false);
+  }
+});
+
+Deno.test("define_domain on an existing domain records the root only if attached", async () => {
+  const key = instanceName("dom", SSH, "node-a");
+  // The live domain boots from another disk: the requested volume is not
+  // recorded, and an earlier verified record is carried forward.
+  const other = statefulDomain(" file   disk     vda      /p/other.qcow2\n", {
+    exists: true,
+  });
+  const om = modelWith(other);
+  const oc = createModelTestContext({
+    globalArgs: {},
+    storedResources: {
+      [key]: { ...domState("node-a", "/p/other.qcow2")[key], uuid: "uuid-a" },
+    },
+  });
+  const o = await om.methods.define_domain.execute(
+    om.methods.define_domain.arguments.parse(DEFINE_A),
+    oc.context,
+  );
+  assertEquals(o.result.changed, false);
+  assertEquals(has(other, "'define'"), false);
+  assertEquals(
+    (await oc.context.readResource(key))?.root_disk,
+    "/p/other.qcow2",
+  );
+
+  const fresh = createModelTestContext({ globalArgs: {} });
+  await om.methods.define_domain.execute(
+    om.methods.define_domain.arguments.parse(DEFINE_A),
+    fresh.context,
+  );
+  assertEquals((await fresh.context.readResource(key))?.root_disk, undefined);
+
+  // The live domain does boot from the volume: it is recorded.
+  const match = statefulDomain(` file   disk     vda      ${ROOT}\n`, {
+    exists: true,
+  });
+  const mm = modelWith(match);
+  const mc = createModelTestContext({ globalArgs: {} });
+  await mm.methods.define_domain.execute(
+    mm.methods.define_domain.arguments.parse(DEFINE_A),
+    mc.context,
+  );
+  assertEquals((await mc.context.readResource(key))?.root_disk, ROOT);
+});
+
+Deno.test("schema: console timeout_s has a 5 s floor", () => {
+  const m = createModel();
+  const base = { ...SSH, uri: URI, name: "node-a" };
+  assertEquals(
+    m.methods.console.arguments.safeParse({ ...base, timeout_s: 4 }).success,
+    false,
+  );
+  assertEquals(
+    m.methods.console.arguments.safeParse({ ...base, timeout_s: 5 }).success,
     true,
   );
 });

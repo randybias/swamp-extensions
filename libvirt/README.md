@@ -16,17 +16,17 @@ One definition manages any hypervisor: the SSH target, the libvirt URI and every
 operand are method arguments. State is keyed by the canonical
 `{host, port, user}` plus the resource name.
 
-| Method             | Kind   | Description                                                                                                                                                                                             |
-| ------------------ | ------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `define_network`   | action | Define a network (raw XML or structured), start and autostart it; `replace=true` to redefine                                                                                                            |
-| `undefine_network` | action | Stop a network if active and undefine it; use this to remove the `default` network                                                                                                                      |
-| `clone_volume`     | action | Clone a golden volume or zvol in a pool to a new volume, via the pool driver (`vol-clone`)                                                                                                              |
-| `define_domain`    | action | Define a KVM domain from a pool volume with ACPI and a pty console, plus optional extra/CD-ROM disks; optionally start it                                                                               |
-| `power`            | action | `start`, `shutdown`, `destroy`, `reboot`, `suspend`, `resume`; idempotent toward the desired state, `shutdown` waits for power-off                                                                      |
-| `console`          | query  | Attach to the serial console under a hard timeout; returns `bytes` and `sha256`, not the text                                                                                                           |
-| `undefine_domain`  | action | Destroy the domain if running, then undefine it; `remove_volumes` removes the boot volume recorded by `define_domain` and detaches every other disk (keeping a seed ISO) unless `remove_attached_media` |
-| `get`              | query  | Report networks, domains and pool volumes from `net-list`, `list` and `vol-list`                                                                                                                        |
-| `sync`             | query  | Probe the host and report drift between the last recorded inventory and the live state                                                                                                                  |
+| Method             | Kind   | Description                                                                                                                                                                                                        |
+| ------------------ | ------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `define_network`   | action | Define a network (raw XML or structured), start and autostart it; `replace=true` to redefine                                                                                                                       |
+| `undefine_network` | action | Stop a network if active and undefine it; use this to remove the `default` network                                                                                                                                 |
+| `clone_volume`     | action | Clone a golden volume or zvol in a pool to a new volume, via the pool driver (`vol-clone`)                                                                                                                         |
+| `define_domain`    | action | Define a KVM domain from a pool volume with ACPI and a pty console, plus optional extra/CD-ROM disks; optionally start it                                                                                          |
+| `power`            | action | `start`, `shutdown`, `destroy`, `reboot`, `suspend`, `resume`; idempotent toward the desired state, `shutdown` waits for power-off                                                                                 |
+| `console`          | query  | Attach to the serial console under a hard timeout; returns `bytes` and `sha256`, not the text                                                                                                                      |
+| `undefine_domain`  | action | Destroy the domain if running, then undefine it; `remove_volumes` removes only the boot volume recorded by `define_domain` (plus read-only media with `remove_attached_media`) and detaches every other disk first |
+| `get`              | query  | Report networks, domains and pool volumes from `net-list`, `list` and `vol-list`                                                                                                                                   |
+| `sync`             | query  | Probe the host and report drift between the last recorded inventory and the live state                                                                                                                             |
 
 `define_network`, `undefine_network`, `clone_volume`, `define_domain`, `power`
 and `undefine_domain` are `kind: action`, so a single method call cannot mark
@@ -52,6 +52,21 @@ the ACPI power button works and `power shutdown` can power the guest off.
 `extra_disks` attaches more disks — a `cdrom` defaults to read-only, so a
 cloud-init NoCloud seed ISO can be attached. `define_domain` refuses to define
 from a volume that does not exist, so it always follows a successful clone.
+
+`define_domain` records the resolved boot volume as `root_disk` on the
+`domain_state` record, but only after `domblklist --inactive` shows the domain's
+persistent config really uses it: an existing domain left alone (no `replace`)
+that boots from another disk keeps its earlier record instead. `power` refreshes
+the record and carries `root_disk` forward (unless the domain's uuid changed),
+so `undefine_domain remove_volumes=true` after `power shutdown` still finds it.
+
+`undefine_domain remove_volumes=true` keeps only the recorded root attached,
+detaches every other disk from the persistent config, then runs
+`undefine --remove-all-storage`, so only the root clone is deleted. With
+`remove_attached_media=true` it also keeps read-only media attached (a CD-ROM, a
+floppy, or a disk marked `<readonly/>`) so it is deleted too; data disks are
+still detached and kept. Every refusal (no recorded root, or none attached)
+happens before a running domain is destroyed.
 
 ## Idempotency and safety
 
@@ -93,9 +108,12 @@ from a volume that does not exist, so it always follows a successful clone.
   needs one and has no `--timeout`), run inside an outer `sh -c` that survives
   the killed child and exits 0 on a timeout, so a timed-out capture returns the
   bytes read so far instead of an ssh transport error. A local deadline is a
-  backstop, and `max_output_bytes` caps the bytes the transport returns. It
-  passes `--force`, so a capture takes over the console from any operator
-  already attached to it.
+  backstop, and `max_output_bytes` caps the bytes the transport returns. A
+  SIGKILL exit counts as the timeout only when the elapsed whole seconds reach
+  `timeout_s`, so an early kill (e.g. the OOM killer) is an error; `timeout_s`
+  has a 5-second floor to keep that one-second ambiguity small. It passes
+  `--force`, so a capture takes over the console from any operator already
+  attached to it.
 
 ## Install
 

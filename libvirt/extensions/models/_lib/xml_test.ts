@@ -364,3 +364,146 @@ Deno.test("domain xml: an unaccepted disk format is refused", () => {
     LibvirtConfigError,
   );
 });
+
+/** True when `cmd` can be spawned from PATH. */
+async function onPath(cmd: string): Promise<boolean> {
+  try {
+    await new Deno.Command(cmd, {
+      args: ["--help"],
+      stdout: "null",
+      stderr: "null",
+    }).output();
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+// TRIAGE 4e2: the renders libvirt consumes are validated against libvirt's own
+// RNG schemas when the validator is installed. `virsh define --validate` needs
+// a connection whose driver accepts type='kvm', which a test host rarely has,
+// so the schema validator is the tool used here.
+const XML_VALIDATOR = await onPath("virt-xml-validate");
+
+Deno.test({
+  name: XML_VALIDATOR
+    ? "virt-xml-validate accepts every network and domain render"
+    : "virt-xml-validate accepts every network and domain render (SKIPPED: virt-xml-validate not on PATH; install libvirt-clients to run)",
+  ignore: !XML_VALIDATOR,
+  fn: async () => {
+    const root = {
+      path: "/var/lib/libvirt/images/node-a-root.qcow2",
+      format: "qcow2" as const,
+      target: "vda",
+      bus: "virtio" as const,
+      device: "disk" as const,
+      readonly: false,
+    };
+    const renders: [string, string, string][] = [
+      [
+        "network",
+        "nat",
+        renderNetworkXml({
+          name: "net-a",
+          mode: "nat",
+          gateway: "192.0.2.1",
+          prefix: 24,
+          dhcpStart: "192.0.2.10",
+          dhcpEnd: "192.0.2.99",
+          domain: "lab.example",
+        }),
+      ],
+      [
+        "network",
+        "route",
+        renderNetworkXml({
+          name: "net-r",
+          mode: "route",
+          gateway: "198.51.100.1",
+          prefix: 24,
+        }),
+      ],
+      [
+        "network",
+        "bridge",
+        renderNetworkXml({
+          name: "net-b",
+          mode: "bridge",
+          bridge: "br0",
+        }),
+      ],
+      [
+        "network",
+        "none",
+        renderNetworkXml({
+          name: "net-i",
+          mode: "none",
+          gateway: "203.0.113.1",
+          prefix: 24,
+        }),
+      ],
+      [
+        "domain",
+        "network+seed+data",
+        renderDomainXml({
+          name: "node-a",
+          vcpus: 2,
+          memoryMib: 2048,
+          arch: "x86_64",
+          disks: [
+            root,
+            {
+              path: "/var/lib/libvirt/images/data.qcow2",
+              format: "qcow2",
+              target: "vdb",
+              bus: "virtio",
+              device: "disk",
+              readonly: false,
+            },
+            {
+              path: "/var/lib/libvirt/images/seed.iso",
+              format: "raw",
+              target: "sda",
+              bus: "sata",
+              device: "cdrom",
+              readonly: true,
+            },
+          ],
+          network: "net-a",
+          mac: "02:00:00:00:00:01",
+        }),
+      ],
+      [
+        "domain",
+        "bridge",
+        renderDomainXml({
+          name: "node-b",
+          vcpus: 1,
+          memoryMib: 1024,
+          arch: "x86_64",
+          disks: [root],
+          bridge: "br0",
+        }),
+      ],
+    ];
+    const dir = await Deno.makeTempDir({ prefix: "libvirt-xml-validate-" });
+    try {
+      for (const [schema, label, xml] of renders) {
+        const file = `${dir}/${schema}-${label.replace(/\W/g, "_")}.xml`;
+        await Deno.writeTextFile(file, xml);
+        const out = await new Deno.Command("virt-xml-validate", {
+          args: [file, schema],
+          stdout: "piped",
+          stderr: "piped",
+        }).output();
+        assertEquals(
+          out.code,
+          0,
+          `${schema} ${label}: ${new TextDecoder().decode(out.stderr)}`,
+        );
+      }
+    } finally {
+      await Deno.remove(dir, { recursive: true });
+    }
+  },
+});

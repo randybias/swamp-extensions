@@ -33,7 +33,7 @@ Deno.test("consoleArgv: one quoted command and a timeout-to-zero wrapper", () =>
   assertEquals(script.includes("'/dev/null'"), true);
   assertEquals(script.includes("[ $rc -eq 124 ]"), true);
   assertEquals(
-    script.includes("[ $rc -eq 137 ] && [ $((end - start)) -ge 14 ]"),
+    script.includes("[ $rc -eq 137 ] && [ $((end - start)) -ge 15 ]"),
     true,
   );
   assertEquals(script.includes("--timeout"), false);
@@ -89,6 +89,38 @@ Deno.test({
       await Deno.remove(dir, { recursive: true });
     }
   },
+});
+
+Deno.test({
+  name: "consoleArgv: an early SIGKILL (not the timeout) is not a capture",
+  ignore: Deno.build.os === "windows",
+  fn: async () => {
+    const dir = await Deno.makeTempDir({ prefix: "libvirt-console-kill-" });
+    try {
+      // Stands in for an OOM-killed virsh: SIGKILL well before the bound.
+      const virsh = `${dir}/virsh`;
+      await Deno.writeTextFile(virsh, "#!/bin/sh\nprintf 'x'\nkill -9 $$\n");
+      await Deno.chmod(virsh, 0o755);
+      const argv = consoleArgv("qemu:///system", "node-a", 5);
+      const out = await new Deno.Command(argv[0], {
+        args: argv.slice(1),
+        env: { PATH: `${dir}:${Deno.env.get("PATH") ?? ""}` },
+        stdout: "piped",
+        stderr: "piped",
+      }).output();
+      assertEquals(out.code !== 0, true);
+    } finally {
+      await Deno.remove(dir, { recursive: true });
+    }
+  },
+});
+
+Deno.test("consoleArgv: a non-positive bound is refused", () => {
+  assertThrows(
+    () => consoleArgv("qemu:///system", "node-a", 0),
+    LibvirtError,
+    "positive",
+  );
 });
 
 Deno.test("xmlTempPath: reject a token that could escape /tmp", () => {

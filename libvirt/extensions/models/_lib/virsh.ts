@@ -131,8 +131,15 @@ export function consoleArgv(
   ]);
   // 124 is timeout's own exit and 137 is the SIGKILL it sends, but a virsh
   // killed by something else (e.g. the OOM killer) also exits 137. Only treat a
-  // 137 as a timeout when the bound was actually reached.
-  const budget = Math.max(0, timeoutS - 1);
+  // 137 as a timeout when the bound was actually reached. With whole-second
+  // clocks floor(end) - floor(start) >= floor(end - start), so a run that
+  // lasted the full bound always shows at least `timeoutS`; an early kill can
+  // only pass in the last second of the window, which the model's 5 s floor on
+  // timeout_s keeps to a small fraction of it.
+  if (!Number.isInteger(timeoutS) || timeoutS < 1) {
+    throw new LibvirtError("console timeout must be a positive whole number");
+  }
+  const budget = timeoutS;
   const script = `start=$(date +%s); ${cmd}; rc=$?; end=$(date +%s); ` +
     `if [ $rc -eq 124 ]; then exit 0; fi; ` +
     `if [ $rc -eq 137 ] && [ $((end - start)) -ge ${budget} ]; then exit 0; fi; ` +

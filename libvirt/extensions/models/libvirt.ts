@@ -47,6 +47,7 @@ import {
   memoryMib,
   networkProjection,
   parseBlkListDetails,
+  parseDomainDisks,
   parseKeyValues,
   parseNameList,
   parseVolList,
@@ -248,8 +249,8 @@ const ConsoleArgs = z.strictObject({
   ...SshFields,
   uri: UriField,
   name: NameField.describe("Domain name"),
-  timeout_s: z.number().int().min(1).max(300).default(15).describe(
-    "Seconds to capture before disconnecting, 1-300",
+  timeout_s: z.number().int().min(5).max(300).default(15).describe(
+    "Seconds to capture before disconnecting, 5-300",
   ),
   devname: z.string().min(1).max(63).regex(NAME_RE).optional().describe(
     "Console device name, when the domain has more than one",
@@ -261,10 +262,10 @@ const UndefineDomainArgs = z.strictObject({
   uri: UriField,
   name: NameField.describe("Domain to destroy and undefine"),
   remove_volumes: z.boolean().default(false).describe(
-    "Also remove the domain's managed volumes (virsh undefine --remove-all-storage)",
+    "Also remove the root volume recorded by define_domain (virsh undefine --remove-all-storage); every other disk is detached first and kept",
   ),
   remove_attached_media: z.boolean().default(false).describe(
-    "Also remove attached read-only media the domain did not create, e.g. a seed ISO; without this a CD-ROM seed is detached first and kept",
+    "With remove_volumes, also remove attached read-only media (a CD-ROM, a floppy or a disk marked readonly), e.g. a seed ISO; every other non-root disk is still detached and kept. Without this the media is detached and kept too",
   ),
 });
 
@@ -442,6 +443,36 @@ function sanitizeVirshDetail(text: string): string {
     flattened += code < 0x20 || code === 0x7f ? " " : ch;
   }
   return flattened.replace(/\s+/g, " ").trim().slice(0, 400);
+}
+
+/** The stored domain_state record for `name` on this target, or null. */
+async function readDomainRecord(
+  context: Ctx,
+  a: { host: string; port: number; user: string },
+  name: string,
+): Promise<DomainState | null> {
+  return await context.readResource(
+    instanceName("dom", a, name),
+  ) as DomainState | null;
+}
+
+/**
+ * A domain_state record for a fresh observation that carries forward every
+ * field of the previous record the observation does not refresh, above all
+ * `root_disk`, which only define_domain establishes. A previous record of a
+ * different domain under the same name (another uuid) is not carried.
+ */
+function mergeDomainRecord(
+  prev: DomainState | null,
+  fresh: DomainState,
+): DomainState {
+  if (prev === null || !prev.present) return fresh;
+  if (prev.uuid && fresh.uuid && prev.uuid !== fresh.uuid) return fresh;
+  const merged: Record<string, unknown> = { ...prev };
+  for (const [key, value] of Object.entries(fresh)) {
+    if (value !== undefined) merged[key] = value;
+  }
+  return merged as DomainState;
 }
 
 const BENIGN = {
@@ -1036,20 +1067,45 @@ export function createModel(overrides: Partial<LibvirtDeps> = {}) {
             changed = true;
             before = await domainInfo(deps, t, args.uri, args.name);
           }
+          // Record the root only when the domain's persistent config really
+          // boots from it: an existing domain left alone (no replace) may use
+          // another volume, and recording `volume` unchecked would make
+          // undefine_domain keep and delete the wrong disk.
+          const blk = await virsh(deps, t, args.uri, [
+            "domblklist",
+            args.name,
+            "--inactive",
+            "--details",
+          ]);
+          const attached = parseBlkListDetails(blk.stdout).some((entry) =>
+            entry.source === volPath
+          );
+          const prev = await readDomainRecord(context, args, args.name);
+          const fresh: DomainState = {
+            target: targetKey(args),
+            name: args.name,
+            present: true,
+            uuid: before["uuid"] ?? "",
+            state: domainState(before),
+            vcpus: Number(before["cpu(s)"] ?? "") || undefined,
+            memory_mib: memoryMib(before),
+            root_disk: attached ? volPath : undefined,
+            observed_at: new Date(deps.now()).toISOString(),
+          };
+          let record: DomainState;
+          if (attached) {
+            record = mergeDomainRecord(prev, fresh);
+          } else {
+            context.logger.warning(
+              "domain {name} does not use volume {volume}; its root disk is not recorded from this call",
+              { name: args.name, volume: args.volume },
+            );
+            record = changed ? fresh : mergeDomainRecord(prev, fresh);
+          }
           const handle = await context.writeResource(
             "domain_state",
             instanceName("dom", args, args.name),
-            {
-              target: targetKey(args),
-              name: args.name,
-              present: true,
-              uuid: before["uuid"] ?? "",
-              state: domainState(before),
-              vcpus: Number(before["cpu(s)"] ?? "") || undefined,
-              memory_mib: memoryMib(before),
-              root_disk: volPath,
-              observed_at: new Date(deps.now()).toISOString(),
-            },
+            record,
           );
           return {
             dataHandles: [handle],
@@ -1161,10 +1217,11 @@ export function createModel(overrides: Partial<LibvirtDeps> = {}) {
             }
           }
           const after = await domainInfo(deps, t, args.uri, args.name);
+          const prev = await readDomainRecord(context, args, args.name);
           const handle = await context.writeResource(
             "domain_state",
             instanceName("dom", args, args.name),
-            {
+            mergeDomainRecord(prev, {
               target: targetKey(args),
               name: args.name,
               present: true,
@@ -1173,7 +1230,7 @@ export function createModel(overrides: Partial<LibvirtDeps> = {}) {
               vcpus: Number(after["cpu(s)"] ?? "") || undefined,
               memory_mib: memoryMib(after),
               observed_at: new Date(deps.now()).toISOString(),
-            },
+            }),
           );
           return {
             dataHandles: [handle],
@@ -1252,7 +1309,7 @@ export function createModel(overrides: Partial<LibvirtDeps> = {}) {
       },
       undefine_domain: {
         description:
-          "DESTRUCTIVE. Destroy the domain if running, then undefine it; remove_volumes also deletes its managed volumes. Undefining an absent domain is a clean no-op.",
+          "DESTRUCTIVE. Destroy the domain if running, then undefine it; remove_volumes also deletes the root volume recorded by define_domain (plus read-only media with remove_attached_media) after detaching every other disk, and refuses before any power-off when no recorded root is attached. Undefining an absent domain is a clean no-op.",
         kind: "action" as const,
         arguments: UndefineDomainArgs,
         execute: async (
@@ -1283,6 +1340,61 @@ export function createModel(overrides: Partial<LibvirtDeps> = {}) {
               },
             };
           }
+          // Every refusal check runs before the domain is destroyed, so a
+          // refused remove_volumes never powers off the guest.
+          const detachTargets: string[] = [];
+          if (args.remove_volumes) {
+            // Keep only the disk recorded as this domain's root volume (and,
+            // with remove_attached_media, read-only media) and detach every
+            // other disk, so `--remove-all-storage` cannot delete an extra
+            // data disk or an image this extension did not create. A domain
+            // with no recorded root, or none attached, refuses.
+            const recorded = await readDomainRecord(context, args, args.name);
+            const rootDisk = recorded?.root_disk;
+            if (rootDisk === undefined) {
+              throw new LibvirtError(
+                `refusing to remove volumes for ${args.name}: no recorded root disk; run define_domain first`,
+              );
+            }
+            const blk = await virsh(deps, t, args.uri, [
+              "domblklist",
+              args.name,
+              "--inactive",
+              "--details",
+            ]);
+            const entries = parseBlkListDetails(blk.stdout);
+            if (!entries.some((entry) => entry.source === rootDisk)) {
+              throw new LibvirtError(
+                `refusing to remove volumes for ${args.name}: no attached disk matches the recorded root ${rootDisk}`,
+              );
+            }
+            let readonlyPaths = new Set<string>();
+            if (args.remove_attached_media) {
+              const dump = await virsh(deps, t, args.uri, [
+                "dumpxml",
+                "--inactive",
+                args.name,
+              ]);
+              readonlyPaths = new Set(
+                parseDomainDisks(dump.stdout).filter((d) => d.readonly).map((
+                  d,
+                ) => d.path),
+              );
+            }
+            for (const entry of entries) {
+              if (entry.source === rootDisk) continue;
+              if (entry.source === "" || entry.source === "-") continue;
+              if (
+                args.remove_attached_media &&
+                (entry.device === "cdrom" || entry.device === "floppy" ||
+                  readonlyPaths.has(entry.source))
+              ) {
+                continue;
+              }
+              assertName(entry.target, "disk target");
+              detachTargets.push(entry.target);
+            }
+          }
           const state = domainState(info);
           if (isRunningState(state) || isPausedState(state)) {
             const destroy = await virshTry(deps, t, args.uri, [
@@ -1295,46 +1407,17 @@ export function createModel(overrides: Partial<LibvirtDeps> = {}) {
               );
             }
           }
-          if (args.remove_volumes && !args.remove_attached_media) {
-            // Keep only the disk recorded as this domain's root volume and
-            // detach every other disk, so `--remove-all-storage` deletes the
-            // root but cannot delete an extra disk or a seed this extension
-            // did not create. A domain with no recorded root refuses.
-            const recorded = await context.readResource(
-              instanceName("dom", args, args.name),
-            ) as { root_disk?: string } | null;
-            const rootDisk = recorded?.root_disk;
-            if (rootDisk === undefined) {
-              throw new LibvirtError(
-                `refusing to remove volumes for ${args.name}: no recorded root disk; run define_domain first, or pass remove_attached_media`,
-              );
-            }
-            const blk = await virsh(deps, t, args.uri, [
-              "domblklist",
+          for (const target of detachTargets) {
+            const detach = await virshTry(deps, t, args.uri, [
+              "detach-disk",
               args.name,
-              "--details",
+              target,
+              "--config",
             ]);
-            const entries = parseBlkListDetails(blk.stdout);
-            if (!entries.some((entry) => entry.source === rootDisk)) {
+            if (detach.exit_code !== 0 && !isBenign(detach, BENIGN.detach)) {
               throw new LibvirtError(
-                `refusing to remove volumes for ${args.name}: no attached disk matches the recorded root ${rootDisk}`,
+                `could not detach ${target} from ${args.name} before undefining it; refusing to remove volumes`,
               );
-            }
-            for (const entry of entries) {
-              if (entry.source === rootDisk) continue;
-              if (entry.source === "" || entry.source === "-") continue;
-              assertName(entry.target, "disk target");
-              const detach = await virshTry(deps, t, args.uri, [
-                "detach-disk",
-                args.name,
-                entry.target,
-                "--config",
-              ]);
-              if (detach.exit_code !== 0 && !isBenign(detach, BENIGN.detach)) {
-                throw new LibvirtError(
-                  `could not detach ${entry.target} from ${args.name} before undefining it; refusing to remove volumes`,
-                );
-              }
             }
           }
           const undefine = ["undefine", args.name];

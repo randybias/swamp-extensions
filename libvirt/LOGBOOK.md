@@ -238,3 +238,38 @@ this environment.
   the timeout kill: the console wrapper records elapsed seconds with `date` and
   only maps 137 to success when the bound was actually reached.
 - 106 tests; gates 0-6 PASS offline; ssh.ts blob fe0139f0 unchanged.
+
+## Escalation fix (Claude, lane/fx-libvirt from 889af57)
+
+- HIGH `power` rewrote `domain_state` without `root_disk`, so the README flow
+  define -> power shutdown -> undefine remove_volumes always refused. Every
+  `domain_state` writer for a present domain now merges the previous record
+  (fresh fields win; nothing carried when the uuid differs). `get`/`sync` write
+  only `host_state`; `undefine_domain` writes `present: false` and deliberately
+  drops `root_disk`, because the domain is gone and a stale root could match a
+  later same-named domain. Test: the full golden-image flow in one context with
+  a data disk and a seed, only `vda` left attached for `--remove-all-storage`.
+- HIGH `remove_attached_media=true` skipped every detach, so a data disk was
+  deleted. It now still requires the recorded root, keeps the root plus
+  read-only media (cdrom, floppy, or `<readonly/>` in `dumpxml --inactive`), and
+  detaches every other disk. Refusal text no longer points at it. Test: a data
+  disk, a read-only shared image, a cdrom and a floppy; only the data disk is
+  detached. `domblklist` now reads `--inactive` (the persistent config that
+  `undefine --remove-all-storage` acts on).
+- MEDIUM `define_domain` on an existing domain without replace recorded an
+  unchecked root. The root is recorded only when `domblklist --inactive` shows
+  it attached; otherwise the earlier record is carried (no-op) or nothing is
+  recorded (redefined).
+- MEDIUM refusal checks in `undefine_domain` ran after destroying a running
+  domain; record and domblklist checks now run first. Test: running domain, no
+  record / no match, no `destroy` sent.
+- MEDIUM console 137 with `timeout_s=1` had a 0-second budget. The budget is now
+  `timeout_s` (whole-second floor difference is provably >= the real elapsed
+  floor), `timeout_s` has a 5 s floor, and `consoleArgv` refuses a bound < 1.
+  Test: an early `kill -9` exits non-zero.
+- MEDIUM (TRIAGE 4e2) `xml_test.ts` runs `virt-xml-validate` on four network and
+  two domain renders when it is on PATH, and is reported ignored with the reason
+  otherwise. Verified locally against libvirt 11.3 schemas (extracted
+  libvirt-common + libvirt-clients 9.0 script); all renders validate.
+  `virsh define --validate` is not used: it needs a connection whose driver
+  accepts `type='kvm'`.

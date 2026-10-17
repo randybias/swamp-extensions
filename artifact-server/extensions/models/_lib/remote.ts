@@ -53,8 +53,9 @@ export async function runScript(
 
 /**
  * A shell expression that prints a file's SHA-256, using GNU `sha256sum` or
- * BSD `shasum -a 256`. `pathExpr` must already be a safe shell word (a quoted
- * literal or a quoted variable).
+ * BSD `shasum - a 256`. `pathExpr` must already be a safe shell word (a quoted
+ * literal or a quoted variable). The pipeline returns awk's status, so callers
+ * that depend on the value must check it is 64 hex characters.
  */
 export function hashCmd(pathExpr: string): string {
   return `{ sha256sum ${pathExpr} 2>/dev/null || shasum -a 256 ${pathExpr} 2>/dev/null; } | awk '{print $1}'`;
@@ -89,6 +90,7 @@ export async function probeFile(
     `elif [ -d "$f" ]; then echo dir`,
     `elif [ -f "$f" ]; then`,
     `  h=$(${hashCmd('"$f"')})`,
+    `  printf '%s' "$h" | grep -Eq '^[0-9a-f]{64}$' || h=`,
     `  m=$( { stat -c %a "$f" 2>/dev/null || stat -f %Lp "$f" 2>/dev/null; } )`,
     `  u=$( { stat -c %U "$f" 2>/dev/null; } )`,
     `  g=$( { stat -c %G "$f" 2>/dev/null; } )`,

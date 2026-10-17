@@ -108,3 +108,47 @@ Deno.test("regenerateSumsScript ignores a newline-named directory", async () => 
   assertEquals(sums, `${HASH}  sha256/${HASH}/data\n`);
   assertEquals(sums.includes("evil"), false);
 });
+
+Deno.test("regenerateSumsScript ignores a newline in a file name", async () => {
+  const hasFlock = await new Deno.Command("sh", {
+    args: ["-c", "command -v flock"],
+  }).output().then((o) => o.code === 0).catch(() => false);
+  if (!hasFlock) return;
+
+  const dir = await Deno.makeTempDir();
+  const root = `${dir}/root`;
+  await Deno.mkdir(`${root}/sha256/${HASH}`, { recursive: true });
+  await Deno.writeTextFile(`${root}/sha256/${HASH}/data`, "ok\n");
+  // A file whose name contains a newline and a forged index line.
+  await Deno.writeTextFile(
+    `${root}/sha256/${HASH}/data\n${"e".repeat(64)}  injected`,
+    "bad\n",
+  );
+
+  assertEquals((await sh(regenerateSumsScript(root))).code, 0);
+  const sums = await Deno.readTextFile(`${root}/SHA256SUMS`);
+  assertEquals(sums, `${HASH}  sha256/${HASH}/data\n`);
+  assertEquals(sums.includes("injected"), false);
+});
+
+Deno.test("regenerateSumsScript skips a symlinked hash directory", async () => {
+  const hasFlock = await new Deno.Command("sh", {
+    args: ["-c", "command -v flock"],
+  }).output().then((o) => o.code === 0).catch(() => false);
+  if (!hasFlock) return;
+
+  const dir = await Deno.makeTempDir();
+  const root = `${dir}/root`;
+  const other = "e".repeat(64);
+  await Deno.mkdir(`${root}/sha256/${HASH}`, { recursive: true });
+  await Deno.writeTextFile(`${root}/sha256/${HASH}/data`, "ok\n");
+  const outside = `${dir}/outside`;
+  await Deno.mkdir(outside, { recursive: true });
+  await Deno.writeTextFile(`${outside}/data`, "outside\n");
+  await Deno.symlink(outside, `${root}/sha256/${other}`);
+
+  assertEquals((await sh(regenerateSumsScript(root))).code, 0);
+  const sums = await Deno.readTextFile(`${root}/SHA256SUMS`);
+  assertEquals(sums, `${HASH}  sha256/${HASH}/data\n`);
+  assertEquals(sums.includes(other), false);
+});

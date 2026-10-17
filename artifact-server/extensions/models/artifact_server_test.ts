@@ -376,8 +376,6 @@ Deno.test("ref writes and unref removes a ref, idempotently", async () => {
   );
 });
 
-/** Seeds a layout with one blob and one ref. */
-
 Deno.test("list reads refs, blobs and bundles and persists a listing", async () => {
   const host = makeFakeRemote();
   await seed(host);

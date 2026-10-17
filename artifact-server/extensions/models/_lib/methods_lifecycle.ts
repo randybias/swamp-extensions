@@ -78,7 +78,7 @@ export const lifecycleMethods: Record<string, ArtifactServerMethod> = {
   install: {
     kind: "action",
     description:
-      "DESTRUCTIVE. Install nginx, create the served layout, write the site config, htpasswd and TLS files, prove the config with nginx -t and reload. Idempotent: the same rendered config is not reloaded. A failed nginx -t restores the previous config and never reloads.",
+      "DESTRUCTIVE. Install nginx, create the served layout, write the site config, htpasswd and TLS files, prove the config with nginx -t and reload. The reload is idempotent and always runs; any failure after the host is snapshotted rolls every change back and re-tests the restored config.",
     arguments: InstallArgs,
     execute: async (rawArgs: unknown, context: MethodContext) => {
       const args = InstallArgs.parse(rawArgs);
@@ -95,47 +95,53 @@ export const lifecycleMethods: Record<string, ArtifactServerMethod> = {
       }
       await installNginx(activeDeps, target);
       const snaps = await captureInstallSnaps(activeDeps, target, args);
+      let text = "";
+      let configSha = "";
+      let changed = false;
       try {
         await ensureLayout(activeDeps, target, args);
-        const text = renderFor(args);
-        const configSha = await sha256Hex(text);
+        text = renderFor(args);
+        configSha = await sha256Hex(text);
         // Credentials first: the site is enabled last, so a failure writing the
         // cert can never leave an enabled link pointing at a missing file.
-        let changed = await writeCredentials(activeDeps, target, args);
+        changed = await writeCredentials(activeDeps, target, args);
         changed = (await writeSite(activeDeps, target, args, text, snaps)) ||
           changed;
         await verifyAndReload(activeDeps, target);
-        const scheme = args.tls.mode === "provided" ? "https" : "http";
-        const base = urlBase(args.server_name, args.listen.port, scheme);
-        const handle = await context.writeResource(
-          "config",
-          `config-${instanceKey(args)}`,
-          ConfigSchema.parse({
-            config_sha256: configSha,
-            text,
-            url_base: base,
-            rendered_at: new Date(activeDeps.now()).toISOString(),
-          }),
-        );
-        context.logger.info("Installed artifact server on {host}:{port}", {
-          host: args.ssh.host,
-          port: args.listen.port,
-        });
-        return {
-          dataHandles: [handle],
-          result: { config_sha256: configSha, url_base: base, changed },
-        };
       } catch (err) {
         // Any throw after the snapshots — nginx -t, a failed credential write,
         // a failed remove, a lost connection — rolls the host back.
-        const clean = await rollbackInstall(activeDeps, target, snaps);
+        const failures = await rollbackInstall(activeDeps, target, snaps);
         const reason = err instanceof Error ? err.message : String(err);
+        const rolled = failures.length
+          ? ` with rollback errors (${failures.join("; ")})`
+          : "";
         throw new SshError(
-          `install failed; rolled back and not reloaded${
-            clean ? "" : " (the restored config also fails nginx -t)"
-          }: ${reason}`,
+          `install failed; rolled back and not reloaded${rolled}: ${reason}`,
         );
       }
+      // Persist and log only after the host is known good, so a failure here
+      // cannot restore the files while nginx keeps running the new config.
+      const scheme = args.tls.mode === "provided" ? "https" : "http";
+      const base = urlBase(args.server_name, args.listen.port, scheme);
+      const handle = await context.writeResource(
+        "config",
+        `config-${instanceKey(args)}`,
+        ConfigSchema.parse({
+          config_sha256: configSha,
+          text,
+          url_base: base,
+          rendered_at: new Date(activeDeps.now()).toISOString(),
+        }),
+      );
+      context.logger.info("Installed artifact server on {host}:{port}", {
+        host: args.ssh.host,
+        port: args.listen.port,
+      });
+      return {
+        dataHandles: [handle],
+        result: { config_sha256: configSha, url_base: base, changed },
+      };
     },
   },
   get: {

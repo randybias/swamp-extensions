@@ -211,23 +211,45 @@ export async function writeCredentials(
 
 /**
  * Puts every file and link back the way {@link captureInstallSnaps} found it,
- * then re-runs `nginx -t`. Returns whether the restored config passes.
+ * then re-runs `nginx -t`. Returns the list of rollback failures; an empty
+ * list means the host is back to the captured state and the config passes.
  */
 export async function rollbackInstall(
   deps: SshDeps,
   target: SshTarget,
   snaps: InstallSnaps,
-): Promise<boolean> {
-  await restoreFile(deps, target, snaps.site);
-  await restoreLink(deps, target, snaps.enabled);
-  if (snaps.default !== null) await restoreLink(deps, target, snaps.default);
-  if (snaps.cert !== null) await restoreFile(deps, target, snaps.cert);
-  if (snaps.key !== null) await restoreFile(deps, target, snaps.key);
-  if (snaps.htpasswd !== null) {
-    await restoreFile(deps, target, snaps.htpasswd);
+): Promise<string[]> {
+  const failures: string[] = [];
+  const attempt = async (label: string, work: () => Promise<void>) => {
+    try {
+      await work();
+    } catch (err) {
+      failures.push(`${label}: ${err instanceof Error ? err.message : err}`);
+    }
+  };
+  await attempt("site", () => restoreFile(deps, target, snaps.site));
+  await attempt("enabled link", () => restoreLink(deps, target, snaps.enabled));
+  const def = snaps.default;
+  if (def !== null) {
+    await attempt("default site", () => restoreLink(deps, target, def));
+  }
+  const cert = snaps.cert;
+  if (cert !== null) {
+    await attempt("certificate", () => restoreFile(deps, target, cert));
+  }
+  const key = snaps.key;
+  if (key !== null) {
+    await attempt("key", () => restoreFile(deps, target, key));
+  }
+  const htpasswd = snaps.htpasswd;
+  if (htpasswd !== null) {
+    await attempt("htpasswd", () => restoreFile(deps, target, htpasswd));
   }
   const retest = await execSudo(deps, target, ["nginx", "-t"]);
-  return retest.exit_code === 0;
+  if (retest.exit_code !== 0) {
+    failures.push("nginx -t still fails after rollback");
+  }
+  return failures;
 }
 
 /**

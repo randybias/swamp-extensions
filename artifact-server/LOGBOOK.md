@@ -12,6 +12,55 @@ addresses and `.test` names only.
 - Tests: layout, nginx rendering, TLS validation, observation parsing, remote
   file helpers and the full model over an in-memory SSH target.
 
+## Prior art
+
+Three nearby packages exist. None delivers a content-addressed, SSH-only
+artifact origin, so this extension is not a duplicate of any of them.
+
+### `@taylor/nexus` 2026.10.14.1
+
+Runs a Nexus repository manager in a container and configures raw repositories.
+
+- **What it gives you:** a long-lived repository daemon, its own HTTP API and
+  admin surface, and raw hosted repos keyed by _path_.
+- **Gap:** raw repos are mutable and path-addressed: the same URL can serve
+  different bytes over time, so a consumer cannot pin a build to the exact bytes
+  it validated. It also adds a second daemon and API that must be managed,
+  patched and authenticated.
+- **What ours adds:** immutable, SHA-256-addressed blobs served as plain files
+  (`sha256/<hash>/<name>`), with `SHA256SUMS` and `verify` to prove the bytes;
+  no repository daemon or new API is introduced — management is SSH-only and the
+  served tree is a static directory any web server can host.
+
+### `@keeb/nginx`
+
+Covers nginx **stream proxying** only (TCP/UDP `stream {}` proxying).
+
+- **Gap:** it configures a forwarder, not an origin. It has no notion of stored
+  objects, manifests, immutability or fetch verification.
+- **What ours adds:** the HTTP(S) origin itself: an nginx `server` block that
+  serves a pinned artifact tree read-only, plus upload/fetch/bundle/ref and a
+  prune plan. The two are complementary; ours does not do stream proxying.
+
+### nginx-proxy-manager packages
+
+Drive the Nginx Proxy Manager API (hosts, certificates, access lists) against a
+running NPM instance.
+
+- **Gap:** NPM is a reverse-proxy control plane with a mutable database and a
+  web API; it has no content-addressed store and no host-side verification. A
+  package that drives its API still depends on that daemon being up and that API
+  being reachable and authenticated.
+- **What ours adds:** no control-plane API to depend on. The extension manages a
+  static tree over SSH, stores bytes by content hash, verifies a download before
+  it is adopted (`fetch` keeps a hidden temp file until the host-side SHA-256
+  matches the pin), and publishes named bundles and refs so a versioned set of
+  files is addressable and protected from prune.
+
+**Net:** the unique combination here is SHA-256-addressed immutable blobs, a
+verified fetch, named bundles/refs, and SSH-only management that starts no new
+daemon or API — none of the three pieces gives that.
+
 ## Decisions for Randy's review
 
 1. **Daemon** — nginx, as the spec recommends: explicit TLS, a `nginx -t`
@@ -105,6 +154,20 @@ After the review rounds, one deliberate simplification pass:
   installed while `sync` succeeds; `renderFor` takes its inputs as one object;
   `InstallArgs` extends `RenderConfigArgs`.
 - Tests share one `test_support.ts` helper and are split by concern.
+
+## Round-3 polish
+
+- The `SHA256SUMS` and verify loops now reject a newline in a **file** name too
+  (a shell `case` test, not a per-line `grep`), and skip a symlinked hash
+  directory, so neither can inject a forged index line or hash outside the root.
+- `verify` exports `LC_ALL=C` so a bundle's file order — and therefore its tree
+  hash — is code-point order regardless of the caller's locale.
+- Install persists the config resource and logs only after a successful reload,
+  so a later throw cannot restore the files while nginx keeps the new config.
+- `snapLink` refuses a failed read and rollback checks every `rm`/`ln` exit
+  code, reporting any rollback failure in the error.
+- `hashCmd` callers validate a 64-hex result; comments that restated code were
+  removed; the install description matches the always-reload behaviour.
 
 ## Open spec questions resolved by the simplest safe option
 

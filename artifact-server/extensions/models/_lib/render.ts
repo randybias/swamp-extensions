@@ -9,15 +9,10 @@ import type { BasicAuthArgs, TlsArgs } from "./schema.ts";
 
 /** The inputs {@link renderFor} draws from a method's arguments. */
 export interface RenderInput {
-  /** Served root. */
   root: string;
-  /** Listen address and port. */
   listen: { address: string; port: number };
-  /** `server_name`. */
   server_name: string;
-  /** The TLS argument. */
   tls: TlsArgs;
-  /** The basic-auth argument, when used. */
   basic_auth?: BasicAuthArgs | null;
 }
 

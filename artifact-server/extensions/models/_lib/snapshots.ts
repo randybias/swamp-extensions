@@ -83,7 +83,10 @@ export async function restoreFile(
   snap: FileSnap,
 ): Promise<void> {
   if (!snap.existed) {
-    await execSudo(deps, target, ["rm", "-f", snap.path]);
+    const rm = await execSudo(deps, target, ["rm", "-f", snap.path]);
+    if (rm.exit_code !== 0) {
+      throw new SshError(`could not remove ${snap.path} during rollback`);
+    }
     return;
   }
   await putRootFile(deps, target, {
@@ -119,12 +122,15 @@ export async function snapLink(
     };
   }
   if (probe.state === "file") {
-    return {
-      path,
-      state: "file",
-      target: null,
-      content: await readFileText(deps, target, path, true),
-    };
+    const content = await readFileText(deps, target, path, true);
+    if (content === null) {
+      // Same rule as snapFile: a probe that saw a file but a read that failed
+      // must fail before any mutation, or the rollback would delete it.
+      throw new SshError(
+        `could not read ${path} for rollback; refusing to change the host`,
+      );
+    }
+    return { path, state: "file", target: null, content };
   }
   return { path, state: probe.state, target: null, content: null };
 }
@@ -136,7 +142,15 @@ export async function restoreLink(
   snap: LinkSnap,
 ): Promise<void> {
   if (snap.state === "symlink" && snap.target !== null) {
-    await execSudo(deps, target, ["ln", "-sfn", snap.target, snap.path]);
+    const ln = await execSudo(deps, target, [
+      "ln",
+      "-sfn",
+      snap.target,
+      snap.path,
+    ]);
+    if (ln.exit_code !== 0) {
+      throw new SshError(`could not restore link ${snap.path} during rollback`);
+    }
   } else if (snap.state === "file" && snap.content !== null) {
     await putRootFile(deps, target, {
       path: snap.path,
@@ -146,6 +160,9 @@ export async function restoreLink(
       group: "root",
     });
   } else {
-    await execSudo(deps, target, ["rm", "-f", snap.path]);
+    const rm = await execSudo(deps, target, ["rm", "-f", snap.path]);
+    if (rm.exit_code !== 0) {
+      throw new SshError(`could not remove ${snap.path} during rollback`);
+    }
   }
 }

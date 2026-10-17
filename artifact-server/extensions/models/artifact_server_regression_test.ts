@@ -287,3 +287,50 @@ Deno.test("fetch repairs a stale index even when the object is present", async (
     true,
   );
 });
+
+Deno.test("install refuses when a link target cannot be read for rollback", async () => {
+  const host = makeFakeRemote();
+  host.setFile(NGINX_DEFAULT_SITE, "default site\n", "644");
+  host.readFails.add(NGINX_DEFAULT_SITE);
+  const { m, context } = modelFor(host);
+  await assertRejects(
+    () =>
+      m.methods.install.execute(
+        base({
+          ...SITE_ARGS,
+          tls: { mode: "none", plaintext_ack: true },
+          disable_default_site: true,
+        }),
+        context,
+      ),
+    Error,
+    "could not read",
+  );
+  assertEquals(host.files.get(NGINX_DEFAULT_SITE)?.content, "default site\n");
+});
+
+Deno.test("install reports rollback failures in the error", async () => {
+  const host = makeFakeRemote();
+  host.setFile("/etc/nginx/ssl", "not a directory\n", "644");
+  host.failArgv = (argv) =>
+    (argv[0] === "install" && argv[1] === "-d" &&
+      argv.includes("/etc/nginx/ssl")) ||
+    argv[0] === "rm";
+  const { m, context } = modelFor(host);
+  await assertRejects(
+    () =>
+      m.methods.install.execute(
+        base({
+          ...SITE_ARGS,
+          tls: {
+            mode: "provided",
+            cert_pem: "c".repeat(64),
+            key_pem: "k".repeat(64),
+          },
+        }),
+        context,
+      ),
+    Error,
+    "rollback errors",
+  );
+});

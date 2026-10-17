@@ -129,3 +129,19 @@ The Chart object is recreated from `k0s.yaml` within a minute and installs with
 the current values. Avoid it by getting the values right before the first
 install: `config.merge: {host: <mesh address>, http: "0.0.0.0:8222"}` with
 `hostNetwork`, because the firewall still blocks 8222 from outside.
+
+## 2026.10.17.3 (adopt re-run)
+
+- The first adopt re-run re-applied `allow_ssh_from_anywhere: true` before
+  lockdown closed it again, re-exposing public SSH for about 20 seconds on a
+  locked-down host. `apply-firewall` now passes `allow_ssh_from_anywhere` from
+  the recorded exposure when adopting (a locked-down host gets the management
+  ruleset, which server-host finds already live), and server-host 2026.10.17.3
+  refuses to widen on its own regardless of the workflow.
+- A rebuilt server that received a deleted server's address inherited its
+  server-host records, so `apply_base` did nothing. Every server-host step now
+  passes the Cherry server id as `identity`, and teardown calls `forget` for the
+  public and mesh addresses after the server is verified gone.
+- Adopting still re-runs `apply-base` through the mesh address under a separate
+  record from the public address used on the first run; its steps are
+  idempotent.

@@ -103,3 +103,57 @@ Deno.test("apply-nats never waits on the forEach secrets step when there are no 
     "- step: apply-secrets\n            condition:\n              type: succeeded\n",
   );
 });
+
+Deno.test("no path re-applies allow_ssh_from_anywhere after lockdown: the first firewall step reads the recorded exposure", async () => {
+  const s = await read("server-stack-provision-host");
+  assertEquals(s.includes("allow_ssh_from_anywhere: true"), false);
+  const fw = stepText(s, "apply-firewall");
+  assertStringIncludes(fw, "allow_ssh_from_anywhere: >-");
+  assertStringIncludes(fw, "inputs.adopt");
+  assertStringIncludes(fw, 'ssh_exposure == "management-only"');
+  // Lockdown itself never opens SSH, and nothing else mentions the input.
+  assertEquals(
+    stepText(s, "lockdown").includes("allow_ssh_from_anywhere"),
+    false,
+  );
+  assertEquals((s.match(/allow_ssh_from_anywhere/g) ?? []).length, 1);
+});
+
+Deno.test("every server-host step carries the provider server id as the record identity", async () => {
+  const s = await read("server-stack-provision-host");
+  const id =
+    "identity: ${{ string(data.latest(inputs.server_model, inputs.hostname).attributes.id) }}";
+  for (
+    const step of [
+      "apply-base",
+      "apply-firewall",
+      "commit-firewall",
+      "lockdown",
+      "inspect-lockdown",
+      "commit-lockdown",
+    ]
+  ) {
+    assertStringIncludes(stepText(s, step), id);
+  }
+});
+
+Deno.test("teardown forgets the server-host records, only after the server is verifiably gone", async () => {
+  const s = await read("server-stack-teardown-host");
+  for (const step of ["forget-public-record", "forget-mesh-record"]) {
+    const t = stepText(s, step);
+    assertStringIncludes(t, "methodName: forget");
+    assertStringIncludes(
+      t,
+      "- step: check-cherry\n            condition:\n              type: succeeded\n",
+    );
+    assertEquals(t.includes("skipped"), false);
+    assertStringIncludes(
+      t,
+      "identity: ${{ string(data.latest(inputs.server_model, inputs.hostname).attributes.id) }}",
+    );
+  }
+  assertStringIncludes(
+    stepText(s, "forget-mesh-record"),
+    'inputs.mesh_address.split("/")[0]',
+  );
+});

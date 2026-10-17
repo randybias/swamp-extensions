@@ -569,6 +569,7 @@ jobs:
           modelName: server-host
           methodName: apply_base
           inputs:
+            identity: ${{ string(data.latest(inputs.server_model, inputs.hostname).attributes.id) }}
             host: >-
               ${{ inputs.adopt
                 ? inputs.mesh_node.address.split("/")[0]
@@ -667,6 +668,7 @@ jobs:
           modelName: server-host
           methodName: apply_firewall
           inputs:
+            identity: ${{ string(data.latest(inputs.server_model, inputs.hostname).attributes.id) }}
             host: ${{ inputs.mesh_node.address.split("/")[0] }}
             port: ${{ inputs.ssh_port }}
             user: ${{ inputs.ssh_user }}
@@ -679,7 +681,11 @@ jobs:
             allow_tcp: ${{ inputs.allow_tcp }}
             allow_udp: ${{ inputs.allow_udp }}
             ssh_port: ${{ inputs.ssh_port }}
-            allow_ssh_from_anywhere: true
+            allow_ssh_from_anywhere: >-
+              ${{ !(inputs.adopt &&
+                data.latest("server-host", "state-" + inputs.mesh_node.address.split("/")[0]) != null &&
+                "firewall" in data.latest("server-host", "state-" + inputs.mesh_node.address.split("/")[0]).attributes &&
+                data.latest("server-host", "state-" + inputs.mesh_node.address.split("/")[0]).attributes.firewall.ssh_exposure == "management-only") }}
             trusted_interfaces: ${{ inputs.trusted_interfaces }}
             revert_after_s: ${{ inputs.revert_after_s }}
       - name: verify-firewall
@@ -716,6 +722,7 @@ jobs:
           modelName: server-host
           methodName: commit
           inputs:
+            identity: ${{ string(data.latest(inputs.server_model, inputs.hostname).attributes.id) }}
             host: ${{ inputs.mesh_node.address.split("/")[0] }}
             port: ${{ inputs.ssh_port }}
             user: ${{ inputs.ssh_user }}
@@ -745,6 +752,7 @@ jobs:
           modelName: server-host
           methodName: lockdown
           inputs:
+            identity: ${{ string(data.latest(inputs.server_model, inputs.hostname).attributes.id) }}
             host: ${{ inputs.mesh_node.address.split("/")[0] }}
             port: ${{ inputs.ssh_port }}
             user: ${{ inputs.ssh_user }}
@@ -789,6 +797,7 @@ jobs:
           modelName: server-host
           methodName: get
           inputs:
+            identity: ${{ string(data.latest(inputs.server_model, inputs.hostname).attributes.id) }}
             host: ${{ inputs.mesh_node.address.split("/")[0] }}
             port: ${{ inputs.ssh_port }}
             user: ${{ inputs.ssh_user }}
@@ -827,6 +836,7 @@ jobs:
           modelName: server-host
           methodName: commit
           inputs:
+            identity: ${{ string(data.latest(inputs.server_model, inputs.hostname).attributes.id) }}
             host: ${{ inputs.mesh_node.address.split("/")[0] }}
             port: ${{ inputs.ssh_port }}
             user: ${{ inputs.ssh_user }}

@@ -129,7 +129,17 @@ swamp workflow run @randybias/server-stack-teardown-host \
   input and forward policies drop, so the CNI interface must be trusted:
   `trusted_interfaces` (default `[kube-bridge]`, k0s's kube-router bridge; use
   `cali*` and the like for another CNI) is passed to both firewall steps. This
-  needs `@randybias/server-host` 2026.10.17.2 or later.
+  needs `@randybias/server-host` 2026.10.17.3 or later.
+- A re-run never reopens public SSH: `apply-firewall` asks for SSH from anywhere
+  only on a host that is not already locked down (the recorded exposure is read
+  when `adopt` is set), and server-host itself refuses to replace a live
+  management-only SSH rule with an open one.
+- Every server-host step passes the provider server id as the record `identity`,
+  and teardown runs `forget` for the host's public and mesh addresses once the
+  server is gone. A rebuilt host that receives a deleted host's address
+  therefore starts clean instead of inheriting its records. Records of the other
+  models (`wireguard-mesh`, `k0s-cluster`) are keyed by node or by user and
+  address and are overwritten by the next run.
 - The API server binds the mesh address (`api_address`), and the kubeconfig the
   workflow stores points at it; the step's log line shows it.
 

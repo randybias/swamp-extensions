@@ -25,6 +25,15 @@ function testCtx(options: TestCtxOptions = {}) {
     ...options,
   });
 }
+
+/** A test context whose vaultService is a plain `{get, put}` object. */
+function withVault(vaultService: unknown) {
+  const base = testCtx({ globalArgs: {} });
+  return {
+    ...base,
+    context: { ...base.context, vaultService },
+  };
+}
 const VAL = "placeholder-value-one";
 const BASE = { kubeconfig: KC, namespace: "app", name: "db-creds" };
 const APPLY = { ...BASE, data: { password: VAL, user: "svc" } };
@@ -134,15 +143,21 @@ function assertNoValueOrHash(blob: unknown, value: string) {
 }
 
 Deno.test("schema: kubeconfig, the data record and every value are sensitive", () => {
+  type Field = {
+    meta(): { sensitive?: boolean };
+    unwrap?: () => Field;
+    valueType?: Field;
+  };
   const shape = (model.methods.apply.arguments as unknown as {
-    shape: Record<string, {
-      meta(): { sensitive?: boolean };
-      valueType?: { meta(): { sensitive?: boolean } };
-    }>;
+    shape: Record<string, Field>;
   }).shape;
   assertEquals(shape.kubeconfig.meta().sensitive, true);
-  assertEquals(shape.data.meta().sensitive, true);
-  assertEquals(shape.data.valueType?.meta().sensitive, true);
+  const data = shape.data.unwrap?.() ?? shape.data;
+  assertEquals(data.meta().sensitive, true);
+  assertEquals(data.valueType?.meta().sensitive, true);
+  // data_from_vault carries vault and key names, not values.
+  const fromVault = shape.data_from_vault.unwrap?.() ?? shape.data_from_vault;
+  assertEquals(fromVault.meta().sensitive, undefined);
 });
 
 Deno.test("apply creates: values on stdin only, output and state carry no value", async () => {
@@ -487,6 +502,172 @@ Deno.test("a kubeconfig with exec credentials is rejected before kubectl", async
     );
     assertEquals(h.calls.length, 0);
     assertEquals(h.written.length, 0);
+  } finally {
+    h.restore();
+  }
+});
+
+const REFS = {
+  password: { vault: "app", key: "db-password" },
+  user: { vault: "app", key: "db-user" },
+};
+const APPLY_VAULT = { ...BASE, data_from_vault: REFS };
+
+Deno.test("apply resolves data_from_vault through a plain {get, put} object", async () => {
+  const asked: [string, string][] = [];
+  const service = {
+    get: (vault: string, key: string) => {
+      asked.push([vault, key]);
+      return Promise.resolve(`${VAL}-${key}`);
+    },
+    put: () => Promise.resolve(),
+  };
+  const resolved = {
+    password: `${VAL}-db-password`,
+    user: `${VAL}-db-user`,
+  };
+  let created = false;
+  const h = harness((c) => {
+    if (verb(c) === "get") {
+      return created ? { stdout: secretJson(resolved) } : { stdout: "" };
+    }
+    created = true;
+    return { stdout: "secret/db-creds\n" };
+  });
+  try {
+    const { context, getWrittenResources } = withVault(service);
+    const out = await model.methods.apply.execute(
+      APPLY_VAULT,
+      context as never,
+    ) as { result: Record<string, unknown> };
+    assertEquals(asked, [["app", "db-password"], ["app", "db-user"]]);
+    const ap = h.calls.find((c) => verb(c) === "apply")!;
+    const m = JSON.parse(ap.stdin!);
+    assertEquals(m.data.password, b64(resolved.password));
+    assert(!ap.args.join(" ").includes(VAL));
+    assertNoValueOrHash([out.result, getWrittenResources()], VAL);
+    assertEquals(out.result.keys, ["password", "user"]);
+    assertEquals(h.removed, h.written);
+  } finally {
+    h.restore();
+  }
+});
+
+Deno.test("exactly one of data or data_from_vault is required", async () => {
+  const h = harness(() => ({}));
+  try {
+    const { context } = testCtx({ globalArgs: {} });
+    await assertRejects(() =>
+      model.methods.apply.execute({ ...BASE } as never, context)
+    );
+    await assertRejects(() =>
+      model.methods.apply.execute(
+        { ...APPLY, data_from_vault: REFS } as never,
+        context,
+      )
+    );
+    assertEquals(h.calls.length, 0);
+  } finally {
+    h.restore();
+  }
+});
+
+Deno.test("a missing vault key is a fixed error naming vault and key only", async () => {
+  const h = harness(() => ({}));
+  try {
+    const { context } = withVault({
+      get: () => Promise.reject(new Error(`boom ${VAL}`)),
+      put: () => Promise.resolve(),
+    });
+    const e = await assertRejects(() =>
+      model.methods.apply.execute(APPLY_VAULT, context as never)
+    ) as K8sSecretError;
+    assertEquals(e.code, "invalid_input");
+    assert(e.message.includes("app") && e.message.includes("db-password"));
+    assert(!e.message.includes(VAL));
+    assertEquals(h.calls.length, 0);
+    assertEquals(h.written.length, 0);
+  } finally {
+    h.restore();
+  }
+});
+
+Deno.test("a missing or factory-shaped vault service is a fixed error", async () => {
+  const h = harness(() => ({}));
+  try {
+    const services: unknown[] = [
+      undefined,
+      () => ({ get: () => Promise.resolve(VAL) }),
+      { put: () => Promise.resolve() },
+    ];
+    for (const service of services) {
+      const { context } = withVault(service);
+      const e = await assertRejects(() =>
+        model.methods.apply.execute(APPLY_VAULT, context as never)
+      ) as K8sSecretError;
+      assertEquals(e.code, "invalid_input");
+      assert(!e.message.includes(VAL));
+    }
+    assertEquals(h.calls.length, 0);
+  } finally {
+    h.restore();
+  }
+});
+
+Deno.test("data_from_vault names are grammar-validated before any lookup", async () => {
+  const h = harness(() => ({}));
+  try {
+    const asked: unknown[] = [];
+    const { context } = withVault({
+      get: () => {
+        asked.push(1);
+        return Promise.resolve(VAL);
+      },
+      put: () => Promise.resolve(),
+    });
+    const bad: Record<string, unknown>[] = [
+      { password: { vault: "bad name", key: "k" } },
+      { password: { vault: "app", key: "bad;key" } },
+      { "bad key": { vault: "app", key: "k" } },
+    ];
+    for (const refs of bad) {
+      await assertRejects(() =>
+        model.methods.apply.execute(
+          { ...BASE, data_from_vault: refs } as never,
+          context as never,
+        )
+      );
+    }
+    assertEquals(asked.length, 0);
+    assertEquals(h.calls.length, 0);
+  } finally {
+    h.restore();
+  }
+});
+
+Deno.test("resolved data is bounded by total UTF-8 bytes", async () => {
+  const h = harness(() => ({}));
+  try {
+    const big = "placeholder-byte-padding".repeat(30_000);
+    const { context } = withVault({
+      get: () => Promise.resolve(big),
+      put: () => Promise.resolve(),
+    });
+    const e = await assertRejects(() =>
+      model.methods.apply.execute(
+        {
+          ...BASE,
+          data_from_vault: {
+            a: { vault: "app", key: "a" },
+            b: { vault: "app", key: "b" },
+          },
+        } as never,
+        context as never,
+      )
+    ) as K8sSecretError;
+    assertEquals(e.code, "invalid_input");
+    assert(!e.message.includes("placeholder-byte-padding"));
+    assertEquals(h.calls.length, 0);
   } finally {
     h.restore();
   }

@@ -35,6 +35,12 @@ import {
   withKubectl,
 } from "./_lib/kubectl.ts";
 import { checkKubeconfig, clusterFingerprint } from "./_lib/kubeconfig.ts";
+import {
+  isVaultKey,
+  isVaultName,
+  resolveDataFromVault,
+  type VaultRef,
+} from "./_lib/vault.ts";
 
 /** Maximum number of keys in one Secret. */
 export const MAX_KEYS = 256;
@@ -70,6 +76,16 @@ const TargetShape = {
 
 const TargetArgs = z.strictObject(TargetShape);
 
+/** One vault reference: a vault name and a key inside it. */
+const DataRefSchema = z.strictObject({
+  vault: z.string().refine(isVaultName, "invalid vault name").describe(
+    "Vault instance name.",
+  ),
+  key: z.string().refine(isVaultKey, "invalid vault key").describe(
+    "Key inside the vault.",
+  ),
+});
+
 const ApplyArgs = z.strictObject({
   ...TargetShape,
   type: z.string().refine(isSecretType, "invalid Secret type").default(
@@ -86,7 +102,28 @@ const ApplyArgs = z.strictObject({
     `data must be at most ${MAX_TOTAL_BYTES} UTF-8 bytes in total`,
   ).meta({ sensitive: true }).describe(
     "Secret key to value. Wire each value with a vault.get(...) expression.",
-  ),
+  ).optional(),
+  data_from_vault: z.record(
+    z.string().refine(isDataKey, "invalid Secret key"),
+    DataRefSchema,
+  ).refine(
+    (d) => Object.keys(d).length > 0,
+    "data_from_vault must not be empty",
+  ).refine(
+    (d) => Object.keys(d).length <= MAX_KEYS,
+    `data_from_vault must have at most ${MAX_KEYS} keys`,
+  ).describe(
+    "Secret key to {vault, key}. The model resolves each value from the named vault at run time, so a workflow can pass vault and key names instead of resolved values.",
+  ).optional(),
+}).superRefine((a, ctx) => {
+  const present = [a.data, a.data_from_vault].filter((v) => v !== undefined)
+    .length;
+  if (present !== 1) {
+    ctx.addIssue({
+      code: "custom",
+      message: "exactly one of data or data_from_vault is required",
+    });
+  }
 });
 
 const GlobalArgsSchema = z.strictObject({});
@@ -272,7 +309,17 @@ export const model = {
       execute: async (args: z.input<typeof ApplyArgs>, context: Ctx) => {
         const a = ApplyArgs.parse(args);
         const t = target(a);
-        const want = await hashData(a.data);
+        const data = a.data ?? await resolveDataFromVault(
+          context.vaultService,
+          a.data_from_vault as Record<string, VaultRef>,
+        );
+        if (dataBytes(data) > MAX_TOTAL_BYTES) {
+          throw new K8sSecretError(
+            "invalid_input",
+            `resolved data must be at most ${MAX_TOTAL_BYTES} UTF-8 bytes in total`,
+          );
+        }
+        const want = await hashData(data);
         const desiredKeys = Object.keys(want);
         const fm = await fieldManager(context.definition.name);
         const state = await withKubectl(deps, t, async (kubectl) => {
@@ -292,7 +339,7 @@ export const model = {
               "-o",
               "name",
             ],
-            buildManifest(t, a.type, a.data),
+            buildManifest(t, a.type, data),
           );
           if (r.code !== 0) throw classify(r.stderr, t);
           const after = await observe(kubectl, t, fm);

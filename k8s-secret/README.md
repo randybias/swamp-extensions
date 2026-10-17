@@ -27,6 +27,13 @@ still reported in `keys`, while a key this model previously owned and no longer
 receives is pruned. It uses `--force-conflicts`, so a conflicting value is
 overwritten. Failures are typed and carry no remote text.
 
+`apply` takes exactly one of `data` (key to value, each value a vault reference)
+or `data_from_vault` (key to `{vault, key}` names). The model resolves
+`data_from_vault` itself through the runtime vault service, so a workflow can
+pass vault and key names instead of resolving a dynamic map in an expression.
+Both the vault name and the key are validated as names before any lookup, and a
+failed lookup names the vault and key only, never a value.
+
 ## Dependencies
 
 `kubectl` on the PATH and a reachable API server.
@@ -53,6 +60,15 @@ for ns in app app-staging; do
 done
 ```
 
+In a workflow, pass vault and key names; the model resolves them at run time:
+
+```sh
+swamp model method run db-secret apply \
+  --input 'kubeconfig=${{ vault.get("cluster", "kubeconfig") }}' \
+  --input namespace=app --input name=db-creds \
+  --input 'data_from_vault:json={"password":{"vault":"app","key":"db-password"}}'
+```
+
 Read it back (key names only) and delete it:
 
 ```sh
@@ -65,7 +81,8 @@ swamp model method run db-secret delete \
 ```
 
 Pass `kubeconfig` and every `data` value only as vault references (or over
-stdin); never as literal `--input` values.
+stdin); never as literal `--input` values. `data_from_vault` carries vault and
+key names, not values.
 
 ## How it works
 

@@ -2,6 +2,17 @@
 
 Not packaged. Notes for whoever maintains this extension.
 
+- 2026-10-17 (lane/d2-k8svault, base lane/b2-k8s `073f868`): added
+  `data_from_vault` for the item-7 workflow. It is a map of Secret key to
+  `{vault, key}` names that the model resolves itself through the runtime's
+  `context.vaultService` (a plain `{get, put}` object, not a factory), so a
+  workflow can pass vault and key names where a dynamic map would not resolve in
+  an expression. Exactly one of `data` / `data_from_vault` is required. Vault
+  and key names are grammar-validated before any lookup; a failed lookup fails
+  with a fixed message naming the vault and key only. Resolved values live in
+  memory only and are bounded by the same total-byte limit. Tests drive a
+  plain-object `{get, put}` context; a new `_lib/vault.ts` plus
+  `_lib/vault_test.ts` covers the resolver.
 - 2026-10-17: initial model. Evaluated `@swamp/kubernetes` 2026.10.13.1 first
   (its `secret` type is 2026.08.01.1; `@john/k8s` ships the same types): the
   Secret type takes literal `data` arguments, returns decoded values from

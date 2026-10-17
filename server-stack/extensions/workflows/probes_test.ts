@@ -9,7 +9,7 @@ import {
   assertEquals,
   assertStringIncludes,
 } from "jsr:@std/assert@1.0.19";
-import { parse } from "jsr:@std/yaml@1.0.9";
+import { parse, stringify } from "jsr:@std/yaml@1.0.9";
 
 interface Step {
   name: string;
@@ -56,14 +56,20 @@ async function docker(...args: string[]): Promise<number> {
 }
 
 const haveNats = await docker("image", "inspect", NATS_IMAGE) === 0;
+const haveHelm = await new Deno.Command("helm", {
+  args: ["version", "--short"],
+  stdout: "null",
+  stderr: "null",
+}).output().then((r) => r.code === 0, () => false);
 
 /** Starts a NATS server on a loopback port; returns its stop function. */
 async function nats(
   port: number,
-  authToken?: string,
+  serverArgs: string[],
+  dockerArgs: string[] = [],
 ): Promise<() => Promise<void>> {
-  const name = `probe-nats-${port}`;
-  await docker("rm", "-f", name);
+  // Unique per start, so a parallel run cannot remove this container.
+  const name = `probe-nats-${port}-${crypto.randomUUID().slice(0, 8)}`;
   const code = await docker(
     "run",
     "-d",
@@ -72,8 +78,9 @@ async function nats(
     name,
     "-p",
     `127.0.0.1:${port}:4222`,
+    ...dockerArgs,
     NATS_IMAGE,
-    ...(authToken ? ["--auth", authToken] : []),
+    ...serverArgs,
   );
   assertEquals(code, 0);
   await new Promise((r) => setTimeout(r, 1500));
@@ -93,7 +100,7 @@ Deno.test({
     "the unauthenticated probe is unchanged and passes against a plain server",
   ignore: !haveNats,
   fn: async () => {
-    const stop = await nats(14223);
+    const stop = await nats(14223, []);
     try {
       const r = await bash(await script("verify", "probe-nats"), target(14223));
       assertEquals(r.code, 0);
@@ -111,7 +118,7 @@ Deno.test({
   ignore: !haveNats,
   fn: async () => {
     const token = 'tok"en\\x';
-    const stop = await nats(14224, token);
+    const stop = await nats(14224, ["--auth", token]);
     try {
       const run = await script("verify", "probe-nats-auth");
       const ok = await bash(run, { ...target(14224), NATS_TOKEN: token });
@@ -146,4 +153,83 @@ Deno.test("the mesh wait gives up quietly at its bound, and answers at once when
   } finally {
     listener.close();
   }
+});
+
+/** The values block of the README's NATS authentication section. */
+async function readmeValues(): Promise<unknown> {
+  const readme = await Deno.readTextFile(
+    new URL("../../README.md", import.meta.url),
+  );
+  const section = readme.slice(readme.indexOf("## NATS authentication"));
+  const block = section.match(/```yaml\n([\s\S]*?)```/)?.[1];
+  assert(block, "README has a values block");
+  return (parse(block) as { nats_chart: { values: unknown } }).nats_chart
+    .values;
+}
+
+const REPO = "https://nats-io.github.io/k8s/helm/charts/";
+
+Deno.test({
+  name:
+    "the documented token reference renders unquoted and NATS expands it from the environment",
+  ignore: !haveNats || !haveHelm,
+  fn: async () => {
+    const dir = await Deno.makeTempDir();
+    try {
+      const values = `${dir}/values.yaml`;
+      await Deno.writeTextFile(
+        values,
+        stringify(await readmeValues() as Record<string, unknown>),
+      );
+      const rendered = await new Deno.Command("helm", {
+        args: [
+          "template",
+          "nats",
+          "nats",
+          "--repo",
+          REPO,
+          "--version",
+          "2.15.1",
+          "-f",
+          values,
+        ],
+        stdout: "piped",
+        stderr: "null",
+      }).output();
+      assertEquals(rendered.code, 0, "helm template renders the chart");
+      const stanza = new TextDecoder().decode(rendered.stdout).match(
+        /"authorization": \{[^}]*\}/,
+      )?.[0];
+      assert(stanza, "the chart renders an authorization stanza");
+      assertStringIncludes(stanza, '"token": $NATS_TOKEN');
+      await Deno.writeTextFile(`${dir}/nats.conf`, `{ ${stanza} }\n`);
+      await Deno.chmod(`${dir}/nats.conf`, 0o644);
+      const token = crypto.randomUUID();
+      const stop = await nats(
+        14225,
+        ["-c", "/etc/nats/nats.conf"],
+        [
+          "-v",
+          `${dir}/nats.conf:/etc/nats/nats.conf:ro`,
+          "-e",
+          `NATS_TOKEN=${token}`,
+        ],
+      );
+      try {
+        const run = await script("verify", "probe-nats-auth");
+        const ok = await bash(run, { ...target(14225), NATS_TOKEN: token });
+        assertStringIncludes(ok.out, "\n+OK");
+        assertStringIncludes(ok.out, "Authorization Violation");
+        const literal = await bash(run, {
+          ...target(14225),
+          NATS_TOKEN: "$NATS_TOKEN",
+        });
+        assertEquals(literal.out.includes("\n+OK"), false);
+      } finally {
+        await stop();
+      }
+    } finally {
+      await Deno.remove(dir, { recursive: true });
+    }
+  },
 });

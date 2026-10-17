@@ -203,14 +203,12 @@ Deno.test("check-mesh waits a bounded time for the first handshake and cannot be
     "timeout: ${{ (inputs.mesh_handshake_wait_s + 15) * 1000 }}",
   );
   assertStringIncludes(wait, "ignoreExitCode: true");
-  // Skipping the wait is allowed; skipping past a failed join is not.
   const verify = stepText(s, "verify-mesh");
   assertStringIncludes(
     verify,
     "- step: join-mesh\n            condition:\n              type: succeeded\n",
   );
   assertStringIncludes(verify, "- step: wait-mesh");
-  // The assertion stays the gate.
   assertStringIncludes(
     stepText(s, "check-mesh"),
     "message: No mesh peer handshake was recorded",
@@ -224,14 +222,12 @@ Deno.test("NATS auth is off by default: its steps are guarded and the plain prob
     "    nats_auth_token_key:\n      type: string",
   );
   assertStringIncludes(s, "      default: null\n      maxLength: 256");
-  assertStringIncludes(
-    stepText(s, "apply-nats-auth"),
-    "guard: ${{ inputs.nats_auth_token_key == null }}",
-  );
-  assertStringIncludes(
-    stepText(s, "probe-nats-auth"),
-    "guard: ${{ inputs.nats_auth_token_key == null }}",
-  );
+  for (const step of ["apply-nats-auth", "probe-nats-auth"]) {
+    assertStringIncludes(
+      stepText(s, step),
+      "guard: ${{ inputs.nats_auth_token_key == null }}",
+    );
+  }
   const plain = stepText(s, "probe-nats");
   assertStringIncludes(
     plain,

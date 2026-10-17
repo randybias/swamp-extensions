@@ -165,8 +165,11 @@ install: `config.merge: {host: <mesh address>, http: "0.0.0.0:8222"}` with
 - Why the chart values are not generated: swamp CEL has no map merge and
   `string(map)` fails, so the workflow cannot add the token reference to the
   operator's `nats_chart.values`. The operator adds a reference (not the secret)
-  as in the README; a wrong or missing reference is caught because the probe
-  then sees no `auth_required`.
+  as in the README; a missing reference is caught because the probe then sees no
+  `auth_required`. The reference must be the chart's unquoted
+  `<< $NATS_TOKEN >>`: a quoted `"$NATS_TOKEN"` is a literal password to NATS
+  (review finding). The README values are rendered with `helm template` and run
+  through nats in `probes_test.ts`.
 - `vault.get(...)` is resolved before a ternary picks a branch, so an optional
   secret needs a guarded step (as here), never `cond ? "" : vault.get(...)`.
 - The probe script's replies end in `\r`: assert on `"\n+OK"`, not `"\n+OK\n"`

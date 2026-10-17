@@ -123,8 +123,13 @@ nats_chart:
     config:
       merge:
         authorization:
-          token: "$NATS_TOKEN"
+          token: << $NATS_TOKEN >>
 ```
+
+Write the reference as `<< $NATS_TOKEN >>`: the chart renders it unquoted, which
+NATS expands from the environment. A quoted `"$NATS_TOKEN"` is taken literally,
+so the literal string would become the password. The token must be printable
+ASCII.
 
 The probe presents the token and then checks that an anonymous connection is
 refused; the run fails if NATS does not enforce authentication. With the key

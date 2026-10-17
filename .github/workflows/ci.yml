@@ -23,6 +23,10 @@ jobs:
         env:
           LEAK_DENYLIST: ${{ secrets.LEAK_DENYLIST }}
         run: bash scripts/gates.sh --tree
+      - name: Naming check (gate 9) on every extension
+        env:
+          LEAK_DENYLIST: ${{ secrets.LEAK_DENYLIST }}
+        run: deno run --allow-read --allow-env --allow-run=yq scripts/naming-check.ts --all
       - name: Gates per changed extension
         env:
           SWAMP_API_KEY: ${{ secrets.SWAMP_API_KEY }}

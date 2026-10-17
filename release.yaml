@@ -1,6 +1,8 @@
 kea-dhcp:
   channel: beta
   ci: true
+  visibility: public
+  audience: general
   published:
     2026.10.17.1: c6e3b02ddac539ee6e10ad4b85e4ec87577e24c276821dcca5b934ce8eeae517
   notes:
@@ -10,11 +12,16 @@ kea-dhcp:
 # changes an archive's contentHash.
 #   channel: beta until a live run passes; then stable
 #   ci:      false until the first push; then true
+#   visibility: public | private; audience: general | personal. Private
+#              implies personal, public implies general; a private extension
+#              never lives in this repo (naming check, gate 9)
 #   published: version -> contentHash, recorded with every push; a published
 #              version may only be re-gated with exactly that hash
 artifact-server:
   channel: beta
   ci: true
+  visibility: public
+  audience: general
   published:
     2026.10.17.1: 198f765c88ce5f849cdb8403e1973628e605b347f292182f5ff68dd1e3966530
   notes:
@@ -23,6 +30,8 @@ artifact-server:
 azure-vm:
   channel: beta
   ci: true
+  visibility: public
+  audience: general
   published:
     2026.10.17.1: a33456c899d2a3e182e44da27e5998f72c877b9751c6b7c8f3abb4aa2de0f9d0
   notes:
@@ -32,6 +41,8 @@ azure-vm:
 azure-nsg:
   channel: beta
   ci: true
+  visibility: public
+  audience: general
   published:
     2026.10.17.1: 36bf4978f3b5f5d20ded7cb5ac13d146cf9b4c018920931daa4f69b2c183649b
   notes:
@@ -40,6 +51,8 @@ azure-nsg:
 secret-file:
   channel: beta
   ci: true
+  visibility: public
+  audience: general
   published:
     2026.10.17.1: 5a2170e016bf3e5aed4adeefb927456e7564448525c93117257e286136c64ab5
   notes:
@@ -48,6 +61,8 @@ secret-file:
 ssh-host:
   channel: beta
   ci: true
+  visibility: public
+  audience: general
   published:
     2026.10.17.1: 22a2e41c695d28d3a45066cf2c9eb247503244fbefd95e63be5760ca6d414d2c
     2026.10.17.2: 2bb3f150334c01e5ffef8a16e8ef1333e8831848bdb8a49e7192a57094274c0f
@@ -59,6 +74,8 @@ ssh-host:
 cephadm:
   channel: beta
   ci: true
+  visibility: public
+  audience: general
   published:
     2026.10.17.1: cb3f5404e00b2797a65dfae6694cc9a03f2d474c734ae3f2640bf5e09f50254e
     2026.10.17.2: 470d022f326c850e15bab5485556c0c6f629f5aa9727156cd9a6bab0c078feed
@@ -71,6 +88,8 @@ cephadm:
 cherry-servers:
   channel: beta
   ci: true
+  visibility: public
+  audience: general
   published:
     "2026.10.16.1": 32515d4218dc027686a09506c50794a55c2c65e06a2e21f562c101aa48a19697
     "2026.10.16.2": 4eda2a766c6443bb471a31fc111c175466f41bf5f81d758f2dfe6f56e8a97b51
@@ -81,6 +100,8 @@ cherry-servers:
 wireguard-mesh:
   channel: beta
   ci: true
+  visibility: public
+  audience: general
   published:
     2026.10.17.4: f74daacaa223888d33da7a3018ca6d2beb22520f2d04f1e44a50913882eb7957
     2026.10.17.5: 298d58924a8c7e8127a067f2f33a66c87ad13934e704b1f5df1891c9dfbe60dd
@@ -91,6 +112,8 @@ wireguard-mesh:
 k8s-secret:
   channel: beta
   ci: true
+  visibility: public
+  audience: general
   published:
     2026.10.17.1: 7ec9b9521c2c31d070ca6991cd19eb276a3216e820624ea306bd09e345ab2d1b
   notes:
@@ -99,6 +122,8 @@ k8s-secret:
 k0s-cluster:
   channel: beta
   ci: true
+  visibility: public
+  audience: general
   published:
     2026.10.17.1: 617b23132f64784a82a0abd0a75e0627eddff67b1bce7d4de8570de51c88635b
     2026.10.17.2: 296d3778ee0d426019e9bf347f711994521fb046113cc3f81d84aa4fee879418
@@ -111,6 +136,8 @@ k0s-cluster:
 server-host:
   channel: beta
   ci: true
+  visibility: public
+  audience: general
   published:
     2026.10.17.1: c83486edf44844afae336c57dc1273dc250985d352fecf82be84664e01e8894d
     2026.10.17.3: 60d0113fce5f2d5cbffadb0cab068087ff16fd4d742e999545cfddda08854f3c
@@ -121,6 +148,8 @@ server-host:
 redfish:
   channel: beta
   ci: true
+  visibility: public
+  audience: general
   published:
     2026.10.17.1: 72438164e802ae182df22a25d5739d8468101dfc593c5890161cb19eaa4a4043
   notes:
@@ -129,6 +158,8 @@ redfish:
 syncthing-peer:
   channel: beta
   ci: true
+  visibility: public
+  audience: general
   published:
     2026.10.17.1: abb4df5af6f0919cd9866a4d9f444a5038ad2cf02bf780c6825c4510d64f621a
   notes:
@@ -137,6 +168,8 @@ syncthing-peer:
 host-net:
   channel: beta
   ci: true
+  visibility: public
+  audience: general
   published:
     2026.10.17.1: 4f6b79250812d7126a891444b11c1daaa13cd2a7bfdf1532d327da83ec067cbf
   notes:
@@ -145,6 +178,8 @@ host-net:
 libvirt:
   channel: beta
   ci: true
+  visibility: public
+  audience: general
   published:
     2026.10.17.1: 4e9eb385d28a61f2aac6a6a7ca5cc54cc7e4298537ed5f1d86d00ae4c1f9cf94
   notes:
@@ -152,6 +187,8 @@ libvirt:
 zfs:
   channel: beta
   ci: true
+  visibility: public
+  audience: general
   published:
     2026.10.17.1: 1507ce5570b9b91a4ca8de579e90152a55aa34071df80cd450cd0e545d7d64e5
   notes:
@@ -160,6 +197,11 @@ zfs:
 server-stack:
   channel: beta
   ci: true
+  # Temporary exception: private and personal, so the naming check (gate 9)
+  # fails it here; waived for server-stack only in scripts/naming-check.ts
+  # WAIVERS. Moving to the private repo, see STATUS.
+  visibility: private
+  audience: personal
   published:
     2026.10.17.3: e58bc1370170bb19f7fb1fe289c81c219bc24b1856211b8df7c880ba7a228940
     2026.10.17.4: 4bf1c1c1199fd4f54eb71be98b84ae92bda319c4444cf3fe2e417541673e5f5d
@@ -172,6 +214,8 @@ server-stack:
 apt-cache:
   channel: beta
   ci: true
+  visibility: public
+  audience: general
   published:
     2026.10.17.1: d54ce88bc97c7153a57268d98a4e3a0701765ca57170ada8ffeddbbd903c983e
   notes:
@@ -180,6 +224,8 @@ apt-cache:
 kubevirt:
   channel: beta
   ci: true
+  visibility: public
+  audience: general
   published:
     2026.10.17.1: 274d5c5d2588eccadb6d7c97a082ec94f05755fc3170c886db1c4e4086893316
   notes:
@@ -188,6 +234,8 @@ kubevirt:
 ubuntu-autoinstall:
   channel: beta
   ci: true
+  visibility: public
+  audience: general
   published:
     2026.10.17.1: de4aedc1a536a6ccabfa377a29a54b2f400e0f951671b5ff6bfbe082a07c1d4d
   notes:
@@ -196,6 +244,8 @@ ubuntu-autoinstall:
 knot-dns:
   channel: beta
   ci: true
+  visibility: public
+  audience: general
   published:
     2026.10.17.1: 36e2012c3e40544fd847350d49347d8c3b7f958b67cbfce9f35017f62cf05a43
   notes:

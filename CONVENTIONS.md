@@ -232,6 +232,10 @@ script is the authority on gate order. In short:
 - fixture guard;
 - dry-run push;
 - adversarial-review report;
+- naming check (gate 9, `scripts/naming-check.ts`): `visibility:` and
+  `audience:` in `release.yaml` and the LOGBOOK, no private extension in this
+  repo, package and workflow name lint; its temporary exceptions are listed in
+  the script and in STATUS;
 - code review.
 
 Review rules:

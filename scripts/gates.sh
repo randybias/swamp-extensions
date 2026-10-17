@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Run every gate for one extension directory, in increasing-risk order.
+# Run every gate for one extension directory, in increasing-risk order (gate 9, the
+# deterministic naming check, runs last so its number stays stable).
 # Gates 4 and 5 also scan every tracked file in the repo, whatever the extension.
 # Usage: scripts/gates.sh [--offline] <extension-dir>
 #        scripts/gates.sh --tree   (gates 4 and 5 on the whole tracked tree only)
@@ -171,6 +172,18 @@ deno run --allow-read scripts/fixture-guard.ts "$ext" >"$out/fixtures.txt" 2>&1
 rc=$?
 note $rc 6 "fixture guard" "$( ((rc)) && head -5 "$out/fixtures.txt" | tr '\n' ';')"
 
+# 9 naming: visibility, audience, package and workflow names (scripts/naming-check.ts)
+gate_naming() {
+  deno run --allow-read --allow-env --allow-run=yq scripts/naming-check.ts "$ext" >"$out/naming.txt" 2>&1
+  local rc=$?
+  local detail
+  if ((rc)); then detail=$(grep -v "^WAIVED" "$out/naming.txt" | head -5 | tr "\n" ";")
+  elif grep -q "^WAIVED" "$out/naming.txt"; then
+    detail="$(grep -c "^WAIVED" "$out/naming.txt") waived (temporary, see STATUS): .gates/$ext/naming.txt"
+  fi
+  note $rc 9 naming "${detail:-}"
+}
+
 # 7 + 8 dry run and adversarial review
 if ((offline)); then
   note 3 7 "dry run" "--offline"
@@ -230,5 +243,7 @@ else
     note 1 8 review "missing $report"
   fi
 fi
+
+gate_naming
 
 exit $worst

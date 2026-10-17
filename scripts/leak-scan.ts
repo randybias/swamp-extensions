@@ -62,7 +62,7 @@ export function scanText(rel: string, text: string, deny: string[], packaged: bo
 }
 
 /** Replace every denylisted term in a diagnostic line with its index. */
-function redact(line: string, deny: string[]): string {
+export function redact(line: string, deny: string[]): string {
   let shown = line;
   deny.forEach((t, n) => {
     shown = shown.replace(

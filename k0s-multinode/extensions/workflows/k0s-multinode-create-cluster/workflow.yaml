@@ -1,4 +1,4 @@
-id: k0s-multinode-create-cluster
+id: 6f1a2b34-5c6d-4e7f-8a90-1234567890ab
 name: "@randybias/k0s-multinode-create-cluster"
 version: 1
 description: >-
@@ -47,28 +47,27 @@ inputs:
           enum: [etcd, kine]
           default: etcd
         api_address:
-          type: [string, "null"]
-          default: null
+          type: string
+          default: ""
         api_port:
           type: integer
           default: 6443
         external_address:
-          type: [string, "null"]
-          default: null
+          type: string
+          default: ""
         node_local_load_balancing:
           type: boolean
           default: false
         etcd_peer_address:
-          type: [string, "null"]
-          default: null
+          type: string
+          default: ""
         api_sans:
           type: array
           items:
             type: string
           default: []
         control_plane_load_balancing:
-          type: [object, "null"]
-          default: null
+          type: object
     controller:
       type: object
       additionalProperties: false
@@ -118,6 +117,7 @@ inputs:
           - host_key_policy
           - known_hosts
           - ssh_private_key_key
+          - token_key
         properties:
           name:
             type: string
@@ -144,6 +144,9 @@ inputs:
             default: []
           ssh_private_key_key:
             type: string
+          token_key:
+            type: string
+            pattern: "^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$"
           no_taints:
             type: boolean
             default: false
@@ -179,10 +182,10 @@ jobs:
           inputs:
             cluster_name: ${{ inputs.cluster.cluster_name }}
             nodes: >-
-              ${{ [{"name": inputs.controller.name, "ssh_host": inputs.controller.ssh_host, "role": "controller", "private_address": inputs.controller.private_address}].concat(inputs.nodes.map(n, {"name": n.name, "ssh_host": n.ssh_host, "role": n.role, "private_address": n.private_address})) }}
+              ${{ [{"name": inputs.controller.name, "ssh_host": inputs.controller.ssh_host, "role": "controller", "private_address": inputs.controller.private_address}] + inputs.nodes.map(n, {"name": n.name, "ssh_host": n.ssh_host, "role": n.role, "private_address": n.private_address}) }}
             k0s_version: ${{ inputs.cluster.k0s_version }}
             ha_mode: ${{ inputs.ha_mode }}
-            external_address: ${{ inputs.cluster.external_address }}
+            external_address: '${{ inputs.cluster.external_address == "" ? null : inputs.cluster.external_address }}'
             allow_even_controllers: ${{ inputs.allow_even_controllers }}
             token_expiry: ${{ inputs.token_expiry }}
   - name: bootstrap
@@ -214,13 +217,13 @@ jobs:
             pod_cidr: ${{ inputs.cluster.pod_cidr }}
             service_cidr: ${{ inputs.cluster.service_cidr }}
             storage_type: ${{ inputs.cluster.storage_type }}
-            api_address: ${{ inputs.cluster.api_address }}
+            api_address: '${{ inputs.cluster.api_address == "" ? null : inputs.cluster.api_address }}'
             api_port: ${{ inputs.cluster.api_port }}
-            external_address: ${{ inputs.cluster.external_address }}
+            external_address: '${{ inputs.cluster.external_address == "" ? null : inputs.cluster.external_address }}'
             node_local_load_balancing: ${{ inputs.cluster.node_local_load_balancing }}
-            etcd_peer_address: ${{ inputs.cluster.etcd_peer_address }}
+            etcd_peer_address: '${{ inputs.cluster.etcd_peer_address == "" ? null : inputs.cluster.etcd_peer_address }}'
             api_sans: ${{ inputs.cluster.api_sans }}
-            control_plane_load_balancing: ${{ inputs.cluster.control_plane_load_balancing }}
+            control_plane_load_balancing: "${{ has(inputs.cluster.control_plane_load_balancing) ? inputs.cluster.control_plane_load_balancing : null }}"
       - name: wait-first-controller
         description: Wait for the first controller to be Ready and an etcd member
         dependsOn:
@@ -276,7 +279,7 @@ jobs:
             token_expiry: ${{ inputs.token_expiry }}
             token_vault:
               vault: k0s-multinode
-              key: ${{ inputs.token_key_prefix + self.node.name }}
+              key: ${{ self.node.token_key }}
       - name: install-${{ self.node.name }}
         description: Join this node with the minted token
         forEach:
@@ -301,20 +304,20 @@ jobs:
               private_key: ${{ vault.get("k0s-multinode", self.node.ssh_private_key_key) }}
             role: ${{ self.node.role }}
             no_taints: ${{ self.node.no_taints }}
-            join_token: ${{ vault.get("k0s-multinode", inputs.token_key_prefix + self.node.name) }}
+            join_token: ${{ vault.get("k0s-multinode", self.node.token_key) }}
             k0s_version: ${{ inputs.cluster.k0s_version }}
             k0s_binary_sha256: ${{ inputs.cluster.k0s_binary_sha256 }}
             cluster_name: ${{ inputs.cluster.cluster_name }}
             pod_cidr: ${{ inputs.cluster.pod_cidr }}
             service_cidr: ${{ inputs.cluster.service_cidr }}
             storage_type: ${{ inputs.cluster.storage_type }}
-            api_address: ${{ inputs.cluster.api_address }}
+            api_address: '${{ inputs.cluster.api_address == "" ? null : inputs.cluster.api_address }}'
             api_port: ${{ inputs.cluster.api_port }}
-            external_address: ${{ inputs.cluster.external_address }}
+            external_address: '${{ inputs.cluster.external_address == "" ? null : inputs.cluster.external_address }}'
             node_local_load_balancing: ${{ inputs.cluster.node_local_load_balancing }}
-            etcd_peer_address: ${{ inputs.cluster.etcd_peer_address }}
+            etcd_peer_address: '${{ inputs.cluster.etcd_peer_address == "" ? null : inputs.cluster.etcd_peer_address }}'
             api_sans: ${{ inputs.cluster.api_sans }}
-            control_plane_load_balancing: ${{ inputs.cluster.control_plane_load_balancing }}
+            control_plane_load_balancing: "${{ has(inputs.cluster.control_plane_load_balancing) ? inputs.cluster.control_plane_load_balancing : null }}"
       - name: wait-${{ self.node.name }}
         description: Wait for this node to join before the next one starts
         forEach:
@@ -369,7 +372,7 @@ jobs:
               private_key: ${{ vault.get("k0s-multinode", inputs.controller.ssh_private_key_key) }}
             token_vault:
               vault: k0s-multinode
-              key: ${{ inputs.token_key_prefix + self.node.name }}
+              key: ${{ self.node.token_key }}
   - name: verify
     description: Read back the membership
     dependsOn:
@@ -402,6 +405,6 @@ jobs:
         task:
           type: assert
           expr: >-
-            data.latest('k0s-multinode', inputs.cluster.cluster_name + '-status').attributes.nodes.filter(n, n.ready).size() >= inputs.nodes.size() + 1
-          message: Not every desired node joined and became Ready
+            data.latest('k0s-multinode', inputs.cluster.cluster_name + '-status').attributes.etcd_members.exists(x, x.name == inputs.controller.name) && inputs.nodes.all(n, n.role == "worker" ? data.latest('k0s-multinode', inputs.cluster.cluster_name + '-status').attributes.nodes.exists(x, x.name == n.name && x.ready) : data.latest('k0s-multinode', inputs.cluster.cluster_name + '-status').attributes.etcd_members.exists(x, x.name == n.name))
+          message: Not every desired node joined (workers and controller_workers Ready, dedicated controllers etcd members)
           severity: high

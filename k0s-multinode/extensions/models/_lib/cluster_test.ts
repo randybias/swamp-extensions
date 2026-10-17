@@ -106,8 +106,7 @@ Deno.test("parseEtcdMembers reads the real name->peerURL map", () => {
     peer_urls: ["https://192.0.2.11:2380"],
     client_urls: [],
   }]);
-  const arr = JSON.stringify([{ name: "w", peerURLs: [], clientURLs: [] }]);
-  assertEquals(parseEtcdMembers(arr).length, 1);
+  assertEquals(parseEtcdMembers('[{"name":"w"}]'), []);
   assertEquals(parseEtcdMembers("nope"), []);
 });
 

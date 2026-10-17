@@ -45,7 +45,9 @@ import {
 } from "./_lib/ssh.ts";
 import { createSshTransport, type SshTransport } from "./_lib/transport.ts";
 import {
+  durationMinutes,
   inferOperation,
+  IP_RE,
   type NodeSpec,
   plan,
   type PlanInput,
@@ -99,9 +101,10 @@ const VaultRefSchema = z.strictObject({
 const ROLE = z.enum(["controller", "worker"]).describe(
   "Role the token joins as; a controller_worker joins as controller.",
 );
-const TOKEN_ID = z.string().max(128).regex(/^[A-Za-z0-9_-]+$/).describe(
-  "Public token ID returned by mint_join_token.",
-);
+const TOKEN_ID = z.string().regex(/^[a-z0-9]{6}$/, "not a k0s token id")
+  .describe(
+    "Public token ID returned by mint_join_token.",
+  );
 const TOKEN_EXPIRY = z.string().regex(/^\d{1,3}(m|h)$/, "not a Go duration")
   .refine((value) => {
     const minutes = value.endsWith("h")
@@ -146,9 +149,10 @@ const UncordonArgs = ClusterArgs.extend({
 const DetachArgs = ClusterArgs.extend({
   node: z.string().max(253).regex(SUBDOMAIN_RE, "not a DNS-1123 subdomain")
     .describe("Node name to detach."),
-  peer_address: z.string().max(45).nullish().describe(
-    "The leaving controller's etcd peer address; derived from etcd member-list when omitted.",
-  ),
+  peer_address: z.string().max(45).regex(IP_RE, "not an IP address").nullish()
+    .describe(
+      "The leaving controller's etcd peer address; derived from etcd member-list when omitted.",
+    ),
   confirm: z.string().nullish().describe(
     "Must equal the node name to detach an undrained node or a quorum-critical controller.",
   ),
@@ -335,10 +339,8 @@ async function vaultPut(
 
 /** Adds `duration` (a Go-style minutes/hours string) to a base time. */
 function expiresAt(base: Date, duration: string): string {
-  const minutes = duration.endsWith("h")
-    ? Number(duration.slice(0, -1)) * 60
-    : Number(duration.slice(0, -1));
-  return new Date(base.getTime() + minutes * 60_000).toISOString();
+  return new Date(base.getTime() + durationMinutes(duration) * 60_000)
+    .toISOString();
 }
 
 /** The host part of the first etcd peer URL. */
@@ -529,13 +531,9 @@ export function createModel(deps: Partial<Deps> = {}) {
           const parsed = PlanInputSchema.extend({
             node: z.string().regex(SUBDOMAIN_RE, "not a DNS-1123 subdomain"),
           }).parse(args);
-          const input = PlanInputSchema.parse(parsed);
-          return await store(
-            context,
-            input,
-            "remove",
-            planRemove(input, parsed.node),
-          );
+          const { node, ...rest } = parsed;
+          const input = PlanInputSchema.parse(rest);
+          return await store(context, input, "remove", planRemove(input, node));
         },
       },
       mint_join_token: {
@@ -650,13 +648,14 @@ export function createModel(deps: Partial<Deps> = {}) {
             key: string;
             invalidated_at: string | null;
           }[] = Array.isArray(record?.tokens) ? record.tokens : [];
-          const tokenId = parsed.token_id ??
-            stored.find((entry) =>
+          const ids = parsed.token_id
+            ? [parsed.token_id]
+            : stored.filter((entry) =>
               entry.vault === parsed.token_vault.vault &&
               entry.key === parsed.token_vault.key &&
               entry.invalidated_at === null
-            )?.token_id;
-          if (!tokenId) {
+            ).map((entry) => entry.token_id);
+          if (ids.length === 0) {
             return {
               dataHandles: [],
               result: {
@@ -666,12 +665,14 @@ export function createModel(deps: Partial<Deps> = {}) {
               },
             };
           }
-          const target = targetOf(parsed.ssh);
-          await run(d, target, tokenInvalidateArgs(tokenId));
+          for (const id of ids) {
+            await run(d, parsed.ssh, tokenInvalidateArgs(id));
+          }
           const invalidated = true;
           await vaultPut(context, parsed.token_vault, TOKEN_TOMBSTONE);
+          const done = new Set(ids);
           const tokens = stored.map((entry) =>
-            entry.token_id === tokenId
+            done.has(entry.token_id)
               ? { ...entry, invalidated_at: d.now().toISOString() }
               : entry
           );
@@ -687,7 +688,7 @@ export function createModel(deps: Partial<Deps> = {}) {
           return {
             dataHandles: [handle],
             result: {
-              token_id: tokenId,
+              token_id: ids[0],
               invalidated,
               vault: parsed.token_vault,
             },
@@ -696,7 +697,7 @@ export function createModel(deps: Partial<Deps> = {}) {
       },
       wait_joined: {
         description:
-          "READ-ONLY semantics. Poll a controller until the named node is Ready (worker) or is an etcd member with a ControlNode (controller).",
+          "READ-ONLY. Poll a controller until the named node is Ready (worker) or is an etcd member with a ControlNode (controller).",
         arguments: WaitArgs,
         execute: async (args: z.input<typeof WaitArgs>, _context: Ctx) => {
           const parsed = WaitArgs.parse(args);
@@ -803,11 +804,15 @@ export function createModel(deps: Partial<Deps> = {}) {
                 `${parsed.node} is not drained; set confirm to ${parsed.node} to detach it anyway`,
               );
             }
-            if (
-              hasNonDaemonSetPods(
+            let schedulable = false;
+            try {
+              schedulable = hasNonDaemonSetPods(
                 (await run(d, target, nodePodListArgs(parsed.node))).stdout,
-              )
-            ) {
+              );
+            } catch {
+              schedulable = true;
+            }
+            if (schedulable) {
               throw new DetachRefusedError(
                 `${parsed.node} still has schedulable pods; drain it or set confirm to ${parsed.node}`,
               );
@@ -916,22 +921,19 @@ export function createModel(deps: Partial<Deps> = {}) {
                 diffs.push(`unknown node ${n.name} is in the cluster`);
               }
             }
-            for (const n of recordedNodes) {
-              if (!liveNames.has(n.name)) {
-                diffs.push(`recorded node ${n.name} is missing`);
-                continue;
-              }
-              const want = n.role === "worker" ? "worker" : "controller";
-              const seen = live.nodes.find((l) => l.name === n.name);
-              if (seen && seen.role !== "unknown" && seen.role !== want) {
-                diffs.push(`${n.name} role changed ${want} -> ${seen.role}`);
-              }
-            }
             const memberNames = new Set(
               live.etcd_members.map((m) => m.name),
             );
             for (const n of recordedNodes) {
-              if (n.role !== "worker" && !memberNames.has(n.name)) {
+              if (n.role === "worker") {
+                if (!liveNames.has(n.name)) {
+                  diffs.push(`recorded worker ${n.name} is missing`);
+                }
+                continue;
+              }
+              // A dedicated controller has no Node object; membership is the
+              // etcd member list.
+              if (!memberNames.has(n.name)) {
                 diffs.push(
                   `recorded controller ${n.name} is not an etcd member`,
                 );

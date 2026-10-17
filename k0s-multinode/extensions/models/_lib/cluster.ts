@@ -167,12 +167,6 @@ function stringOf(value: unknown): string {
   return typeof value === "string" ? value : "";
 }
 
-function stringList(value: unknown): string[] {
-  return Array.isArray(value)
-    ? value.filter((v): v is string => typeof v === "string")
-    : [];
-}
-
 function labelOf(
   meta: Record<string, unknown> | undefined,
   key: string,
@@ -237,36 +231,19 @@ export function parseClusterNodes(text: string): ClusterNode[] {
  */
 export function parseEtcdMembers(text: string): EtcdMember[] {
   const parsed = parseJson(text);
-  const container = isPlain(parsed) && parsed.members !== undefined
+  const members = isPlain(parsed) && isPlain(parsed.members)
     ? parsed.members
     : parsed;
-  const members: EtcdMember[] = [];
-  if (Array.isArray(container)) {
-    for (const item of container) {
-      if (!isPlain(item)) continue;
-      const name = stringOf(item.name);
-      if (name === "") continue;
-      members.push({
-        name,
-        peer_urls: stringList(item.peerURLs),
-        client_urls: stringList(item.clientURLs),
-      });
-    }
-  } else if (isPlain(container)) {
-    // Real v1.36 output maps each member name to its peer URL string.
-    for (const [key, value] of Object.entries(container)) {
-      if (typeof value === "string") {
-        members.push({ name: key, peer_urls: [value], client_urls: [] });
-      } else if (isPlain(value)) {
-        members.push({
-          name: stringOf(value.name) || key,
-          peer_urls: stringList(value.peerURLs),
-          client_urls: stringList(value.clientURLs),
-        });
-      }
-    }
-  }
-  return members.filter((member) => member.name !== "");
+  if (!isPlain(members)) return [];
+  // Real v1.36 output maps each member name to its peer URL string.
+  return Object.entries(members)
+    .filter(([, value]) => typeof value === "string")
+    .map(([name, value]) => ({
+      name,
+      peer_urls: [value as string],
+      client_urls: [],
+    }))
+    .filter((member) => member.name !== "");
 }
 
 /** A token ID is the part before the first dot, if a dotted token string. */
@@ -321,7 +298,9 @@ export function newTokenIds(
  */
 export function hasNonDaemonSetPods(text: string): boolean {
   const parsed = parseJson(text);
-  if (!isPlain(parsed) || !Array.isArray(parsed.items)) return false;
+  if (!isPlain(parsed) || !Array.isArray(parsed.items)) {
+    throw new Error("k0s-multinode: pod list was not a Kubernetes List");
+  }
   return parsed.items.filter(isPlain).some((item) => {
     const meta = isPlain(item.metadata) ? item.metadata : undefined;
     const annotations = isPlain(meta?.annotations)

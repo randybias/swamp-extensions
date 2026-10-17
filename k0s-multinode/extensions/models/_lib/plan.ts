@@ -23,14 +23,14 @@
 import { z } from "npm:zod@4.3.6";
 
 /** DNS-1123 label (cluster and namespace names). */
-const LABEL_RE = /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/;
+export const LABEL_RE = /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/;
 /** DNS-1123 subdomain (node names). */
 export const SUBDOMAIN_RE = /^[a-z0-9](?:[a-z0-9.-]{0,251}[a-z0-9])?$/;
 const HOST_RE =
   /^(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)*$|^[0-9a-fA-F:.]{2,45}$/;
 const VERSION_RE = /^v?\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?$/;
 const DURATION_RE = /^\d{1,3}(m|h)$/;
-const IP_RE = /^(?:(?:\d{1,3}\.){3}\d{1,3}|[0-9a-fA-F:]{2,45})$/;
+export const IP_RE = /^(?:(?:\d{1,3}\.){3}\d{1,3}|[0-9a-fA-F:]{2,45})$/;
 
 /** A node as the caller describes it. */
 const NodeSpecSchema = z.strictObject({
@@ -73,6 +73,13 @@ export const PlanInputSchema = z.strictObject({
   ),
   confirm: z.string().nullish(),
 });
+/** Minutes in a k0s Go duration string such as `5m` or `2h`. */
+export function durationMinutes(value: string): number {
+  return value.endsWith("h")
+    ? Number(value.slice(0, -1)) * 60
+    : Number(value.slice(0, -1));
+}
+
 /** Validated plan input. */
 export type PlanInput = z.infer<typeof PlanInputSchema>;
 /** One desired node. */

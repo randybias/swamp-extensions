@@ -42,7 +42,7 @@ Deno.test("create workflow installs the first controller before any token", asyn
   // The token is read from the vault, never passed literally.
   assertStringIncludes(
     s,
-    'join_token: ${{ vault.get("k0s-multinode", inputs.token_key_prefix + self.node.name) }}',
+    'join_token: ${{ vault.get("k0s-multinode", self.node.token_key) }}',
   );
   assertEquals(/BEGIN [A-Z ]*PRIVATE KEY/.test(s), false);
   // private_key is a vault reference, not a literal.
@@ -53,7 +53,7 @@ Deno.test("create workflow touches the token vault by key, never a literal token
   const s = await read("k0s-multinode-create-cluster");
   assertStringIncludes(
     s,
-    "key: ${{ inputs.token_key_prefix + self.node.name }}",
+    "key: ${{ self.node.token_key }}",
   );
   // No step carries a bare token-shaped value.
   assertEquals(/\bjoin_token: [^$]/.test(s), false);

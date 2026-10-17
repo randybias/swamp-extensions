@@ -123,3 +123,48 @@ Checked against the real k0s v1.36.4 binary in a container.
 No prior k0s/k0sctl/etcd/multinode swamp extension found on stable or beta; the
 only near neighbour is `@dataverket/talosctl`, which targets Talos, a different
 distribution.
+
+## Review round 2 (HEAD 4982ce9) — fixed
+
+- `plan_remove` now destructures `node` before `PlanInputSchema.parse` (it was
+  throwing "Unrecognized key: node"); a model-level test is still to add.
+- `TOKEN_ID` is `^[a-z0-9]{6}$`, so a leading-dash id (`-h`, which prints help
+  and exits 0) is refused.
+- `invalidate_join_token` invalidates every live record for the key (not the
+  oldest) and marks each.
+- `hasNonDaemonSetPods` throws on a non-List, and detach turns that into a
+  refusal (fails closed).
+- `sync` checks controllers by etcd membership, not Node presence, so a
+  dedicated controller is no longer "missing".
+- The etcd fixtures use the real `{"members":{"<name>":"https://ip:2380"}}`
+  shape; the invented object/array branches are gone.
+- `durationMinutes` and `LABEL_RE`/`IP_RE` are exported from plan.ts (one
+  duration helper; the model's `expiresAt` uses it).
+- create-cluster workflow: UUID id; single input types with `has()`/empty-string
+  handling for absence; `+` instead of `.concat()`; the vault key is a plain
+  per-node `token_key` field (no concatenation in `vault.get`); the verify
+  assert checks each desired name (workers Ready, controllers ssh members).
+
+## Review round 2 — deferred (recorded, HIGH)
+
+- **The create workflow's forEach grouping is not safe.** A mock run proved
+  `dependsOn` between forEach steps is a group barrier (all mints, then all
+  installs, then all waits) and that `completed` excludes `skipped`, so a failed
+  install leaves live tokens. The fix is a per-node child workflow: mint ->
+  install -> wait -> invalidate called with forEach concurrency 1 (controllers
+  first), with an invalidate for `wait completed` and one for `install failed`.
+  This must land before the workflow is used; the extension is unpublished
+  (`release.yaml ci: false`), so nothing live is affected.
+- Nested input defaults are not applied by swamp; several `cluster` fields are
+  optional and rely on `has()`/empty handling. A per-node `token_key_prefix`
+  input is now unused.
+- `peer_address` has no IP grammar yet and self-host refusal compares only the
+  ssh.host string (hostname-vs-IP bypass); resolving the node's InternalIP is
+  still to add.
+- `swamp workflow validate` `workflow not found` was the broken-workflow load
+  error; it can be run in a scratch repo with
+  `swamp extension source add <ext dir>` (the LOGBOOK's earlier claim that it
+  cannot run locally was wrong).
+- The model export is still `createModel()` (not a plain literal), so swamp's
+  static type read may warn (gate 7); transport.ts keeps unused upload/learn
+  adapters; `fakeJoinToken` is duplicated in two test files.

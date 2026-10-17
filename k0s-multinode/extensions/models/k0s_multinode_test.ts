@@ -284,15 +284,16 @@ Deno.test("detach_node leaves etcd for a cordoned controller with confirm", asyn
   });
   const members = JSON.stringify({
     members: {
-      "ctrl-1": { name: "ctrl-1", peerURLs: ["https://192.0.2.11:2380"] },
-      "ctrl-2": { name: "ctrl-2", peerURLs: ["https://192.0.2.12:2380"] },
-      "ctrl-3": { name: "ctrl-3", peerURLs: ["https://192.0.2.13:2380"] },
-      "ctrl-4": { name: "ctrl-4", peerURLs: ["https://192.0.2.14:2380"] },
+      "ctrl-1": "https://192.0.2.11:2380",
+      "ctrl-2": "https://192.0.2.12:2380",
+      "ctrl-3": "https://192.0.2.13:2380",
+      "ctrl-4": "https://192.0.2.14:2380",
     },
   });
   const execs: string[][] = [];
   const transport = makeTransport((argv) => {
     execs.push(argv);
+    if (argv[3] === "pods") return { stdout: JSON.stringify({ items: [] }) };
     if (argv[3] === "nodes") return { stdout: cordoned };
     if (argv[1] === "etcd") return { stdout: members };
     return undefined;
@@ -333,12 +334,13 @@ Deno.test("detach_node refuses a 3->2 controller removal without confirm", async
   });
   const members = JSON.stringify({
     members: {
-      "ctrl-1": { name: "ctrl-1", peerURLs: ["https://192.0.2.11:2380"] },
-      "ctrl-2": { name: "ctrl-2", peerURLs: ["https://192.0.2.12:2380"] },
-      "ctrl-3": { name: "ctrl-3", peerURLs: ["https://192.0.2.13:2380"] },
+      "ctrl-1": "https://192.0.2.11:2380",
+      "ctrl-2": "https://192.0.2.12:2380",
+      "ctrl-3": "https://192.0.2.13:2380",
     },
   });
   const transport = makeTransport((argv) => {
+    if (argv[3] === "pods") return { stdout: JSON.stringify({ items: [] }) };
     if (argv[3] === "nodes") return { stdout: cordoned };
     if (argv[1] === "etcd") return { stdout: members };
     return undefined;
@@ -364,7 +366,7 @@ Deno.test("get and sync report live membership and flag an unknown node", async 
       return {
         stdout: JSON.stringify({
           members: {
-            "ctrl-1": { name: "ctrl-1", peerURLs: ["https://192.0.2.11:2380"] },
+            "ctrl-1": "https://192.0.2.11:2380",
           },
         }),
       };

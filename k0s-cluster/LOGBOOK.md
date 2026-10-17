@@ -230,3 +230,29 @@ Follow-up (reset leftovers): `reset` leaves the k0s binary
 an empty `/etc/k0s/containerd.d` on the host (cell R2; removed by hand after the
 run). The README now says so. Decide whether `reset` removes them (an option to
 remove the binary, and `/etc/k0s` when it holds only k0s's placeholders).
+
+## 2026-10-17: merge prep and known residuals (2026.10.17.1)
+
+Review-clean (no unrefuted Critical/High). Gate 7 needed the plain-object model
+export (type and version repeated, checked with `satisfies`); no behaviour
+change. Gate-8 report: `reviews/k0s-cluster/617b2313….json`. Residuals, MEDIUM
+unless noted:
+
+- `applyConfig` treats a failed `cat` of an existing `k0s.yaml` as absence, so a
+  later failed restart removes it (raised HIGH, downgraded: as root this needs
+  an I/O error, the file is a render of the caller's inputs and `install`
+  recreates it). Distinguish "not found" from a read failure.
+- `ensurePrivateDir` follows an existing directory symlink (raised HIGH,
+  downgraded: planting one under `/etc/k0s` or the manifest dir needs root on
+  the target). Reject symlink components.
+- get/sync and apply_helm observation helpers turn some non-zero exits into
+  empty results; rollback ignores the exit of `rm` and the recovery restart.
+- ExecStart classifier matches `controller` and the first `true` flag anywhere
+  in `argv[]`; require `/usr/local/bin/k0s controller` and last-occurrence
+  flags.
+- `kubeconfig` is described READ-ONLY while `store_in_vault` overwrites a key.
+- Upload result returns the content SHA-256 (vendored transport, carried from
+  ssh-host).
+- LOW: `confirm_host`/`confirm_role_change` unbounded; ExecStart fixture copied
+  from a live host; SSH grammars duplicate the transport's; test-only YAML
+  serializer.

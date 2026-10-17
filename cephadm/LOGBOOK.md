@@ -468,3 +468,6 @@ a secret. Fixtures are synthetic only (RFC 5737 addresses, `.test` names).
   re-gate asserts structurally, requires a re-gate assert whenever a job has a
   pre-gate, and requires a direct succeeded-only edge from every mutating step
   to it. Proven: deleting the re-gate edge fails the test.
+
+- 2026-10-17: cephDeleteFs requires the reported client count to be a
+  non-negative integer; -1, 1.5 and a numeric string all refuse. Tests added.

@@ -807,6 +807,8 @@ Deno.test("filesystem deletion fails closed when the client count is unreadable"
     const stdout of [
       '{"clients":[{"fs":"other","clients":0}]}',
       '{"clients":[{"fs":"cephfs","clients":"two"}]}',
+      '{"clients":[{"fs":"cephfs","clients":-1}]}',
+      '{"clients":[{"fs":"cephfs","clients":1.5}]}',
       "{}",
     ]
   ) {

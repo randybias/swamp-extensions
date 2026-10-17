@@ -1046,7 +1046,10 @@ export async function deleteFs(
   ) as
     | Record<string, unknown>
     | undefined;
-  const clientCount = match && typeof match.clients === "number"
+  // A non-negative integer only: -1, 1.5 and a numeric string all mean the
+  // count could not be read, and the method must refuse rather than delete.
+  const clientCount = match && typeof match.clients === "number" &&
+      Number.isInteger(match.clients) && match.clients >= 0
     ? match.clients
     : null;
   if (entries === null || clientCount === null) {

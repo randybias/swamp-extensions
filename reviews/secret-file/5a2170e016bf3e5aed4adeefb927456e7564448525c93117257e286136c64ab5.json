@@ -1,0 +1,88 @@
+{
+  "extension": "@randybias/secret-file",
+  "version": "2026.10.17.1",
+  "reviewedAt": "2026-10-17T14:45:30Z",
+  "dimensions": [
+    {
+      "id": "credentials-secrets",
+      "verdict": "pass",
+      "note": "The value (content, content_base64 or dotenv entries) reaches the target only over the canonical _lib/ssh.ts stdin upload; private_key goes to a short-lived ssh-agent over stdin and password through an askpass helper, never argv. Every content field, entries values, private_key, password and hmac_key are sensitive-marked. State, logs and method results hold path, mode, owner, group, byte count and flags, plus a keyed HMAC only when hmac_key is supplied; never the value or a plain hash. Live: ps -efww sampled every 50 ms on the control host and the target during writes found 0 hits for values, substrings or their SHA-256 (positive control hit). Known external issue swamp-club lab 3555: README examples use vault references only and never --json."
+    },
+    {
+      "id": "logging-quality",
+      "verdict": "pass",
+      "note": "Each method logs once with structured placeholders (path, changed, matches, removed); no value, hash, argv or output in log fields."
+    },
+    {
+      "id": "error-handling",
+      "verdict": "pass",
+      "note": "Every OpenSSH exit 255 maps to a typed SshError (host key, auth, unreachable), live-verified for a wrong pin and an unreachable host with nothing written. A stat failure on an existing file is an error, not not_found; a failed chown or rename removes the stage and writes no state. A symlink or directory destination is refused with a typed SshError before staging and again before the rename (live cell 8 failed on 770114a and passes on 34dd922)."
+    },
+    {
+      "id": "testing-completeness",
+      "verdict": "pass",
+      "note": "56 unit tests (18 model, 38 vendored transport) with an injected runner and a plain-object method context, no process or socket. Live end-to-end: 12/13 on 770114a (cell 8 symlink destination failed), 5/5 on 34dd922 (cells 1, 2, 8, 9, 13). Residual LOW (astra): no test drives the second, pre-rename check with a destination that changes during staging. LOW (astra): the symlink test's fake runner returns the same result on both branches of its condition (dead code)."
+    },
+    {
+      "id": "idempotency-resilience",
+      "verdict": "pass",
+      "note": "write compares the remote SHA-256, mode and owner/group (names and numeric ids) with the local value and skips the write when all match (live: inode and mtime unchanged); a change stages beside the destination, chowns the stage with chown -h, then mv -T. remove is a clean no-op when absent and removes a dangling symlink. Residual MEDIUM (astra, terra; downgraded under the run rulings): the destination checks and mv -T are separate remote calls, so a symlink planted between them in an attacker-writable parent is replaced (rename does not follow it, so no write-through); a symlinked parent directory is not detected, with the same writable-parent precondition."
+    },
+    {
+      "id": "api-contracts",
+      "verdict": "pass",
+      "note": "Built on the OpenSSH client, ssh-agent/ssh-add with -F /dev/null and IdentityFile=none. write requires GNU mv -T, stat -c and sha256sum on the target and fails closed elsewhere. Dotenv values are single-quoted with ' escaped for POSIX-shell sourcing (live: sh and bash source a hostile value exactly)."
+    },
+    {
+      "id": "resource-management",
+      "verdict": "pass",
+      "note": "Temporary known_hosts, askpass helper and ssh-agent are removed or killed in finally (vendored transport tests). The stage file is removed on any failure (live: no *.secret-stage-* left). Remote output is capped by the transport."
+    },
+    {
+      "id": "published-surface-hygiene",
+      "verdict": "pass",
+      "note": "Manifest: @randybias/secret-file 2026.10.17.1 (model version literal matches), two-sentence description, Apache-2.0, additionalFiles README.md and LICENSE.txt. write and remove descriptions start DESTRUCTIVE, verify READ-ONLY. Fixtures use RFC 5737 addresses and synthetic keys; leak scan, gitleaks and fixture guard pass. Merge prep: plain model export so the registry catalogs the type, and the state schema constant renamed so the sensitive-field heuristic no longer matches a non-secret line."
+    },
+    {
+      "id": "schema-strictness",
+      "verdict": "pass",
+      "note": "Global arguments are an empty strictObject; every method argument object is strict. host, user, port, path (absolute, no . or .. components, no trailing slash), mode and owner/group carry grammars. host_key_policy is required and accepts only strict; host_keys is required (1-64). Content is bounded (1 MiB literal, entries 256 keys and 1 MiB rendered). Residual LOW (astra, terra): the rendered-entries cap counts UTF-16 code units, so multibyte values can render to more than 1 MiB of UTF-8."
+    },
+    {
+      "id": "lifetime-gc",
+      "verdict": "pass",
+      "note": "secretFile resource: lifetime infinite, garbageCollection 10."
+    },
+    {
+      "id": "crud-completeness",
+      "verdict": "pass",
+      "note": "write (create/update), verify (read) and remove (delete, an action) cover the file's lifecycle on one host."
+    },
+    {
+      "id": "preflight-checks",
+      "verdict": "pass",
+      "note": "Path grammar, content-form exclusivity, entries keys and caps, and host-key policy are validated before any spawn; the destination is checked with test -L and test -d before staging."
+    },
+    {
+      "id": "instance-names",
+      "verdict": "pass",
+      "note": "secret-<32 hex>: SHA-256 over host, port, user and path, truncated to 128 bits, so two files on one host or one path on two hosts get distinct records."
+    },
+    {
+      "id": "data-access",
+      "verdict": "pass",
+      "note": "Methods read only this model's own records; every target and value arrives as method arguments, so one generic definition serves any host and path."
+    },
+    {
+      "id": "version-upgrades",
+      "verdict": "pass",
+      "note": "First release. The vendored _lib/ssh.ts is the canonical blob fe0139f08c42e3fdae0061b9688fb5c534174957 (ssh-host 2026.10.17.2)."
+    }
+  ],
+  "panel": {
+    "codex-astra": "codex gpt-6-astra conformance seat over the 34dd922 delta (base 770114a): 0 Critical/High; 1 Medium (check-then-rename race), 2 Low (no test of the pre-rename check; dead branch in the symlink test). Earlier full rounds: round-1 High (stage swap) and Medium findings fixed or ruled by 770114a, which reviewed CLEAN.",
+    "codex-terra": "codex gpt-5.6-terra adversarial seat over the 34dd922 delta: 0 Critical/High; 1 Low (TOCTOU between the second check and mv -T in an attacker-writable directory). Round-1 High (insecure_tofu never recorded the key) fixed by dropping insecure_tofu.",
+    "merge-prep": "Merged 34dd922 as cabd588; diff scope secret-file/ plus its release.yaml stanza; _lib/ssh.ts blob verified canonical. Code change at merge prep: plain model export and a schema constant rename for the registry dry run (no behaviour change, 56 tests pass).",
+    "ocr-llm": "OCR sonnet5 and glm seats were not run"
+  }
+}

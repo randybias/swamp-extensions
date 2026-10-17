@@ -48,7 +48,7 @@ case "$1" in
   list)
     case "$2" in
       ruleset) cat "$live" ;;
-      tables) awk '{print $1, $2, $3}' "$live" ;;
+      tables) [ ! -e "${dir}/nft-fail" ] || exit 1; awk '{print $1, $2, $3}' "$live" ;;
       table) grep "^table $3 $4\\( \\|$\\)" "$live" ;;
     esac ;;
   -f)
@@ -321,6 +321,20 @@ Deno.test("shell: when no managed table existed, the restore removes it and stil
       await b.file("live"),
       "table inet k0s kube-proxy-and-cni-rules\n",
     );
+  } finally {
+    await Deno.remove(b.dir, { recursive: true });
+  }
+});
+
+Deno.test("shell: if nft cannot list the tables, arm fails and arms nothing, so a restore can never drop the managed table", async () => {
+  const b = await box();
+  try {
+    await b.put("live", "table inet server_host original\n");
+    await b.put("nft-fail", "");
+    assertEquals((await arm(b, A)) !== 0, true);
+    assertEquals(await b.file("state/current"), null);
+    assertEquals(await b.file(`unit-server-host-revert-${A}.timer`), null);
+    assertEquals(await b.file("live"), "table inet server_host original\n");
   } finally {
     await Deno.remove(b.dir, { recursive: true });
   }

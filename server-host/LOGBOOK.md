@@ -209,3 +209,10 @@ Round 6 (lead's requirements):
 - A lockdown re-run with identical inputs, after commit and with foreign tables
   in the live ruleset, is a no-op (guarded by the stored hash and the live
   managed-table hash; `changeFirewall` in `server_host.ts`).
+
+Round 7: the arm step listed tables through `nft list tables | grep`, so a
+failing `nft` read as "no managed table", the snapshot was left empty, and a
+later restore would have destroyed the managed table instead of restoring it.
+Fixed: the listing is captured on its own (`tables=$(nft list tables)`) under
+`set -e`, so a failure aborts the arm step before the marker or the timer exist.
+Tested under `sh` with an `nft` stub whose listing fails.

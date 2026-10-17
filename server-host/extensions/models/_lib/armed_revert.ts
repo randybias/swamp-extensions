@@ -144,7 +144,8 @@ if [ -f "$cur" ]; then
 fi
 snap="${snapshotPath(token)}"
 : > "$snap"
-if nft list tables | grep -qx 'table inet ${TABLE}'; then nft list table inet ${TABLE} > "$snap"; fi
+tables=$(nft list tables)
+if printf '%s\\n' "$tables" | grep -qx 'table inet ${TABLE}'; then nft list table inet ${TABLE} > "$snap"; fi
 printf '%s %s %s\n' '${token}' "$(( $(date +%s) + ${revertAfterS} ))" '${managedSha256}' > "$cur.tmp"
 mv -f "$cur.tmp" "$cur"
 if ! systemd-run --on-active=${revertAfterS}s --unit=${unit} --collect --description='server-host armed revert' --quiet '${

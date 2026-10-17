@@ -160,6 +160,16 @@ Deno.test("probe: reads the timer state without changing it", () => {
   assertEquals(isTimerActive(""), false);
 });
 
+Deno.test("arm: the table listing's exit status is checked on its own, not through a pipe", () => {
+  const s = renderArmArgv(TOKEN, 300, false, SHA)[2];
+  assertEquals(s.includes("tables=$(nft list tables)"), true);
+  assertEquals(s.includes("nft list tables |"), false);
+  assertEquals(
+    s.indexOf("tables=$(nft list tables)") < s.indexOf("systemd-run"),
+    true,
+  );
+});
+
 Deno.test("arm: refuses (75) while an earlier revert's timer OR service is busy, or its files remain", () => {
   const s = renderArmArgv(TOKEN, 300, false, SHA)[2];
   assertEquals(s.includes('busy "$ou.timer" || busy "$ou.service"'), true);

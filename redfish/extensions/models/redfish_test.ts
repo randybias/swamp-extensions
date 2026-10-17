@@ -48,6 +48,12 @@ function makeBmc() {
   let sessionStatus = 201;
   let systemStatus = 200;
   let ignoreReset = false;
+  let sessionBodyLocation = false;
+  let taskOnReset = false;
+  let taskState = "Completed";
+  let restartTransition = true;
+  let restartCounter = 0;
+  let systemBodyOverride: unknown = undefined;
   const fetchImpl: FetchFn = (url, init) => {
     const method = init?.method ?? "GET";
     const headers = headersOf(init);
@@ -58,15 +64,23 @@ function makeBmc() {
       if (sessionStatus !== 201) {
         return Promise.resolve(new Response("x", { status: sessionStatus }));
       }
+      const sessionBody = sessionBodyLocation
+        ? JSON.stringify({ "@odata.id": SESSION_LOCATION })
+        : "{}";
       return Promise.resolve(
-        new Response("{}", {
+        new Response(sessionBody, {
           status: 201,
-          headers: { "x-auth-token": TOKEN, location: SESSION_LOCATION },
+          headers: sessionBodyLocation
+            ? { "x-auth-token": TOKEN }
+            : { "x-auth-token": TOKEN, location: SESSION_LOCATION },
         }),
       );
     }
     if (method === "DELETE" && path === SESSION_LOCATION) {
       return Promise.resolve(new Response(null, { status: 204 }));
+    }
+    if (method === "GET" && path === "/redfish/v1/TaskService/Tasks/1") {
+      return Promise.resolve(json({ TaskState: taskState }));
     }
     if (method === "GET" && path === "/redfish/v1/Systems") {
       return Promise.resolve(json(systems));
@@ -74,6 +88,21 @@ function makeBmc() {
     if (method === "GET" && path === SYSTEM_PATH) {
       if (systemStatus !== 200) {
         return Promise.resolve(new Response("x", { status: systemStatus }));
+      }
+      if (systemBodyOverride !== undefined) {
+        return Promise.resolve(
+          new Response(JSON.stringify(systemBodyOverride), {
+            status: 200,
+            headers: { "content-type": "application/json" },
+          }),
+        );
+      }
+      if (restartCounter === 1) {
+        restartCounter = 2;
+        system.PowerState = "Off";
+      } else if (restartCounter === 2) {
+        restartCounter = 0;
+        system.PowerState = "On";
       }
       return Promise.resolve(json(system, 'W/"e1"'));
     }
@@ -89,10 +118,24 @@ function makeBmc() {
           system.PowerState = "Off";
         }
         if (
-          resetType === "ForceRestart" || resetType === "GracefulRestart"
+          resetType === "ForceRestart" || resetType === "GracefulRestart" ||
+          resetType === "PowerCycle" || resetType === "Nmi"
         ) {
-          system.PowerState = "On";
+          if (restartTransition) {
+            restartCounter = 1;
+            system.PowerState = "Off";
+          } else {
+            system.PowerState = "On";
+          }
         }
+      }
+      if (taskOnReset) {
+        return Promise.resolve(
+          new Response(null, {
+            status: 202,
+            headers: { location: "/redfish/v1/TaskService/Tasks/1" },
+          }),
+        );
       }
       return Promise.resolve(new Response(null, { status: 204 }));
     }
@@ -125,6 +168,21 @@ function makeBmc() {
     setIgnoreReset: (v: boolean) => {
       ignoreReset = v;
     },
+    setSessionBodyLocation: (v: boolean) => {
+      sessionBodyLocation = v;
+    },
+    setTaskOnReset: (v: boolean) => {
+      taskOnReset = v;
+    },
+    setTaskState: (v: string) => {
+      taskState = v;
+    },
+    setRestartTransition: (v: boolean) => {
+      restartTransition = v;
+    },
+    setSystemBody: (v: unknown) => {
+      systemBodyOverride = v;
+    },
   };
 }
 
@@ -133,7 +191,7 @@ type Bmc = ReturnType<typeof makeBmc>;
 let lastTls: TlsPolicy | undefined;
 
 /** Installs the fake BMC as the model's deps. */
-function useBmc(bmc: Bmc) {
+function useBmc(bmc: Bmc, requestTimeoutMs = 30_000) {
   let clock = 1_700_000_000_000;
   const prev = setDeps({
     fetch: bmc.fetch,
@@ -143,6 +201,7 @@ function useBmc(bmc: Bmc) {
     },
     now: () => new Date(clock += 1000),
     sleep: () => Promise.resolve(),
+    requestTimeoutMs,
   });
   return { restore: () => setDeps(prev) };
 }
@@ -185,6 +244,22 @@ Deno.test("schema: username and password are sensitive and tls_verify is require
     password: PASS,
   });
   assertEquals(parsed.success, false);
+  const withTls = model.methods.get.arguments.safeParse({
+    endpoint: ORIGIN,
+    username: USER,
+    password: PASS,
+    tls_verify: "strict",
+  });
+  assertEquals(withTls.success, true);
+  if (withTls.success) {
+    assertEquals(
+      (withTls.data as { allow_insecure_basic: boolean }).allow_insecure_basic,
+      false,
+    );
+  }
+  const caDesc =
+    (shape.ca_pem as unknown as { description?: string }).description ?? "";
+  assert(caDesc.includes("additionally"));
 });
 
 Deno.test("get reads state, sends credentials in headers only, and deletes the session", async () => {
@@ -381,6 +456,7 @@ Deno.test("power refuses a reset type the BMC does not allow", async () => {
   ] = [
     "On",
     "ForceOff",
+    "VendorMagic",
   ];
   const u = useBmc(bmc);
   try {
@@ -393,6 +469,7 @@ Deno.test("power refuses a reset type the BMC does not allow", async () => {
     ) as RedfishError;
     assertEquals(e.code, "invalid_input");
     assert(e.message.includes("GracefulRestart"));
+    assert(!e.message.includes("VendorMagic"));
     assert(
       !bmc.calls.some((c) => c.method === "POST" && c.url.includes("Reset")),
     );
@@ -605,6 +682,183 @@ Deno.test("injection in endpoint and system_id is rejected before any request", 
   } finally {
     u.restore();
   }
+});
+
+Deno.test("Basic auth over insecure TLS is refused unless explicitly allowed", async () => {
+  const bmc = makeBmc();
+  const u = useBmc(bmc);
+  try {
+    const { context } = createModelTestContext(ctxOptions);
+    const e = await assertRejects(() =>
+      model.methods.get.execute({
+        ...BASE,
+        auth_mode: "basic",
+        tls_verify: "insecure_skip_verify",
+      }, context)
+    ) as RedfishError;
+    assertEquals(e.code, "invalid_input");
+    assertEquals(bmc.calls.length, 0);
+    await model.methods.get.execute({
+      ...BASE,
+      auth_mode: "basic",
+      tls_verify: "insecure_skip_verify",
+      allow_insecure_basic: true,
+    }, context);
+    assert(bmc.calls.some((c) => c.method === "GET"));
+  } finally {
+    u.restore();
+  }
+});
+
+Deno.test("the SessionService fallback is refused over insecure TLS unless allowed", async () => {
+  const bmc = makeBmc();
+  bmc.setSessionStatus(404);
+  const u = useBmc(bmc);
+  try {
+    const { context } = createModelTestContext(ctxOptions);
+    const e = await assertRejects(() =>
+      model.methods.get.execute(
+        { ...BASE, tls_verify: "insecure_skip_verify" },
+        context,
+      )
+    ) as RedfishError;
+    assertEquals(e.code, "invalid_input");
+    assert(!bmc.calls.some((c) => c.method === "GET"));
+    // Strict TLS allows the fallback.
+    await model.methods.get.execute(BASE, context);
+    const read = bmc.calls.find((c) => c.method === "GET")!;
+    assert(read.headers["Authorization"]?.startsWith("Basic "));
+  } finally {
+    u.restore();
+  }
+});
+
+Deno.test("a stalled request times out and the session is still deleted", async () => {
+  const bmc = makeBmc();
+  const baseFetch = bmc.fetch;
+  const stalled: Bmc = {
+    ...bmc,
+    fetch: (url, init) => {
+      const method = init?.method ?? "GET";
+      if (method === "POST" && url.endsWith("/Sessions")) {
+        return baseFetch(url, init);
+      }
+      if (method === "DELETE") return baseFetch(url, init);
+      return new Promise<Response>((_resolve, reject) => {
+        const signal = (init as { signal?: AbortSignal } | undefined)?.signal;
+        if (!signal) return;
+        if (signal.aborted) return reject(signal.reason);
+        signal.addEventListener("abort", () => reject(signal.reason), {
+          once: true,
+        });
+      });
+    },
+  };
+  const u = useBmc(stalled, 20);
+  try {
+    const { context } = createModelTestContext(ctxOptions);
+    const e = await assertRejects(() =>
+      model.methods.get.execute(BASE, context)
+    ) as RedfishError;
+    assertEquals(e.code, "timeout");
+    assert(stalled.calls.some((c) => c.method === "DELETE"));
+  } finally {
+    u.restore();
+  }
+});
+
+Deno.test("a session with no Location header is deleted via its body @odata.id", async () => {
+  const bmc = makeBmc();
+  bmc.setSessionBodyLocation(true);
+  const u = useBmc(bmc);
+  try {
+    const { context } = createModelTestContext(ctxOptions);
+    await model.methods.get.execute(BASE, context);
+    assert(
+      bmc.calls.some((c) =>
+        c.method === "DELETE" && c.url.endsWith(SESSION_LOCATION)
+      ),
+    );
+  } finally {
+    u.restore();
+  }
+});
+
+Deno.test("power restart waits for an observed transition before accepting On", async () => {
+  const bmc = makeBmc();
+  bmc.setRestartTransition(true);
+  const u = useBmc(bmc);
+  try {
+    const { context } = createModelTestContext(ctxOptions);
+    const out = await model.methods.power.execute(
+      { ...BASE, action: "ForceRestart", timeout_seconds: 30 },
+      context,
+    ) as { result: Record<string, unknown> };
+    assertEquals(out.result.power_state, "On");
+  } finally {
+    u.restore();
+  }
+});
+
+Deno.test("power restart times out when no transition is observed", async () => {
+  const bmc = makeBmc();
+  bmc.setRestartTransition(false);
+  const u = useBmc(bmc);
+  try {
+    const { context } = createModelTestContext(ctxOptions);
+    const e = await assertRejects(() =>
+      model.methods.power.execute(
+        { ...BASE, action: "ForceRestart", timeout_seconds: 5 },
+        context,
+      )
+    ) as RedfishError;
+    assertEquals(e.code, "timeout");
+  } finally {
+    u.restore();
+  }
+});
+
+Deno.test("power follows a returned Redfish task monitor", async () => {
+  const bmc = makeBmc();
+  bmc.setTaskOnReset(true);
+  bmc.setTaskState("Completed");
+  bmc.setRestartTransition(true);
+  const u = useBmc(bmc);
+  try {
+    const { context } = createModelTestContext(ctxOptions);
+    await model.methods.power.execute(
+      { ...BASE, action: "ForceRestart", timeout_seconds: 30 },
+      context,
+    );
+    assert(
+      bmc.calls.some((c) => c.url.endsWith("/redfish/v1/TaskService/Tasks/1")),
+    );
+  } finally {
+    u.restore();
+  }
+});
+
+Deno.test("a null or Id-less ComputerSystem body is refused", async () => {
+  for (const body of [null, { PowerState: "On" }]) {
+    const bmc = makeBmc();
+    bmc.setSystemBody(body);
+    const u = useBmc(bmc);
+    try {
+      const { context } = createModelTestContext(ctxOptions);
+      const e = await assertRejects(() =>
+        model.methods.get.execute({ ...BASE, system_id: ID }, context)
+      ) as RedfishError;
+      assertEquals(e.code, "redfish_failed", JSON.stringify(body));
+    } finally {
+      u.restore();
+    }
+  }
+});
+
+Deno.test("set_boot is described as destructive", () => {
+  assert(
+    String(model.methods.set_boot.description).startsWith("DESTRUCTIVE."),
+  );
 });
 
 Deno.test("no fixture, source or doc carries real-looking secret material", async () => {

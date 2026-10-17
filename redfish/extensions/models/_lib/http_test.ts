@@ -65,10 +65,32 @@ Deno.test("drain discards a body without throwing", async () => {
   await drain(new Response(null, { status: 204 }));
 });
 
+Deno.test("readBounded fails as a timeout when the signal is already aborted", async () => {
+  const controller = new AbortController();
+  controller.abort();
+  const stream = new ReadableStream<Uint8Array>({ start() {} });
+  const e = await assertRejects(() =>
+    readBounded(new Response(stream), undefined, controller.signal)
+  ) as RedfishError;
+  assertEquals(e.code, "timeout");
+});
+
+Deno.test("classifyFetch maps an abort to a typed timeout", () => {
+  assertEquals(
+    classifyFetch(new DOMException("x", "TimeoutError")).code,
+    "timeout",
+  );
+  assertEquals(
+    classifyFetch(new DOMException("x", "AbortError")).code,
+    "timeout",
+  );
+});
+
 Deno.test("defaultDeps exposes the injectable seams", () => {
   const d = defaultDeps();
   assertEquals(typeof d.fetch, "function");
   assertEquals(typeof d.makeClient, "function");
   assertEquals(typeof d.now, "function");
   assertEquals(typeof d.sleep, "function");
+  assertEquals(typeof d.requestTimeoutMs, "number");
 });

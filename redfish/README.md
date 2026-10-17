@@ -20,6 +20,9 @@ policy is an explicit input with no default.
 | `power`    | Power on, power off or restart, then wait for the resulting state |
 | `set_boot` | Set a one-time or continuous boot override and confirm it         |
 
+`set_boot` is destructive: a continuous override can boot the host into an
+installer on every restart.
+
 ## Dependencies
 
 HTTPS reachability to the BMC and a Redfish `ComputerSystem` resource. No
@@ -73,17 +76,23 @@ Pass `username` and `password` only as vault references; never as literal
 allowlist of metadata; no credential is ever written to state or output. By
 default a Redfish SessionService session is opened and deleted in a `finally`,
 falling back to Basic auth when the BMC has no SessionService; `auth_mode`
-forces one or the other. `power` validates the requested `ResetType` against the
-system's `AllowableValues`, is a no-op when the system is already in the target
-state, and polls to a bounded timeout. `set_boot` patches the override, sending
-`If-Match` when the BMC provides an ETag, and reads it back to confirm.
+forces one or the other. Basic auth sends the password on every request, so it
+is refused over an unverified TLS connection unless `allow_insecure_basic` is
+set. `power` validates the requested `ResetType` against the system's advertised
+allowables (only values this model knows are echoed back), is a no-op when the
+system is already in the target state, follows a returned Redfish task monitor,
+and requires an observed state change before accepting a restart. `set_boot`
+patches the override, sending `If-Match` when the BMC provides an ETag, and
+reads it back to confirm.
 
 The endpoint must be an https origin: no path, query, fragment or embedded
 credentials, and every `@odata.id` is resolved back onto that origin. The TLS
-policy is required — `strict` (system trust, or a pinned `ca_pem`) or the
-explicit `insecure_skip_verify` for the self-signed certificates BMCs commonly
-ship. Response bodies are read with a hard byte cap, and every failure is a
-typed message that never echoes a response body, URL or credential.
+policy is required — `strict` (system trust, plus an optional additional CA via
+`ca_pem`, which is not an exclusive pin) or the explicit `insecure_skip_verify`
+for the self-signed certificates BMCs commonly ship. Every request carries a
+timeout (clamped to the `power` deadline, and also applied to the body read and
+the session logout), response bodies are read with a hard byte cap, and every
+failure is a typed message that never echoes a response body, URL or credential.
 
 ## License
 

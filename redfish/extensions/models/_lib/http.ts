@@ -41,6 +41,8 @@ export interface Deps {
   now(): Date;
   /** Waits between polls. */
   sleep(ms: number): Promise<void>;
+  /** Per-request deadline in milliseconds. */
+  requestTimeoutMs: number;
 }
 
 const denoFetch: FetchFn = (url, init) => fetch(url, init as RequestInit);
@@ -55,6 +57,9 @@ const denoMakeClient = (tls: TlsPolicy): HttpClientHandle => {
   return { client, close: () => client.close() };
 };
 
+/** Default per-request deadline. */
+export const REQUEST_TIMEOUT_MS = 30_000;
+
 /** Production dependencies. */
 export function defaultDeps(): Deps {
   return {
@@ -62,6 +67,7 @@ export function defaultDeps(): Deps {
     makeClient: denoMakeClient,
     now: () => new Date(),
     sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+    requestTimeoutMs: REQUEST_TIMEOUT_MS,
   };
 }
 
@@ -91,20 +97,53 @@ export class RedfishError extends Error {
 /** Maximum response body kept in memory. */
 export const MAX_BODY_BYTES = 1024 * 1024;
 
+/** A typed error for a request that did not finish in time. */
+export function timeoutError(): RedfishError {
+  return new RedfishError(
+    "timeout",
+    "BMC did not respond within the request timeout",
+  );
+}
+
+/** Reads one chunk, rejecting as a typed timeout if `signal` aborts first. */
+async function readWithSignal(
+  reader: ReadableStreamDefaultReader<Uint8Array>,
+  signal?: AbortSignal,
+): Promise<ReadableStreamReadResult<Uint8Array>> {
+  if (!signal) return await reader.read();
+  if (signal.aborted) throw timeoutError();
+  return await new Promise((resolve, reject) => {
+    const onAbort = () => reject(timeoutError());
+    signal.addEventListener("abort", onAbort, { once: true });
+    reader.read().then(
+      (r) => {
+        signal.removeEventListener("abort", onAbort);
+        resolve(r);
+      },
+      (e) => {
+        signal.removeEventListener("abort", onAbort);
+        reject(e);
+      },
+    );
+  });
+}
+
 /**
  * Reads at most `max` bytes of a response body. A larger body is refused
- * instead of buffered, so a hostile or broken BMC cannot exhaust memory.
+ * instead of buffered, so a hostile or broken BMC cannot exhaust memory. When
+ * `signal` aborts (or is already aborted), the read fails as a typed timeout.
  */
 export async function readBounded(
   resp: Response,
   max = MAX_BODY_BYTES,
+  signal?: AbortSignal,
 ): Promise<string> {
   if (!resp.body) return "";
   const reader = resp.body.getReader();
   const chunks: Uint8Array[] = [];
   let total = 0;
   for (;;) {
-    const { done, value } = await reader.read();
+    const { done, value } = await readWithSignal(reader, signal);
     if (done) break;
     if (!value) continue;
     total += value.byteLength;
@@ -140,6 +179,12 @@ export async function drain(resp: Response): Promise<void> {
  * `tls`; anything else is `unreachable`. The thrown message is never included.
  */
 export function classifyFetch(e: unknown): RedfishError {
+  if (
+    e instanceof Error &&
+    (e.name === "AbortError" || e.name === "TimeoutError")
+  ) {
+    return timeoutError();
+  }
   const text = e instanceof Error ? e.message : "";
   if (/certificate|self.signed|x509|tls|ssl|verify/i.test(text)) {
     return new RedfishError(

@@ -23,6 +23,7 @@ import {
   BOOT_TARGETS,
   desiredPowerState,
   isPowerNoop,
+  isRestartAction,
   isSystemId,
   normalizeEndpoint,
   parseSystem,
@@ -60,10 +61,13 @@ const TargetShape = {
     "TLS policy. strict: verify against the system trust store or ca_pem. insecure_skip_verify: do not verify the certificate. Required; there is no default.",
   ),
   ca_pem: z.string().max(65536).optional().describe(
-    "PEM-encoded CA to pin when tls_verify=strict; omit to use the system trust store.",
+    "PEM-encoded CA to additionally trust when tls_verify=strict; the system trust store is still used, so this is not an exclusive pin.",
   ),
   auth_mode: z.enum(["session", "basic"]).default("session").describe(
     "session: open and delete a Redfish SessionService session; basic: send Basic auth. Falls back to basic when the BMC has no SessionService.",
+  ),
+  allow_insecure_basic: z.boolean().default(false).describe(
+    "Permit Basic auth (the password on every request) when tls_verify=insecure_skip_verify. Default false; strict TLS always allows Basic.",
   ),
 };
 
@@ -142,6 +146,7 @@ function target(a: z.infer<typeof TargetArgs>) {
     password: a.password,
     tls,
     authMode: a.auth_mode,
+    allowInsecureBasic: a.allow_insecure_basic,
   };
 }
 
@@ -260,12 +265,14 @@ export const model = {
     power: {
       kind: "action" as const,
       description:
-        "DESTRUCTIVE. Power on, power off or restart the ComputerSystem, then poll until the resulting power state is reached. On and the off actions are a no-op when the system is already there. Returns the observed state.",
+        "DESTRUCTIVE. Power on, power off or restart the ComputerSystem, then wait until the resulting state is observed. On and the off actions are a no-op when the system is already there; a restart is accepted only after an observed state change or a completed Redfish task. Returns the observed state.",
       arguments: PowerArgs,
       execute: async (args: z.input<typeof PowerArgs>, context: Ctx) => {
         const a = PowerArgs.parse(args);
         const t = target(a);
         const action = a.action as ResetType;
+        const deadline = deps.now().getTime() + a.timeout_seconds * 1000;
+        const pollMs = a.poll_interval_seconds * 1000;
         const state = await withRedfish(deps, t, async (api, origin) => {
           const found = await api.findSystem(a.system_id);
           let current = parseSystem(
@@ -289,11 +296,16 @@ export const model = {
               `BMC does not allow ${action}; allowed: ${allowable.join(", ")}`,
             );
           }
-          await api.resetSystem(found.raw, action);
-          const desired = desiredPowerState(action, current.power_state);
-          const deadline = deps.now().getTime() + a.timeout_seconds * 1000;
+          const initial = current.power_state;
+          const restart = isRestartAction(action);
+          const desired = desiredPowerState(action, initial);
+          const reset = await api.resetSystem(found.raw, action);
+          if (reset.taskLocation) {
+            await api.awaitTask(reset.taskLocation, pollMs);
+          }
+          let sawTransition = false;
           while (deps.now().getTime() < deadline) {
-            await deps.sleep(a.poll_interval_seconds * 1000);
+            await deps.sleep(pollMs);
             const again = await api.readSystem();
             current = parseSystem(
               again.raw,
@@ -302,13 +314,20 @@ export const model = {
               "present",
               again.etag,
             );
-            if (current.power_state === desired) return current;
+            if (restart) {
+              if (current.power_state !== initial) sawTransition = true;
+              if (sawTransition && current.power_state === desired) {
+                return current;
+              }
+            } else if (current.power_state === desired) {
+              return current;
+            }
           }
           throw new RedfishError(
             "timeout",
             `System ${current.system_id} did not reach ${desired} within ${a.timeout_seconds}s`,
           );
-        });
+        }, deadline);
         const handle = await persist(context, state);
         return { dataHandles: [handle], result: summary(state) };
       },
@@ -317,7 +336,7 @@ export const model = {
     set_boot: {
       kind: "action" as const,
       description:
-        "Set the one-time or continuous boot override and read it back to confirm. Returns the observed state.",
+        "DESTRUCTIVE. Set the one-time or continuous boot override and read it back to confirm. A continuous override can reboot the host into an installer on every boot. Returns the observed state.",
       arguments: SetBootArgs,
       execute: async (args: z.input<typeof SetBootArgs>, context: Ctx) => {
         const a = SetBootArgs.parse(args);

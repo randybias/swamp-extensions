@@ -5,7 +5,8 @@
  * that origin, so a BMC cannot point the model at another host. Credentials
  * are sent only in an `X-Auth-Token` or `Authorization` header. A Redfish
  * session is opened through the SessionService and deleted in a `finally`, or
- * Basic auth is used explicitly.
+ * Basic auth is used explicitly. Every request carries an abort signal, so a
+ * stalled BMC cannot outlast the caller's deadline.
  *
  * @module
  */
@@ -15,9 +16,11 @@ import {
   classifyFetch,
   type Deps,
   drain,
+  MAX_BODY_BYTES,
   readBounded,
   RedfishError,
   statusError,
+  timeoutError,
   type TlsPolicy,
 } from "./http.ts";
 
@@ -40,6 +43,14 @@ export const RESET_TYPES = [
 ] as const;
 /** One Redfish `ResetType`. */
 export type ResetType = typeof RESET_TYPES[number];
+
+/** Actions that end powered on after an intervening reset. */
+export const RESTART_TYPES = [
+  "GracefulRestart",
+  "ForceRestart",
+  "PowerCycle",
+  "Nmi",
+] as const;
 
 /** Standard boot override targets this model exposes. */
 export const BOOT_TARGETS = [
@@ -64,6 +75,14 @@ export const BOOT_ENABLED = ["Once", "Continuous", "Disabled"] as const;
 /** One Redfish `BootSourceOverrideEnabled`. */
 export type BootEnabled = typeof BOOT_ENABLED[number];
 
+const RESET_TYPE_SET = new Set<string>(RESET_TYPES);
+const BOOT_TARGET_SET = new Set<string>(BOOT_TARGETS);
+
+/** Keep only values that are members of the local allowlist. */
+function knownOnly(values: string[] | undefined, known: Set<string>): string[] {
+  return (values ?? []).filter((v) => known.has(v));
+}
+
 function asRecord(v: unknown): Record<string, unknown> | undefined {
   return v && typeof v === "object" && !Array.isArray(v)
     ? v as Record<string, unknown>
@@ -73,17 +92,6 @@ function asRecord(v: unknown): Record<string, unknown> | undefined {
 function str(v: unknown): string | undefined {
   return typeof v === "string" && v !== "" ? v : undefined;
 }
-
-// The `@Redfish.*` annotation names are built from parts so no source line
-// looks like an email address to the leak scanner.
-const RESET_ALLOWABLE_KEY = ["ResetType", "@", "Redfish.AllowableValues"].join(
-  "",
-);
-const BOOT_ALLOWABLE_KEY = [
-  "BootSourceOverrideTarget",
-  "@",
-  "Redfish.AllowableValues",
-].join("");
 
 function strList(v: unknown): string[] | undefined {
   if (!Array.isArray(v)) return undefined;
@@ -149,6 +157,17 @@ export function resolveOdata(origin: string, id: string): string {
   return url.toString();
 }
 
+// The `@Redfish.*` annotation names are built from parts so no source line
+// looks like an email address to the leak scanner.
+const RESET_ALLOWABLE_KEY = ["ResetType", "@", "Redfish.AllowableValues"].join(
+  "",
+);
+const BOOT_ALLOWABLE_KEY = [
+  "BootSourceOverrideTarget",
+  "@",
+  "Redfish.AllowableValues",
+].join("");
+
 /** The `RESET` action target and its allowable values, when advertised. */
 export function resetAction(
   raw: Record<string, unknown>,
@@ -166,9 +185,7 @@ export function resetAction(
 export function allowableBootTargets(
   raw: Record<string, unknown>,
 ): string[] | undefined {
-  return strList(
-    asRecord(raw.Boot)?.[BOOT_ALLOWABLE_KEY],
-  );
+  return strList(asRecord(raw.Boot)?.[BOOT_ALLOWABLE_KEY]);
 }
 
 /** Stored state of one ComputerSystem; never holds a credential. */
@@ -205,6 +222,8 @@ export function parseSystem(
   const boot = asRecord(raw.Boot);
   const statusObj = asRecord(raw.Status);
   const id = str(raw.Id) ?? "";
+  const allowReset = knownOnly(resetAction(raw).allowable, RESET_TYPE_SET);
+  const allowBoot = knownOnly(allowableBootTargets(raw), BOOT_TARGET_SET);
   return {
     origin,
     system_id: id,
@@ -228,14 +247,8 @@ export function parseSystem(
     ...(str(boot?.BootSourceOverrideMode)
       ? { boot_mode: str(boot?.BootSourceOverrideMode) }
       : {}),
-    ...(() => {
-      const a = resetAction(raw).allowable;
-      return a ? { allowable_reset_types: a } : {};
-    })(),
-    ...(() => {
-      const a = allowableBootTargets(raw);
-      return a ? { allowable_boot_targets: a } : {};
-    })(),
+    ...(allowReset.length > 0 ? { allowable_reset_types: allowReset } : {}),
+    ...(allowBoot.length > 0 ? { allowable_boot_targets: allowBoot } : {}),
     ...(etag ? { etag } : {}),
     status,
     observed_at: observedAt,
@@ -243,6 +256,12 @@ export function parseSystem(
 }
 
 const OFF_ACTIONS = new Set(["ForceOff", "GracefulShutdown"]);
+const RESTART_ACTION_SET = new Set<string>(RESTART_TYPES);
+
+/** True when the action restarts the system (an intervening state is needed). */
+export function isRestartAction(action: string): boolean {
+  return RESTART_ACTION_SET.has(action);
+}
 
 /** The final power state a reset action should reach. */
 export function desiredPowerState(
@@ -295,6 +314,8 @@ export interface RedfishTarget {
   password: string;
   tls: TlsPolicy;
   authMode: "session" | "basic";
+  /** Permit Basic auth over an unverified TLS connection. */
+  allowInsecureBasic: boolean;
 }
 
 interface Auth {
@@ -306,6 +327,7 @@ interface RawResult {
   status: number;
   etag?: string;
   text: string;
+  location?: string;
 }
 
 function authHeader(
@@ -316,27 +338,50 @@ function authHeader(
 }
 
 /**
+ * Refuses Basic auth over an unverified TLS connection unless the caller
+ * explicitly allowed it. Basic sends the password on every request, so a
+ * spoofed BMC would learn it.
+ */
+function assertBasicAllowed(tls: TlsPolicy, allowInsecureBasic: boolean): void {
+  if (tls.mode === "strict" || allowInsecureBasic) return;
+  throw new RedfishError(
+    "invalid_input",
+    "Basic auth sends the password on every request and is not allowed over an unverified TLS connection; use tls_verify=strict or set allow_insecure_basic=true",
+  );
+}
+
+/** Per-request signal, clamped to a caller deadline when one is given. */
+function requestSignal(deps: Deps, deadline?: number): AbortSignal {
+  const ms = deadline === undefined ? deps.requestTimeoutMs : Math.max(
+    1,
+    Math.min(deps.requestTimeoutMs, deadline - deps.now().getTime()),
+  );
+  return AbortSignal.timeout(ms);
+}
+
+/**
  * Opens a Redfish session and returns its header plus a logout. If the BMC
- * does not implement SessionService (404/405), Basic auth is used instead.
+ * does not implement SessionService (404/405), Basic auth is used instead, but
+ * only when the TLS policy (or the explicit override) allows it.
  */
 async function openAuth(
   deps: Deps,
-  origin: string,
+  target: RedfishTarget,
   client: unknown,
-  username: string,
-  password: string,
-  mode: "session" | "basic",
+  deadline?: number,
 ): Promise<Auth> {
-  if (mode === "basic") {
+  if (target.authMode === "basic") {
+    assertBasicAllowed(target.tls, target.allowInsecureBasic);
     return {
-      headers: authHeader(username, password),
+      headers: authHeader(target.username, target.password),
       logout: () => Promise.resolve(),
     };
   }
+  const signal = requestSignal(deps, deadline);
   let resp: Response;
   try {
     resp = await deps.fetch(
-      resolveOdata(origin, "/redfish/v1/SessionService/Sessions"),
+      resolveOdata(target.endpoint, "/redfish/v1/SessionService/Sessions"),
       {
         method: "POST",
         redirect: "error",
@@ -344,7 +389,11 @@ async function openAuth(
           "Accept": "application/json",
           "Content-Type": "application/json",
         },
-        body: JSON.stringify({ UserName: username, Password: password }),
+        body: JSON.stringify({
+          UserName: target.username,
+          Password: target.password,
+        }),
+        signal,
         client,
       },
     );
@@ -353,8 +402,9 @@ async function openAuth(
   }
   if (resp.status === 404 || resp.status === 405) {
     await drain(resp);
+    assertBasicAllowed(target.tls, target.allowInsecureBasic);
     return {
-      headers: authHeader(username, password),
+      headers: authHeader(target.username, target.password),
       logout: () => Promise.resolve(),
     };
   }
@@ -363,8 +413,17 @@ async function openAuth(
     throw statusError(resp.status);
   }
   const token = resp.headers.get("x-auth-token");
-  const location = resp.headers.get("location");
-  await drain(resp);
+  const text = await readBounded(resp, MAX_BODY_BYTES, signal);
+  let location = resp.headers.get("location") ?? undefined;
+  if (!location) {
+    // Some BMCs return the session URI only in the body.
+    try {
+      const body = JSON.parse(text) as unknown;
+      location = str(asRecord(body)?.["@odata.id"]);
+    } catch {
+      location = undefined;
+    }
+  }
   if (!token) {
     throw new RedfishError(
       "redfish_failed",
@@ -372,15 +431,19 @@ async function openAuth(
     );
   }
   const headers = { "X-Auth-Token": token };
+  const sessionUrl = location
+    ? resolveOdata(target.endpoint, location)
+    : undefined;
   return {
     headers,
     logout: async () => {
-      if (!location) return;
+      if (!sessionUrl) return;
       try {
-        const r = await deps.fetch(resolveOdata(origin, location), {
+        const r = await deps.fetch(sessionUrl, {
           method: "DELETE",
           redirect: "error",
           headers,
+          signal: AbortSignal.timeout(deps.requestTimeoutMs),
           client,
         });
         await drain(r);
@@ -399,22 +462,56 @@ function parseJson(text: string): Record<string, unknown> {
   } catch {
     throw new RedfishError("redfish_failed", "BMC returned invalid JSON");
   }
-  return asRecord(parsed) ?? {};
+  const record = asRecord(parsed);
+  if (!record) {
+    throw new RedfishError(
+      "redfish_failed",
+      "BMC returned a non-object JSON body",
+    );
+  }
+  return record;
 }
+
+/** Refuses a ComputerSystem resource that has no usable Id. */
+function requireSystemId(raw: Record<string, unknown>): void {
+  const id = str(raw.Id);
+  if (!id || !isSystemId(id)) {
+    throw new RedfishError(
+      "redfish_failed",
+      "BMC returned a ComputerSystem without a valid Id",
+    );
+  }
+}
+
+const TERMINAL_TASK = new Set([
+  "Completed",
+  "Killed",
+  "Exception",
+  "Interrupted",
+  "Cancelled",
+]);
+const FAILED_TASK = new Set([
+  "Killed",
+  "Exception",
+  "Interrupted",
+  "Cancelled",
+]);
 
 /** Authenticated Redfish client bound to one origin and one system. */
 export class RedfishApi {
   #deps: Deps;
   #origin: string;
   #client: unknown;
+  #deadline?: number;
   #authHeaders: Record<string, string> = {};
   /** Path of the selected ComputerSystem. */
   systemPath = "";
 
-  constructor(deps: Deps, origin: string, client: unknown) {
+  constructor(deps: Deps, origin: string, client: unknown, deadline?: number) {
     this.#deps = deps;
     this.#origin = origin;
     this.#client = client;
+    this.#deadline = deadline;
   }
 
   setAuth(headers: Record<string, string>): void {
@@ -440,15 +537,21 @@ export class RedfishApi {
           ...extra,
         },
         body: body !== undefined ? JSON.stringify(body) : undefined,
+        signal: requestSignal(this.#deps, this.#deadline),
         client: this.#client,
       });
     } catch (e) {
       throw classifyFetch(e);
     }
-    const text = await readBounded(resp);
+    const text = await readBounded(
+      resp,
+      MAX_BODY_BYTES,
+      requestSignal(this.#deps, this.#deadline),
+    );
     return {
       status: resp.status,
       etag: resp.headers.get("etag") ?? undefined,
+      location: resp.headers.get("location") ?? undefined,
       text,
     };
   }
@@ -481,24 +584,60 @@ export class RedfishApi {
       path = str(first?.["@odata.id"]) ?? "/redfish/v1/Systems/1";
     }
     const result = await this.#getRaw(path);
+    requireSystemId(result.raw);
     this.systemPath = path;
     return result;
   }
 
   /** Re-reads the selected ComputerSystem, for polling and ETag. */
   async readSystem(): Promise<{ raw: Record<string, unknown>; etag?: string }> {
-    return await this.#getRaw(this.systemPath);
+    const result = await this.#getRaw(this.systemPath);
+    requireSystemId(result.raw);
+    return result;
   }
 
-  /** POSTs a reset action to the selected ComputerSystem. */
+  /**
+   * POSTs a reset action to the selected ComputerSystem. A 202 task monitor
+   * location, when returned, is handed back for the caller to follow.
+   */
   async resetSystem(
     raw: Record<string, unknown>,
     type: ResetType | string,
-  ): Promise<void> {
+  ): Promise<{ taskLocation?: string }> {
     const target = resetAction(raw).target ??
       `${this.systemPath}/Actions/ComputerSystem.Reset`;
     const r = await this.#send("POST", target, resetBody(type));
     if (r.status < 200 || r.status >= 300) throw statusError(r.status);
+    return r.location
+      ? { taskLocation: resolveOdata(this.#origin, r.location) }
+      : {};
+  }
+
+  /** Waits for a Redfish task to reach a terminal state. */
+  async awaitTask(
+    location: string,
+    pollMs: number,
+  ): Promise<void> {
+    for (;;) {
+      const r = await this.#getRaw(location);
+      const taskState = str(r.raw.TaskState);
+      if (taskState && TERMINAL_TASK.has(taskState)) {
+        if (FAILED_TASK.has(taskState)) {
+          throw new RedfishError(
+            "redfish_failed",
+            `Redfish task ended ${taskState}`,
+          );
+        }
+        return;
+      }
+      if (
+        this.#deadline !== undefined &&
+        this.#deps.now().getTime() >= this.#deadline
+      ) {
+        throw timeoutError();
+      }
+      await this.#deps.sleep(pollMs);
+    }
   }
 
   /** PATCHes the boot override, with If-Match when an ETag is known. */
@@ -538,26 +677,21 @@ export class RedfishApi {
 /**
  * Runs `fn` against the BMC with TLS applied and the Redfish session (or Basic
  * header) in place. The session is deleted and the TLS client closed in a
- * `finally`, on every path. `fn` selects the ComputerSystem itself, so `sync`
- * can record `not_found` instead of failing.
+ * `finally`, on every path, and every request is bounded by `deadline` (epoch
+ * ms) when given. `fn` selects the ComputerSystem itself, so `sync` can record
+ * `not_found` instead of failing.
  */
 export async function withRedfish<T>(
   deps: Deps,
   target: RedfishTarget,
   fn: (api: RedfishApi, origin: string) => Promise<T>,
+  deadline?: number,
 ): Promise<T> {
   const handle = deps.makeClient(target.tls);
   let auth: Auth | undefined;
   try {
-    const api = new RedfishApi(deps, target.endpoint, handle.client);
-    auth = await openAuth(
-      deps,
-      target.endpoint,
-      handle.client,
-      target.username,
-      target.password,
-      target.authMode,
-    );
+    const api = new RedfishApi(deps, target.endpoint, handle.client, deadline);
+    auth = await openAuth(deps, target, handle.client, deadline);
     api.setAuth(auth.headers);
     return await fn(api, target.endpoint);
   } finally {

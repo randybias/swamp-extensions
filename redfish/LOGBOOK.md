@@ -29,3 +29,24 @@ Not packaged. Notes for whoever maintains this extension.
   - unreachable, bad credential, self-signed cert with strict vs
     insecure_skip_verify: blocked
 - Unit tests use a fake fetch and DMTF-shaped fixtures; no socket is opened.
+- 2026-10-17 (lane/d2-redfish): review round 1 (HEAD 761b6df). Dispositions:
+  - HIGH: Basic auth (the password on every request) is refused over an
+    unverified TLS connection unless the new `allow_insecure_basic` input is
+    true; the SessionService 404/405 fallback obeys the same rule (strict-TLS
+    only by default). Tests cover both refusals.
+  - HIGH: every request now carries an abort deadline (`requestTimeoutMs`,
+    clamped to the `power` deadline) including the body read and the session
+    logout; a stalled BMC maps to a typed `timeout`, and the session DELETE
+    still runs on that path.
+  - MEDIUM: BMC `AllowableValues` are filtered to the local enums before being
+    listed in an error, so a vendor value cannot inject text.
+  - MEDIUM: restart actions follow a returned Redfish task monitor and require
+    an observed state change before accepting `On`; a restart with no observed
+    transition times out instead of succeeding on the first poll.
+  - MEDIUM: `ca_pem` is documented as an additional trusted CA, not an exclusive
+    pin (`caCerts` adds to the system roots).
+  - MEDIUM: a session response without a `Location` header falls back to the
+    body `@odata.id` (same-origin checked) for the logout DELETE.
+  - MEDIUM: `set_boot` is now prefixed `DESTRUCTIVE.`.
+  - MEDIUM: a `null`/non-object JSON body is refused, and a ComputerSystem
+    without a usable `Id` is refused before it can be persisted.

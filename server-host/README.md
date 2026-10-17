@@ -33,6 +33,11 @@ SSH session that armed it dies. The change is not permanent until `commit`
 cancels the timer; an operator who locks themselves out recovers without console
 access.
 
+The firewall owns one nftables table, `inet server_host`, and never flushes or
+reads other tables: the snapshot and the restore cover only that table, so rules
+added by other software (a Kubernetes distribution, Docker) survive both an
+apply and a revert.
+
 The host is the source of truth. The apply runs under the same lock as the
 restore and is refused once its revert has expired, fired or been superseded, so
 the two never interleave. A new change is refused while an earlier revert's

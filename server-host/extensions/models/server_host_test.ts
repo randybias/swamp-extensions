@@ -1143,3 +1143,97 @@ Deno.test("management_cidrs: halves of the address space need the SSH-from-anywh
     );
   }
 });
+
+Deno.test("apply_base: an account change with an empty key list still rewrites the managed keys", async () => {
+  const f = fakeTransport();
+  const m = modelWith(f);
+  const { context } = createModelTestContext({
+    globalArgs: {},
+    storedResources: {
+      [`state-${hostInstance(SSH.host)}`]: {
+        host: SSH.host,
+        base: {
+          packages: [],
+          admin_user: "oldops",
+          authorized_keys_sha256: await rulesetSha256(""),
+          sysctl_sha256: await rulesetSha256(renderSysctlConf({})),
+          timezone: "UTC",
+          applied_at: "2026-01-01T00:00:00.000Z",
+        },
+        observed_at: "2026-01-01T00:00:00.000Z",
+      },
+    },
+  });
+  const out = await m.methods.apply_base.execute(
+    m.methods.apply_base.arguments.parse({
+      ...SSH,
+      packages: [],
+      admin_user: "ops",
+      authorized_keys: [],
+      sysctl: {},
+      timezone: "UTC",
+    }),
+    context,
+  );
+  assertEquals(out.result.changed.includes("authorized_keys"), true);
+  const i = f.commands.findIndex((c) => c.includes("authorized_keys"));
+  assertEquals(i >= 0, true);
+});
+
+Deno.test("lockdown: a re-run with identical inputs after commit is a no-op, with other tables present", async () => {
+  const rendered = renderRuleset(FIREWALL);
+  const ruleset_sha256 = await rulesetSha256(rendered);
+  const managed_sha256 = await managedTableSha256(rendered);
+  // What `nft list ruleset` prints once other software has added its own
+  // tables around ours.
+  const live =
+    `table inet k0s {\n\tchain forward {\n\t}\n}\n${rendered}table ip nat {\n}\n`;
+  const f = fakeTransport((c) =>
+    c.includes("'nft' 'list' 'ruleset'")
+      ? { code: 0, stdout: live }
+      : { code: 0 }
+  );
+  const m = modelWith(f);
+  const { context, getWrittenResources } = createModelTestContext({
+    globalArgs: {},
+    storedResources: {
+      [`state-${hostInstance(SSH.host)}`]: {
+        host: SSH.host,
+        firewall: {
+          ruleset_sha256,
+          managed_sha256,
+          mode: "lockdown",
+          ssh_exposure: "management-only",
+          applied_at: "2026-01-01T00:00:00.000Z",
+        },
+        observed_at: "2026-01-01T00:00:00.000Z",
+      },
+      [`revert-${hostInstance(SSH.host)}`]: {
+        host: SSH.host,
+        token: TOKEN,
+        phase: "lockdown",
+        unit: `server-host-revert-${TOKEN}`,
+        expires_at: "2026-01-01T00:05:00.000Z",
+        armed_at: "2026-01-01T00:00:00.000Z",
+        ruleset_sha256,
+        managed_sha256,
+        committed_at: "2026-01-01T00:01:00.000Z",
+      },
+    },
+  });
+  const out = await m.methods.lockdown.execute(
+    m.methods.lockdown.arguments.parse(FIREWALL_ARGS),
+    context,
+  );
+  assertEquals(out.result.changed, false);
+  assertEquals(out.result.revert_token, null);
+  // Only read-only probes ran: nothing armed, staged or applied.
+  assertEquals(
+    f.commands.some((c) =>
+      c.includes("systemd-run") || c.includes("nft -f -") ||
+      c.includes("'nft' '-f'")
+    ),
+    false,
+  );
+  assertEquals(getWrittenResources().length, 0);
+});

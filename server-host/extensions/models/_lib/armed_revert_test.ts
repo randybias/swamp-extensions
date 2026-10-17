@@ -52,7 +52,9 @@ Deno.test("withSudo: prefixes only when asked", () => {
 
 Deno.test("revert script: locked, atomic, and abort-safe", () => {
   const script = renderRevertScript(TOKEN);
-  assertEquals(script.includes("echo 'flush ruleset'"), true);
+  assertEquals(script.includes("echo 'destroy table inet server_host'"), true);
+  // Only the managed table is ever restored: never the whole ruleset.
+  assertEquals(script.includes("flush ruleset"), false);
   assertEquals(script.includes("| nft -f -"), true);
   assertEquals(script.includes("nft flush ruleset\n"), false);
   assertEquals(
@@ -95,7 +97,7 @@ Deno.test("arm: under the host lock, snapshots, records the marker, then starts 
   const s = argv[4];
   assertEquals(s.indexOf("flock 9") > 0, true);
   const snap = s.indexOf(
-    `nft list ruleset > "/var/lib/server-host/revert-${TOKEN}.nft"`,
+    `nft list table inet server_host > "$snap"`,
   );
   const mark = s.indexOf(`'${TOKEN}'`, s.indexOf("printf"));
   const run = s.indexOf("systemd-run");

@@ -644,9 +644,10 @@ export function createModel(overrides: Partial<HostDeps> = {}) {
           }
           if (!prev) changed.push("journald", "time_sync");
           // A changed account must receive the managed keys even when the key
-          // material itself is unchanged, or the new account has none.
+          // material is unchanged, and an empty list too: the managed file is
+          // rewritten empty rather than leaving the new account with old keys.
           if (
-            changed.includes("admin_user") && keys.length > 0 &&
+            changed.includes("admin_user") &&
             !changed.includes("authorized_keys")
           ) {
             changed.push("authorized_keys");

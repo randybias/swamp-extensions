@@ -162,3 +162,20 @@ Deno.test("assertFirewallRules: a /0 needs the acknowledgement", () => {
     HostConfigError,
   );
 });
+
+Deno.test("the rendered script owns exactly one table and never flushes anything else", () => {
+  const text = renderRuleset({
+    managementCidrs: ["192.0.2.0/24"],
+    allowTcp: [443],
+    allowUdp: [],
+    defaultPolicy: "drop",
+    sshPort: 22,
+    allowSshFromAnywhere: false,
+  });
+  assertEquals(/flush/i.test(text), false);
+  assertEquals(text.includes("destroy table inet server_host"), true);
+  // Every `table` statement and every `destroy` names the managed table.
+  const tables = text.split("\n").filter((l) => /^(destroy )?table /.test(l));
+  assertEquals(tables.length, 2);
+  for (const l of tables) assertEquals(l.includes("inet server_host"), true, l);
+});

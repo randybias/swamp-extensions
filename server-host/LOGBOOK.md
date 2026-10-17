@@ -188,5 +188,24 @@ Round 5 (review of 99871aa):
 - MEDIUM commit fallback skipped the ruleset checks. Fixed: the arm step writes
   the managed-table hash into the host marker, and the fallback uses it, or
   refuses when it is absent.
-- MEDIUM marker read hid failures. Fixed: only an absent file reads as empty;
-  a read error, truncated output or an unparseable marker throws.
+- MEDIUM marker read hid failures. Fixed: only an absent file reads as empty; a
+  read error, truncated output or an unparseable marker throws.
+
+Round 6 (lead's requirements):
+
+- The revert restored with `flush ruleset` from a snapshot of the whole ruleset,
+  which would have wiped other software's tables (k0s, kube-proxy, CNI, Docker)
+  whenever a revert fired. Fixed: the arm step snapshots only `inet server_host`
+  (empty when it does not exist) and the restore is
+  `destroy table inet server_host` plus that snapshot in one `nft -f -`
+  transaction. The applied script already began with
+  `destroy table inet
+  server_host`. Tests run the scripts under `sh` with a
+  multi-table `nft` stub: foreign tables survive the snapshot, the apply and the
+  restore, including a table added after the apply; turning the restore back
+  into `flush ruleset` fails them.
+- `apply_base`: an `admin_user` change now rewrites `authorized_keys` even when
+  the key list is empty, so the new account cannot keep the old keys.
+- A lockdown re-run with identical inputs, after commit and with foreign tables
+  in the live ruleset, is a no-op (guarded by the stored hash and the live
+  managed-table hash; `changeFirewall` in `server_host.ts`).

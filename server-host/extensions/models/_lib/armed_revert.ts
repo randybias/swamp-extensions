@@ -11,6 +11,7 @@
  * @module
  */
 
+import { TABLE } from "./nftables.ts";
 import { HostConfigError } from "./validate.ts";
 
 /** Remote directory holding snapshots and revert scripts. */
@@ -69,7 +70,7 @@ const BUSY_FN = `busy() {
  * only while it is still the CURRENT revert and its snapshot exists: a
  * superseded or already-cancelled revert does nothing, so a late restore can
  * never overwrite newer rules. The restore is ONE `nft -f -` transaction
- * (`flush ruleset` plus the snapshot).
+ * (`destroy table` of the managed table plus its snapshot; no other table is read, flushed or restored).
  */
 export function renderRevertScript(token: string): string {
   const snap = snapshotPath(token);
@@ -87,7 +88,7 @@ if [ "$ctok" != '${token}' ] || [ ! -f "$snap" ]; then
   exit 0
 fi
 {
-  echo 'flush ruleset'
+  echo 'destroy table inet ${TABLE}'
   if [ -s "$snap" ]; then cat "$snap"; fi
 } | nft -f -
 rm -f "$snap" "${self}" "${CURRENT_PATH}"
@@ -141,7 +142,9 @@ if [ -f "$cur" ]; then
     rm -f "${STATE_DIR}/revert-$otok.nft" "${STATE_DIR}/revert-$otok.sh"
   fi
 fi
-nft list ruleset > "${snapshotPath(token)}"
+snap="${snapshotPath(token)}"
+: > "$snap"
+if nft list tables | grep -qx 'table inet ${TABLE}'; then nft list table inet ${TABLE} > "$snap"; fi
 printf '%s %s %s\n' '${token}' "$(( $(date +%s) + ${revertAfterS} ))" '${managedSha256}' > "$cur.tmp"
 mv -f "$cur.tmp" "$cur"
 if ! systemd-run --on-active=${revertAfterS}s --unit=${unit} --collect --description='server-host armed revert' --quiet '${

@@ -326,3 +326,7 @@ the triage checks, no Critical/High. `_lib/ssh.ts` is the canonical blob
   hash never reaches the host argv. Live finding: pushing the ~261 MB binary
   from the control host over SSH stdin through a lossy mesh took over an hour.
   The upgrade action must use the same path.
+
+- `k0s config validate` (v1.36.4) is lenient about unknown fields, so a render
+  is checked against the upstream ClusterConfig shape with goldens, not by that
+  command alone.

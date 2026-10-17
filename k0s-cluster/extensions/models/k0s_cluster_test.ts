@@ -2565,7 +2565,7 @@ Deno.test("kubeconfig builds the server URL from api_address and stores that kub
   assertEquals(v6.result.server, "https://[2001:db8::7]:6444");
 });
 
-const UP_FROM = "v1.31.2+k0s.0";
+const UP_FROM = "v1.31.2+k0s.2";
 const UP_TO = "v1.32.0+k0s.0";
 function upgradeState(overrides: Record<string, unknown> = {}) {
   return {
@@ -2589,6 +2589,7 @@ function upgradeRouter(
     argv: string[],
   ) => { code?: number; stdout?: string } | undefined = () => undefined,
 ) {
+  let promoted = false;
   return (argv: string[]) => {
     const override = overrides(argv);
     if (override) return override;
@@ -2599,11 +2600,25 @@ function upgradeRouter(
     if (argv[0] === "systemctl" && argv[1] === "is-active") {
       return { code: 0, stdout: "active\n" };
     }
-    if (argv[0] === K0S_BINARY_PATH && argv[1] === "kubectl") {
-      return { code: 0, stdout: "ok\n" };
+    if (argv[0] === "mv" && argv[1] === `${K0S_BINARY_PATH}.new`) {
+      promoted = true;
     }
     if (argv[0] === K0S_BINARY_PATH && argv[1] === "version") {
-      return { code: 0, stdout: `${UP_TO}\n` };
+      return { code: 0, stdout: `${promoted ? UP_TO : UP_FROM}\n` };
+    }
+    if (
+      argv[0] === K0S_BINARY_PATH && argv[1] === "kubectl" &&
+      argv[2] === "version"
+    ) {
+      return {
+        code: 0,
+        stdout: `{"serverVersion":{"gitVersion":"${
+          promoted ? UP_TO : UP_FROM
+        }"}}\n`,
+      };
+    }
+    if (argv[0] === K0S_BINARY_PATH && argv[1] === "kubectl") {
+      return { code: 0, stdout: "ok\n" };
     }
     return { code: 0, stdout: "", stderr: "" };
   };
@@ -2625,6 +2640,80 @@ function upgradeContext(overrides: Record<string, unknown> = {}) {
     },
   });
 }
+
+Deno.test("etcd_peer_address must be an IP and the join_token rules hold", () => {
+  const model = createModel(makeDeps().deps);
+  assertEquals(
+    model.methods.install.arguments.safeParse({
+      ssh: SSH,
+      k0s_version: VERSION,
+      k0s_binary_sha256: PAYLOAD_SHA,
+      ...CLUSTER,
+      etcd_peer_address: "not-an-ip",
+    }).success,
+    false,
+  );
+  assertEquals(
+    model.methods.install.arguments.safeParse({
+      ssh: SSH,
+      k0s_version: VERSION,
+      k0s_binary_sha256: PAYLOAD_SHA,
+      ...CLUSTER,
+      join_token: "",
+    }).success,
+    false,
+  );
+  assertEquals(
+    model.methods.install.arguments.safeParse({
+      ssh: SSH,
+      k0s_version: VERSION,
+      k0s_binary_sha256: PAYLOAD_SHA,
+      ...CLUSTER,
+      role: "single",
+      join_token: "PLACEHOLDER-JOIN-TOKEN",
+    }).success,
+    false,
+  );
+});
+
+Deno.test("install and render_config share a redacted config_sha256 for a keepalived VIP", async () => {
+  const secret = "abc12345";
+  const cplb = {
+    control_plane_load_balancing: {
+      virtual_ips: ["192.0.2.10/24"],
+      auth_pass: secret,
+    },
+  };
+  const rm = createModel(makeDeps().deps);
+  const rctx = createModelTestContext();
+  const rout = await rm.methods.render_config.execute(
+    rm.methods.render_config.arguments.parse({
+      k0s_version: VERSION,
+      ...CLUSTER,
+      manifests: [],
+      helm: [],
+      ...cplb,
+    }),
+    rctx.context,
+  );
+  const fake = makeDeps({
+    exec: installRouter,
+    fetch: () => Promise.resolve(PAYLOAD),
+  });
+  const im = createModel(fake.deps);
+  const ictx = createModelTestContext();
+  const iout = await im.methods.install.execute(
+    installArgs(cplb),
+    ictx.context,
+  );
+  assertEquals(iout.result.config_sha256, rout.result.config_sha256);
+  assertEquals(JSON.stringify(iout.result).includes(secret), false);
+  assertEquals(
+    JSON.stringify(ictx.getWrittenResources()).includes(secret),
+    false,
+  );
+  assertEquals(rout.result.k0s_yaml.includes(secret), false);
+});
 
 Deno.test("the exact install argv for each role and join", async () => {
   const cases: [Record<string, unknown>, string[]][] = [
@@ -2691,7 +2780,10 @@ Deno.test("upgrade to the same version is a no-op", async () => {
 });
 
 Deno.test("upgrade refuses a downgrade and a skipped minor", async () => {
-  const model = createModel(makeDeps().deps);
+  const model = createModel(
+    makeDeps({ exec: upgradeRouter(), fetch: () => Promise.resolve(PAYLOAD) })
+      .deps,
+  );
   const { context } = upgradeContext();
   await assertRejects(
     () =>
@@ -2731,11 +2823,126 @@ Deno.test("upgrade verifies the binary before stopping anything", async () => {
 });
 
 Deno.test("upgrade restores the previous binary when the start fails", async () => {
-  let started = false;
+  const fake = makeDeps({
+    exec: upgradeRouter((argv) =>
+      argv[0] === "systemctl" && argv[1] === "start" ? { code: 1 } : undefined
+    ),
+    fetch: () => Promise.resolve(PAYLOAD),
+  });
+  const model = createModel(fake.deps);
+  const { context } = upgradeContext();
+  await assertRejects(
+    () => model.methods.upgrade.execute(upgradeArgs(), context),
+    Error,
+    "restored",
+  );
+  const restoreAt = fake.execs.findIndex((a) =>
+    a[0] === "mv" && a[1] === `${K0S_BINARY_PATH}.old` &&
+    a[2] === K0S_BINARY_PATH
+  );
+  assertEquals(restoreAt > 0, true);
+  assertEquals(
+    fake.execs.slice(restoreAt).some((a) =>
+      a[0] === "systemctl" && a[1] === "restart"
+    ),
+    true,
+  );
+});
+
+Deno.test("upgrade rolls back on a readiness timeout and on a server-version mismatch", async () => {
+  const timeout = makeDeps({
+    exec: upgradeRouter((argv) =>
+      argv[0] === K0S_BINARY_PATH && argv[1] === "kubectl" && argv[2] === "get"
+        ? { code: 1 }
+        : undefined
+    ),
+    fetch: () => Promise.resolve(PAYLOAD),
+  });
+  const tm = createModel(timeout.deps);
+  const tctx = upgradeContext();
+  await assertRejects(
+    () =>
+      tm.methods.upgrade.execute(
+        upgradeArgs({ ready_timeout_s: 10 }),
+        tctx.context,
+      ),
+    Error,
+  );
+  assertEquals(
+    timeout.execs.some((a) =>
+      a[0] === "mv" && a[1] === `${K0S_BINARY_PATH}.old`
+    ),
+    true,
+  );
+
+  const badVersion = makeDeps({
+    exec: upgradeRouter((argv) =>
+      argv[0] === K0S_BINARY_PATH && argv[1] === "kubectl" &&
+        argv[2] === "version"
+        ? { code: 0, stdout: `{"serverVersion":{"gitVersion":"${UP_FROM}"}}\n` }
+        : undefined
+    ),
+    fetch: () => Promise.resolve(PAYLOAD),
+  });
+  const bm = createModel(badVersion.deps);
+  const bctx = upgradeContext();
+  await assertRejects(
+    () => bm.methods.upgrade.execute(upgradeArgs(), bctx.context),
+    Error,
+    "restored",
+  );
+});
+
+Deno.test("upgrade refuses patch, revision and minor-skew downgrades, and a stale or unknown host version", async () => {
+  const model = createModel(
+    makeDeps({ exec: upgradeRouter(), fetch: () => Promise.resolve(PAYLOAD) })
+      .deps,
+  );
+  const { context } = upgradeContext();
+  for (const target_ of ["v1.31.2+k0s.1", "v1.31.1+k0s.0"]) {
+    await assertRejects(
+      () =>
+        model.methods.upgrade.execute(
+          upgradeArgs({ k0s_version: target_ }),
+          context,
+        ),
+      Error,
+      "downgrade",
+    );
+  }
+  // 1.31 -> 1.33 skips a minor.
+  await assertRejects(
+    () =>
+      model.methods.upgrade.execute(
+        upgradeArgs({ k0s_version: "v1.33.0+k0s.0" }),
+        context,
+      ),
+    Error,
+    "skip",
+  );
+  // A host whose version cannot be read is refused.
+  const unknown = createModel(
+    makeDeps({
+      exec: upgradeRouter((argv) =>
+        argv[0] === K0S_BINARY_PATH && argv[1] === "version"
+          ? { code: 1 }
+          : undefined
+      ),
+    }).deps,
+  );
+  await assertRejects(
+    () =>
+      unknown.methods.upgrade.execute(upgradeArgs(), upgradeContext().context),
+    Error,
+    "could not read",
+  );
+});
+
+Deno.test("upgrade reports a failed rollback and keeps the backup", async () => {
   const fake = makeDeps({
     exec: upgradeRouter((argv) => {
-      if (argv[0] === "systemctl" && argv[1] === "start") {
-        started = true;
+      if (argv[0] === "systemctl" && argv[1] === "start") return { code: 1 };
+      if (argv[0] === "mv" && argv[1] === `${K0S_BINARY_PATH}.old`) {
         return { code: 1 };
       }
       return undefined;
@@ -2747,12 +2954,11 @@ Deno.test("upgrade restores the previous binary when the start fails", async () 
   await assertRejects(
     () => model.methods.upgrade.execute(upgradeArgs(), context),
     Error,
-    "restored",
+    "ROLLBACK FAILED",
   );
-  assertEquals(started, true);
   assertEquals(
-    fake.execs.some((a) => a[0] === "mv" && a[2] === K0S_BINARY_PATH),
-    true,
+    fake.execs.some((a) => a[0] === "rm" && a[2] === `${K0S_BINARY_PATH}.old`),
+    false,
   );
 });
 

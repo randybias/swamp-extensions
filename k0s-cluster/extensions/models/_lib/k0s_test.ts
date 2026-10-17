@@ -489,30 +489,33 @@ Deno.test("classifyControllerExecStart reads the argv[] field of the real system
   }
 });
 
-Deno.test("HA config inputs render only when set, leaving the base byte-identical", () => {
+Deno.test("HA config inputs render goldens and leave the base byte-identical", async () => {
   const base = renderK0sConfig(BASE);
   assertEquals(base.includes("externalAddress"), false);
   assertEquals(base.includes("nodeLocalLoadBalancing"), false);
   assertEquals(base.includes("controlPlaneLoadBalancing"), false);
-  const nllb = renderK0sConfig({ ...BASE, node_local_load_balancing: true });
   assertEquals(
-    nllb.includes("nodeLocalLoadBalancing:\n      enabled: true"),
-    true,
+    renderK0sConfig({ ...BASE, external_address: "192.0.2.10" }),
+    await golden("external-address.golden.txt"),
   );
-  const cplb = renderK0sConfig({
-    ...BASE,
-    control_plane_load_balancing: {
-      virtual_ips: ["192.0.2.10/24"],
-      auth_pass: "abc12345",
-    },
-  });
-  assertEquals(cplb.includes("controlPlaneLoadBalancing:"), true);
-  assertEquals(cplb.includes("authPass: abc12345"), true);
-  assertEquals(cplb.includes("vrrpInstances:"), true);
-  assertEquals(cplb.includes('- "192.0.2.10/24"'), true);
-  assertEquals(cplb.includes("virtualIP:"), false);
-  const ext = renderK0sConfig({ ...BASE, external_address: "192.0.2.10" });
-  assertEquals(ext.includes('externalAddress: "192.0.2.10"'), true);
+  assertEquals(
+    renderK0sConfig({ ...BASE, node_local_load_balancing: true }),
+    await golden("nllb.golden.txt"),
+  );
+  assertEquals(
+    renderK0sConfig({
+      ...BASE,
+      control_plane_load_balancing: {
+        virtual_ips: ["192.0.2.10/24"],
+        auth_pass: "abc12345",
+      },
+    }),
+    await golden("cplb.golden.txt"),
+  );
+  assertEquals(
+    renderK0sConfig({ ...BASE, etcd_peer_address: "192.0.2.11" }),
+    await golden("etcd-peer.golden.txt"),
+  );
 });
 
 Deno.test("installArgs: controller_worker enables a worker and honors no_taints", () => {
@@ -521,7 +524,7 @@ Deno.test("installArgs: controller_worker enables a worker and honors no_taints"
     "controller",
     "--enable-worker",
   ]);
-  assertEquals(installArgs("controller_worker", true), [
+  assertEquals(installArgs("controller_worker", { noTaints: true }), [
     "install",
     "controller",
     "--enable-worker",
@@ -534,7 +537,7 @@ Deno.test("installArgs: controller_worker enables a worker and honors no_taints"
     "--no-taints",
   ]);
   assertEquals(installArgs("controller"), ["install", "controller"]);
-  assertEquals(installArgs("controller_worker", false, true), [
+  assertEquals(installArgs("controller_worker", { force: true }), [
     "install",
     "controller",
     "--enable-worker",

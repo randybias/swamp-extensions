@@ -206,6 +206,45 @@ export function archFromUname(uname: string): K0sArch {
   }
 }
 
+/** A parsed k0s version: Kubernetes major/minor/patch plus the k0s revision. */
+export interface K0sVersion {
+  /** Kubernetes major. */
+  major: number;
+  /** Kubernetes minor. */
+  minor: number;
+  /** Kubernetes patch. */
+  patch: number;
+  /** The `k0s.N` revision, 0 when absent. */
+  revision: number;
+}
+
+/** Parses a k0s version, or null when it is not one. */
+export function tryK0sVersion(version: string): K0sVersion | null {
+  const m = /^v?(\d+)\.(\d+)\.(\d+)(?:\+k0s\.(\d+))?/.exec(version.trim());
+  if (!m) return null;
+  return {
+    major: Number(m[1]),
+    minor: Number(m[2]),
+    patch: Number(m[3]),
+    revision: m[4] ? Number(m[4]) : 0,
+  };
+}
+
+/**
+ * Compares two k0s versions by Kubernetes major/minor/patch and then the k0s
+ * revision, so a patch or revision downgrade is refused, not only a minor one.
+ * Negative when `a` is lower, 0 when equal, positive when higher.
+ */
+export function compareK0sVersion(a: string, b: string): number {
+  const x = tryK0sVersion(a);
+  const y = tryK0sVersion(b);
+  if (!x || !y) throw new Error(`cannot compare k0s versions ${a} and ${b}`);
+  for (const key of ["major", "minor", "patch", "revision"] as const) {
+    if (x[key] !== y[key]) return x[key] - y[key];
+  }
+  return 0;
+}
+
 /** The major.minor of a k0s/Kubernetes version, for skew checks. */
 export function k8sMinor(version: string): number {
   const m = /^v?(\d+)\.(\d+)/.exec(version);
@@ -245,25 +284,21 @@ export async function verifyBinary(
  */
 export function installArgs(
   role: K0sRole,
-  noTaints = false,
-  force = false,
-  join = false,
+  options: { noTaints?: boolean; force?: boolean; join?: boolean } = {},
 ): string[] {
-  const tokenFile = ["--token-file", K0S_WORKER_TOKEN_PATH];
-  const base = role === "single"
-    ? ["install", "controller", "--enable-worker", "--no-taints"]
-    : role === "controller_worker"
-    ? [
-      "install",
-      "controller",
-      "--enable-worker",
-      ...(noTaints ? ["--no-taints"] : []),
-      ...(join ? tokenFile : []),
-    ]
-    : role === "controller"
-    ? ["install", "controller", ...(join ? tokenFile : [])]
-    : ["install", "worker", ...tokenFile];
-  return force ? [...base, "--force"] : base;
+  const { noTaints = false, force = false, join = false } = options;
+  const args = ["install", role === "worker" ? "worker" : "controller"];
+  if (role === "single" || role === "controller_worker") {
+    args.push("--enable-worker");
+  }
+  if (role === "single" || (role === "controller_worker" && noTaints)) {
+    args.push("--no-taints");
+  }
+  if (role === "worker" || join) {
+    args.push("--token-file", K0S_WORKER_TOKEN_PATH);
+  }
+  if (force) args.push("--force");
+  return args;
 }
 
 /** How an installed k0scontroller unit was set up. */

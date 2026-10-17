@@ -99,14 +99,17 @@ swamp CLI echoes method arguments, sensitive ones included, in `--json` output
   `stdout_sha256`/`stderr_sha256` hashes, never the raw bytes. Set
   `return_output` to store the captured output in the sensitive-marked
   `execution` resource; the result then also names that resource, and a model
-  read resolves its vault reference.
+  read resolves its vault reference. Captured output is capped by
+  `max_output_bytes` (default 10 MiB); exceeding it is a typed error rather than
+  unbounded memory use.
 - `upload` writes a temporary file in the destination directory from stdin,
   applies `mode`, then renames it over the destination, so the destination is
   never half-written and an unwritable path or a destination that is a directory
-  is an error. It converges on bytes and mode: identical bytes and mode mean no
-  write, no rename and no new resource version, while the same bytes under a
-  different mode get a `chmod` only. It returns the path, byte count, SHA-256
-  and whether anything changed.
+  or a symlink is an error. It converges on bytes and mode: identical bytes and
+  mode mean no write, no rename and no new resource version, while a mode-only
+  difference is replaced through the same temp-file path (never a chmod that
+  could follow a symlink). It returns the path, byte count, SHA-256 and whether
+  anything changed.
 - Credentials never touch the command line. A private key is loaded into a
   short-lived `ssh-agent` over stdin; a password goes through a temporary
   askpass helper and an environment variable. Neither appears in a spawned argv.

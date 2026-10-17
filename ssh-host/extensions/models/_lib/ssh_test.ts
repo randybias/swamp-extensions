@@ -407,6 +407,18 @@ Deno.test("exec returns a non-zero remote exit as data, not an error", async () 
   });
 });
 
+Deno.test("exec enforces the output capture cap with a typed error", async () => {
+  const calls: Call[] = [];
+  const deps = fakeDeps(fakeRun(calls, {
+    ssh: () => ({ code: 0, stdout: "0123456789", stderr: "" }),
+  }));
+  await assertRejects(
+    () => exec(deps, { ...STRICT_TARGET, max_output_bytes: 4 }, ["true"]),
+    SshError,
+    "capture limit",
+  );
+});
+
 Deno.test("exec returns an unexplained 255 as data", async () => {
   const calls: Call[] = [];
   const deps = fakeDeps(fakeRun(calls, {
@@ -514,7 +526,7 @@ Deno.test("upload is idempotent: matching bytes and mode mean no write", async (
   assertEquals(sshCalls[0].stdin, undefined);
 });
 
-Deno.test("upload applies a mode change when only permissions differ", async () => {
+Deno.test("upload replaces through the temp path on a mode-only difference", async () => {
   const calls: Call[] = [];
   const content = "same bytes\n";
   const sha = await sha256Hex(content);
@@ -529,8 +541,26 @@ Deno.test("upload applies a mode change when only permissions differ", async () 
   assertEquals(result.changed, true);
   const sshCalls = calls.filter((c) => c.cmd === "ssh");
   assertEquals(sshCalls.length, 2);
-  assertEquals(sshCalls[1].args.at(-1), "chmod '0600' '/etc/x'");
-  assertEquals(sshCalls[1].stdin, undefined);
+  const remote = sshCalls[1].args.at(-1) ?? "";
+  assertStringIncludes(remote, "mktemp");
+  assertStringIncludes(remote, "chmod '0600'");
+  assertStringIncludes(remote, "mv -T");
+  // Never a chmod-in-place on the destination.
+  assertEquals(remote.includes("chmod '0600' '/etc/x'"), false);
+  assertEquals(sshCalls[1].stdin !== undefined, true);
+});
+
+Deno.test("upload refuses a symlink destination without following it", async () => {
+  const calls: Call[] = [];
+  const deps = fakeDeps(fakeRun(calls, {
+    ssh: () => ({ code: 0, stdout: "SYMLINK\n", stderr: "" }),
+  }));
+  await assertRejects(
+    () => upload(deps, STRICT_TARGET, { path: "/etc/x", content: "x" }),
+    SshError,
+    "symlink",
+  );
+  assertEquals(calls.filter((c) => c.cmd === "ssh").length, 1);
 });
 
 Deno.test("upload fails closed on a target without a no-target-directory rename", async () => {

@@ -138,6 +138,10 @@ const TargetShape = {
   connect_timeout_s: z.number().int().min(1).max(120).default(15).describe(
     "Connection timeout in seconds.",
   ),
+  max_output_bytes: z.number().int().min(1).max(104857600).default(10485760)
+    .describe(
+      "Cap in bytes on captured stdout and stderr; exceeding it is a typed error.",
+    ),
 };
 
 const ExecArgsSchema = z.strictObject({
@@ -250,6 +254,7 @@ interface TargetArgs {
   private_key?: string | null;
   password?: string | null;
   connect_timeout_s: number;
+  max_output_bytes?: number;
 }
 
 interface ExecArgs extends TargetArgs {
@@ -294,6 +299,7 @@ function toTarget(args: TargetArgs): SshTarget {
     private_key: args.private_key ?? undefined,
     password: args.password ?? undefined,
     connect_timeout_s: args.connect_timeout_s,
+    max_output_bytes: args.max_output_bytes ?? undefined,
   };
 }
 

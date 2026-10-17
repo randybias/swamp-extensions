@@ -233,6 +233,7 @@ Deno.test("argument schemas are strict and mark every secret sensitive", () => {
   });
   assertEquals(parsed.port, 22);
   assertEquals(parsed.connect_timeout_s, 15);
+  assertEquals(parsed.max_output_bytes, 10485760);
 });
 
 Deno.test("schemas reject injection in host, user, path and mode", () => {
@@ -349,6 +350,24 @@ Deno.test("exec passes shell metacharacters as literal argv words", async () => 
   assertEquals(
     ssh?.args.at(-1),
     "'sh' '-c' '; rm -rf /' '$(id)' '`id`' 'a\nb'",
+  );
+});
+
+Deno.test("exec surfaces the output capture cap as a typed error", async () => {
+  const calls: Call[] = [];
+  const deps = fakeDeps(fakeRun(calls, {
+    ssh: () => ({ code: 0, stdout: "0123456789", stderr: "" }),
+  }));
+  const m = createModel(deps);
+  const { context } = testContext();
+  await assertRejects(
+    () =>
+      m.methods.exec.execute(
+        { ...STRICT, argv: ["true"], max_output_bytes: 4 },
+        context,
+      ),
+    SshError,
+    "capture limit",
   );
 });
 

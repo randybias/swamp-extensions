@@ -149,3 +149,17 @@ for this round.
 - LOW (wait schema carried credentials): `wait_connection` now takes a scan-only
   target shape with no `private_key` or `password`; a test asserts they are
   absent.
+
+## Review ledger: round 6 (codex astra + terra on 1b78c7d)
+
+- HIGH-1 (mode-only chmod followed symlinks): the chmod-in-place branch is gone.
+  The probe tests `-L` first and refuses a symlink, and a mode-only difference
+  now goes through the temp-file `mv -T` replacement path. The write script also
+  refuses a symlink or directory immediately before and after the rename. Tests
+  cover the symlink refusal and that a mode-only change never runs `chmod` on
+  the destination path.
+- HIGH-2 (unbounded capture): every method takes `max_output_bytes` (default 10
+  MiB, max 100 MiB). `denoRunner` streams each stream and throws a typed
+  `SshError` at the cap (killing the child); `runRemote` re-checks the returned
+  strings with a non-allocating UTF-8 length so an injected runner is bounded
+  too. Tests cover the typed overflow error.

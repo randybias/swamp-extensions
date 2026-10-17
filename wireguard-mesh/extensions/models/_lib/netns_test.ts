@@ -268,3 +268,121 @@ Deno.test({
     }
   },
 });
+
+Deno.test({
+  name:
+    "netns: a retry after a failed confirmation retires the old rollback; extra addresses are drift; delete retries too",
+  ignore: !enabled,
+  sanitizeOps: false,
+  sanitizeResources: false,
+  fn: async () => {
+    const dir = await Deno.makeTempDir({ prefix: "wgmesh-netns3-" });
+    const applyFile = `${dir}/apply.sh`;
+    const deleteFile = `${dir}/delete.sh`;
+    const confirmFile = `${dir}/confirm.sh`;
+    const rollbackFile = `${dir}/run-rollback.sh`;
+    await Deno.writeTextFile(applyFile, applyScript(IFACE));
+    await Deno.writeTextFile(deleteFile, deleteScript(IFACE, 60));
+    const key = (await sh(["wg", "genkey"])).stdout.trim();
+    const hub = "H".repeat(42) + "A=";
+    const stdin = (addr: string) =>
+      `${key}\n[Interface]\nAddress = ${addr}\nListenPort = 51996\n` +
+      `PostUp = wg set '%i' private-key '/etc/wireguard/%i.key'\n` +
+      `[Peer]\nPublicKey = ${hub}\nAllowedIPs = 198.51.100.0/24\n`;
+    const cleanupSystem = async () => {
+      await sudo(["ip", "netns", "del", NS]);
+      await sudo([
+        "sh",
+        "-c",
+        `rm -rf /etc/wireguard/${IFACE}.* /etc/wireguard/.${IFACE}.*`,
+      ]);
+    };
+    const confirm = async (rb: string) => {
+      await Deno.writeTextFile(confirmFile, confirmScript(IFACE, rb));
+      return await inNs(["sh", confirmFile]);
+    };
+    /** Rollback directories of this interface that are still armed. */
+    const armed = async () =>
+      (await sudo([
+        "sh",
+        "-c",
+        `for p in /etc/wireguard/.${IFACE}.rollback.*; do [ -d "$p" ] && [ ! -e "$p/disarm" ] && echo "$p"; done; true`,
+      ])).stdout.trim().split("\n").filter((l) => l !== "");
+    const runRollback = async (rb: string) => {
+      await Deno.writeTextFile(
+        rollbackFile,
+        `epoch=$(cat ${rb}/epoch); sh ${rb}/rollback.sh 0 ${rb} /etc/wireguard ${IFACE} 1 "$epoch"`,
+      );
+      return await inNs(["sh", rollbackFile]);
+    };
+    await cleanupSystem();
+    await sudo(["ip", "netns", "add", NS]);
+    try {
+      // Apply, then lose the confirmation (never run it).
+      let r = await inNs(["sh", applyFile], stdin("192.0.2.1/24"));
+      assertEquals(r.code, 0, r.stderr);
+      const rb1 = parseRollbackDir(r.stdout, IFACE);
+      assertExists(rb1);
+      // The retry must not call this converged: it retires rb1 and hands
+      // back a rollback of its own to confirm.
+      r = await inNs(["sh", applyFile], stdin("192.0.2.1/24"));
+      assertEquals(r.code, 0, r.stderr);
+      assertStringIncludes(r.stdout, "changed=1");
+      const rb2 = parseRollbackDir(r.stdout, IFACE);
+      assertExists(rb2);
+      assertEquals(rb1 === rb2, false);
+      assertEquals((await confirm(rb1)).code, 4); // superseded
+      assertEquals((await confirm(rb2)).code, 0);
+      // The retired rollback, if it fires, restores nothing.
+      assertEquals((await runRollback(rb1)).code, 0);
+      assertStringIncludes(
+        (await inNs(["ip", "-4", "addr", "show", IFACE])).stdout,
+        "192.0.2.1/24",
+      );
+      // Everything is disarmed once confirmed.
+      assertEquals(
+        (await armed()).filter((p) => p !== rb1 && p !== rb2),
+        [],
+      );
+
+      // An address added behind our back is drift, not a converged node.
+      await inNs(["ip", "addr", "add", "192.0.2.77/24", "dev", IFACE]);
+      r = await inNs(["sh", applyFile], stdin("192.0.2.1/24"));
+      assertEquals(r.code, 0, r.stderr);
+      assertStringIncludes(r.stdout, "changed=1");
+      const rb3 = parseRollbackDir(r.stdout, IFACE);
+      assertExists(rb3);
+      assertEquals((await confirm(rb3)).code, 0);
+      assertEquals(
+        (await inNs(["ip", "-4", "addr", "show", IFACE])).stdout.includes(
+          "192.0.2.77",
+        ),
+        false,
+      );
+
+      // Delete whose confirmation is lost: the retry is not a no-op either.
+      r = await inNs(["sh", deleteFile]);
+      assertEquals(r.code, 0, r.stderr);
+      const rb4 = parseRollbackDir(r.stdout, IFACE);
+      assertExists(rb4);
+      r = await inNs(["sh", deleteFile]);
+      assertEquals(r.code, 0, r.stderr);
+      assertStringIncludes(r.stdout, "changed=1");
+      const rb5 = parseRollbackDir(r.stdout, IFACE);
+      assertExists(rb5);
+      assertEquals((await confirm(rb5)).code, 0);
+      // The first delete's rollback would have restored the config; it is retired.
+      assertEquals((await runRollback(rb4)).code, 0);
+      assertEquals(
+        (await inNs(["ip", "link", "show", IFACE])).code !== 0,
+        true,
+      );
+      // Now fully confirmed and gone: a further delete is a clean no-op.
+      r = await inNs(["sh", deleteFile]);
+      assertStringIncludes(r.stdout, "changed=0");
+    } finally {
+      await cleanupSystem();
+      await Deno.remove(dir, { recursive: true }).catch(() => {});
+    }
+  },
+});

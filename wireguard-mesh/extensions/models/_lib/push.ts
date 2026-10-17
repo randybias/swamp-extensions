@@ -316,10 +316,31 @@ function bumpEpochLines(): string[] {
 /** Takes an advisory remote lock around a change, when `flock` is present. */
 function lockLines(): string[] {
   return [
-    "if command -v flock >/dev/null 2>&1; then",
-    '  exec 9>"$d/.$i.lock"',
-    '  if ! flock -w 60 9; then echo "another run holds the $i lock" >&2; exit 75; fi',
-    "fi",
+    // Every change is confirmed under the lock, so a node without flock is
+    // refused before anything is touched.
+    'if ! command -v flock >/dev/null 2>&1; then echo "flock is required" >&2; exit 75; fi',
+    'exec 9>"$d/.$i.lock"',
+    'if ! flock -w 60 9; then echo "another run holds the $i lock" >&2; exit 75; fi',
+  ];
+}
+
+/**
+ * Shell function `pending_rb`: succeeds when an earlier change on `$i` is
+ * still waiting for its confirmation (a rollback directory of the current
+ * generation that has not been disarmed). A run that finds one must not report
+ * a no-op: it starts a new generation, which retires the old rollback, and goes
+ * through confirmation itself.
+ */
+function pendingRbLines(): string[] {
+  return [
+    "pending_rb() {",
+    '  cur=$(cat "$d/.$i.epoch" 2>/dev/null || echo none)',
+    '  for p in "$d"/.$i.rollback.*; do',
+    '    [ -d "$p" ] && [ -e "$p/epoch" ] && [ ! -e "$p/disarm" ] || continue',
+    '    if [ "$(cat "$p/epoch")" = "$cur" ]; then return 0; fi',
+    "  done",
+    "  return 1",
+    "}",
   ];
 }
 
@@ -400,6 +421,7 @@ export function applyScript(iface: string): string {
     // Arms a detached rollback. `$1` = 1 starts a new generation, which retires
     // any earlier unconfirmed rollback; 0 reuses the current one.
     "arm_rollback() {",
+    '  [ -e "$d/.$i.epoch" ] || echo 0 > "$d/.$i.epoch"',
     '  epoch=$(cat "$d/.$i.epoch" 2>/dev/null || echo 0)',
     '  if [ "$1" = 1 ]; then epoch=$((epoch + 1)); echo "$epoch" > "$d/.$i.epoch"; fi',
     ...backupLines(),
@@ -409,16 +431,23 @@ export function applyScript(iface: string): string {
     "live_sig() {",
     '  wg show "$i" dump 2>/dev/null | { IFS= read -r first || true; printf "%s\\n" "$first" | cut -f2,3,4; cut -f1,3,4,8 | sort; }',
     "}",
+    ...pendingRbLines(),
     "changed=0",
+    "if pending_rb; then changed=1; fi",
     'if ! cmp -s "$cfg" "$d/$i.conf"; then changed=1; fi',
     'if ! cmp -s "$kf" "$d/$i.key"; then changed=1; fi',
     'if [ "$up" = 0 ]; then changed=1; fi',
     "live_drift=0",
     'if [ "$up" = 1 ] && [ "$changed" = 0 ]; then',
     "  addr_ok=1",
+    "  want=0",
     "  for a in $(sed -n 's/^Address *= *//p' \"$cfg\" | tr ',' ' '); do",
+    "    want=$((want + 1))",
     '    if ! ip -o addr show dev "$i" 2>/dev/null | grep -qF " $a "; then addr_ok=0; fi',
     "  done",
+    // An address nobody asked for is drift too (link-local ones are ignored).
+    '  have=$(ip -o addr show dev "$i" scope global 2>/dev/null | wc -l)',
+    '  if [ "$have" -ne "$want" ]; then addr_ok=0; fi',
     '  if [ "$addr_ok" = 0 ]; then',
     "    live_drift=1",
     "  else",
@@ -485,7 +514,9 @@ export function deleteScript(iface: string, rollbackSeconds: number): string {
     `i='${iface}'`,
     'mkdir -p "$d"',
     ...lockLines(),
+    ...pendingRbLines(),
     "changed=0",
+    "if pending_rb; then changed=1; fi",
     'if ip link show "$i" >/dev/null 2>&1; then changed=1; fi',
     'if [ -e "$d/$i.conf" ]; then changed=1; fi',
     'if [ -e "$d/$i.key" ]; then changed=1; fi',
@@ -495,7 +526,8 @@ export function deleteScript(iface: string, rollbackSeconds: number): string {
     ...bumpEpochLines(),
     ...backupLines(),
     ...launchRollbackLines(rollbackSeconds),
-    'if ip link show "$i" >/dev/null 2>&1; then wg-quick down "$i"; fi',
+    // wg-quick cannot take down an interface whose config is missing or corrupt.
+    'if ip link show "$i" >/dev/null 2>&1; then wg-quick down "$i" >/dev/null 2>&1 || ip link delete "$i" || true; fi',
     'rm -f "$d/$i.conf" "$d/$i.key"',
     'if ip link show "$i" >/dev/null 2>&1; then echo "interface $i is still up" >&2; exit 1; fi',
     'if [ -e "$d/$i.conf" ]; then echo "config $i.conf still present" >&2; exit 1; fi',

@@ -34,7 +34,7 @@ export const KeySchema = z.string().length(44).regex(
   /^[A-Za-z0-9+/]{42}[AEIMQUYcgkosw048]=$/,
   "must be a 44-character base64 WireGuard key",
 );
-const CidrSchema = z.string().refine((s) => parseCidr(s) !== null, {
+const CidrSchema = z.string().max(64).refine((s) => parseCidr(s) !== null, {
   message: "must be a CIDR such as 192.0.2.0/24",
 });
 const NameSchema = z.string().regex(NAME_RE, "invalid name");

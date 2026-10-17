@@ -52,9 +52,10 @@ const SshSchema = z.strictObject({
   host_keys: z.array(HostKeySchema).max(64).default([]).describe(
     "Pinned host keys; required for strict.",
   ),
-  private_key: z.string().meta({ sensitive: true }).optional().describe(
-    "SSH private key, loaded into a temporary ssh-agent over stdin. Pass a vault reference.",
-  ),
+  private_key: z.string().max(16384).meta({ sensitive: true }).optional()
+    .describe(
+      "SSH private key, loaded into a temporary ssh-agent over stdin. Pass a vault reference.",
+    ),
 });
 
 const IfaceSchema = z.string().regex(IFACE_RE).default("wg0");
@@ -399,7 +400,7 @@ export function createModel(deps: Partial<Deps> = {}) {
       apply: {
         kind: "action" as const,
         description:
-          "DESTRUCTIVE. Render the node's config and push it over SSH, recreating the interface when its address changes. Restores both files on any failure and is idempotent: a proven-converged node changes nothing. Never capture --json output of a run with a literal private key.",
+          "DESTRUCTIVE. Render the node's config and push it over SSH, recreating the interface when its address or routes change and restoring both files on any failure; idempotent for a proven-converged node, but an unconfirmed earlier change is never a no-op. Never capture --json output of a run with a literal private key.",
         arguments: ApplyArgs,
         execute: async (args: z.input<typeof ApplyArgs>, context: Ctx) => {
           const { private_key, ssh, ...mesh } = ApplyArgs.parse(args);

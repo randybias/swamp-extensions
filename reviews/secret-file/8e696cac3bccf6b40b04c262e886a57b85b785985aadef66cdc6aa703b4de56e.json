@@ -1,0 +1,89 @@
+{
+  "extension": "@randybias/secret-file",
+  "version": "2026.10.17.2",
+  "reviewedAt": "2026-10-17T19:45:00Z",
+  "dimensions": [
+    {
+      "id": "credentials-secrets",
+      "verdict": "pass",
+      "note": "The value (content, content_base64 or dotenv entries) reaches the target only over the canonical _lib/ssh.ts stdin upload; private_key goes to a short-lived ssh-agent over stdin and password through an askpass helper, never argv. Every content field, entries values, private_key, password and hmac_key are sensitive-marked. State, logs and method results hold path, mode, owner, group, byte count and flags, plus a keyed HMAC only when hmac_key is supplied; never the value or a plain hash. Live: ps -efww sampled every 50 ms on the control host and the target during writes found 0 hits for values, substrings or their SHA-256 (positive control hit). Known external issue swamp-club lab 3555: README examples use vault references only and never --json. 2026.10.17.2: the value no longer goes through the transport upload temp file; write streams it on exec stdin straight into one remote sh -c script (mktemp beside the destination, cat, length check, chmod, chown -h, no-follow re-check, mv -T). The only value-derived figure in the script text is its byte count, never a content hash (rule 4h); the destination SHA-256 is compared locally. Live on ec4cbd5: ps -efww every 50 ms on control and target across six writes, 22 patterns including substrings and sha256: 0 hits, no 64-hex string on the target, and no .ssh-host-upload* file ever appeared."
+    },
+    {
+      "id": "logging-quality",
+      "verdict": "pass",
+      "note": "Each method logs once with structured placeholders (path, changed, matches, removed); no value, hash, argv or output in log fields."
+    },
+    {
+      "id": "error-handling",
+      "verdict": "pass",
+      "note": "Every OpenSSH exit 255 maps to a typed SshError (host key, auth, unreachable), live-verified for a wrong pin and an unreachable host with nothing written. A stat failure on an existing file is an error, not not_found; a failed chown or rename removes the stage and writes no state. A symlink or directory destination is refused with a typed SshError before staging and again before the rename (live cell 8 failed on 770114a and passes on 34dd922). 2026.10.17.2: the remote script is POSIX sh (set -eu; the round-1 Critical, set -o pipefail rejected by dash so every changed write failed, is fixed and tested under a real dash). A short stdin (ssh drop or the 120 s local timeout) now fails the staged byte-count check before the rename; HUP/INT/TERM exit 1 and the EXIT trap removes the temp. Live: a kill -9 of the local ssh mid-stream gave exit 137 as a typed failure, the stage was removed and the old file kept (three runs)."
+    },
+    {
+      "id": "testing-completeness",
+      "verdict": "pass",
+      "note": "56 unit tests (18 model, 38 vendored transport) with an injected runner and a plain-object method context, no process or socket. Live end-to-end: 12/13 on 770114a (cell 8 symlink destination failed), 5/5 on 34dd922 (cells 1, 2, 8, 9, 13). Residual LOW (astra): no test drives the second, pre-rename check with a destination that changes during staging. LOW (astra): the symlink test's fake runner returns the same result on both branches of its condition (dead code). 2026.10.17.2: the canonical transport tests (ssh_test.ts) are vendored; a new test runs the generated write script under a real dash (else sh) for the normal, short-read, symlink and directory cases. Live end-to-end on ec4cbd5: 8/8 (normal write, idempotent re-write, symlink and directory refusal, atomic publish over 2730 samples with 0 missing or partial, killed write, argv and temp scan, remove)."
+    },
+    {
+      "id": "idempotency-resilience",
+      "verdict": "pass",
+      "note": "write compares the remote SHA-256, mode and owner/group (names and numeric ids) with the local value and skips the write when all match (live: inode and mtime unchanged); a change stages beside the destination, chowns the stage with chown -h, then mv -T. remove is a clean no-op when absent and removes a dangling symlink. Residual MEDIUM (astra, terra; downgraded under the run rulings): the destination checks and mv -T are separate remote calls, so a symlink planted between them in an attacker-writable parent is replaced (rename does not follow it, so no write-through); a symlinked parent directory is not detected, with the same writable-parent precondition. 2026.10.17.2: the pre-rename symlink/directory re-check now runs inside the same remote script as mv -T, narrowing the check-then-rename window to one shell. Live: an idempotent re-write left inode and mtime unchanged."
+    },
+    {
+      "id": "api-contracts",
+      "verdict": "pass",
+      "note": "Built on the OpenSSH client, ssh-agent/ssh-add with -F /dev/null and IdentityFile=none. write requires GNU mv -T, stat -c and sha256sum on the target and fails closed elsewhere. Dotenv values are single-quoted with ' escaped for POSIX-shell sourcing (live: sh and bash source a hostile value exactly)."
+    },
+    {
+      "id": "resource-management",
+      "verdict": "pass",
+      "note": "Temporary known_hosts, askpass helper and ssh-agent are removed or killed in finally (vendored transport tests). The stage file is removed on any failure (live: no *.secret-stage-* left). Remote output is capped by the transport. 2026.10.17.2: no transport-level temp file; the script's own temp is removed by its EXIT trap on any failure (live: 0 stage files left after all cells). Residual LOW: after a local timeout the remote script runs until its stdin closes, then fails the length check and keeps the old file."
+    },
+    {
+      "id": "published-surface-hygiene",
+      "verdict": "pass",
+      "note": "Manifest: @randybias/secret-file 2026.10.17.1 (model version literal matches), two-sentence description, Apache-2.0, additionalFiles README.md and LICENSE.txt. write and remove descriptions start DESTRUCTIVE, verify READ-ONLY. Fixtures use RFC 5737 addresses and synthetic keys; leak scan, gitleaks and fixture guard pass. Merge prep: plain model export so the registry catalogs the type, and the state schema constant renamed so the sensitive-field heuristic no longer matches a non-secret line. 2026.10.17.2: manifest and model version literals 2026.10.17.2; the upgrades entry is one UPGRADES const referenced by createModel and the plain exported model (dry run free of the version-bump warning). Residual LOW: deno.json grants --allow-run=sh,dash to the whole test task. Naming: visibility public, audience general; a rename to ssh-secret-file is proposed and pending Randy."
+    },
+    {
+      "id": "schema-strictness",
+      "verdict": "pass",
+      "note": "Global arguments are an empty strictObject; every method argument object is strict. host, user, port, path (absolute, no . or .. components, no trailing slash), mode and owner/group carry grammars. host_key_policy is required and accepts only strict; host_keys is required (1-64). Content is bounded (1 MiB literal, entries 256 keys and 1 MiB rendered). Residual LOW (astra, terra): the rendered-entries cap counts UTF-16 code units, so multibyte values can render to more than 1 MiB of UTF-8."
+    },
+    {
+      "id": "lifetime-gc",
+      "verdict": "pass",
+      "note": "secretFile resource: lifetime infinite, garbageCollection 10."
+    },
+    {
+      "id": "crud-completeness",
+      "verdict": "pass",
+      "note": "write (create/update), verify (read) and remove (delete, an action) cover the file's lifecycle on one host."
+    },
+    {
+      "id": "preflight-checks",
+      "verdict": "pass",
+      "note": "Path grammar, content-form exclusivity, entries keys and caps, and host-key policy are validated before any spawn; the destination is checked with test -L and test -d before staging."
+    },
+    {
+      "id": "instance-names",
+      "verdict": "pass",
+      "note": "secret-<32 hex>: SHA-256 over host, port, user and path, truncated to 128 bits, so two files on one host or one path on two hosts get distinct records."
+    },
+    {
+      "id": "data-access",
+      "verdict": "pass",
+      "note": "Methods read only this model's own records; every target and value arrives as method arguments, so one generic definition serves any host and path."
+    },
+    {
+      "id": "version-upgrades",
+      "verdict": "pass",
+      "note": "First release. The vendored _lib/ssh.ts is the canonical blob fe0139f08c42e3fdae0061b9688fb5c534174957 (ssh-host 2026.10.17.2). 2026.10.17.2 is a point release with no schema, argument, resource or instance-name change; an identity upgrade entry is declared. The vendored _lib/ssh.ts is now the canonical blob 8f132c4329c9e64bed686731cd5a0e02980194ea (ssh-host 2026.10.17.3)."
+    }
+  ],
+  "panel": {
+    "codex-astra": "codex gpt-6-astra conformance seat over b34692d: 2 High (set -o pipefail fails under dash; a timeout kills only the local ssh so a short stdin could publish a truncated file), 1 Low (LOGBOOK said mktemp makes a 0700 file). All fixed in ec4cbd5.",
+    "codex-terra": "codex gpt-5.6-terra adversarial seat over b34692d: 1 High (dash rejects pipefail, every changed write fails), triaged Critical and reproduced in ubuntu:24.04; fixed in ec4cbd5 with a real-dash test.",
+    "tightness-astra": "COULD-BE-TIGHTER, about 9 removable lines: shorten the stageWriteScript JSDoc and drop the write-site comment (done in ec4cbd5); inlining the single-use f local remains a LOW.",
+    "adversarial-glm": "Advisory GLM seat: the short-stdin High (same as astra, fixed); MEDIUM relative path refuted (schema requires an absolute path); duplicated upgrades literal (fixed, one UPGRADES const); --allow-run on the whole test task (LOW, open); ssh.ts-only findings dropped as the canonical blob.",
+    "merge-prep": "Merged ec4cbd5 as 72ad39d; diff scope secret-file/ plus its release.yaml stanza; _lib/ssh.ts blob 8f132c43 verified canonical. Self-review of b34692d..ec4cbd5 against TRIAGE 4b-4h: no context-shape change (4b), no parser differential (4c), no workflow (4d), hashes compared locally (4e, 4h), the remote script survives a client kill and fails closed (4f), strict pins only (4g). No code change at merge prep; the published bytes are the live-tested ec4cbd5 code."
+  }
+}

@@ -22,7 +22,7 @@ every later connection is pinned to them; if a host is rebuilt, supply
 | `render_config`   | Render the deterministic `k0s.yaml` for the given inputs (read-only)              |
 | `install`         | Verify, upload and install the pinned binary and role, then start the service     |
 | `wait_ready`      | Poll until a node is Ready and kube-system pods are running                       |
-| `kubeconfig`      | Fetch the admin kubeconfig and store it as a sensitive value                      |
+| `kubeconfig`      | Fetch the admin kubeconfig into a sensitive value or a vault key you name         |
 | `apply_manifests` | Place a named manifest stack under the k0s manifest directory; remove stale files |
 | `apply_helm`      | Reconcile the declared Helm extensions in `k0s.yaml`                              |
 | `get`             | Read the k0s version, node status, stacks and Helm releases (read-only)           |
@@ -90,7 +90,9 @@ Do not add `--json` to a run that carries the SSH key or the kubeconfig: the CLI
 echoes method arguments, including sensitive ones, in that output
 ([swamp-club lab 3555](https://swamp-club.com/lab/3555)). The kubeconfig is
 written to the configured vault, not to stdout; read it from the vault, and
-never from a captured `--json`.
+never from a captured `--json`. To choose the vault and key yourself, pass
+`store_in_vault` (`vault` and `key`); the kubeconfig is then written only there,
+and a later step reads it with a `vault.get(...)` reference.
 
 A strict host-key policy pins the expected keys and requires them:
 

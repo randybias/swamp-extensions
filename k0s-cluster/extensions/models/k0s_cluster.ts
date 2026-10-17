@@ -232,7 +232,19 @@ const WaitReadyArgs = z.strictObject({
   ),
 });
 
-const KubeconfigArgs = z.strictObject({ ssh: SSH });
+const KubeconfigArgs = z.strictObject({
+  ssh: SSH,
+  store_in_vault: z.strictObject({
+    vault: z.string().regex(/^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/).describe(
+      "Name of an existing swamp vault.",
+    ),
+    key: z.string().regex(/^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$/).describe(
+      "Secret key to write the kubeconfig to.",
+    ),
+  }).nullish().describe(
+    "Write the kubeconfig to this vault key instead of keeping it in the stored record, so a later step can read it with a vault.get(...) reference and the value never passes through workflow data.",
+  ),
+});
 
 const ApplyManifestsArgs = z.strictObject({ ssh: SSH, stack: MANIFEST_STACK });
 
@@ -288,7 +300,9 @@ const KubeconfigSchema = z.strictObject({
   user: z.string(),
   server: z.string().nullable(),
   sha256: z.string(),
-  kubeconfig: z.string().meta({ sensitive: true }),
+  kubeconfig: z.string().optional().meta({ sensitive: true }),
+  vault: z.string().optional(),
+  vault_key: z.string().optional(),
   observed_at: z.string(),
 });
 
@@ -390,6 +404,11 @@ export const defaultK0sDeps: K0sDeps = {
 
 function iso(ms: number): string {
   return new Date(ms).toISOString();
+}
+
+/** Removes a secret from text that is about to become an error message. */
+function scrubSecret(text: string, secret: string): string {
+  return secret.length >= 3 ? text.split(secret).join("[redacted]") : text;
 }
 
 /** SSH settings as parsed from a method's arguments. */
@@ -1312,7 +1331,7 @@ function buildK0sModel(deps: K0sDeps) {
       kubeconfig: {
         kind: "action" as const,
         description:
-          "READ-ONLY. Fetch the admin kubeconfig and store it as a sensitive value. The kubeconfig text never appears in the return value, logs or --json output; only its SHA-256 and server URL are returned.",
+          "READ-ONLY. Fetch the admin kubeconfig and keep it as a sensitive value, or write it to a vault key named by store_in_vault. The kubeconfig text never appears in the return value, logs or --json output; only its SHA-256, server URL and the vault key are returned.",
         arguments: KubeconfigArgs,
         execute: async (args: z.infer<typeof KubeconfigArgs>, context: Ctx) => {
           const { target, handles } = await resolveTarget(
@@ -1333,6 +1352,29 @@ function buildK0sModel(deps: K0sDeps) {
           const kubeconfig = result.stdout;
           const digest = await sha256Hex(encoder.encode(kubeconfig));
           const server = parseKubeconfigServer(kubeconfig);
+          const vault = args.store_in_vault ?? null;
+          if (vault) {
+            // swamp's vault service is not part of the documented method
+            // context, so require it by shape and say so if it is missing.
+            if (typeof context.vaultService?.put !== "function") {
+              throw new Error(
+                "this swamp version does not expose a vault service to methods; omit store_in_vault",
+              );
+            }
+            try {
+              await context.vaultService.put(
+                vault.vault,
+                vault.key,
+                kubeconfig,
+              );
+            } catch (error) {
+              throw new Error(
+                `could not write the kubeconfig to vault ${vault.vault}: ${
+                  scrubSecret((error as Error).message, kubeconfig)
+                }`,
+              );
+            }
+          }
           const handled = await context.writeResource(
             "kubeconfig",
             `${targetId(target)}~kubeconfig`,
@@ -1340,13 +1382,20 @@ function buildK0sModel(deps: K0sDeps) {
               ...whoOf(target),
               server,
               sha256: digest,
-              kubeconfig,
+              ...(vault
+                ? { vault: vault.vault, vault_key: vault.key }
+                : { kubeconfig }),
               observed_at: iso(deps.now()),
             }),
           );
           context.logger.info(
-            "Stored a sensitive kubeconfig for {host}: server {server}, sha256 {sha256}",
-            { host: target.host, server: server ?? "unknown", sha256: digest },
+            "Stored a sensitive kubeconfig for {host}: server {server}, sha256 {sha256}, vault {vault}",
+            {
+              host: target.host,
+              server: server ?? "unknown",
+              sha256: digest,
+              vault: vault ? `${vault.vault}/${vault.key}` : "none",
+            },
           );
           return {
             dataHandles: [...handles, handled],
@@ -1354,6 +1403,7 @@ function buildK0sModel(deps: K0sDeps) {
               host: target.host,
               server,
               sha256: digest,
+              ...(vault ? { vault: vault.vault, vault_key: vault.key } : {}),
             },
           };
         },

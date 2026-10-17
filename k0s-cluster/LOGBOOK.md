@@ -157,3 +157,9 @@ Low findings fixed as noted.
   the requested role is treated as a role change: refused without
   `confirm_role_change`, reset and reinstalled with it. The ExecStart format
   from `systemctl show --value` is unverified until a live run.
+- 2026-10-17: `kubeconfig` takes `store_in_vault` ({vault, key}) and writes the
+  kubeconfig there through `context.vaultService.put`, which is not part of the
+  documented method context. It was found by probing a real run (the put works
+  and the key lists afterwards); the method checks for it by shape and fails
+  clearly if a swamp version drops it. The stored record then holds the vault
+  and key names, not the value.

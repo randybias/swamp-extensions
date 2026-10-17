@@ -1791,3 +1791,94 @@ Deno.test("a matching single/controller mode is adopted without a change", async
     );
   }
 });
+
+Deno.test("kubeconfig can be written to a caller-named vault key and kept out of the record", async () => {
+  const fake = makeDeps({
+    exec: (argv) =>
+      argv.includes("kubeconfig")
+        ? { code: 0, stdout: FAKE_KUBECONFIG }
+        : undefined,
+  });
+  const model = createModel(fake.deps);
+  const puts: [string, string, string][] = [];
+  const { context, getWrittenResources, getLogs } = createModelTestContext();
+  // deno-lint-ignore no-explicit-any
+  (context as any).vaultService = {
+    put: (vault: string, key: string, value: string) => {
+      puts.push([vault, key, value]);
+      return Promise.resolve();
+    },
+  };
+  const out = await model.methods.kubeconfig.execute(
+    model.methods.kubeconfig.arguments.parse({
+      ssh: SSH,
+      store_in_vault: { vault: "cluster", key: "kubeconfig-a" },
+    }),
+    context,
+  );
+  assertEquals(puts, [["cluster", "kubeconfig-a", FAKE_KUBECONFIG]]);
+  assertEquals(out.result.vault, "cluster");
+  assertEquals(out.result.vault_key, "kubeconfig-a");
+  const kept = JSON.stringify([
+    out.result,
+    getWrittenResources(),
+    getLogs(),
+  ]);
+  assertEquals(kept.includes("client-key-data"), false);
+  assertEquals(kept.includes("FAKE-KEY-DATA"), false);
+  const record = primary(getWrittenResources()).data as Record<string, unknown>;
+  assertEquals("kubeconfig" in record, false);
+  assertEquals(record.vault_key, "kubeconfig-a");
+});
+
+Deno.test("a vault write failure or missing vault service fails without the value", async () => {
+  const fake = makeDeps({
+    exec: (argv) =>
+      argv.includes("kubeconfig")
+        ? { code: 0, stdout: FAKE_KUBECONFIG }
+        : undefined,
+  });
+  const model = createModel(fake.deps);
+  const args = model.methods.kubeconfig.arguments.parse({
+    ssh: SSH,
+    store_in_vault: { vault: "cluster", key: "kc" },
+  });
+  const none = createModelTestContext();
+  await assertRejects(
+    () => model.methods.kubeconfig.execute(args, none.context),
+    Error,
+    "does not expose a vault service",
+  );
+  const failing = createModelTestContext();
+  // deno-lint-ignore no-explicit-any
+  (failing.context as any).vaultService = {
+    put: (_v: string, _k: string, value: string) =>
+      Promise.reject(new Error(`no such vault, value was ${value}`)),
+  };
+  const error = await assertRejects(
+    () => model.methods.kubeconfig.execute(args, failing.context),
+    Error,
+    "could not write the kubeconfig to vault cluster",
+  );
+  assertEquals(error.message.includes("FAKE-KEY-DATA"), false);
+  assertEquals(primary(failing.getWrittenResources(), true).length, 0);
+});
+
+Deno.test("store_in_vault rejects malformed vault names and keys", () => {
+  const model = createModel(makeDeps().deps);
+  for (
+    const bad of [
+      { vault: "a b", key: "k" },
+      { vault: "v", key: "../k" },
+      { vault: "", key: "k" },
+      { vault: "v", key: "k;rm" },
+    ]
+  ) {
+    assertThrows(() =>
+      model.methods.kubeconfig.arguments.parse({
+        ssh: SSH,
+        store_in_vault: bad,
+      })
+    );
+  }
+});

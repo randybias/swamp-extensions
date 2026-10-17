@@ -17,11 +17,13 @@ import {
   type CommandResult,
   type CommandRunner,
   denoDeps,
+  denoRunner,
   exec,
   execPipeline,
   fingerprint,
   type HostKey,
   keysForHost,
+  MAX_EXEC_TIMEOUT_MS,
   parseHostKeys,
   posixQuote,
   quoteArgv,
@@ -53,6 +55,8 @@ interface Call {
   args: string[];
   stdin?: Uint8Array | string;
   env?: Record<string, string>;
+  timeoutMs?: number;
+  truncate?: boolean;
 }
 
 /** A fake runner that answers ssh-agent/ssh-add and delegates ssh/keyscan. */
@@ -65,7 +69,14 @@ function fakeRun(
   } = {},
 ): CommandRunner {
   return (cmd, args, options = {}) => {
-    calls.push({ cmd, args, stdin: options.stdin, env: options.env });
+    calls.push({
+      cmd,
+      args,
+      stdin: options.stdin,
+      env: options.env,
+      timeoutMs: options.timeoutMs,
+      truncate: options.truncate,
+    });
     if (cmd === "ssh-agent" && args[0] === "-s") {
       return Promise.resolve({
         code: 0,
@@ -346,7 +357,13 @@ Deno.test("exec quotes the argv and never puts the key on the command line", asy
   const calls: Call[] = [];
   const deps = fakeDeps(fakeRun(calls));
   const result = await exec(deps, STRICT_TARGET, ["echo", "; rm -rf /"]);
-  assertEquals(result, { stdout: "ok\n", stderr: "", exit_code: 0 });
+  assertEquals(result, {
+    stdout: "ok\n",
+    stderr: "",
+    exit_code: 0,
+    truncated: false,
+    duration_ms: 0,
+  });
 
   const ssh = calls.find((c) => c.cmd === "ssh");
   assert(ssh);
@@ -404,6 +421,8 @@ Deno.test("exec returns a non-zero remote exit as data, not an error", async () 
     stdout: "",
     stderr: "boom\n",
     exit_code: 1,
+    truncated: false,
+    duration_ms: 0,
   });
 });
 
@@ -428,6 +447,282 @@ Deno.test("exec treats any ssh exit 255 as a transport error, not data", async (
     () => exec(deps, STRICT_TARGET, ["./script"]),
     SshError,
     "transport failed",
+  );
+});
+
+/**
+ * The exact ssh argv a no-options exec produced before the options extension,
+ * with the transport-internal random known_hosts path masked.
+ */
+const GOLDEN_EXEC_ARGS = [
+  "-F",
+  "/dev/null",
+  "-o",
+  "IdentityFile=none",
+  "-o",
+  "StrictHostKeyChecking=yes",
+  "-o",
+  "UserKnownHostsFile=<tmp>",
+  "-o",
+  "GlobalKnownHostsFile=/dev/null",
+  "-o",
+  "ConnectTimeout=15",
+  "-o",
+  "ServerAliveInterval=5",
+  "-o",
+  "ServerAliveCountMax=2",
+  "-o",
+  "IdentityAgent=/tmp/agent.test",
+  "-o",
+  "BatchMode=yes",
+  "-o",
+  "PreferredAuthentications=publickey",
+  "-p",
+  "22",
+  "-l",
+  "root",
+  HOST,
+  "'echo' 'hi'",
+];
+
+Deno.test("exec without options spawns the byte-identical pre-extension argv", async () => {
+  const calls: Call[] = [];
+  const deps = fakeDeps(fakeRun(calls));
+  const result = await exec(deps, STRICT_TARGET, ["echo", "hi"]);
+  assertEquals(result, {
+    stdout: "ok\n",
+    stderr: "",
+    exit_code: 0,
+    truncated: false,
+    duration_ms: 0,
+  });
+  const ssh = calls.find((c) => c.cmd === "ssh");
+  assert(ssh);
+  assertEquals(
+    ssh.args.map((a) =>
+      a.startsWith("UserKnownHostsFile=") ? "UserKnownHostsFile=<tmp>" : a
+    ),
+    GOLDEN_EXEC_ARGS,
+  );
+  assertEquals(ssh.stdin, undefined);
+  assertEquals(ssh.timeoutMs, undefined);
+  assertEquals(ssh.truncate, undefined);
+});
+
+Deno.test("exec streams stdin byte-exact, including NUL, and never on argv", async () => {
+  const payload = new Uint8Array([0, 1, 2, 255, 0, 65, 0, 10]);
+  const calls: Call[] = [];
+  const deps = fakeDeps(fakeRun(calls));
+  await exec(deps, STRICT_TARGET, ["sha256sum"], { stdin: payload });
+  const ssh = calls.find((c) => c.cmd === "ssh");
+  assert(ssh);
+  assert(ssh.stdin instanceof Uint8Array);
+  assertEquals([...(ssh.stdin as Uint8Array)], [...payload]);
+  for (const call of calls) {
+    assertEquals(call.args.join(" ").includes("\u0000"), false);
+  }
+});
+
+Deno.test("exec streams a large stdin payload byte-exact", async () => {
+  const payload = new Uint8Array(256 * 1024);
+  for (let i = 0; i < payload.length; i++) payload[i] = i % 256;
+  const calls: Call[] = [];
+  const deps = fakeDeps(fakeRun(calls));
+  await exec(deps, STRICT_TARGET, ["cat"], { stdin: payload });
+  const ssh = calls.find((c) => c.cmd === "ssh");
+  assert(ssh);
+  const sent = ssh.stdin as Uint8Array;
+  assertEquals(sent.byteLength, payload.byteLength);
+  assertEquals(sent[255], 255);
+  assertEquals(sent[256], 0);
+});
+
+Deno.test("exec timeout kills ssh and raises a typed timeout", async () => {
+  const calls: Call[] = [];
+  const deps = fakeDeps(fakeRun(calls, {
+    ssh: () => ({ code: -1, stdout: "partial", stderr: "", timedOut: true }),
+  }));
+  const err = await assertRejects(
+    () => exec(deps, STRICT_TARGET, ["sleep", "5"], { timeoutMs: 50 }),
+    SshError,
+  ) as SshError;
+  assertEquals(err.kind, "timeout");
+  assertStringIncludes(err.message, "timed out");
+  assertEquals(calls.find((c) => c.cmd === "ssh")?.timeoutMs, 50);
+});
+
+Deno.test("exec truncates and flags instead of throwing when maxOutputBytes is set", async () => {
+  const calls: Call[] = [];
+  const deps = fakeDeps(fakeRun(calls, {
+    ssh: () => ({
+      code: 0,
+      stdout: "0123",
+      stderr: "",
+      truncated: true,
+      killedForCap: true,
+    }),
+  }));
+  const result = await exec(deps, STRICT_TARGET, ["true"], {
+    maxOutputBytes: 4,
+  });
+  assertEquals(result, {
+    stdout: "0123",
+    stderr: "",
+    exit_code: 0,
+    truncated: true,
+    duration_ms: 0,
+  });
+  assertEquals(calls.find((c) => c.cmd === "ssh")?.truncate, true);
+});
+
+Deno.test("a secret in stdin never appears on argv or in a transport error", async () => {
+  const secret = "PLACEHOLDER-SECRET-VALUE";
+  const calls: Call[] = [];
+  const deps = fakeDeps(fakeRun(calls, {
+    ssh: () => ({ code: 255, stdout: "", stderr: "Connection refused" }),
+  }));
+  const err = await assertRejects(
+    () => exec(deps, STRICT_TARGET, ["cat"], { stdin: secret }),
+    SshError,
+  ) as SshError;
+  assertEquals(err.message.includes(secret), false);
+  for (const call of calls) {
+    assertEquals(call.args.join(" ").includes(secret), false);
+  }
+});
+
+Deno.test("exec rejects invalid maxOutputBytes and timeoutMs before connecting", async () => {
+  const calls: Call[] = [];
+  const deps = fakeDeps(fakeRun(calls));
+  const target = { ...STRICT_TARGET, max_output_bytes: 1000 };
+  for (const bad of [NaN, Infinity, -Infinity, 0, -1, 1.5, 1001]) {
+    await assertRejects(
+      () => exec(deps, target, ["true"], { maxOutputBytes: bad }),
+      SshConfigError,
+      "maxOutputBytes",
+    );
+  }
+  for (const bad of [NaN, Infinity, 0, -1, 1.5, MAX_EXEC_TIMEOUT_MS + 1]) {
+    await assertRejects(
+      () => exec(deps, target, ["true"], { timeoutMs: bad }),
+      SshConfigError,
+      "timeoutMs",
+    );
+  }
+  // Nothing was spawned for any rejected option.
+  assertEquals(calls.length, 0);
+  const ok = await exec(deps, target, ["true"], {
+    maxOutputBytes: 1000,
+    timeoutMs: 1,
+  });
+  assertEquals(ok.exit_code, 0);
+});
+
+Deno.test("denoRunner streams a multi-megabyte stdin while stderr floods", async () => {
+  const big = new Uint8Array(4 * 1024 * 1024);
+  for (let i = 0; i < big.length; i++) big[i] = i % 256;
+  const res = await denoRunner(
+    "sh",
+    [
+      "-c",
+      "i=0; while [ $i -lt 2000 ]; do echo flood >&2; i=$((i+1)); done; wc -c",
+    ],
+    { stdin: big, maxOutputBytes: 1024 * 1024 },
+  );
+  assertEquals(res.code, 0);
+  assertEquals(res.stdout.trim(), String(big.length));
+  assertEquals(res.truncated, false);
+});
+
+Deno.test("denoRunner truncates at the cap and returns without draining", async () => {
+  const started = Date.now();
+  const res = await denoRunner("sh", ["-c", "yes"], {
+    maxOutputBytes: 128,
+    truncate: true,
+  });
+  const elapsed = Date.now() - started;
+  assertEquals(res.truncated, true);
+  assertEquals(res.stdout.length, 128);
+  assert(elapsed < 5000, `truncation took ${elapsed}ms`);
+});
+
+Deno.test("denoRunner caps without truncation by throwing", async () => {
+  await assertRejects(
+    () => denoRunner("sh", ["-c", "printf 0123456789"], { maxOutputBytes: 4 }),
+    SshError,
+    "capture limit",
+  );
+});
+
+Deno.test("denoRunner times out a large stdin write and leaves no child", async () => {
+  const big = new Uint8Array(4 * 1024 * 1024);
+  const started = Date.now();
+  const res = await denoRunner("sh", ["-c", "exec sleep 10"], {
+    stdin: big,
+    timeoutMs: 300,
+    maxOutputBytes: 1024 * 1024,
+  });
+  const elapsed = Date.now() - started;
+  assertEquals(res.timedOut, true);
+  assert(elapsed < 5000, `timeout took ${elapsed}ms`);
+});
+
+Deno.test("exec still throws on a transport 255 whose stderr exceeds a small cap", async () => {
+  const deps = fakeDeps(fakeRun([], {
+    ssh: () => ({
+      code: 255,
+      stdout: "",
+      stderr: "Connection closed by remote host " + "x".repeat(200),
+    }),
+  }));
+  await assertRejects(
+    () => exec(deps, STRICT_TARGET, ["true"], { maxOutputBytes: 16 }),
+    SshError,
+    "could not connect",
+  );
+});
+
+Deno.test("a long stderr warning does not fail a successful command", async () => {
+  let seen: RunOptions = {};
+  const deps = fakeDeps(fakeRun([], {
+    ssh: (_args, options) => {
+      seen = options;
+      return { code: 0, stdout: "ok\n", stderr: "w".repeat(500) };
+    },
+  }));
+  const target = { ...STRICT_TARGET, max_output_bytes: 1000 };
+  const res = await exec(deps, target, ["true"], { maxOutputBytes: 100 });
+  assertEquals(seen.maxOutputBytes, 100);
+  assertEquals(seen.stderrMaxOutputBytes, 1000);
+  assertEquals(res.exit_code, 0);
+  assertEquals(res.stderr.length, 500);
+  assertEquals(res.truncated, false);
+});
+
+const WARN_50 = "i=0; while [ $i -lt 50 ]; do echo warn >&2; i=$((i+1)); done";
+
+Deno.test("denoRunner keeps a stderr warning whole under a small stdout cap", async () => {
+  const res = await denoRunner(
+    "sh",
+    ["-c", `${WARN_50}; echo hi`],
+    { maxOutputBytes: 4, truncate: true, stderrMaxOutputBytes: 4096 },
+  );
+  assertEquals(res.code, 0);
+  assertEquals(res.stdout, "hi\n");
+  assertEquals(res.stderr.split("\n").filter((l) => l !== "").length, 50);
+  assertEquals(res.truncated, false);
+});
+
+Deno.test("denoRunner throws when stderr exceeds its own cap", async () => {
+  await assertRejects(
+    () =>
+      denoRunner(
+        "sh",
+        ["-c", WARN_50],
+        { maxOutputBytes: 4, truncate: true, stderrMaxOutputBytes: 16 },
+      ),
+    SshError,
+    "capture limit",
   );
 });
 

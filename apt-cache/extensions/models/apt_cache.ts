@@ -8,8 +8,8 @@
  * key is resolved from a vault reference inside the method.
  *
  * The implementation lives in `_lib/`: `schemas.ts` (argument and state
- * shapes), `remote.ts` (host operations and parsers), `server_methods.ts` and
- * `client_methods.ts` (the method bodies).
+ * shapes), `remote.ts` (host operations and parsers), `server_install.ts`,
+ * `server_methods.ts` and `client_methods.ts` (the method bodies).
  *
  * @module
  */

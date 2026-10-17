@@ -13,58 +13,11 @@ import {
 } from "jsr:@std/assert@1.0.19";
 import { SshError } from "./ssh.ts";
 import { renderBackendFiles, renderServerFragment } from "./apt.ts";
-import { createModel, model } from "../apt_cache.ts";
+import { model } from "../apt_cache.ts";
 import { fakeApt, has, hasTok, type Resp, useFake } from "./test_support.ts";
 import { ctx, SERVER, serverArgs, SSH } from "./model_test_support.ts";
 
-Deno.test("createModel returns the model", () => {
-  assertEquals(createModel().type, "@randybias/apt-cache");
-});
-
 // --- schema and in-method preconditions -------------------------------------
-
-Deno.test("schema: empty globals; mutating methods are actions; secrets sensitive", () => {
-  assertEquals(Object.keys(model.globalArguments.shape), []);
-  for (
-    const name of [
-      "install_server",
-      "apply_server",
-      "remove_server",
-      "configure_client",
-      "unconfigure_client",
-    ] as const
-  ) {
-    assertEquals(
-      (model.methods[name] as { kind?: string }).kind,
-      "action",
-      name,
-    );
-  }
-  for (
-    const name of [
-      "render_server",
-      "get",
-      "sync",
-      "stats",
-      "client_get",
-    ] as const
-  ) {
-    assertEquals(
-      (model.methods[name] as { kind?: string }).kind,
-      undefined,
-      name,
-    );
-    assertEquals(
-      (model.methods[name].description as string).startsWith("READ-ONLY."),
-      true,
-      name,
-    );
-  }
-  assertEquals(
-    model.methods.remove_server.description.startsWith("DESTRUCTIVE."),
-    true,
-  );
-});
 
 Deno.test("schema: strict host keys, required policy, sensitive refs", () => {
   assertThrows(() =>

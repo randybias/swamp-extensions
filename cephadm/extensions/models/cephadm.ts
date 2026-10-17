@@ -96,6 +96,20 @@ import {
   verifyPool,
   verifyRbdSmoke,
 } from "./_lib/verify.ts";
+import {
+  checkHost,
+  disableOrchestration,
+  enterMaintenance,
+  exitMaintenance,
+  hostTornDown,
+  maintenanceState,
+  nooutClear,
+  observeHost,
+  okToStop,
+  osdActivate,
+  rmCluster,
+  verifyClusterFsid,
+} from "./_lib/maintenance.ts";
 import { fail, TransportError } from "./_lib/errors.ts";
 import { wipeDiskToRaw, type WipeRecord } from "./_lib/wipe.ts";
 
@@ -643,6 +657,223 @@ const CapacityReportSchema = z.strictObject({
   observedAt: z.string(),
 });
 
+const MaintenanceEnterArgs = z.strictObject({
+  host: HOST_FIELD.describe("Admin host the ceph commands run on."),
+  ...SSH_FIELDS,
+  hostName: HOSTNAME_SCHEMA.describe("Ceph host to put into maintenance."),
+  osdCount: z.number().int().min(1).describe("Number of OSDs on that host."),
+  pollIntervalMs: z.number().int().min(1).max(3600000).nullish().describe(
+    "Backoff ceiling.",
+  ),
+  pollTimeoutMs: z.number().int().min(1).max(86400000).nullish().describe(
+    "Poll budget.",
+  ),
+});
+
+const MaintenanceExitArgs = z.strictObject({
+  host: HOST_FIELD.describe("Admin host."),
+  ...SSH_FIELDS,
+  hostName: HOSTNAME_SCHEMA.describe("Ceph host to take out of maintenance."),
+  pollIntervalMs: z.number().int().min(1).max(3600000).nullish().describe(
+    "Backoff ceiling.",
+  ),
+  pollTimeoutMs: z.number().int().min(1).max(86400000).nullish().describe(
+    "Poll budget.",
+  ),
+});
+
+const MaintenanceStateArgs = z.strictObject({
+  host: HOST_FIELD.describe("Admin host."),
+  ...SSH_FIELDS,
+});
+
+const HostNameArgs = z.strictObject({
+  host: HOST_FIELD.describe("Admin host."),
+  ...SSH_FIELDS,
+  hostName: HOSTNAME_SCHEMA.describe("Ceph host to act on."),
+});
+
+const MaintenanceResultSchema = z.strictObject({
+  method: z.string(),
+  host: z.string(),
+  hostName: z.string(),
+  action: z.enum(["enter", "exit"]),
+  didIssueCommand: z.boolean(),
+  pollAttempts: z.number(),
+  pollDurationMs: z.number(),
+  hostInMaintenance: z.boolean().optional(),
+  nooutFlagFound: z.boolean().optional(),
+  hostOsdsDown: z.boolean().optional(),
+  hostOsdsStayIn: z.boolean().optional(),
+  hostExitedMaintenance: z.boolean().optional(),
+  osdsRestored: z.boolean().optional(),
+  numUpOsds: z.number(),
+  numInOsds: z.number(),
+  capturedAt: z.string(),
+});
+
+const MaintenanceStateResultSchema = z.strictObject({
+  method: z.string(),
+  host: z.string(),
+  hosts: z.array(z.strictObject({
+    hostname: z.string(),
+    status: z.string(),
+    nooutFlag: z.boolean(),
+    out: z.boolean(),
+  })),
+  hostsOut: z.array(z.string()),
+  numHosts: z.number(),
+  numHostsOut: z.number(),
+  capturedAt: z.string(),
+});
+
+const OkToStopResultSchema = z.strictObject({
+  method: z.string(),
+  host: z.string(),
+  hostName: z.string(),
+  safe: z.boolean(),
+  reason: z.string(),
+  daemons: z.array(z.string()),
+  capturedAt: z.string(),
+});
+
+const CheckHostResultSchema = z.strictObject({
+  method: z.string(),
+  host: z.string(),
+  hostName: z.string(),
+  ok: z.boolean(),
+  detail: z.string(),
+  capturedAt: z.string(),
+});
+
+const NooutClearResultSchema = z.strictObject({
+  method: z.string(),
+  host: z.string(),
+  hostName: z.string(),
+  wasSet: z.boolean(),
+  didIssueCommand: z.boolean(),
+  nooutClearedObserved: z.boolean(),
+  hostInMaintenance: z.boolean(),
+  hostOsdIds: z.array(z.number()),
+  downOsdIds: z.array(z.number()),
+  elapsedMs: z.number(),
+  capturedAt: z.string(),
+});
+
+const OsdActivateResultSchema = z.strictObject({
+  method: z.string(),
+  host: z.string(),
+  hostName: z.string(),
+  activated: z.array(z.number()),
+  alreadyPresent: z.boolean(),
+  capturedAt: z.string(),
+});
+
+const VerifyClusterFsidArgs = z.strictObject({
+  host: HOST_FIELD.describe("Host to observe."),
+  ...SSH_FIELDS,
+  fsid: FSID_SCHEMA.describe("The cluster the caller intends to tear down."),
+});
+
+const DisableOrchArgs = z.strictObject({
+  adminHost: HOST_FIELD.describe("Node used to reach the cluster."),
+  ...SSH_FIELDS,
+});
+
+const RmClusterArgs = z.strictObject({
+  host: HOST_FIELD.describe("Host to purge."),
+  ...SSH_FIELDS,
+  fsid: FSID_SCHEMA.describe(
+    "Cluster to remove; any other fsid on the host refuses.",
+  ),
+  zapOsds: z.boolean().describe(
+    "Add --zap-osds; destroys OSD device contents. Must be stated.",
+  ),
+  verifyTimeoutMs: z.number().int().min(1).max(86400000).nullish().describe(
+    "Post-purge effect-poll budget.",
+  ),
+  verifyPollIntervalMs: z.number().int().min(1).max(3600000).nullish().describe(
+    "Backoff ceiling.",
+  ),
+});
+
+const VerifyHostTornDownArgs = z.strictObject({
+  host: HOST_FIELD.describe("Host to check."),
+  ...SSH_FIELDS,
+  fsid: FSID_SCHEMA.describe("The cluster this verdict is about."),
+});
+
+const HostStateResultSchema = z.strictObject({
+  host: z.string(),
+  fsids: z.array(z.string()),
+  cephUnits: z.array(z.string()),
+  clusterUnits: z.array(z.string()),
+  cephVolumeGroups: z.array(z.string()),
+  cephLogicalVolumes: z.array(z.string()),
+  mdArrays: z.array(z.string()),
+  toolsSeen: z.strictObject({
+    systemctl: z.boolean(),
+    lvm: z.boolean(),
+    mdstat: z.boolean(),
+  }),
+  capturedAt: z.string(),
+});
+
+const ClusterFsidResultSchema = z.strictObject({
+  host: z.string(),
+  fsid: z.string(),
+  pass: z.boolean(),
+  fsidsFound: z.array(z.string()),
+  carriesNamedFsid: z.boolean(),
+  capturedAt: z.string(),
+});
+
+const OrchestrationDisableResultSchema = z.strictObject({
+  method: z.string(),
+  adminHost: z.string(),
+  outcome: z.enum(["disabled", "alreadyDisabled", "clusterUnreachable"]),
+  enabledBefore: z.boolean().optional(),
+  unreachableReason: z.string().optional(),
+  capturedAt: z.string(),
+});
+
+const RmClusterResultSchema = z.strictObject({
+  host: z.string(),
+  fsid: z.string(),
+  zapOsds: z.boolean(),
+  purged: z.boolean(),
+  alreadyAbsent: z.boolean(),
+  cephadmStateAbsent: z.boolean().optional(),
+  lvmResidue: z.array(z.string()),
+  command: z.string().optional(),
+  fsidsBefore: z.array(z.string()),
+  fsidsAfter: z.array(z.string()),
+  clusterUnitsBefore: z.array(z.string()),
+  cephVolumeGroupsBefore: z.array(z.string()),
+  mdArraysAfter: z.array(z.string()),
+  capturedAt: z.string(),
+});
+
+const HostTornDownResultSchema = z.strictObject({
+  host: z.string(),
+  fsid: z.string(),
+  fsids: z.array(z.string()),
+  cephUnits: z.array(z.string()),
+  clusterUnits: z.array(z.string()),
+  cephVolumeGroups: z.array(z.string()),
+  cephLogicalVolumes: z.array(z.string()),
+  mdArrays: z.array(z.string()),
+  toolsSeen: z.strictObject({
+    systemctl: z.boolean(),
+    lvm: z.boolean(),
+    mdstat: z.boolean(),
+  }),
+  pass: z.boolean(),
+  namedFsidGone: z.boolean(),
+  findings: z.array(z.strictObject({ kind: z.string(), item: z.string() })),
+  capturedAt: z.string(),
+});
+
 const PoolResultSchema = z.strictObject({
   name: z.string(),
   scheme: z.string(),
@@ -771,6 +1002,30 @@ const ApplyMdsResultSchema = z.strictObject({
  */
 export function createCephadmModel(overrides: Partial<CephadmDeps> = {}) {
   const deps: CephadmDeps = { ...productionDeps, ...overrides };
+
+  const sessionFor = (
+    a: {
+      host: string;
+      sshUser: string;
+      port?: number | null;
+      keyPath?: string | null;
+      privateKey?: string | null;
+      strictHostKeyChecking: "yes" | "no";
+      multiplex?: boolean | null;
+    },
+  ) =>
+    openSession(
+      deps,
+      toTarget({
+        host: a.host,
+        sshUser: a.sshUser,
+        port: a.port,
+        keyPath: a.keyPath,
+        privateKey: a.privateKey,
+        strictHostKeyChecking: a.strictHostKeyChecking,
+      }),
+      { multiplex: a.multiplex ?? false },
+    );
 
   const methods = {
     cephHostPrep: {
@@ -2262,6 +2517,361 @@ export function createCephadmModel(overrides: Partial<CephadmDeps> = {}) {
         }
       },
     },
+    cephHostMaintenanceEnter: {
+      kind: "action" as const,
+      description:
+        "Put one Ceph host into maintenance and prove the effect by polling host status, the host-subtree noout flag, OSD-down counts and that every OSD stayed in. Idempotent; a host already in maintenance issues nothing but is still fully verified.",
+      arguments: MaintenanceEnterArgs,
+      execute: async (
+        args: z.infer<typeof MaintenanceEnterArgs>,
+        context: MethodContext,
+      ) => {
+        const session = await sessionFor(args);
+        try {
+          const result = await enterMaintenance(deps, session, {
+            host: args.host,
+            hostName: args.hostName,
+            osdCount: args.osdCount,
+            pollIntervalMs: args.pollIntervalMs,
+            pollTimeoutMs: args.pollTimeoutMs,
+          }, context.logger);
+          const handle = await context.writeResource(
+            "cephMaintenanceResult",
+            `cephHostMaintenanceEnter-${args.host}-${args.hostName}`,
+            { ...result, capturedAt: new Date(deps.now()).toISOString() },
+          );
+          return { dataHandles: [handle] };
+        } finally {
+          await session.close();
+        }
+      },
+    },
+
+    cephHostMaintenanceExit: {
+      kind: "action" as const,
+      description:
+        "Take one Ceph host out of maintenance and prove its OSDs are restored, retrying the exit at most once when check-host says the host looks OK. Idempotent; a host not in maintenance issues nothing but is still verified.",
+      arguments: MaintenanceExitArgs,
+      execute: async (
+        args: z.infer<typeof MaintenanceExitArgs>,
+        context: MethodContext,
+      ) => {
+        const session = await sessionFor(args);
+        try {
+          const result = await exitMaintenance(deps, session, {
+            host: args.host,
+            hostName: args.hostName,
+            pollIntervalMs: args.pollIntervalMs,
+            pollTimeoutMs: args.pollTimeoutMs,
+          }, context.logger);
+          const handle = await context.writeResource(
+            "cephMaintenanceResult",
+            `cephHostMaintenanceExit-${args.host}-${args.hostName}`,
+            { ...result, capturedAt: new Date(deps.now()).toISOString() },
+          );
+          return { dataHandles: [handle] };
+        } finally {
+          await session.close();
+        }
+      },
+    },
+
+    cephHostMaintenanceState: {
+      description:
+        "READ-ONLY. Report which hosts are already out, by maintenance status or by the host-subtree noout flag, in one call. A host is out when either is true, so a partly failed window is still found.",
+      arguments: MaintenanceStateArgs,
+      execute: async (
+        args: z.infer<typeof MaintenanceStateArgs>,
+        context: MethodContext,
+      ) => {
+        const session = await sessionFor(args);
+        try {
+          const result = await maintenanceState(
+            deps,
+            session,
+            args.host,
+            context.logger,
+          );
+          const handle = await context.writeResource(
+            "cephHostMaintenanceStateResult",
+            `cephHostMaintenanceState-${args.host}`,
+            { ...result, capturedAt: new Date(deps.now()).toISOString() },
+          );
+          return { dataHandles: [handle] };
+        } finally {
+          await session.close();
+        }
+      },
+    },
+
+    cephOsdOkToStop: {
+      description:
+        "READ-ONLY. Ask the orchestrator whether one host can be stopped safely, reporting the verdict, the cluster's verbatim reason on refusal, and the daemons it names. A refusal is a recorded result, never an error.",
+      arguments: HostNameArgs,
+      execute: async (
+        args: z.infer<typeof HostNameArgs>,
+        context: MethodContext,
+      ) => {
+        const session = await sessionFor(args);
+        try {
+          const result = await okToStop(
+            deps,
+            session,
+            args.host,
+            args.hostName,
+            context.logger,
+          );
+          const handle = await context.writeResource(
+            "cephOkToStopResult",
+            `cephOsdOkToStop-${args.host}-${args.hostName}`,
+            { ...result, capturedAt: new Date(deps.now()).toISOString() },
+          );
+          return { dataHandles: [handle] };
+        } finally {
+          await session.close();
+        }
+      },
+    },
+
+    cephCephadmCheckHost: {
+      description:
+        "READ-ONLY. Run ceph cephadm check-host for one host and classify the result as ok only on the tool's healthy result. A reported problem is a recorded result, not a thrown error.",
+      arguments: HostNameArgs,
+      execute: async (
+        args: z.infer<typeof HostNameArgs>,
+        context: MethodContext,
+      ) => {
+        const session = await sessionFor(args);
+        try {
+          const result = await checkHost(
+            deps,
+            session,
+            args.hostName,
+            context.logger,
+          );
+          const handle = await context.writeResource(
+            "cephCheckHostResult",
+            `cephCephadmCheckHost-${args.host}-${args.hostName}`,
+            {
+              method: "cephCephadmCheckHost",
+              host: args.host,
+              hostName: args.hostName,
+              ...result,
+              capturedAt: new Date(deps.now()).toISOString(),
+            },
+          );
+          return { dataHandles: [handle] };
+        } finally {
+          await session.close();
+        }
+      },
+    },
+
+    cephHostNooutClear: {
+      kind: "action" as const,
+      description:
+        "Clear an orphaned host-subtree noout flag for one host, or do nothing if it is already clear. Refuses an unknown host, a host in maintenance, or a host with any down OSD; there is no override.",
+      arguments: MaintenanceExitArgs,
+      execute: async (
+        args: z.infer<typeof MaintenanceExitArgs>,
+        context: MethodContext,
+      ) => {
+        const session = await sessionFor(args);
+        try {
+          const result = await nooutClear(deps, session, {
+            host: args.host,
+            hostName: args.hostName,
+            pollIntervalMs: args.pollIntervalMs,
+            pollTimeoutMs: args.pollTimeoutMs,
+          }, context.logger);
+          const handle = await context.writeResource(
+            "cephNooutClearResult",
+            `cephHostNooutClear-${args.host}-${args.hostName}`,
+            { ...result, capturedAt: new Date(deps.now()).toISOString() },
+          );
+          return { dataHandles: [handle] };
+        } finally {
+          await session.close();
+        }
+      },
+    },
+
+    cephOsdActivate: {
+      kind: "action" as const,
+      description:
+        "Re-create OSD daemons for existing OSD volumes on one host and parse the result; created and already-created are both success. Idempotent.",
+      arguments: HostNameArgs,
+      execute: async (
+        args: z.infer<typeof HostNameArgs>,
+        context: MethodContext,
+      ) => {
+        const session = await sessionFor(args);
+        try {
+          const result = await osdActivate(
+            deps,
+            session,
+            args.host,
+            args.hostName,
+            context.logger,
+          );
+          const handle = await context.writeResource(
+            "cephOsdActivateResult",
+            `cephOsdActivate-${args.host}-${args.hostName}`,
+            { ...result, capturedAt: new Date(deps.now()).toISOString() },
+          );
+          return { dataHandles: [handle] };
+        } finally {
+          await session.close();
+        }
+      },
+    },
+
+    cephHostClusterState: {
+      description:
+        "READ-ONLY. Report what Ceph state one host carries on its OS disk: fsid directories, cluster units, Ceph volume groups and logical volumes, md arrays and which tools were seen.",
+      arguments: MaintenanceStateArgs,
+      execute: async (
+        args: z.infer<typeof MaintenanceStateArgs>,
+        context: MethodContext,
+      ) => {
+        const session = await sessionFor(args);
+        try {
+          const state = await observeHost(deps, session, args.host);
+          context.logger.info(
+            "Host {host} carries {fsids} fsid(s), {units} cluster unit(s), {vgs} VG(s)",
+            {
+              host: args.host,
+              fsids: state.fsids.length,
+              units: state.clusterUnits.length,
+              vgs: state.cephVolumeGroups.length,
+            },
+          );
+          const handle = await context.writeResource(
+            "cephHostClusterStateResult",
+            `cephHostClusterState-${args.host}`,
+            { ...state, capturedAt: new Date(deps.now()).toISOString() },
+          );
+          return { dataHandles: [handle] };
+        } finally {
+          await session.close();
+        }
+      },
+    },
+    cephVerifyClusterFsid: {
+      description:
+        "READ-ONLY. Refuse unless every fsid on the host is the named one, so a refusal leaves the cluster as it found it. Writes a pass record only when the host carries no foreign fsid.",
+      arguments: VerifyClusterFsidArgs,
+      execute: async (
+        args: z.infer<typeof VerifyClusterFsidArgs>,
+        context: MethodContext,
+      ) => {
+        const session = await sessionFor(args);
+        try {
+          const result = await verifyClusterFsid(
+            deps,
+            session,
+            args.host,
+            args.fsid,
+            context.logger,
+          );
+          const handle = await context.writeResource(
+            "cephClusterFsidResult",
+            `cephVerifyClusterFsid-${args.host}`,
+            { ...result, capturedAt: new Date(deps.now()).toISOString() },
+          );
+          return { dataHandles: [handle] };
+        } finally {
+          await session.close();
+        }
+      },
+    },
+
+    cephDisableOrchestration: {
+      kind: "action" as const,
+      description:
+        "Disable the cephadm mgr module so the orchestrator stops deploying daemons, and prove it. An unreachable cluster is a recorded outcome, never a thrown error.",
+      arguments: DisableOrchArgs,
+      execute: async (
+        args: z.infer<typeof DisableOrchArgs>,
+        context: MethodContext,
+      ) => {
+        const session = await sessionFor({ ...args, host: args.adminHost });
+        try {
+          const result = await disableOrchestration(
+            deps,
+            args.adminHost,
+            session,
+            context.logger,
+          );
+          const handle = await context.writeResource(
+            "cephOrchestrationDisableResult",
+            `cephDisableOrchestration-${args.adminHost}`,
+            { ...result, capturedAt: new Date(deps.now()).toISOString() },
+          );
+          return { dataHandles: [handle] };
+        } finally {
+          await session.close();
+        }
+      },
+    },
+
+    cephRmCluster: {
+      kind: "action" as const,
+      description:
+        "DESTRUCTIVE. Purge a named cluster from one host, after refusing any foreign fsid, and prove that cephadm's state is gone. Re-runnable after a partial failure; LVM residue is recorded, not fatal here.",
+      arguments: RmClusterArgs,
+      execute: async (
+        args: z.infer<typeof RmClusterArgs>,
+        context: MethodContext,
+      ) => {
+        const session = await sessionFor(args);
+        try {
+          const result = await rmCluster(deps, session, {
+            host: args.host,
+            fsid: args.fsid,
+            zapOsds: args.zapOsds,
+            verifyTimeoutMs: args.verifyTimeoutMs,
+            verifyPollIntervalMs: args.verifyPollIntervalMs,
+          }, context.logger);
+          const handle = await context.writeResource(
+            "cephRmClusterResult",
+            `cephRmCluster-${args.host}`,
+            result,
+          );
+          return { dataHandles: [handle] };
+        } finally {
+          await session.close();
+        }
+      },
+    },
+
+    cephVerifyHostTornDown: {
+      description:
+        "READ-ONLY. Verify that the OS-disk plane of one host carries no Ceph cluster state. A dirty host is recorded with pass false and its findings; unobserved tools throw and write nothing.",
+      arguments: VerifyHostTornDownArgs,
+      execute: async (
+        args: z.infer<typeof VerifyHostTornDownArgs>,
+        context: MethodContext,
+      ) => {
+        const session = await sessionFor(args);
+        try {
+          const result = await hostTornDown(
+            deps,
+            session,
+            args.host,
+            args.fsid,
+          );
+          const handle = await context.writeResource(
+            "cephHostTornDownResult",
+            `cephVerifyHostTornDown-${args.host}`,
+            { ...result, capturedAt: new Date(deps.now()).toISOString() },
+          );
+          return { dataHandles: [handle] };
+        } finally {
+          await session.close();
+        }
+      },
+    },
   };
 
   const sshMethods = Object.keys(methods);
@@ -2341,6 +2951,73 @@ export function createCephadmModel(overrides: Partial<CephadmDeps> = {}) {
       cephApplyOsdResult: {
         description: "OSD service application evidence",
         schema: ApplyOsdResultSchema,
+        lifetime: "infinite" as const,
+        garbageCollection: 10,
+      },
+      cephMaintenanceResult: {
+        description: "Maintenance enter or exit evidence",
+        schema: MaintenanceResultSchema,
+        lifetime: "infinite" as const,
+        garbageCollection: 10,
+      },
+      cephHostMaintenanceStateResult: {
+        description:
+          "Which hosts are out by maintenance status or subtree noout",
+        schema: MaintenanceStateResultSchema,
+        lifetime: "infinite" as const,
+        garbageCollection: 10,
+      },
+      cephOkToStopResult: {
+        description: "Orchestrator ok-to-stop verdict",
+        schema: OkToStopResultSchema,
+        lifetime: "infinite" as const,
+        garbageCollection: 10,
+      },
+      cephCheckHostResult: {
+        description: "cephadm check-host classification",
+        schema: CheckHostResultSchema,
+        lifetime: "infinite" as const,
+        garbageCollection: 10,
+      },
+      cephNooutClearResult: {
+        description: "Subtree noout clear evidence",
+        schema: NooutClearResultSchema,
+        lifetime: "infinite" as const,
+        garbageCollection: 10,
+      },
+      cephOsdActivateResult: {
+        description: "OSD activation evidence",
+        schema: OsdActivateResultSchema,
+        lifetime: "infinite" as const,
+        garbageCollection: 10,
+      },
+      cephHostClusterStateResult: {
+        description: "Ceph state carried on a host's OS disk",
+        schema: HostStateResultSchema,
+        lifetime: "infinite" as const,
+        garbageCollection: 10,
+      },
+      cephClusterFsidResult: {
+        description: "Per-host fsid gate evidence",
+        schema: ClusterFsidResultSchema,
+        lifetime: "infinite" as const,
+        garbageCollection: 10,
+      },
+      cephOrchestrationDisableResult: {
+        description: "Orchestration disable outcome",
+        schema: OrchestrationDisableResultSchema,
+        lifetime: "infinite" as const,
+        garbageCollection: 10,
+      },
+      cephRmClusterResult: {
+        description: "Cluster purge evidence",
+        schema: RmClusterResultSchema,
+        lifetime: "infinite" as const,
+        garbageCollection: 10,
+      },
+      cephHostTornDownResult: {
+        description: "OS-disk teardown verdict",
+        schema: HostTornDownResultSchema,
         lifetime: "infinite" as const,
         garbageCollection: 10,
       },

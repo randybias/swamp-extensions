@@ -95,6 +95,13 @@ Not packaged. Notes for whoever maintains this extension.
   bounds added in schema and at run time. NOTE: making host_key_policy required
   deviates from 00-overview section 3 (which defaults absent to yes); done per
   the review's explicit request.
+- 2026-10-17: group 06 (maintenance + teardown) complete: the shared privileged
+  host-observation script (one round trip, marker sections, fail-closed parsing,
+  residue and shared fsid classification), the poll-until-verified contract with
+  the maintenance floor, and the twelve methods: enter/exit/state, ok-to-stop,
+  check-host, noout-clear, osd activate, host-cluster-state,
+  verify-cluster-fsid, disable-orchestration, rm-cluster and
+  verify-host-torn-down. 210 unit tests.
 - The SQLite `pvs`/`mdadm` discovery, the atomic mdadm.conf rewrite and the
   boot-protection gate are unit-tested with scripted sessions; the live twin
   checks in the spec's [twin] items still apply.

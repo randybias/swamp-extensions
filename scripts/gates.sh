@@ -85,7 +85,7 @@ gitleaks_tree() {
   return $rc
 }
 
-# 5 gitleaks: the extension dir, the whole tracked tree, then full history
+# 5 gitleaks: the extension dir, the whole tracked tree, then history reachable from HEAD
 gate_gitleaks() {
   local rc=0
   : >"$out/gitleaks.txt"
@@ -94,8 +94,10 @@ gate_gitleaks() {
   fi
   gitleaks_tree
   rc=$(worse "$rc" $?)
-  echo "== history" >>"$out/gitleaks.txt"
-  gitleaks git . --redact --no-banner >>"$out/gitleaks.txt" 2>&1 || rc=$(worse "$rc" 1)
+  # History reachable from the gated commit only: gitleaks' default log opts include
+  # --all, which would fail this branch on secrets committed to other lane branches.
+  echo "== history (HEAD)" >>"$out/gitleaks.txt"
+  gitleaks git . --log-opts="--full-history HEAD" --redact --no-banner >>"$out/gitleaks.txt" 2>&1 || rc=$(worse "$rc" 1)
   note $rc 5 gitleaks "$( ((rc)) && echo "log: .gates/${ext:-_tree}/gitleaks.txt")"
 }
 

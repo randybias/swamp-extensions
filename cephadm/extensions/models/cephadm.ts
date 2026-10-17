@@ -12,6 +12,7 @@
  */
 
 import { z } from "npm:zod@4.3.6";
+import { HostKeysSchema } from "./_lib/hostkeys.ts";
 import { CEPH_ID_CREATE_RE } from "./_lib/validate.ts";
 import { PhaseError } from "./_lib/errors.ts";
 import {
@@ -32,12 +33,12 @@ import {
   splitSections,
 } from "./_lib/hostprep.ts";
 import {
-  denoSpawner,
   openSession,
-  type Spawner,
+  type SessionRequest,
   type SshSession,
   toTarget,
-} from "./_lib/ssh.ts";
+} from "./_lib/ssh_session.ts";
+import { type CommandRunner, denoRunner } from "./_lib/ssh.ts";
 import {
   CAPS_SCHEMA,
   CEPH_ID_REF_SCHEMA,
@@ -128,7 +129,7 @@ import { fail, TransportError } from "./_lib/errors.ts";
 import { wipeDiskToRaw, type WipeRecord } from "./_lib/wipe.ts";
 
 /** Model type version; must equal the manifest version. */
-export const VERSION = "2026.10.17.2";
+export const VERSION = "2026.10.17.3";
 
 /**
  * The S3-plane methods: they open no SSH session, so they are excluded from
@@ -143,8 +144,8 @@ export const S3_METHODS: ReadonlySet<string> = new Set([
 
 /** Replaceable dependencies of the model. */
 export interface CephadmDeps {
-  /** Spawns the ssh binary. */
-  spawn: Spawner;
+  /** Runs local commands (the canonical ssh transport seam). */
+  run: CommandRunner;
   /** Current time in milliseconds. */
   now: () => number;
   /** Sleeps for the given milliseconds. */
@@ -156,7 +157,7 @@ export interface CephadmDeps {
 }
 
 const productionDeps: CephadmDeps = {
-  spawn: denoSpawner,
+  run: denoRunner,
   now: () => Date.now(),
   sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
   random: Math.random,
@@ -181,6 +182,10 @@ interface MethodContext {
     name: string,
     data: Record<string, unknown>,
   ) => Promise<{ name: string }>;
+  /** Reads a resource by instance name, or null. */
+  readResource: (
+    name: string,
+  ) => Promise<Record<string, unknown> | null>;
 }
 
 const GlobalArgsSchema = z.strictObject({});
@@ -1269,9 +1274,15 @@ const MODEL_UPGRADES = [
     upgradeAttributes: (old: Record<string, unknown>) => old,
   },
   {
-    toVersion: VERSION,
+    toVersion: "2026.10.17.2",
     description:
       "Workflow catalog safety fixes and wipe-guard fixes; no schema changes",
+    upgradeAttributes: (old: Record<string, unknown>) => old,
+  },
+  {
+    toVersion: VERSION,
+    description:
+      "Adopted the canonical ssh transport (typed exit-255 error, authoritative pins, no key on disk, no multiplex/ControlMaster). Method INPUTS were renamed: host_key_policy strict|insecure_tofu replaces strictHostKeyChecking, ssh-keyscan host_keys is new, and multiplex is dropped; every pinned line must name its host. Method arguments are per-call, not stored attributes, so this migration rewrites nothing: callers and the bundled workflows must pass host_key_policy (and, for strict, host_keys).",
     upgradeAttributes: (old: Record<string, unknown>) => old,
   },
 ];
@@ -1284,28 +1295,10 @@ export function createCephadmModel(overrides: Partial<CephadmDeps> = {}) {
   const deps: CephadmDeps = { ...productionDeps, ...overrides };
 
   const sessionFor = (
-    a: {
-      host: string;
-      sshUser: string;
-      port?: number | null;
-      keyPath?: string | null;
-      privateKey?: string | null;
-      strictHostKeyChecking: "yes" | "no";
-      multiplex?: boolean | null;
-    },
-  ) =>
-    openSession(
-      deps,
-      toTarget({
-        host: a.host,
-        sshUser: a.sshUser,
-        port: a.port,
-        keyPath: a.keyPath,
-        privateKey: a.privateKey,
-        strictHostKeyChecking: a.strictHostKeyChecking,
-      }),
-      { multiplex: a.multiplex ?? false },
-    );
+    context: MethodContext,
+    a: SshSource,
+    over?: { host?: string; port?: number | null },
+  ) => openSession(deps, toTarget(sshRequest(a, over)), context);
 
   const methods = {
     cephHostPrep: {
@@ -1317,15 +1310,7 @@ export function createCephadmModel(overrides: Partial<CephadmDeps> = {}) {
         args: z.infer<typeof HostPrepArgs>,
         context: MethodContext,
       ) => {
-        const target = toTarget({
-          host: args.host,
-          sshUser: args.sshUser,
-          port: args.port,
-          keyPath: args.keyPath,
-          privateKey: args.privateKey,
-          strictHostKeyChecking: args.strictHostKeyChecking,
-        });
-        const session = await openSession(deps, target, { multiplex: true });
+        const session = await sessionFor(context, args);
         context.logger.info("Preparing host {host}", { host: args.host });
         try {
           const phase = await runPackagePhase(
@@ -1383,17 +1368,7 @@ export function createCephadmModel(overrides: Partial<CephadmDeps> = {}) {
         args: z.infer<typeof PackageSourceArgs>,
         context: MethodContext,
       ) => {
-        const target = toTarget({
-          host: args.host,
-          sshUser: args.sshUser,
-          port: args.port,
-          keyPath: args.keyPath,
-          privateKey: args.privateKey,
-          strictHostKeyChecking: args.strictHostKeyChecking,
-        });
-        const session = await openSession(deps, target, {
-          multiplex: args.multiplex ?? false,
-        });
+        const session = await sessionFor(context, args);
         try {
           const result = await checkPackageSources(
             session,
@@ -1437,17 +1412,7 @@ export function createCephadmModel(overrides: Partial<CephadmDeps> = {}) {
         args: z.infer<typeof WipeArgsSchema>,
         context: MethodContext,
       ) => {
-        const target = toTarget({
-          host: args.host,
-          sshUser: args.sshUser,
-          port: args.port,
-          keyPath: args.keyPath,
-          privateKey: args.privateKey,
-          strictHostKeyChecking: args.strictHostKeyChecking,
-        });
-        const session = await openSession(deps, target, {
-          multiplex: args.multiplex ?? false,
-        });
+        const session = await sessionFor(context, args);
         context.logger.info(
           "Wiping {count} device(s) on {host} (dryRun {dryRun})",
           {
@@ -1473,12 +1438,7 @@ export function createCephadmModel(overrides: Partial<CephadmDeps> = {}) {
           );
           return { dataHandles: [handle] };
         } finally {
-          const closed = await session.close();
-          if (!closed.closed && session.controlPath !== null) {
-            context.logger.warn("SSH control master not closed: {detail}", {
-              detail: closed.detail,
-            });
-          }
+          await session.close();
         }
       },
     },
@@ -1492,15 +1452,7 @@ export function createCephadmModel(overrides: Partial<CephadmDeps> = {}) {
         args: z.infer<typeof BootstrapArgs>,
         context: MethodContext,
       ) => {
-        const target = toTarget({
-          host: args.host,
-          sshUser: args.sshUser,
-          port: args.port,
-          keyPath: args.keyPath,
-          privateKey: args.privateKey,
-          strictHostKeyChecking: args.strictHostKeyChecking,
-        });
-        const session = await openSession(deps, target, { multiplex: true });
+        const session = await sessionFor(context, args);
         context.logger.info("Bootstrapping {host}", { host: args.host });
         try {
           const result = await bootstrapCluster(
@@ -1552,16 +1504,9 @@ export function createCephadmModel(overrides: Partial<CephadmDeps> = {}) {
       ) => {
         const outcomes: DistributeOutcome[] = [];
         for (const entry of args.hosts) {
-          const target = toTarget({
+          const session = await sessionFor(context, args, {
             host: entry.host,
-            sshUser: args.sshUser,
             port: entry.port,
-            keyPath: args.keyPath,
-            privateKey: args.privateKey,
-            strictHostKeyChecking: args.strictHostKeyChecking,
-          });
-          const session = await openSession(deps, target, {
-            multiplex: args.multiplex ?? false,
           });
           try {
             outcomes.push(
@@ -1629,18 +1574,9 @@ export function createCephadmModel(overrides: Partial<CephadmDeps> = {}) {
         args: z.infer<typeof HostAddArgs>,
         context: MethodContext,
       ) => {
-        const session = await openSession(
-          deps,
-          toTarget({
-            host: args.adminHost,
-            sshUser: args.sshUser,
-            port: args.port,
-            keyPath: args.keyPath,
-            privateKey: args.privateKey,
-            strictHostKeyChecking: args.strictHostKeyChecking,
-          }),
-          { multiplex: args.multiplex ?? false },
-        );
+        const session = await sessionFor(context, args, {
+          host: args.adminHost,
+        });
         try {
           const result = await hostAdd(
             deps,
@@ -1674,18 +1610,9 @@ export function createCephadmModel(overrides: Partial<CephadmDeps> = {}) {
         args: z.infer<typeof ApplyMonArgs>,
         context: MethodContext,
       ) => {
-        const session = await openSession(
-          deps,
-          toTarget({
-            host: args.adminHost,
-            sshUser: args.sshUser,
-            port: args.port,
-            keyPath: args.keyPath,
-            privateKey: args.privateKey,
-            strictHostKeyChecking: args.strictHostKeyChecking,
-          }),
-          { multiplex: args.multiplex ?? false },
-        );
+        const session = await sessionFor(context, args, {
+          host: args.adminHost,
+        });
         try {
           const result = await applyMon(
             deps,
@@ -1724,18 +1651,9 @@ export function createCephadmModel(overrides: Partial<CephadmDeps> = {}) {
         args: z.infer<typeof ApplyMgrArgs>,
         context: MethodContext,
       ) => {
-        const session = await openSession(
-          deps,
-          toTarget({
-            host: args.adminHost,
-            sshUser: args.sshUser,
-            port: args.port,
-            keyPath: args.keyPath,
-            privateKey: args.privateKey,
-            strictHostKeyChecking: args.strictHostKeyChecking,
-          }),
-          { multiplex: args.multiplex ?? false },
-        );
+        const session = await sessionFor(context, args, {
+          host: args.adminHost,
+        });
         try {
           const result = await applyPlacement(
             deps,
@@ -1775,18 +1693,9 @@ export function createCephadmModel(overrides: Partial<CephadmDeps> = {}) {
         args: z.infer<typeof ApplyMdsArgs>,
         context: MethodContext,
       ) => {
-        const session = await openSession(
-          deps,
-          toTarget({
-            host: args.adminHost,
-            sshUser: args.sshUser,
-            port: args.port,
-            keyPath: args.keyPath,
-            privateKey: args.privateKey,
-            strictHostKeyChecking: args.strictHostKeyChecking,
-          }),
-          { multiplex: args.multiplex ?? false },
-        );
+        const session = await sessionFor(context, args, {
+          host: args.adminHost,
+        });
         try {
           const result = await applyPlacement(
             deps,
@@ -1837,9 +1746,10 @@ export function createCephadmModel(overrides: Partial<CephadmDeps> = {}) {
             port: args.port,
             keyPath: args.keyPath,
             privateKey: args.privateKey,
-            strictHostKeyChecking: args.strictHostKeyChecking,
+            host_key_policy: args.host_key_policy,
+            host_keys: args.host_keys,
           }),
-          { multiplex: args.multiplex ?? false },
+          context,
         );
         let targetSession: SshSession | null = null;
         try {
@@ -1852,9 +1762,10 @@ export function createCephadmModel(overrides: Partial<CephadmDeps> = {}) {
                 port: args.targetPort ?? args.port,
                 keyPath: args.keyPath,
                 privateKey: args.privateKey,
-                strictHostKeyChecking: args.strictHostKeyChecking,
+                host_key_policy: args.host_key_policy,
+                host_keys: args.host_keys,
               }),
-              { multiplex: args.multiplex ?? false },
+              context,
             );
           }
           const result = await applyOsd(
@@ -1896,18 +1807,7 @@ export function createCephadmModel(overrides: Partial<CephadmDeps> = {}) {
         args: z.infer<typeof CreatePoolArgs>,
         context: MethodContext,
       ) => {
-        const session = await openSession(
-          deps,
-          toTarget({
-            host: args.host,
-            sshUser: args.sshUser,
-            port: args.port,
-            keyPath: args.keyPath,
-            privateKey: args.privateKey,
-            strictHostKeyChecking: args.strictHostKeyChecking,
-          }),
-          { multiplex: args.multiplex ?? false },
-        );
+        const session = await sessionFor(context, args);
         try {
           const result = await createPool(deps, session, {
             name: args.name,
@@ -1938,18 +1838,7 @@ export function createCephadmModel(overrides: Partial<CephadmDeps> = {}) {
         args: z.infer<typeof CreateFsArgs>,
         context: MethodContext,
       ) => {
-        const session = await openSession(
-          deps,
-          toTarget({
-            host: args.host,
-            sshUser: args.sshUser,
-            port: args.port,
-            keyPath: args.keyPath,
-            privateKey: args.privateKey,
-            strictHostKeyChecking: args.strictHostKeyChecking,
-          }),
-          { multiplex: args.multiplex ?? false },
-        );
+        const session = await sessionFor(context, args);
         try {
           const result = await createFs(deps, session, {
             name: args.name,
@@ -1977,18 +1866,7 @@ export function createCephadmModel(overrides: Partial<CephadmDeps> = {}) {
         args: z.infer<typeof CreateCsiUserArgs>,
         context: MethodContext,
       ) => {
-        const session = await openSession(
-          deps,
-          toTarget({
-            host: args.host,
-            sshUser: args.sshUser,
-            port: args.port,
-            keyPath: args.keyPath,
-            privateKey: args.privateKey,
-            strictHostKeyChecking: args.strictHostKeyChecking,
-          }),
-          { multiplex: args.multiplex ?? false },
-        );
+        const session = await sessionFor(context, args);
         try {
           const result = await createCsiUser(deps, session, {
             name: args.name,
@@ -2014,18 +1892,7 @@ export function createCephadmModel(overrides: Partial<CephadmDeps> = {}) {
         args: z.infer<typeof ReadHostArgs>,
         context: MethodContext,
       ) => {
-        const session = await openSession(
-          deps,
-          toTarget({
-            host: args.host,
-            sshUser: args.sshUser,
-            port: args.port,
-            keyPath: args.keyPath,
-            privateKey: args.privateKey,
-            strictHostKeyChecking: args.strictHostKeyChecking,
-          }),
-          { multiplex: args.multiplex ?? false },
-        );
+        const session = await sessionFor(context, args);
         try {
           const result = await getConnBundle(deps, session, context.logger);
           const handle = await context.writeResource(
@@ -2048,18 +1915,7 @@ export function createCephadmModel(overrides: Partial<CephadmDeps> = {}) {
         args: z.infer<typeof FetchCsiKeyArgs>,
         context: MethodContext,
       ) => {
-        const session = await openSession(
-          deps,
-          toTarget({
-            host: args.host,
-            sshUser: args.sshUser,
-            port: args.port,
-            keyPath: args.keyPath,
-            privateKey: args.privateKey,
-            strictHostKeyChecking: args.strictHostKeyChecking,
-          }),
-          { multiplex: args.multiplex ?? false },
-        );
+        const session = await sessionFor(context, args);
         try {
           const result = await fetchCsiKey(
             deps,
@@ -2088,18 +1944,7 @@ export function createCephadmModel(overrides: Partial<CephadmDeps> = {}) {
         args: z.infer<typeof DeleteFsArgs>,
         context: MethodContext,
       ) => {
-        const session = await openSession(
-          deps,
-          toTarget({
-            host: args.host,
-            sshUser: args.sshUser,
-            port: args.port,
-            keyPath: args.keyPath,
-            privateKey: args.privateKey,
-            strictHostKeyChecking: args.strictHostKeyChecking,
-          }),
-          { multiplex: args.multiplex ?? false },
-        );
+        const session = await sessionFor(context, args);
         try {
           const result = await deleteFs(deps, session, {
             fsName: args.fsName,
@@ -2128,18 +1973,7 @@ export function createCephadmModel(overrides: Partial<CephadmDeps> = {}) {
         args: z.infer<typeof RemoveOsdsArgs>,
         context: MethodContext,
       ) => {
-        const session = await openSession(
-          deps,
-          toTarget({
-            host: args.host,
-            sshUser: args.sshUser,
-            port: args.port,
-            keyPath: args.keyPath,
-            privateKey: args.privateKey,
-            strictHostKeyChecking: args.strictHostKeyChecking,
-          }),
-          { multiplex: args.multiplex ?? false },
-        );
+        const session = await sessionFor(context, args);
         try {
           const result = await removeOsds(deps, session, {
             osdIds: args.osdIds,
@@ -2167,18 +2001,7 @@ export function createCephadmModel(overrides: Partial<CephadmDeps> = {}) {
         args: z.infer<typeof VerifyMonQuorumArgs>,
         context: MethodContext,
       ) => {
-        const session = await openSession(
-          deps,
-          toTarget({
-            host: args.host,
-            sshUser: args.sshUser,
-            port: args.port,
-            keyPath: args.keyPath,
-            privateKey: args.privateKey,
-            strictHostKeyChecking: args.strictHostKeyChecking,
-          }),
-          { multiplex: args.multiplex ?? false },
-        );
+        const session = await sessionFor(context, args);
         try {
           const outcome = await verifyMonQuorum(deps, session, {
             expectedMonCount: args.expectedMonCount,
@@ -2208,18 +2031,7 @@ export function createCephadmModel(overrides: Partial<CephadmDeps> = {}) {
         args: z.infer<typeof VerifyMgrArgs>,
         context: MethodContext,
       ) => {
-        const session = await openSession(
-          deps,
-          toTarget({
-            host: args.host,
-            sshUser: args.sshUser,
-            port: args.port,
-            keyPath: args.keyPath,
-            privateKey: args.privateKey,
-            strictHostKeyChecking: args.strictHostKeyChecking,
-          }),
-          { multiplex: args.multiplex ?? false },
-        );
+        const session = await sessionFor(context, args);
         try {
           const outcome = await verifyMgr(deps, session, {
             expectedCount: args.expectedCount,
@@ -2247,18 +2059,7 @@ export function createCephadmModel(overrides: Partial<CephadmDeps> = {}) {
         args: z.infer<typeof VerifyOsdArgs>,
         context: MethodContext,
       ) => {
-        const session = await openSession(
-          deps,
-          toTarget({
-            host: args.host,
-            sshUser: args.sshUser,
-            port: args.port,
-            keyPath: args.keyPath,
-            privateKey: args.privateKey,
-            strictHostKeyChecking: args.strictHostKeyChecking,
-          }),
-          { multiplex: args.multiplex ?? false },
-        );
+        const session = await sessionFor(context, args);
         try {
           const outcome = await verifyOsd(deps, session, {
             expectedUp: args.expectedUp,
@@ -2291,18 +2092,7 @@ export function createCephadmModel(overrides: Partial<CephadmDeps> = {}) {
         args: z.infer<typeof VerifyCsiUsersArgs>,
         context: MethodContext,
       ) => {
-        const session = await openSession(
-          deps,
-          toTarget({
-            host: args.host,
-            sshUser: args.sshUser,
-            port: args.port,
-            keyPath: args.keyPath,
-            privateKey: args.privateKey,
-            strictHostKeyChecking: args.strictHostKeyChecking,
-          }),
-          { multiplex: args.multiplex ?? false },
-        );
+        const session = await sessionFor(context, args);
         try {
           const outcome = await verifyCsiUsers(
             deps,
@@ -2333,18 +2123,7 @@ export function createCephadmModel(overrides: Partial<CephadmDeps> = {}) {
         args: z.infer<typeof VerifyHealthArgs>,
         context: MethodContext,
       ) => {
-        const session = await openSession(
-          deps,
-          toTarget({
-            host: args.host,
-            sshUser: args.sshUser,
-            port: args.port,
-            keyPath: args.keyPath,
-            privateKey: args.privateKey,
-            strictHostKeyChecking: args.strictHostKeyChecking,
-          }),
-          { multiplex: args.multiplex ?? false },
-        );
+        const session = await sessionFor(context, args);
         try {
           const outcome = await verifyHealth(deps, session, {
             wantOk: args.wantOk,
@@ -2373,18 +2152,7 @@ export function createCephadmModel(overrides: Partial<CephadmDeps> = {}) {
         args: z.infer<typeof VerifyHostNooutArgs>,
         context: MethodContext,
       ) => {
-        const session = await openSession(
-          deps,
-          toTarget({
-            host: args.host,
-            sshUser: args.sshUser,
-            port: args.port,
-            keyPath: args.keyPath,
-            privateKey: args.privateKey,
-            strictHostKeyChecking: args.strictHostKeyChecking,
-          }),
-          { multiplex: args.multiplex ?? false },
-        );
+        const session = await sessionFor(context, args);
         try {
           const outcome = await verifyHostNoout(deps, session, {
             hostName: args.hostName,
@@ -2413,18 +2181,7 @@ export function createCephadmModel(overrides: Partial<CephadmDeps> = {}) {
         args: z.infer<typeof VerifyHostPrepArgs>,
         context: MethodContext,
       ) => {
-        const session = await openSession(
-          deps,
-          toTarget({
-            host: args.host,
-            sshUser: args.sshUser,
-            port: args.port,
-            keyPath: args.keyPath,
-            privateKey: args.privateKey,
-            strictHostKeyChecking: args.strictHostKeyChecking,
-          }),
-          { multiplex: args.multiplex ?? false },
-        );
+        const session = await sessionFor(context, args);
         try {
           const outcome = await verifyHostPrep(deps, session, {
             expectedPackages: args.expectedPackages,
@@ -2454,18 +2211,7 @@ export function createCephadmModel(overrides: Partial<CephadmDeps> = {}) {
         args: z.infer<typeof VerifyDisksRawArgs>,
         context: MethodContext,
       ) => {
-        const session = await openSession(
-          deps,
-          toTarget({
-            host: args.host,
-            sshUser: args.sshUser,
-            port: args.port,
-            keyPath: args.keyPath,
-            privateKey: args.privateKey,
-            strictHostKeyChecking: args.strictHostKeyChecking,
-          }),
-          { multiplex: args.multiplex ?? false },
-        );
+        const session = await sessionFor(context, args);
         try {
           const outcome = await verifyDisksRaw(
             deps,
@@ -2510,9 +2256,10 @@ export function createCephadmModel(overrides: Partial<CephadmDeps> = {}) {
                 port,
                 keyPath: args.keyPath,
                 privateKey: args.privateKey,
-                strictHostKeyChecking: args.strictHostKeyChecking,
+                host_key_policy: args.host_key_policy,
+                host_keys: args.host_keys,
               }),
-              { multiplex: false },
+              context,
             ),
         }, context.logger);
         const key = `cephVerifyKeyDistributed-${
@@ -2557,18 +2304,7 @@ export function createCephadmModel(overrides: Partial<CephadmDeps> = {}) {
         args: z.infer<typeof ReadHostArgs>,
         context: MethodContext,
       ) => {
-        const session = await openSession(
-          deps,
-          toTarget({
-            host: args.host,
-            sshUser: args.sshUser,
-            port: args.port,
-            keyPath: args.keyPath,
-            privateKey: args.privateKey,
-            strictHostKeyChecking: args.strictHostKeyChecking,
-          }),
-          { multiplex: args.multiplex ?? false },
-        );
+        const session = await sessionFor(context, args);
         try {
           const report = await capacityReport(deps, session, context.logger);
           const handle = await context.writeResource(
@@ -2595,18 +2331,7 @@ export function createCephadmModel(overrides: Partial<CephadmDeps> = {}) {
         args: z.infer<typeof VerifyPlacementArgs>,
         context: MethodContext,
       ) => {
-        const session = await openSession(
-          deps,
-          toTarget({
-            host: args.host,
-            sshUser: args.sshUser,
-            port: args.port,
-            keyPath: args.keyPath,
-            privateKey: args.privateKey,
-            strictHostKeyChecking: args.strictHostKeyChecking,
-          }),
-          { multiplex: args.multiplex ?? false },
-        );
+        const session = await sessionFor(context, args);
         try {
           const outcome = await verifyMonPlacement(
             deps,
@@ -2637,18 +2362,7 @@ export function createCephadmModel(overrides: Partial<CephadmDeps> = {}) {
         args: z.infer<typeof VerifyPlacementArgs>,
         context: MethodContext,
       ) => {
-        const session = await openSession(
-          deps,
-          toTarget({
-            host: args.host,
-            sshUser: args.sshUser,
-            port: args.port,
-            keyPath: args.keyPath,
-            privateKey: args.privateKey,
-            strictHostKeyChecking: args.strictHostKeyChecking,
-          }),
-          { multiplex: args.multiplex ?? false },
-        );
+        const session = await sessionFor(context, args);
         try {
           const outcome = await verifyMgrPlacement(
             deps,
@@ -2679,18 +2393,7 @@ export function createCephadmModel(overrides: Partial<CephadmDeps> = {}) {
         args: z.infer<typeof VerifyPoolArgs>,
         context: MethodContext,
       ) => {
-        const session = await openSession(
-          deps,
-          toTarget({
-            host: args.host,
-            sshUser: args.sshUser,
-            port: args.port,
-            keyPath: args.keyPath,
-            privateKey: args.privateKey,
-            strictHostKeyChecking: args.strictHostKeyChecking,
-          }),
-          { multiplex: args.multiplex ?? false },
-        );
+        const session = await sessionFor(context, args);
         try {
           const outcome = await verifyPool(deps, session, {
             poolName: args.poolName,
@@ -2725,18 +2428,7 @@ export function createCephadmModel(overrides: Partial<CephadmDeps> = {}) {
         args: z.infer<typeof VerifyRbdSmokeArgs>,
         context: MethodContext,
       ) => {
-        const session = await openSession(
-          deps,
-          toTarget({
-            host: args.host,
-            sshUser: args.sshUser,
-            port: args.port,
-            keyPath: args.keyPath,
-            privateKey: args.privateKey,
-            strictHostKeyChecking: args.strictHostKeyChecking,
-          }),
-          { multiplex: args.multiplex ?? false },
-        );
+        const session = await sessionFor(context, args);
         try {
           const outcome = await verifyRbdSmoke(
             deps,
@@ -2767,18 +2459,7 @@ export function createCephadmModel(overrides: Partial<CephadmDeps> = {}) {
         args: z.infer<typeof VerifyOsdClaimableArgs>,
         context: MethodContext,
       ) => {
-        const session = await openSession(
-          deps,
-          toTarget({
-            host: args.host,
-            sshUser: args.sshUser,
-            port: args.port,
-            keyPath: args.keyPath,
-            privateKey: args.privateKey,
-            strictHostKeyChecking: args.strictHostKeyChecking,
-          }),
-          { multiplex: args.multiplex ?? false },
-        );
+        const session = await sessionFor(context, args);
         try {
           const outcome = await verifyOsdClaimable(deps, session, {
             allAvailableDevices: args.allAvailableDevices,
@@ -2809,7 +2490,7 @@ export function createCephadmModel(overrides: Partial<CephadmDeps> = {}) {
         args: z.infer<typeof MaintenanceEnterArgs>,
         context: MethodContext,
       ) => {
-        const session = await sessionFor(args);
+        const session = await sessionFor(context, args);
         try {
           const result = await enterMaintenance(deps, session, {
             host: args.host,
@@ -2839,7 +2520,7 @@ export function createCephadmModel(overrides: Partial<CephadmDeps> = {}) {
         args: z.infer<typeof MaintenanceExitArgs>,
         context: MethodContext,
       ) => {
-        const session = await sessionFor(args);
+        const session = await sessionFor(context, args);
         try {
           const result = await exitMaintenance(deps, session, {
             host: args.host,
@@ -2867,7 +2548,7 @@ export function createCephadmModel(overrides: Partial<CephadmDeps> = {}) {
         args: z.infer<typeof MaintenanceStateArgs>,
         context: MethodContext,
       ) => {
-        const session = await sessionFor(args);
+        const session = await sessionFor(context, args);
         try {
           const result = await maintenanceState(
             deps,
@@ -2895,7 +2576,7 @@ export function createCephadmModel(overrides: Partial<CephadmDeps> = {}) {
         args: z.infer<typeof HostNameArgs>,
         context: MethodContext,
       ) => {
-        const session = await sessionFor(args);
+        const session = await sessionFor(context, args);
         try {
           const result = await okToStop(
             deps,
@@ -2924,7 +2605,7 @@ export function createCephadmModel(overrides: Partial<CephadmDeps> = {}) {
         args: z.infer<typeof HostNameArgs>,
         context: MethodContext,
       ) => {
-        const session = await sessionFor(args);
+        const session = await sessionFor(context, args);
         try {
           const result = await checkHost(
             deps,
@@ -2959,7 +2640,7 @@ export function createCephadmModel(overrides: Partial<CephadmDeps> = {}) {
         args: z.infer<typeof MaintenanceExitArgs>,
         context: MethodContext,
       ) => {
-        const session = await sessionFor(args);
+        const session = await sessionFor(context, args);
         try {
           const result = await nooutClear(deps, session, {
             host: args.host,
@@ -2988,7 +2669,7 @@ export function createCephadmModel(overrides: Partial<CephadmDeps> = {}) {
         args: z.infer<typeof HostNameArgs>,
         context: MethodContext,
       ) => {
-        const session = await sessionFor(args);
+        const session = await sessionFor(context, args);
         try {
           const result = await osdActivate(
             deps,
@@ -3017,7 +2698,7 @@ export function createCephadmModel(overrides: Partial<CephadmDeps> = {}) {
         args: z.infer<typeof MaintenanceStateArgs>,
         context: MethodContext,
       ) => {
-        const session = await sessionFor(args);
+        const session = await sessionFor(context, args);
         try {
           const state = await observeHost(deps, session, args.host);
           context.logger.info(
@@ -3048,7 +2729,7 @@ export function createCephadmModel(overrides: Partial<CephadmDeps> = {}) {
         args: z.infer<typeof VerifyClusterFsidArgs>,
         context: MethodContext,
       ) => {
-        const session = await sessionFor(args);
+        const session = await sessionFor(context, args);
         try {
           const result = await verifyClusterFsid(
             deps,
@@ -3078,7 +2759,9 @@ export function createCephadmModel(overrides: Partial<CephadmDeps> = {}) {
         args: z.infer<typeof DisableOrchArgs>,
         context: MethodContext,
       ) => {
-        const session = await sessionFor({ ...args, host: args.adminHost });
+        const session = await sessionFor(context, args, {
+          host: args.adminHost,
+        });
         try {
           const result = await disableOrchestration(
             deps,
@@ -3107,7 +2790,7 @@ export function createCephadmModel(overrides: Partial<CephadmDeps> = {}) {
         args: z.infer<typeof RmClusterArgs>,
         context: MethodContext,
       ) => {
-        const session = await sessionFor(args);
+        const session = await sessionFor(context, args);
         try {
           const result = await rmCluster(deps, session, {
             host: args.host,
@@ -3136,7 +2819,7 @@ export function createCephadmModel(overrides: Partial<CephadmDeps> = {}) {
         args: z.infer<typeof VerifyHostTornDownArgs>,
         context: MethodContext,
       ) => {
-        const session = await sessionFor(args);
+        const session = await sessionFor(context, args);
         try {
           const result = await hostTornDown(
             deps,
@@ -3163,7 +2846,7 @@ export function createCephadmModel(overrides: Partial<CephadmDeps> = {}) {
         args: z.infer<typeof BucketInventoryArgs>,
         context: MethodContext,
       ) => {
-        const session = await sessionFor(args);
+        const session = await sessionFor(context, args);
         const realm = args.rgwRealm ?? "";
         try {
           const record = await bucketInventory(
@@ -3195,7 +2878,7 @@ export function createCephadmModel(overrides: Partial<CephadmDeps> = {}) {
         args: z.infer<typeof RgwUserArgs>,
         context: MethodContext,
       ) => {
-        const session = await sessionFor(args);
+        const session = await sessionFor(context, args);
         try {
           const result = await ensureRgwUser(deps, session, {
             host: args.host,
@@ -3299,12 +2982,19 @@ export function createCephadmModel(overrides: Partial<CephadmDeps> = {}) {
   return {
     type: "@randybias/cephadm",
     // The consistency gate requires this literal; VERSION mirrors it.
-    version: "2026.10.17.2",
+    version: "2026.10.17.3",
     description:
       "Install and operate a standalone Ceph cluster managed by cephadm on Debian-family hosts reached over SSH. One model type serves any number of hosts and clusters; every method takes its own target.",
     upgrades: MODEL_UPGRADES,
     globalArguments: GlobalArgsSchema,
     resources: {
+      hostkeys: {
+        description:
+          "SSH host keys pinned for one host and port, learned on first insecure_tofu use",
+        schema: HostKeysSchema,
+        lifetime: "infinite" as const,
+        garbageCollection: 10,
+      },
       cephVerifyResult: {
         description:
           "A shared verify-result record: method, host, pass, expected, actual, detail and optional subject",
@@ -3531,10 +3221,7 @@ export function createCephadmModel(overrides: Partial<CephadmDeps> = {}) {
         appliesTo: sshMethods,
         execute: async () => {
           try {
-            const child = deps.spawn("ssh", ["-V"]);
-            const writer = child.stdin.getWriter();
-            await writer.close();
-            await child.output();
+            await deps.run("ssh", ["-V"]);
             return { pass: true };
           } catch {
             return {
@@ -3549,11 +3236,39 @@ export function createCephadmModel(overrides: Partial<CephadmDeps> = {}) {
   };
 }
 
+/** The shared SSH fields on any method's parsed arguments. */
+interface SshSource {
+  host?: string;
+  adminHost?: string;
+  sshUser: string;
+  port?: number | null;
+  keyPath?: string | null;
+  privateKey?: string | null;
+  host_key_policy: "strict" | "insecure_tofu";
+  host_keys?: string[] | null;
+}
+
+/** Projects the shared SSH fields, with an optional host/port override. */
+function sshRequest(
+  a: SshSource,
+  over?: { host?: string; port?: number | null },
+): SessionRequest {
+  return {
+    host: over?.host ?? a.host ?? a.adminHost ?? "",
+    sshUser: a.sshUser,
+    port: over?.port ?? a.port,
+    keyPath: a.keyPath,
+    privateKey: a.privateKey,
+    host_key_policy: a.host_key_policy,
+    host_keys: a.host_keys,
+  };
+}
+
 /** Production model export. */
 export const model = {
   ...createCephadmModel(),
   type: "@randybias/cephadm",
-  version: "2026.10.17.2",
+  version: "2026.10.17.3",
   // The registry's upgrade check reads this literal chain from the export; a
   // test keeps it equal to MODEL_UPGRADES.
   upgrades: [
@@ -3566,6 +3281,12 @@ export const model = {
       toVersion: "2026.10.17.2",
       description:
         "Workflow catalog safety fixes and wipe-guard fixes; no schema changes",
+      upgradeAttributes: (old: Record<string, unknown>) => old,
+    },
+    {
+      toVersion: "2026.10.17.3",
+      description:
+        "Adopted the canonical ssh transport (typed exit-255 error, authoritative pins, no key on disk, no multiplex/ControlMaster). Method INPUTS were renamed: host_key_policy strict|insecure_tofu replaces strictHostKeyChecking, ssh-keyscan host_keys is new, and multiplex is dropped; every pinned line must name its host. Method arguments are per-call, not stored attributes, so this migration rewrites nothing: callers and the bundled workflows must pass host_key_policy (and, for strict, host_keys).",
       upgradeAttributes: (old: Record<string, unknown>) => old,
     },
   ],

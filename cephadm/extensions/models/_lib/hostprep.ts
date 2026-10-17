@@ -13,7 +13,7 @@
  */
 
 import { fail, SudoPolicyError, TransportError } from "./errors.ts";
-import type { SshSession } from "./ssh.ts";
+import type { SshSession } from "./ssh_session.ts";
 import {
   assertCephadmVersion,
   assertHttpUrl,

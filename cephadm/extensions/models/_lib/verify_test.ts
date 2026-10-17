@@ -1,6 +1,6 @@
 import { assertEquals, assertRejects } from "jsr:@std/assert@1.0.19";
 import { PhaseError, TransportError } from "./errors.ts";
-import type { CommandResult, SshSession } from "./ssh.ts";
+import type { CommandResult, SshSession } from "./ssh_session.ts";
 import {
   capacityReport,
   crushFailureDomain,
@@ -40,8 +40,7 @@ function vSession(
   const bodies: string[] = [];
   return {
     bodies,
-    target: { host: "192.0.2.10", user: "admin", strictHostKeyChecking: "yes" },
-    controlPath: null,
+    target: { host: "192.0.2.10", port: 22 },
     run: (opts) => {
       if (opts.command.startsWith("mktemp -d")) {
         dir++;
@@ -542,8 +541,7 @@ Deno.test("host-noout verifies the expectation in both directions", async () => 
 /** A plain read-only session for host checks. */
 function plainSession(route: (command: string) => CommandResult): SshSession {
   return {
-    target: { host: "192.0.2.10", user: "admin", strictHostKeyChecking: "yes" },
-    controlPath: null,
+    target: { host: "192.0.2.10", port: 22 },
     run: (opts) => Promise.resolve(route(opts.command)),
     close: () => Promise.resolve({ closed: false, detail: "not multiplexed" }),
   };

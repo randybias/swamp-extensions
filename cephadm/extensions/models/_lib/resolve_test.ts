@@ -9,7 +9,7 @@ import {
   readlinkCommand,
   resolveSerial,
 } from "./resolve.ts";
-import type { CommandResult, RunOptions, SshSession } from "./ssh.ts";
+import type { CommandResult, RunOptions, SshSession } from "./ssh_session.ts";
 
 function fakeSession(
   route: (opts: RunOptions) => CommandResult,
@@ -17,8 +17,7 @@ function fakeSession(
 ): { session: SshSession; calls: RunOptions[] } {
   const calls: RunOptions[] = [];
   const session: SshSession = {
-    target: { host, user: "admin", strictHostKeyChecking: "yes" },
-    controlPath: null,
+    target: { host, port: 22 },
     run: (opts) => {
       calls.push(opts);
       return Promise.resolve(route(opts));

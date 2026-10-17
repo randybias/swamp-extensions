@@ -12,8 +12,8 @@
  */
 
 import { fail } from "./errors.ts";
-import type { CommandResult } from "./ssh.ts";
-import type { SshSession } from "./ssh.ts";
+import type { CommandResult } from "./ssh_session.ts";
+import type { SshSession } from "./ssh_session.ts";
 import { assertSerial, quote, truncate } from "./validate.ts";
 
 /** By-id link-component characters: letters, digits, dot, underscore, colon, hyphen. */

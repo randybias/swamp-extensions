@@ -17,10 +17,17 @@ inputs:
       type: string
       default: ""
       description: Absolute local path to a private key; empty uses the runner default
-    strictHostKeyChecking:
+    host_key_policy:
       type: string
-      enum: ["yes", "no"]
-      description: Host-key policy, yes strict or no explicitly insecure
+      enum: ["strict", "insecure_tofu"]
+      description: Host-key policy; strict requires host_keys
+    host_keys:
+      type: array
+      items:
+        type: string
+      default: []
+      maxItems: 64
+      description: ssh-keyscan host keys, each naming its host; required for strict
     expectedUpAfter:
       type: integer
       description: Expected OSD up count after the apply
@@ -83,7 +90,7 @@ inputs:
     - adminHost
     - port
     - sshUser
-    - strictHostKeyChecking
+    - host_key_policy
     - expectedUpAfter
     - expectedInAfter
     - expectedFailureDomain
@@ -122,7 +129,9 @@ jobs:
             port: ${{ inputs.port }}
             sshUser: ${{ inputs.sshUser }}
             keyPath: '${{ inputs.keyPath == "" ? dyn(null) : dyn(inputs.keyPath) }}'
-            strictHostKeyChecking: ${{ inputs.strictHostKeyChecking }}
+            host_key_policy: ${{ inputs.host_key_policy }}
+
+            host_keys: ${{ inputs.host_keys }}
             allAvailableDevices: ${{ inputs.allAvailableDevices }}
             excludeDevices: ${{ inputs.excludeDevices }}
             targetHost: ${{ inputs.targetHost }}
@@ -193,7 +202,9 @@ jobs:
             port: ${{ inputs.port }}
             sshUser: ${{ inputs.sshUser }}
             keyPath: '${{ inputs.keyPath == "" ? dyn(null) : dyn(inputs.keyPath) }}'
-            strictHostKeyChecking: ${{ inputs.strictHostKeyChecking }}
+            host_key_policy: ${{ inputs.host_key_policy }}
+
+            host_keys: ${{ inputs.host_keys }}
             allAvailableDevices: ${{ inputs.allAvailableDevices }}
             excludeDevices: ${{ inputs.excludeDevices }}
             targetHost: ${{ inputs.targetHost }}
@@ -240,7 +251,9 @@ jobs:
             port: ${{ inputs.port }}
             sshUser: ${{ inputs.sshUser }}
             keyPath: '${{ inputs.keyPath == "" ? dyn(null) : dyn(inputs.keyPath) }}'
-            strictHostKeyChecking: ${{ inputs.strictHostKeyChecking }}
+            host_key_policy: ${{ inputs.host_key_policy }}
+
+            host_keys: ${{ inputs.host_keys }}
             allAvailableDevices: ${{ inputs.allAvailableDevices }}
             excludeDevices: ${{ inputs.excludeDevices }}
             targetHost: ${{ inputs.targetHost }}
@@ -265,7 +278,9 @@ jobs:
             port: ${{ inputs.port }}
             sshUser: ${{ inputs.sshUser }}
             keyPath: '${{ inputs.keyPath == "" ? dyn(null) : dyn(inputs.keyPath) }}'
-            strictHostKeyChecking: ${{ inputs.strictHostKeyChecking }}
+            host_key_policy: ${{ inputs.host_key_policy }}
+
+            host_keys: ${{ inputs.host_keys }}
             expectedUp: ${{ inputs.expectedUpAfter }}
             expectedIn: ${{ inputs.expectedInAfter }}
             expectedFailureDomain: ${{ inputs.expectedFailureDomain }}

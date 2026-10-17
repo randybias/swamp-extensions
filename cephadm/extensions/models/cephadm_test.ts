@@ -2,38 +2,46 @@ import { assertEquals, assertRejects } from "jsr:@std/assert@1.0.19";
 import { createModelTestContext } from "jsr:@swamp-club/swamp-testing@0.20261014.55";
 import { createCephadmModel, model, S3_METHODS, VERSION } from "./cephadm.ts";
 import { busyProbeScript } from "./_lib/hostprep.ts";
-import type { Spawner } from "./_lib/ssh.ts";
+import type { CommandRunner } from "./_lib/ssh.ts";
 
 const decoder = new TextDecoder();
-const encoder = new TextEncoder();
+/** A valid ssh-keyscan pin naming the host the tests dial. */
+const KEY_LINE = "192.0.2.10 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFakeKey";
 
-/** A fake ssh spawner routed by the remote command (the last argv element). */
-function routeSpawner(
+/**
+ * Unwraps the canonical `'sh' '-c' '<remote>'` argv tail back to the remote
+ * command the tests route on.
+ */
+function unquoteSh(remote: string): string {
+  const match = /^'sh' '-c' (.*)$/.exec(remote);
+  if (match === null) return remote;
+  let inner = match[1];
+  if (inner.startsWith("'") && inner.endsWith("'")) {
+    inner = inner.slice(1, -1);
+  }
+  return inner.replace(/'\\''/g, "'");
+}
+
+/** A fake command runner routed by the remote command (the last argv element). */
+function routeRunner(
   handler: (
     command: string,
     stdin: string,
   ) => { code: number; stdout: string; stderr: string },
-): Spawner {
-  return (_cmd, args) => {
-    const command = args.at(-1) ?? "";
-    let stdin = "";
-    return {
-      stdin: new WritableStream<Uint8Array>({
-        write(chunk) {
-          stdin += decoder.decode(chunk);
-        },
-        close() {},
-      }),
-      output: () => {
-        const r = handler(command, stdin);
-        return Promise.resolve({
-          code: r.code,
-          stdout: encoder.encode(r.stdout),
-          stderr: encoder.encode(r.stderr),
-        });
-      },
-      kill: () => {},
-    };
+): CommandRunner {
+  return (_cmd, args, options = {}) => {
+    const command = unquoteSh(args.at(-1) ?? "");
+    const stdin = typeof options.stdin === "string"
+      ? options.stdin
+      : options.stdin !== undefined
+      ? decoder.decode(options.stdin)
+      : "";
+    const r = handler(command, stdin);
+    return Promise.resolve({
+      code: r.code,
+      stdout: r.stdout,
+      stderr: r.stderr,
+    });
   };
 }
 
@@ -87,8 +95,8 @@ Deno.test(
           "port",
           "keyPath",
           "privateKey",
-          "strictHostKeyChecking",
-          "multiplex",
+          "host_key_policy",
+          "host_keys",
         ]
       ) {
         assertEquals(fields.includes(field), true, `${name} lacks ${field}`);
@@ -96,6 +104,22 @@ Deno.test(
     }
   },
 );
+
+Deno.test("the 2026.10.17.3 upgrade is identity (inputs, not stored attrs)", () => {
+  const up = model.upgrades.find((u) => u.toVersion === "2026.10.17.3");
+  assertEquals(up !== undefined, true);
+  const upgrade = up!.upgradeAttributes as (
+    old: Record<string, unknown>,
+  ) => Record<string, unknown>;
+  // SSH fields are per-call arguments, not stored attributes: nothing to map.
+  const old = {
+    sshUser: "admin",
+    strictHostKeyChecking: "yes",
+    multiplex: true,
+  };
+  assertEquals(upgrade(old), old);
+  assertEquals(up!.description.includes("Method INPUTS"), true);
+});
 
 Deno.test(
   "the ssh-installed check applies to exactly the SSH methods", // leak-allow(decision D19)
@@ -115,7 +139,7 @@ Deno.test(
 
 Deno.test("the upgrade chain ends at the model version", () => {
   const upgrades = model.upgrades as unknown as { toVersion: string }[];
-  assertEquals(upgrades.length, 2);
+  assertEquals(upgrades.length, 3);
   assertEquals(upgrades.at(-1)!.toVersion, model.version);
   const factory = createCephadmModel().upgrades as unknown as {
     toVersion: string;
@@ -134,8 +158,8 @@ Deno.test("host preparation rejects hostile hosts, packages, URLs and budgets", 
     port: null,
     keyPath: null,
     privateKey: null,
-    strictHostKeyChecking: "yes",
-    multiplex: null,
+    host_key_policy: "strict",
+    host_keys: [KEY_LINE] as string[],
     packages: ["chrony"],
     cephadmUrl: "https://download.example.com/cephadm",
     cephadmVersion: "19.2.1",
@@ -182,8 +206,8 @@ Deno.test("wipe requires both device lists and rejects injection serials", () =>
     port: null,
     keyPath: null,
     privateKey: null,
-    strictHostKeyChecking: "yes",
-    multiplex: null,
+    host_key_policy: "strict",
+    host_keys: [KEY_LINE] as string[],
     dataDevices: [{ serial: "SN0001" }],
     excludeDevices: [],
     dryRun: null,
@@ -203,7 +227,7 @@ Deno.test("wipe requires both device lists and rejects injection serials", () =>
 });
 
 Deno.test("a ready host preparing end to end writes a complete record", async () => {
-  const spawn = routeSpawner((command) => {
+  const run = routeRunner((command) => {
     if (command === "sudo -n -- bash -s --") {
       return { code: 0, stdout: "idle\n", stderr: "" };
     }
@@ -233,7 +257,7 @@ Deno.test("a ready host preparing end to end writes a complete record", async ()
     return { code: 1, stdout: "", stderr: `unrouted: ${command}` };
   });
   const m = createCephadmModel({
-    spawn,
+    run,
     now: () => 0,
     sleep: () => Promise.resolve(),
     random: () => 0,
@@ -247,8 +271,8 @@ Deno.test("a ready host preparing end to end writes a complete record", async ()
     port: null,
     keyPath: null,
     privateKey: null,
-    strictHostKeyChecking: "yes",
-    multiplex: null,
+    host_key_policy: "strict",
+    host_keys: [KEY_LINE] as string[],
     packages: ["chrony"],
     cephadmUrl: "https://download.example.com/cephadm",
     cephadmVersion: "19.2.1",
@@ -269,9 +293,90 @@ Deno.test("a ready host preparing end to end writes a complete record", async ()
   assertEquals(data.packages[0].alreadyPresent, true);
 });
 
-Deno.test("the ssh-installed check passes when the spawner works", async () => {
+Deno.test("a method learns host keys once and reuses the stored pin", async () => {
+  let scans = 0;
+  const base = routeRunner((command) => {
+    if (command === "sudo -n -- bash -s --") {
+      return { code: 0, stdout: "idle\n", stderr: "" };
+    }
+    if (command.startsWith("dpkg -s ")) {
+      return {
+        code: 0,
+        stdout: "Package: chrony\nVersion: 4.3-2\n",
+        stderr: "",
+      };
+    }
+    if (command === "test -x /usr/local/sbin/cephadm") {
+      return { code: 0, stdout: "", stderr: "" };
+    }
+    if (command === "sudo -n -- /usr/local/sbin/cephadm version") {
+      return {
+        code: 0,
+        stdout: "cephadm version 19.2.1 (abc) squid (stable)\n",
+        stderr: "",
+      };
+    }
+    if (command === "systemctl is-active 'chrony.service'") {
+      return { code: 0, stdout: "active\n", stderr: "" };
+    }
+    if (command.startsWith("-O exit")) {
+      return { code: 0, stdout: "", stderr: "" };
+    }
+    return { code: 1, stdout: "", stderr: `unrouted: ${command}` };
+  });
+  const run: CommandRunner = async (cmd, args, options = {}) => {
+    if (cmd === "ssh-keyscan") {
+      scans++;
+      return {
+        code: 0,
+        stdout: `${args.at(-1)} ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFakeKey\n`,
+        stderr: "",
+      };
+    }
+    return await base(cmd, args, options);
+  };
   const m = createCephadmModel({
-    spawn: routeSpawner(() => ({ code: 0, stdout: "", stderr: "" })),
+    run,
+    now: () => 0,
+    sleep: () => Promise.resolve(),
+    random: () => 0,
+  });
+  const { context, getWrittenResources } = createModelTestContext({
+    globalArgs: GLOBALS,
+  });
+  const args = {
+    host: "192.0.2.10",
+    sshUser: "admin",
+    port: null,
+    keyPath: null,
+    privateKey: null,
+    host_key_policy: "insecure_tofu" as const,
+    host_keys: null,
+    packages: ["chrony"],
+    cephadmUrl: "https://download.example.com/cephadm",
+    cephadmVersion: "19.2.1",
+    timeSyncService: "chrony.service",
+    installRetryBudgetMs: null,
+  };
+  await m.methods.cephHostPrep.execute(args, context);
+  assertEquals(scans, 1, "the first run learns");
+  await m.methods.cephHostPrep.execute(args, context);
+  assertEquals(scans, 1, "the second run reuses the stored pin");
+  const hostkeys = getWrittenResources().filter((r) =>
+    r.name === "hostkeys-192.0.2.10-22"
+  );
+  assertEquals(hostkeys.length, 1, "the pin is persisted once");
+  assertEquals(
+    (hostkeys[0].data as { host_keys: string[] }).host_keys[0].startsWith(
+      "192.0.2.10 ",
+    ),
+    true,
+  );
+});
+
+Deno.test("the ssh-installed check passes when the runner works", async () => {
+  const m = createCephadmModel({
+    run: routeRunner(() => ({ code: 0, stdout: "", stderr: "" })),
   });
   const checks = m.checks as unknown as Record<
     string,
@@ -287,9 +392,9 @@ Deno.test("the ssh-installed check passes when the spawner works", async () => {
   );
 });
 
-Deno.test("the ssh-installed check fails when the binary cannot be spawned", async () => {
+Deno.test("the ssh-installed check fails when the binary cannot be run", async () => {
   const m = createCephadmModel({
-    spawn: () => {
+    run: () => {
       throw new Error("ssh not found");
     },
   });
@@ -315,8 +420,8 @@ const SSH_NULLS = {
   port: null,
   keyPath: null,
   privateKey: null,
-  strictHostKeyChecking: "yes",
-  multiplex: null,
+  host_key_policy: "strict",
+  host_keys: [KEY_LINE] as string[],
   sshUser: "admin",
 } as const;
 
@@ -554,7 +659,7 @@ Deno.test("bootstrap records the fsid and a keyring path, never keyring material
   const key =
     "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIExampleExampleExampleExampleExample";
   let probes = 0;
-  const spawn = routeSpawner((command) => {
+  const run = routeRunner((command) => {
     if (command.endsWith("cephadm ls")) {
       probes++;
       return {
@@ -570,7 +675,7 @@ Deno.test("bootstrap records the fsid and a keyring path, never keyring material
     return { code: 1, stdout: "", stderr: `unrouted: ${command}` };
   });
   const m = createCephadmModel({
-    spawn,
+    run,
     now: () => 0,
     sleep: () => Promise.resolve(),
     random: () => 0.25,
@@ -604,7 +709,7 @@ Deno.test("bootstrap records the fsid and a keyring path, never keyring material
 Deno.test("distribute-key reports all hosts and fails at the end naming failures", async () => {
   const key =
     "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIExampleExampleExampleExampleExample";
-  const spawn = routeSpawner((command) => {
+  const run = routeRunner((command) => {
     if (command.includes("mkdir -p")) {
       return { code: 0, stdout: "", stderr: "" };
     }
@@ -616,12 +721,17 @@ Deno.test("distribute-key reports all hosts and fails at the end naming failures
     }
     return { code: 1, stdout: "", stderr: "unrouted" };
   });
-  const m = createCephadmModel({ spawn, now: () => 0 });
+  const m = createCephadmModel({ run, now: () => 0 });
   const { context, getWrittenResources } = createModelTestContext({
     globalArgs: GLOBALS,
   });
   await m.methods.cephDistributeKey.execute({
     ...SSH_NULLS,
+    // A multi-host set: one line per host, selected per host by the transport.
+    host_keys: [
+      KEY_LINE,
+      "[198.51.100.9]:2202 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFakeKey",
+    ],
     cephPubKey: key,
     hosts: [{ host: "192.0.2.10", port: 22 }, {
       host: "198.51.100.9",
@@ -635,7 +745,7 @@ Deno.test("distribute-key reports all hosts and fails at the end naming failures
 });
 
 Deno.test("verifyPackageSource records first, then throws, when throwOnFail is unset", async () => {
-  const spawn = routeSpawner((command, stdin) => {
+  const run = routeRunner((command, stdin) => {
     if (stdin.includes("###CEPHADM-SOURCES###")) {
       return {
         code: 0,
@@ -656,7 +766,7 @@ Deno.test("verifyPackageSource records first, then throws, when throwOnFail is u
     }
     return { code: 1, stdout: "", stderr: "unrouted" };
   });
-  const m = createCephadmModel({ spawn, now: () => 0 });
+  const m = createCephadmModel({ run, now: () => 0 });
   const { context, getWrittenResources } = createModelTestContext({
     globalArgs: GLOBALS,
   });
@@ -668,8 +778,8 @@ Deno.test("verifyPackageSource records first, then throws, when throwOnFail is u
         port: null,
         keyPath: null,
         privateKey: null,
-        strictHostKeyChecking: "yes",
-        multiplex: null,
+        host_key_policy: "strict",
+        host_keys: [KEY_LINE] as string[],
         cephadmUrl: "https://download.example.com/cephadm",
         throwOnFail: null,
       }, context),
@@ -725,7 +835,7 @@ Deno.test("every mutating method is declared an action", () => {
 Deno.test("distribute-key records every host's outcome, then throws", async () => {
   const key =
     "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIExampleExampleExampleExampleExample";
-  const spawn = routeSpawner((command) => {
+  const run = routeRunner((command) => {
     if (command.includes("mkdir -p")) {
       return { code: 0, stdout: "", stderr: "" };
     }
@@ -737,7 +847,7 @@ Deno.test("distribute-key records every host's outcome, then throws", async () =
     }
     return { code: 1, stdout: "", stderr: "unrouted" };
   });
-  const m = createCephadmModel({ spawn, now: () => 0 });
+  const m = createCephadmModel({ run, now: () => 0 });
   const { context, getWrittenResources } = createModelTestContext({
     globalArgs: GLOBALS,
   });
@@ -808,7 +918,8 @@ Deno.test("the raw-disk gate accepts the wipe's boot-partition acknowledgement a
   const base = {
     host: "192.0.2.10",
     sshUser: "admin",
-    strictHostKeyChecking: "yes",
+    host_key_policy: "strict",
+    host_keys: [KEY_LINE] as string[],
     port: 22,
   };
   const withAck = gate.safeParse({

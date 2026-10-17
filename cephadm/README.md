@@ -71,7 +71,8 @@ and stored state is keyed by host.
 The catalog runs against a model definition named `cephadm`. Every mutating
 workflow asks for approval, then proves its effect with an independent read-back
 and reports a failure without remediating. Every workflow requires an explicit
-`port` and a `strictHostKeyChecking` of `yes` or `no`.
+`port` and a `host_key_policy` of `strict` or `insecure_tofu`; `strict` also
+needs `host_keys` (ssh-keyscan lines, each naming its host).
 
 | Workflow                        | Description                                                              |
 | ------------------------------- | ------------------------------------------------------------------------ |
@@ -145,7 +146,8 @@ Prepare one host, with the key kept in a vault:
 
 ```bash
 swamp behavior run cephadm cephHostPrep --input host=node1.example.com \
-  --input sshUser=admin --input port=22 --input strictHostKeyChecking=yes \
+  --input sshUser=admin --input port=22 --input host_key_policy=strict \
+  --input 'host_keys:json=["node1.example.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFakeKey"]' \
   --input 'privateKey=${{ vault.get("default", "NODE1_KEY") }}' \
   --input 'packages:json=["chrony","lvm2","podman"]' \
   --input cephadmUrl=https://download.example.com/ceph/19.2.1/el9/noarch/cephadm \
@@ -154,10 +156,13 @@ swamp behavior run cephadm cephHostPrep --input host=node1.example.com \
 
 ## How it works
 
-- Every remote action goes through the system OpenSSH client, with key-only
-  authentication and `BatchMode=yes`; it never prompts for a password or a host
-  key. Host-key checking is strict by default (`strictHostKeyChecking=yes`), and
-  `no` is explicit and consults no real known_hosts.
+- Every remote action goes through the canonical vendored `_lib/ssh.ts`: the
+  system OpenSSH client with `-F /dev/null` (so `~/.ssh/config`, ProxyJump and
+  the like are ignored), `BatchMode=yes`, and the private key loaded into a
+  short-lived ssh-agent over stdin. Nothing secret is on disk or argv, and there
+  is no ControlMaster/multiplex. Host-key checking is `strict` (pinned
+  `host_keys`) or `insecure_tofu` (learn and pin the first key per host:port in
+  the `hostkeys` resource); every pinned line must name its host.
 - The host-key policy and port are accepted by every SSH method. A lost session
   is classified: a drop before authentication proves the command never ran and
   may be re-sent, while a mid-session loss is never re-sent blindly.

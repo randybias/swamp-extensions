@@ -12,7 +12,7 @@
 
 import { cappedBackoff, type WaitDeps } from "./backoff.ts";
 import { fail, TransportError } from "./errors.ts";
-import type { SshSession } from "./ssh.ts";
+import type { SshSession } from "./ssh_session.ts";
 import {
   CEPHADM_PATH,
   parseDpkgVersion,

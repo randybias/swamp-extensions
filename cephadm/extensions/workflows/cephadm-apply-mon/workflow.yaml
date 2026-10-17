@@ -17,10 +17,17 @@ inputs:
       type: string
       default: ""
       description: Absolute local path to a private key; empty uses the runner default
-    strictHostKeyChecking:
+    host_key_policy:
       type: string
-      enum: ["yes", "no"]
-      description: Host-key policy, yes strict or no explicitly insecure
+      enum: ["strict", "insecure_tofu"]
+      description: Host-key policy; strict requires host_keys
+    host_keys:
+      type: array
+      items:
+        type: string
+      default: []
+      maxItems: 64
+      description: ssh-keyscan host keys, each naming its host; required for strict
     placement:
       type: array
       items:
@@ -38,7 +45,7 @@ inputs:
     - adminHost
     - port
     - sshUser
-    - strictHostKeyChecking
+    - host_key_policy
     - placement
 jobs:
   - name: apply
@@ -55,7 +62,9 @@ jobs:
             port: ${{ inputs.port }}
             sshUser: ${{ inputs.sshUser }}
             keyPath: '${{ inputs.keyPath == "" ? dyn(null) : dyn(inputs.keyPath) }}'
-            strictHostKeyChecking: ${{ inputs.strictHostKeyChecking }}
+            host_key_policy: ${{ inputs.host_key_policy }}
+
+            host_keys: ${{ inputs.host_keys }}
             placement: ${{ inputs.placement }}
             throwOnFail: false
       - name: assert-mon-placement
@@ -104,7 +113,9 @@ jobs:
             port: ${{ inputs.port }}
             sshUser: ${{ inputs.sshUser }}
             keyPath: '${{ inputs.keyPath == "" ? dyn(null) : dyn(inputs.keyPath) }}'
-            strictHostKeyChecking: ${{ inputs.strictHostKeyChecking }}
+            host_key_policy: ${{ inputs.host_key_policy }}
+
+            host_keys: ${{ inputs.host_keys }}
             placement: ${{ inputs.placement }}
             throwOnFail: false
       - name: assert-recheck-mon-placement
@@ -145,7 +156,9 @@ jobs:
             port: ${{ inputs.port }}
             sshUser: ${{ inputs.sshUser }}
             keyPath: '${{ inputs.keyPath == "" ? dyn(null) : dyn(inputs.keyPath) }}'
-            strictHostKeyChecking: ${{ inputs.strictHostKeyChecking }}
+            host_key_policy: ${{ inputs.host_key_policy }}
+
+            host_keys: ${{ inputs.host_keys }}
             placement: ${{ inputs.placement }}
   - name: prove
     description: Wait for quorum to settle and assert it is complete
@@ -165,7 +178,9 @@ jobs:
             port: ${{ inputs.port }}
             sshUser: ${{ inputs.sshUser }}
             keyPath: '${{ inputs.keyPath == "" ? dyn(null) : dyn(inputs.keyPath) }}'
-            strictHostKeyChecking: ${{ inputs.strictHostKeyChecking }}
+            host_key_policy: ${{ inputs.host_key_policy }}
+
+            host_keys: ${{ inputs.host_keys }}
             expectedMonCount: ${{ size(inputs.placement) }}
             quorumSettleMs: ${{ inputs.quorumSettleMs }}
             quorumPollIntervalMs: ${{ inputs.quorumPollIntervalMs }}

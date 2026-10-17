@@ -201,6 +201,25 @@ export function isSshPublicKey(value: string): boolean {
   return true;
 }
 
+const HOST_FIELD_RE = /^[A-Za-z0-9.,:_\[\]-]{1,512}$/;
+
+/**
+ * True when `value` is one ssh-keyscan line WITH its host field:
+ * `host type blob`, where the host is a name, IP, comma list or `[host]:port`.
+ * cephadm is multi-host, so a bare `type blob` line (no host field) is refused:
+ * it would name no host and so pin a key for every host.
+ */
+export function isHostKeyLine(value: string): boolean {
+  if (/[\r\n]/.test(value) || value.length < 1 || value.length > 8192) {
+    return false;
+  }
+  const fields = value.split(" ");
+  if (fields.length !== 3) return false;
+  if (fields.some((f) => f === "")) return false;
+  return HOST_FIELD_RE.test(fields[0]) && SSH_KEY_TYPES.has(fields[1]) &&
+    KEY_BLOB_RE.test(fields[2]);
+}
+
 const IMAGE_COMPONENT_RE = /^[a-z0-9]+(?:(?:[._]|__|[-]+)[a-z0-9]+)*$/;
 const TAG_RE = /^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$/;
 const DIGEST_RE = /^sha256:[0-9a-f]{64}$/;

@@ -11,7 +11,7 @@
  */
 
 import { fail } from "./errors.ts";
-import type { SshSession } from "./ssh.ts";
+import type { SshSession } from "./ssh_session.ts";
 import { quote, truncate } from "./validate.ts";
 import type { PrepDeps } from "./hostprep.ts";
 import { runCeph } from "./shell.ts";

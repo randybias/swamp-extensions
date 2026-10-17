@@ -4,7 +4,7 @@ import {
   assertThrows,
 } from "jsr:@std/assert@1.0.19";
 import { PhaseError } from "./errors.ts";
-import type { CommandResult, RunOptions, SshSession } from "./ssh.ts";
+import type { CommandResult, RunOptions, SshSession } from "./ssh_session.ts";
 import {
   cephScriptBody,
   parseCephJson,
@@ -20,8 +20,7 @@ function fakeSession(
 ): { session: SshSession; calls: RunOptions[] } {
   const calls: RunOptions[] = [];
   const session: SshSession = {
-    target: { host: "192.0.2.10", user: "admin", strictHostKeyChecking: "yes" },
-    controlPath: null,
+    target: { host: "192.0.2.10", port: 22 },
     run: (opts) => {
       calls.push(opts);
       return Promise.resolve(route(opts));

@@ -28,6 +28,11 @@ ssh-host:
   notes:
     2026.10.17.1: 'First release. Run one argv vector, push bytes atomically (bytes and mode converge; symlink and directory destinations are refused; Linux mv -T), and wait for SSH host keys on any host, under a required strict or trust-on-first-use host-key policy. Every ssh exit 255 is a typed transport error; supplied host keys that do not apply to the target are refused; under trust-on-first-use a recorded key is pinned for later runs and a supplied pin must match it. exec returns exit code and output hashes by default; raw output is stored only in a sensitive resource when asked, with a bounded capture size. Security: pass the private key as a vault reference only; the swamp CLI prints literal sensitive arguments under --json (swamp-club lab 3555). Every method was run live end to end on a VPS (23 cells, including failure and injection paths). Published to stable by a manual push; later versions go to beta first.'
 
+cephadm:
+  channel: beta
+  ci: false
+  published: {}
+
 cherry-servers:
   channel: beta
   ci: true

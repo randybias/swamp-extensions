@@ -1,0 +1,56 @@
+id: dc3f0beb-6342-40f4-9c46-229c3dd78ae0
+name: "@randybias/cephadm-verify-health"
+description: Check cluster health against an allowlist of warning checks
+version: 1
+inputs:
+  properties:
+    host:
+      type: string
+      description: Admin host, hostname or IPv4
+    port:
+      type: integer
+      description: SSH port on the admin host
+    sshUser:
+      type: string
+      description: SSH login user on the admin host
+    keyPath:
+      type: string
+      default: ""
+      description: Absolute local path to a private key; empty uses the runner default
+    strictHostKeyChecking:
+      type: string
+      enum: ["yes", "no"]
+      description: Host-key policy, yes strict or no explicitly insecure
+    wantOk:
+      type: boolean
+      description: True asserts healthy, false asserts not healthy
+    allowedWarnings:
+      type: array
+      items:
+        type: string
+      description: Health check names tolerated when wantOk is true
+  required:
+    - host
+    - port
+    - sshUser
+    - strictHostKeyChecking
+    - wantOk
+    - allowedWarnings
+jobs:
+  - name: verify
+    description: Read cluster health and halt on a failed verdict
+    steps:
+      - name: verify-health
+        description: Check cluster health against the allowlist via ceph
+        task:
+          type: model_method
+          modelIdOrName: cephadm
+          methodName: cephVerifyHealth
+          inputs:
+            host: ${{ inputs.host }}
+            port: ${{ inputs.port }}
+            sshUser: ${{ inputs.sshUser }}
+            keyPath: '${{ inputs.keyPath == "" ? dyn(null) : dyn(inputs.keyPath) }}'
+            strictHostKeyChecking: ${{ inputs.strictHostKeyChecking }}
+            wantOk: ${{ inputs.wantOk }}
+            allowedWarnings: ${{ inputs.allowedWarnings }}

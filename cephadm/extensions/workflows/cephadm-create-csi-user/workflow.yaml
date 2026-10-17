@@ -1,0 +1,136 @@
+id: 9df89b30-9782-4840-8bc5-201ba0c5b50a
+name: "@randybias/cephadm-create-csi-user"
+description: Create or converge a client entity's caps and prove that it exists
+version: 1
+inputs:
+  properties:
+    host:
+      type: string
+      description: Admin host where ceph runs
+    port:
+      type: integer
+      description: SSH port on the admin host
+    sshUser:
+      type: string
+      description: SSH login user on the admin host
+    keyPath:
+      type: string
+      default: ""
+      description: Absolute local path to a private key; empty uses the runner default
+    strictHostKeyChecking:
+      type: string
+      enum: ["yes", "no"]
+      description: Host-key policy, yes strict or no explicitly insecure
+    name:
+      type: string
+      description: Bare client entity name, without the client. prefix
+    caps:
+      type: object
+      properties:
+        mon:
+          type: string
+        mgr:
+          type: string
+        osd:
+          type: string
+        mds:
+          type: string
+      required: ["mon", "mgr", "osd"]
+      description: Caps by subsystem, each a Ceph caps expression
+  required:
+    - host
+    - port
+    - sshUser
+    - strictHostKeyChecking
+    - name
+    - caps
+jobs:
+  - name: create
+    description: Approve and set the client entity caps
+    steps:
+      - name: approve
+        description: Approve creating or converging the client entity
+        task:
+          type: manual_approval
+          prompt: >-
+            Create or converge client entity ${{ inputs.name }} with caps
+            ${{ inputs.caps }} on ${{ inputs.host }}. This changes the entity's
+            authorisation.
+          timeout: 3600
+      - name: create-csi-user
+        description: Create the entity and set its caps via ceph
+        dependsOn:
+          - step: approve
+            condition:
+              type: succeeded
+        task:
+          type: model_method
+          modelIdOrName: cephadm
+          methodName: cephCreateCsiUser
+          inputs:
+            host: ${{ inputs.host }}
+            port: ${{ inputs.port }}
+            sshUser: ${{ inputs.sshUser }}
+            keyPath: '${{ inputs.keyPath == "" ? dyn(null) : dyn(inputs.keyPath) }}'
+            strictHostKeyChecking: ${{ inputs.strictHostKeyChecking }}
+            name: ${{ inputs.name }}
+            caps: ${{ inputs.caps }}
+  - name: prove
+    description: Read the client entities back and assert the entity exists
+    dependsOn:
+      - job: create
+        condition:
+          type: succeeded
+    steps:
+      - name: verify-csi-users
+        description: Read the client entity list and caps via ceph
+        task:
+          type: model_method
+          modelIdOrName: cephadm
+          methodName: cephVerifyCsiUsers
+          inputs:
+            host: ${{ inputs.host }}
+            port: ${{ inputs.port }}
+            sshUser: ${{ inputs.sshUser }}
+            keyPath: '${{ inputs.keyPath == "" ? dyn(null) : dyn(inputs.keyPath) }}'
+            strictHostKeyChecking: ${{ inputs.strictHostKeyChecking }}
+            expectedUserNames: "${{ [inputs.name] }}"
+            throwOnFail: false
+      - name: assert-csi-user
+        description: Assert the client entity exists; caps are set, not re-read
+        dependsOn:
+          - step: verify-csi-users
+            condition:
+              type: succeeded
+        task:
+          type: assert
+          expr: >-
+            data.latest("cephadm", "cephVerifyCsiUsers-" + inputs.host).attributes.pass == true
+          message: >-
+            Expected client entity ${{ inputs.name }} to exist after setting caps
+            ${{ inputs.caps }}; observed
+            pass=${{ data.latest("cephadm", "cephVerifyCsiUsers-" + inputs.host).attributes.pass }}
+            users=${{ data.latest("cephadm", "cephVerifyCsiUsers-" + inputs.host).attributes.detail.users }}
+          severity: high
+  - name: report-failure
+    description: Report that nothing was rolled back or retried
+    dependsOn:
+      - job: prove
+        condition:
+          type: or
+          conditions:
+            - type: failed
+            - type: skipped
+    steps:
+      - name: report-failure
+        description: State that the run changed nothing and was not remediated
+        allowFailure: true
+        task:
+          type: assert
+          expr: "true"
+          message: >-
+            Nothing was rolled back, retried or remediated. A run that stopped
+            at approval changed nothing. Any host in maintenance is still in
+            maintenance. Read the failing method's error from the
+            method-summary report before re-running.
+          severity: low

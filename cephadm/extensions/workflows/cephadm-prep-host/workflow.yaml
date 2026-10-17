@@ -1,0 +1,142 @@
+id: 7ee839a8-a8ad-46cc-99a1-ae45ccbd6e20
+name: "@randybias/cephadm-prep-host"
+description: Install packages, pinned cephadm and time sync on one host
+version: 1
+inputs:
+  properties:
+    host:
+      type: string
+      description: Target host, hostname or IPv4
+    port:
+      type: integer
+      description: SSH port on the target host
+    sshUser:
+      type: string
+      description: SSH login user on the target host
+    keyPath:
+      type: string
+      default: ""
+      description: Absolute local path to a private key; empty uses the runner default
+    strictHostKeyChecking:
+      type: string
+      enum: ["yes", "no"]
+      description: Host-key policy, yes strict or no explicitly insecure
+    packages:
+      type: array
+      items:
+        type: string
+      description: Debian packages to ensure installed
+    cephadmUrl:
+      type: string
+      description: URL of the standalone cephadm executable
+    cephadmVersion:
+      type: string
+      description: Pinned cephadm release, a dotted version such as 19.2.1
+    timeSyncService:
+      type: string
+      description: systemd unit that provides time sync, such as chrony
+    installRetryBudgetMs:
+      type: integer
+      description: Total milliseconds the package phase may retry; absent means one pass
+  required:
+    - host
+    - port
+    - sshUser
+    - strictHostKeyChecking
+    - packages
+    - cephadmUrl
+    - cephadmVersion
+    - timeSyncService
+jobs:
+  - name: prepare
+    description: Approve and run host preparation on the named host
+    steps:
+      - name: approve
+        description: Approve installing pinned cephadm on the named host
+        task:
+          type: manual_approval
+          prompt: >-
+            Install packages ${{ inputs.packages }} and pin cephadm
+            ${{ inputs.cephadmVersion }} on ${{ inputs.host }}. This changes the
+            host's package state and time-sync service.
+          timeout: 3600
+      - name: host-prep
+        description: Install packages and pinned cephadm via SSH
+        dependsOn:
+          - step: approve
+            condition:
+              type: succeeded
+        task:
+          type: model_method
+          modelIdOrName: cephadm
+          methodName: cephHostPrep
+          inputs:
+            host: ${{ inputs.host }}
+            port: ${{ inputs.port }}
+            sshUser: ${{ inputs.sshUser }}
+            keyPath: '${{ inputs.keyPath == "" ? dyn(null) : dyn(inputs.keyPath) }}'
+            strictHostKeyChecking: ${{ inputs.strictHostKeyChecking }}
+            packages: ${{ inputs.packages }}
+            cephadmUrl: ${{ inputs.cephadmUrl }}
+            cephadmVersion: ${{ inputs.cephadmVersion }}
+            timeSyncService: ${{ inputs.timeSyncService }}
+            installRetryBudgetMs: "${{ has(inputs.installRetryBudgetMs) ? dyn(inputs.installRetryBudgetMs) : dyn(null) }}"
+  - name: prove
+    description: Read back host preparation and assert the expected state
+    dependsOn:
+      - job: prepare
+        condition:
+          type: succeeded
+    steps:
+      - name: verify-host-prep
+        description: Read back packages, cephadm version and time sync via ceph
+        task:
+          type: model_method
+          modelIdOrName: cephadm
+          methodName: cephVerifyHostPrep
+          inputs:
+            host: ${{ inputs.host }}
+            port: ${{ inputs.port }}
+            sshUser: ${{ inputs.sshUser }}
+            keyPath: '${{ inputs.keyPath == "" ? dyn(null) : dyn(inputs.keyPath) }}'
+            strictHostKeyChecking: ${{ inputs.strictHostKeyChecking }}
+            expectedPackages: ${{ inputs.packages }}
+            expectedCephadmVersion: ${{ inputs.cephadmVersion }}
+            expectedTimeSyncService: ${{ inputs.timeSyncService }}
+            throwOnFail: false
+      - name: assert-host-prep
+        description: Assert packages, cephadm version and time sync match
+        dependsOn:
+          - step: verify-host-prep
+            condition:
+              type: succeeded
+        task:
+          type: assert
+          expr: >-
+            data.latest("cephadm", "cephVerifyHostPrep-" + inputs.host).attributes.pass == true
+          message: >-
+            Expected cephVerifyHostPrep to pass for ${{ inputs.host }}, observed
+            pass=${{ data.latest("cephadm", "cephVerifyHostPrep-" + inputs.host).attributes.pass }}
+          severity: high
+  - name: report-failure
+    description: Report that nothing was rolled back or retried
+    dependsOn:
+      - job: prove
+        condition:
+          type: or
+          conditions:
+            - type: failed
+            - type: skipped
+    steps:
+      - name: report-failure
+        description: State that the run changed nothing and was not remediated
+        allowFailure: true
+        task:
+          type: assert
+          expr: "true"
+          message: >-
+            Nothing was rolled back, retried or remediated. A run that stopped
+            at approval changed nothing. Any host in maintenance is still in
+            maintenance. Read the failing method's error from the
+            method-summary report before re-running.
+          severity: low

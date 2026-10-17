@@ -1,0 +1,167 @@
+id: 815d952d-10c9-4e9d-9af7-a79c751bc7b2
+name: "@randybias/cephadm-apply-mon"
+description: Converge mons to an explicit host list and wait for quorum to settle
+version: 1
+inputs:
+  properties:
+    adminHost:
+      type: string
+      description: Admin host where ceph runs
+    port:
+      type: integer
+      description: SSH port on the admin host
+    sshUser:
+      type: string
+      description: SSH login user on the admin host
+    keyPath:
+      type: string
+      default: ""
+      description: Absolute local path to a private key; empty uses the runner default
+    strictHostKeyChecking:
+      type: string
+      enum: ["yes", "no"]
+      description: Host-key policy, yes strict or no explicitly insecure
+    placement:
+      type: array
+      items:
+        type: string
+      description: Hostnames that must run mons, unique
+    quorumSettleMs:
+      type: integer
+      default: 300000
+      description: Settle budget in milliseconds for the quorum read-back
+    quorumPollIntervalMs:
+      type: integer
+      default: 10000
+      description: Backoff ceiling in milliseconds between quorum polls
+  required:
+    - adminHost
+    - port
+    - sshUser
+    - strictHostKeyChecking
+    - placement
+jobs:
+  - name: apply
+    description: Check mon placement, approve, then converge the mon set
+    steps:
+      - name: gate-mon-placement
+        description: Judge the requested mon placement without applying it
+        task:
+          type: model_method
+          modelIdOrName: cephadm
+          methodName: cephVerifyMonPlacement
+          inputs:
+            host: ${{ inputs.adminHost }}
+            port: ${{ inputs.port }}
+            sshUser: ${{ inputs.sshUser }}
+            keyPath: '${{ inputs.keyPath == "" ? dyn(null) : dyn(inputs.keyPath) }}'
+            strictHostKeyChecking: ${{ inputs.strictHostKeyChecking }}
+            placement: ${{ inputs.placement }}
+            throwOnFail: false
+      - name: assert-mon-placement
+        description: Assert the placement is safe to apply
+        dependsOn:
+          - step: gate-mon-placement
+            condition:
+              type: succeeded
+        task:
+          type: assert
+          expr: >-
+            data.latest("cephadm", "cephVerifyMonPlacement-" + inputs.adminHost).attributes.pass == true
+          message: >-
+            Expected the mon placement to pass pre-check, observed
+            reasons=${{ data.latest("cephadm", "cephVerifyMonPlacement-" + inputs.adminHost).attributes.detail.reasons }}
+            current=${{ data.latest("cephadm", "cephVerifyMonPlacement-" + inputs.adminHost).attributes.detail.currentHosts }}
+            removed=${{ data.latest("cephadm", "cephVerifyMonPlacement-" + inputs.adminHost).attributes.detail.removedHosts }}
+            added=${{ data.latest("cephadm", "cephVerifyMonPlacement-" + inputs.adminHost).attributes.detail.addedHosts }}
+          severity: high
+      - name: approve
+        description: Approve converging the mon set to the listed hosts
+        dependsOn:
+          - step: assert-mon-placement
+            condition:
+              type: succeeded
+        task:
+          type: manual_approval
+          prompt: >-
+            Converge mons to ${{ inputs.placement }} through
+            ${{ inputs.adminHost }}. The pre-check record is
+            cephVerifyMonPlacement-${{ inputs.adminHost }}. This can shrink the
+            mon set.
+          timeout: 3600
+      - name: apply-mon
+        description: Apply the explicit mon placement through the orchestrator
+        dependsOn:
+          - step: approve
+            condition:
+              type: succeeded
+        task:
+          type: model_method
+          modelIdOrName: cephadm
+          methodName: cephApplyMon
+          inputs:
+            adminHost: ${{ inputs.adminHost }}
+            port: ${{ inputs.port }}
+            sshUser: ${{ inputs.sshUser }}
+            keyPath: '${{ inputs.keyPath == "" ? dyn(null) : dyn(inputs.keyPath) }}'
+            strictHostKeyChecking: ${{ inputs.strictHostKeyChecking }}
+            placement: ${{ inputs.placement }}
+  - name: prove
+    description: Wait for quorum to settle and assert it is complete
+    dependsOn:
+      - job: apply
+        condition:
+          type: succeeded
+    steps:
+      - name: verify-mon-quorum
+        description: Wait for the mon count and quorum to settle via ceph
+        task:
+          type: model_method
+          modelIdOrName: cephadm
+          methodName: cephVerifyMonQuorum
+          inputs:
+            host: ${{ inputs.adminHost }}
+            port: ${{ inputs.port }}
+            sshUser: ${{ inputs.sshUser }}
+            keyPath: '${{ inputs.keyPath == "" ? dyn(null) : dyn(inputs.keyPath) }}'
+            strictHostKeyChecking: ${{ inputs.strictHostKeyChecking }}
+            expectedMonCount: ${{ size(inputs.placement) }}
+            quorumSettleMs: ${{ inputs.quorumSettleMs }}
+            quorumPollIntervalMs: ${{ inputs.quorumPollIntervalMs }}
+            throwOnFail: false
+      - name: assert-mon-quorum
+        description: Assert every expected mon is in quorum
+        dependsOn:
+          - step: verify-mon-quorum
+            condition:
+              type: succeeded
+        task:
+          type: assert
+          expr: >-
+            data.latest("cephadm", "cephVerifyMonQuorum-" + inputs.adminHost).attributes.pass == true
+          message: >-
+            Expected ${{ size(inputs.placement) }} mons in quorum, observed
+            pass=${{ data.latest("cephadm", "cephVerifyMonQuorum-" + inputs.adminHost).attributes.pass }}
+          severity: high
+  - name: report-failure
+    description: Report that nothing was rolled back or retried
+    dependsOn:
+      - job: prove
+        condition:
+          type: or
+          conditions:
+            - type: failed
+            - type: skipped
+    steps:
+      - name: report-failure
+        description: State that the run changed nothing and was not remediated
+        allowFailure: true
+        task:
+          type: assert
+          expr: "true"
+          message: >-
+            Nothing was rolled back, retried or remediated. A run that stopped
+            at the pre-gate or approval changed nothing. Any host in maintenance
+            is still in maintenance. Read the failing method's error from the
+            method-summary report before re-running.
+          severity: low

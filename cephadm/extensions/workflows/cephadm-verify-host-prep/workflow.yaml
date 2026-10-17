@@ -1,0 +1,61 @@
+id: 1096f5a7-7434-47c5-8a7a-f1b1d28af38d
+name: "@randybias/cephadm-verify-host-prep"
+description: Check one host's packages, cephadm version and time-sync service
+version: 1
+inputs:
+  properties:
+    host:
+      type: string
+      description: Target host, hostname or IPv4
+    port:
+      type: integer
+      description: SSH port on the target host
+    sshUser:
+      type: string
+      description: SSH login user on the target host
+    keyPath:
+      type: string
+      default: ""
+      description: Absolute local path to a private key; empty uses the runner default
+    strictHostKeyChecking:
+      type: string
+      enum: ["yes", "no"]
+      description: Host-key policy, yes strict or no explicitly insecure
+    packages:
+      type: array
+      items:
+        type: string
+      description: Debian packages that must be installed
+    cephadmVersion:
+      type: string
+      description: Exact cephadm version token expected, such as 19.2.1
+    timeSyncService:
+      type: string
+      description: Time-sync systemd unit that must be active
+  required:
+    - host
+    - port
+    - sshUser
+    - strictHostKeyChecking
+    - packages
+    - cephadmVersion
+    - timeSyncService
+jobs:
+  - name: verify
+    description: Read host preparation state and halt on a failed verdict
+    steps:
+      - name: verify-host-prep
+        description: Check packages, cephadm version and time sync via ceph
+        task:
+          type: model_method
+          modelIdOrName: cephadm
+          methodName: cephVerifyHostPrep
+          inputs:
+            host: ${{ inputs.host }}
+            port: ${{ inputs.port }}
+            sshUser: ${{ inputs.sshUser }}
+            keyPath: '${{ inputs.keyPath == "" ? dyn(null) : dyn(inputs.keyPath) }}'
+            strictHostKeyChecking: ${{ inputs.strictHostKeyChecking }}
+            expectedPackages: ${{ inputs.packages }}
+            expectedCephadmVersion: ${{ inputs.cephadmVersion }}
+            expectedTimeSyncService: ${{ inputs.timeSyncService }}

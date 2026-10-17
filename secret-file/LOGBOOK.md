@@ -280,6 +280,45 @@ hit list.
   - `@wendy/rsync` (stable): local rsync src/dst pairs, run on the host where
     swamp runs; no vault, no remote target over SSH, no owner or mode
     convergence. NONE.
+- ssh (the proposed rename's segment):
+  - `@keeb/ssh` (stable): general-purpose SSH operations (exec, upload, wait)
+    for a host, now shipped as skills. It offers no vault-to-file contract: no
+    atomic, content-hash-converged write, no mode/owner convergence and no
+    stdin-only secret delivery, so the value would be just another uploaded
+    file. NONE.
+  - `@randybias/ssh-host` (stable): our own host-hardening model and the source
+    of the `_lib/ssh.ts` transport this extension vendors. It hardens a host and
+    manages keys; it is not a generic secret-file writer. This extension borrows
+    its transport, not its model.
+  - `@evrardjp/ssh-ca` (stable): an SSH certificate-authority workflow that
+    signs host and user keys. It issues credentials rather than writing a file
+    on a target, and has no atomic, hash-converged write. NONE.
+  - `@nedbellavance/azure-ssh-key` (stable): manages Azure SSH public-key
+    resources and VM access through the cloud control plane. It is provider-API
+    management, not a per-host file delivery, and holds no vault-sourced
+    secret-file contract. NONE.
+- file:
+  - `@swamp/gcp/file` (stable): models Google Cloud Filestore as Swamp
+    resources. It is provider-API management for a cloud filesystem; it writes
+    no file onto a host and has no vault, mode/owner or atomic-rename surface.
+    NONE.
+  - `@sntxrr/scaleway-file-storage` (stable): manages Scaleway File Storage
+    (managed NFS) filesystems through the File Storage API. Cloud filesystem
+    lifecycle only; not a per-host file with content-hash and mode/owner
+    convergence. NONE.
+  - `@mgreten/github-file-track` (stable): tracks files in GitHub repositories
+    and materialises them on the local filesystem, deduplicated on the upstream
+    Git blob SHA. It writes local files from a repository over the `gh` CLI, not
+    a vault secret onto a remote host over SSH. NONE.
+
+The remaining `ssh` and `file` hits are description-only word matches — network,
+virtualization and estate tools that mention SSH access in passing
+(`@josephholsten/tailscale/device`, `@shelson/k3s`, `@randybias/k0s-cluster`,
+`@randybias/server-host`, `@psftw/pets`, the `@randybias/*` ZFS/libvirt/mesh
+models) and object-storage or repository tooling that uses "file" for its own
+outputs (`@sntxrr/b2-files`, `@jamesakeech/forgejo-code`,
+`@webframp/falai/storage`, `@magistr/telegram-send`, the SBOM/settings
+packages). None delivers a vault value onto a host as a file.
 
 Verdict: OVERLAP (minor), justified. No package delivers a vault value onto a
 remote host over stdin with nothing on disk or argv, atomically and idempotently

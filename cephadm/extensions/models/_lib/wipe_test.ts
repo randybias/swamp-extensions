@@ -34,7 +34,7 @@ function fakeSession(
 ): { session: SshSession; calls: RunOptions[] } {
   const calls: RunOptions[] = [];
   const session: SshSession = {
-    target: { host, user: "admin" },
+    target: { host, user: "admin", strictHostKeyChecking: "yes" },
     controlPath: null,
     run: (opts) => {
       calls.push(opts);
@@ -159,7 +159,7 @@ function routedSession(
 ): { session: SshSession; calls: RunOptions[] } {
   const calls: RunOptions[] = [];
   const session: SshSession = {
-    target: { host, user: "admin" },
+    target: { host, user: "admin", strictHostKeyChecking: "yes" },
     controlPath: null,
     run: (opts) => {
       calls.push(opts);
@@ -459,3 +459,146 @@ Deno.test("an already-raw disk completes the teardown idempotently", async () =>
     false,
   );
 });
+
+Deno.test(
+  "root on a plain md array protects every member disk", // leak-allow(decision D3)
+  async () => {
+    const tree = JSON.stringify({
+      blockdevices: [
+        {
+          name: "sda",
+          path: "/dev/sda",
+          type: "disk",
+          fstype: null,
+          children: [{
+            name: "md0",
+            path: "/dev/md0",
+            type: "raid1",
+            fstype: null,
+            children: [{
+              name: "md0p1",
+              path: "/dev/md0p1",
+              type: "part",
+              fstype: "ext4",
+              mountpoint: "/",
+            }],
+          }],
+        },
+        {
+          name: "sdb",
+          path: "/dev/sdb",
+          type: "disk",
+          fstype: null,
+          children: [{
+            name: "md0",
+            path: "/dev/md0",
+            type: "raid1",
+            fstype: null,
+          }],
+        },
+      ],
+    });
+    const { session, calls } = routedSession((opts) => {
+      if (opts.command === listByIdCommand()) {
+        return { code: 0, stdout: "sdb-SN0001\n", stderr: "" };
+      }
+      if (opts.command.startsWith("readlink -f '/dev/disk/by-id/")) {
+        return { code: 0, stdout: "/dev/sdb\n", stderr: "" };
+      }
+      if (opts.command === lsblkCommand()) {
+        return { code: 0, stdout: tree, stderr: "" };
+      }
+      if (opts.command === "findmnt -rno SOURCE,TARGET") {
+        return { code: 0, stdout: "/dev/md0p1 /\n", stderr: "" };
+      }
+      if (opts.command.startsWith("findmnt --fstab")) {
+        return { code: 1, stdout: "", stderr: "" };
+      }
+      if (opts.command.startsWith("readlink -f '/dev/md0p1'")) {
+        return { code: 0, stdout: "/dev/md0p1\n", stderr: "" };
+      }
+      return undefined;
+    });
+    await assertRejects(
+      () =>
+        wipeDiskToRaw({ ...deps, session }, {
+          dataDevices: [{ serial: "SN0001" }],
+          excludeDevices: [],
+        }),
+      PhaseError,
+      "boot-protected",
+    );
+    assertEquals(calls.some((c) => NO_DESTRUCTIVE.test(c.command)), false);
+  },
+);
+
+Deno.test(
+  "root on LVM over md protects the md device and its members", // leak-allow(decision D3)
+  async () => {
+    const tree = JSON.stringify({
+      blockdevices: [
+        {
+          name: "sda",
+          path: "/dev/sda",
+          type: "disk",
+          fstype: null,
+          children: [{
+            name: "md0",
+            path: "/dev/md0",
+            type: "raid1",
+            fstype: null,
+            children: [{
+              name: "dm-0",
+              path: "/dev/dm-0",
+              type: "lvm",
+              fstype: "ext4",
+            }],
+          }],
+        },
+        {
+          name: "sdb",
+          path: "/dev/sdb",
+          type: "disk",
+          fstype: null,
+          children: [{
+            name: "md0",
+            path: "/dev/md0",
+            type: "raid1",
+            fstype: null,
+          }],
+        },
+      ],
+    });
+    const { session, calls } = routedSession((opts) => {
+      if (opts.command === listByIdCommand()) {
+        return { code: 0, stdout: "sdb-SN0001\n", stderr: "" };
+      }
+      if (opts.command.startsWith("readlink -f '/dev/disk/by-id/")) {
+        return { code: 0, stdout: "/dev/sdb\n", stderr: "" };
+      }
+      if (opts.command === lsblkCommand()) {
+        return { code: 0, stdout: tree, stderr: "" };
+      }
+      if (opts.command === "findmnt -rno SOURCE,TARGET") {
+        return { code: 0, stdout: "/dev/mapper/vg-root /\n", stderr: "" };
+      }
+      if (opts.command.startsWith("findmnt --fstab")) {
+        return { code: 1, stdout: "", stderr: "" };
+      }
+      if (opts.command.startsWith("readlink -f '/dev/mapper/vg-root'")) {
+        return { code: 0, stdout: "/dev/dm-0\n", stderr: "" };
+      }
+      return undefined;
+    });
+    await assertRejects(
+      () =>
+        wipeDiskToRaw({ ...deps, session }, {
+          dataDevices: [{ serial: "SN0001" }],
+          excludeDevices: [],
+        }),
+      PhaseError,
+      "boot-protected",
+    );
+    assertEquals(calls.some((c) => NO_DESTRUCTIVE.test(c.command)), false);
+  },
+);

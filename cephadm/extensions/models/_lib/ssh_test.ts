@@ -84,7 +84,11 @@ function deps(spawn: Spawner, extra: Partial<SshDeps> = {}): SshDeps {
   };
 }
 
-const TARGET = toTarget({ host: "192.0.2.10", sshUser: "admin" });
+const TARGET = toTarget({
+  strictHostKeyChecking: "yes",
+  host: "192.0.2.10",
+  sshUser: "admin",
+});
 
 Deno.test("argv carries key-only auth, the port and a trailing command", () => {
   const f = fakeSpawner(() => ({ code: 0, stdout: "OK\n", stderr: "" }));
@@ -108,7 +112,12 @@ Deno.test("an explicit port is dialled and stdin is delivered then closed", asyn
   const f = fakeSpawner(() => ({ code: 0, stdout: "", stderr: "" }));
   const session = await openSession(
     deps(f.spawn),
-    toTarget({ host: "node1.example.com", sshUser: "admin", port: 2222 }),
+    toTarget({
+      strictHostKeyChecking: "yes",
+      host: "node1.example.com",
+      sshUser: "admin",
+      port: 2222,
+    }),
     { multiplex: false },
   );
   await session.run({ command: "read x", stdin: "exact content\nsecond line" });
@@ -164,6 +173,7 @@ Deno.test(
     const s1 = await openSession(
       deps(f.spawn),
       toTarget({
+        strictHostKeyChecking: "yes",
         host: "192.0.2.10",
         sshUser: "admin",
         keyPath: "/home/admin/.ssh/id_ed25519",
@@ -202,7 +212,12 @@ Deno.test(
     );
     const session = await openSession(
       deps(f.spawn),
-      toTarget({ host: "192.0.2.10", sshUser: "admin", privateKey: key }),
+      toTarget({
+        strictHostKeyChecking: "yes",
+        host: "192.0.2.10",
+        sshUser: "admin",
+        privateKey: key,
+      }),
       { multiplex: false },
     );
     await session.run({ command: "true" });
@@ -232,7 +247,12 @@ Deno.test("the inline key file is removed after a failure", async () => {
   );
   const session = await openSession(
     deps(f.spawn),
-    toTarget({ host: "192.0.2.10", sshUser: "admin", privateKey: "KEY\n" }),
+    toTarget({
+      strictHostKeyChecking: "yes",
+      host: "192.0.2.10",
+      sshUser: "admin",
+      privateKey: "KEY\n",
+    }),
     { multiplex: false },
   );
   await assertRejects(() => session.run({ command: "true" }), TransportError);
@@ -244,6 +264,7 @@ Deno.test("both identities are refused at conversion and at the transport", asyn
   assertThrows(
     () =>
       toTarget({
+        strictHostKeyChecking: "yes",
         host: "192.0.2.10",
         sshUser: "admin",
         keyPath: "/k",
@@ -254,6 +275,7 @@ Deno.test("both identities are refused at conversion and at the transport", asyn
   const raw = {
     host: "192.0.2.10",
     user: "admin",
+    strictHostKeyChecking: "yes" as const,
     keyPath: "/k",
     privateKey: "KEY\n",
   };
@@ -463,30 +485,55 @@ Deno.test(
 Deno.test("control socket paths are stable and differ per identity", async () => {
   const env = () => "/run/user/1000";
   const a = await controlSocketPath(
-    toTarget({ host: "192.0.2.10", sshUser: "admin" }),
+    toTarget({
+      strictHostKeyChecking: "yes",
+      host: "192.0.2.10",
+      sshUser: "admin",
+    }),
     env,
   );
   const b = await controlSocketPath(
-    toTarget({ host: "192.0.2.10", sshUser: "admin" }),
+    toTarget({
+      strictHostKeyChecking: "yes",
+      host: "192.0.2.10",
+      sshUser: "admin",
+    }),
     env,
   );
   assertEquals(a.path, b.path);
   assertEquals(a.path.endsWith(".sock"), true);
   const user = await controlSocketPath(
-    toTarget({ host: "192.0.2.10", sshUser: "other" }),
+    toTarget({
+      strictHostKeyChecking: "yes",
+      host: "192.0.2.10",
+      sshUser: "other",
+    }),
     env,
   );
   const host = await controlSocketPath(
-    toTarget({ host: "198.51.100.9", sshUser: "admin" }),
+    toTarget({
+      strictHostKeyChecking: "yes",
+      host: "198.51.100.9",
+      sshUser: "admin",
+    }),
     env,
   );
   const port = await controlSocketPath(
-    toTarget({ host: "192.0.2.10", sshUser: "admin", port: 2222 }),
+    toTarget({
+      strictHostKeyChecking: "yes",
+      host: "192.0.2.10",
+      sshUser: "admin",
+      port: 2222,
+    }),
     env,
   );
   assertEquals(new Set([a.path, user.path, host.path, port.path]).size, 4);
   const long = await controlSocketPath(
-    toTarget({ host: "192.0.2.10", sshUser: "admin" }),
+    toTarget({
+      strictHostKeyChecking: "yes",
+      host: "192.0.2.10",
+      sshUser: "admin",
+    }),
     () => `/${"a".repeat(200)}`,
   );
   assertEquals(long.path.startsWith("/tmp/"), true);
@@ -627,5 +674,73 @@ Deno.test(
       assertEquals((e as PhaseError).phase, "wipe.signatures-outcome-unknown");
     }
     assertEquals(calls, 1);
+  },
+);
+
+Deno.test(
+  "host-key policy is required and never silently defaulted", // leak-allow(decision D9)
+  () => {
+    assertThrows(() => toTarget({ host: "192.0.2.10", sshUser: "admin" }));
+    assertThrows(() =>
+      toTarget({
+        host: "192.0.2.10",
+        sshUser: "admin",
+        strictHostKeyChecking: null,
+      })
+    );
+    assertEquals(
+      toTarget({
+        host: "192.0.2.10",
+        sshUser: "admin",
+        strictHostKeyChecking: "no",
+      })
+        .strictHostKeyChecking,
+      "no",
+    );
+  },
+);
+
+Deno.test(
+  "control sockets are isolated by host-key policy and credential", // leak-allow(decision D18)
+  async () => {
+    const env = () => "/run/user/1000";
+    const strict = await controlSocketPath(
+      toTarget({
+        host: "192.0.2.10",
+        sshUser: "admin",
+        strictHostKeyChecking: "yes",
+      }),
+      env,
+    );
+    const insecure = await controlSocketPath(
+      toTarget({
+        host: "192.0.2.10",
+        sshUser: "admin",
+        strictHostKeyChecking: "no",
+      }),
+      env,
+    );
+    const pathKey = await controlSocketPath(
+      toTarget({
+        host: "192.0.2.10",
+        sshUser: "admin",
+        strictHostKeyChecking: "yes",
+        keyPath: "/home/admin/.ssh/id_ed25519",
+      }),
+      env,
+    );
+    const inlineKey = await controlSocketPath(
+      toTarget({
+        host: "192.0.2.10",
+        sshUser: "admin",
+        strictHostKeyChecking: "yes",
+        privateKey: "KEY\n",
+      }),
+      env,
+    );
+    assertEquals(
+      new Set([strict.path, insecure.path, pathKey.path, inlineKey.path]).size,
+      4,
+    );
   },
 );

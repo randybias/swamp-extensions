@@ -28,14 +28,14 @@ function dpSession(
   let dir = 0;
   let scriptBody = "";
   const session: SshSession = {
-    target: { host: "192.0.2.10", user: "admin" },
+    target: { host: "192.0.2.10", user: "admin", strictHostKeyChecking: "yes" },
     controlPath: null,
     run: (opts) => {
-      if (opts.command === "mktemp -d") {
+      if (opts.command.startsWith("mktemp -d")) {
         dir++;
         return Promise.resolve({
           code: 0,
-          stdout: `/tmp/tmp.${dir}\n`,
+          stdout: `/tmp/cephadm-shell.ABCDE${dir}\n`,
           stderr: "",
         });
       }
@@ -562,3 +562,73 @@ Deno.test("deleting a filesystem confirms, polls MDS removal and restores the ga
     true,
   );
 });
+
+Deno.test(
+  "an existing pool whose rule structure or EC profile content drifted is refused", // leak-allow(decision D31)
+  async () => {
+    // Same rule id, but the rule chooses the wrong failure domain.
+    const ruleDrift = dpSession((body) => {
+      if (body.includes("osd pool ls detail")) {
+        return {
+          code: 0,
+          stdout:
+            '[{"pool_name":"p","type":1,"size":3,"crush_rule":7,"application_metadata":{"rbd":{}}}]',
+          stderr: "",
+        };
+      }
+      if (body.includes("osd crush rule dump")) {
+        return {
+          code: 0,
+          stdout:
+            '{"rule_id":7,"steps":[{"item_name":"default"},{"type":"rack"}]}',
+          stderr: "",
+        };
+      }
+      return { code: 0, stdout: "", stderr: "" };
+    });
+    await assertRejects(
+      () =>
+        createPool(deps, ruleDrift.session, {
+          name: "p",
+          scheme: "replicated",
+          size: 3,
+          application: "rbd",
+          failureDomain: "host",
+        }),
+      PhaseError,
+      "different CRUSH rule",
+    );
+
+    // Same profile name, different content.
+    const profileDrift = dpSession((body) => {
+      if (body.includes("osd pool ls detail")) {
+        return {
+          code: 0,
+          stdout:
+            '[{"pool_name":"p","type":3,"erasure_code_profile":"ec_k4_m2_host"}]',
+          stderr: "",
+        };
+      }
+      if (body.includes("erasure-code-profile get")) {
+        return {
+          code: 0,
+          stdout: '{"k":"4","m":"3","crush-failure-domain":"host"}',
+          stderr: "",
+        };
+      }
+      return { code: 0, stdout: "", stderr: "" };
+    });
+    await assertRejects(
+      () =>
+        createPool(deps, profileDrift.session, {
+          name: "p",
+          scheme: "erasure",
+          erasureProfile: { k: 4, m: 2 },
+          application: "rgw",
+          failureDomain: "host",
+        }),
+      PhaseError,
+      "EC profile does not match",
+    );
+  },
+);

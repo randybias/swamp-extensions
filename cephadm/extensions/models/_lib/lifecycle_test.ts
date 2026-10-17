@@ -40,17 +40,17 @@ function cephSession(
   let dir = 0;
   let scriptBody = "";
   const session: SshSession = {
-    target: { host: "192.0.2.10", user: "admin" },
+    target: { host: "192.0.2.10", user: "admin", strictHostKeyChecking: "yes" },
     controlPath: null,
     run: (opts) => {
       calls.push(opts);
       const special = plain?.(opts);
       if (special) return Promise.resolve(special);
-      if (opts.command === "mktemp -d") {
+      if (opts.command.startsWith("mktemp -d")) {
         dir++;
         return Promise.resolve({
           code: 0,
-          stdout: `/tmp/tmp.${dir}\n`,
+          stdout: `/tmp/cephadm-shell.ABCDE${dir}\n`,
           stderr: "",
         });
       }

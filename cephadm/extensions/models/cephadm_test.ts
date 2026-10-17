@@ -124,7 +124,7 @@ Deno.test("host preparation rejects hostile hosts, packages, URLs and budgets", 
     port: null,
     keyPath: null,
     privateKey: null,
-    strictHostKeyChecking: null,
+    strictHostKeyChecking: "yes",
     multiplex: null,
     packages: ["chrony"],
     cephadmUrl: "https://download.example.com/cephadm",
@@ -172,7 +172,7 @@ Deno.test("wipe requires both device lists and rejects injection serials", () =>
     port: null,
     keyPath: null,
     privateKey: null,
-    strictHostKeyChecking: null,
+    strictHostKeyChecking: "yes",
     multiplex: null,
     dataDevices: [{ serial: "SN0001" }],
     excludeDevices: [],
@@ -237,7 +237,7 @@ Deno.test("a ready host preparing end to end writes a complete record", async ()
     port: null,
     keyPath: null,
     privateKey: null,
-    strictHostKeyChecking: null,
+    strictHostKeyChecking: "yes",
     multiplex: null,
     packages: ["chrony"],
     cephadmUrl: "https://download.example.com/cephadm",
@@ -305,10 +305,10 @@ const SSH_NULLS = {
   port: null,
   keyPath: null,
   privateKey: null,
-  strictHostKeyChecking: null,
+  strictHostKeyChecking: "yes",
   multiplex: null,
   sshUser: "admin",
-};
+} as const;
 
 Deno.test("the bootstrap schema rejects hostile or malformed targets and images", () => {
   const schema = model.methods.cephBootstrap.arguments;
@@ -658,7 +658,7 @@ Deno.test("verifyPackageSource records first, then throws, when throwOnFail is u
         port: null,
         keyPath: null,
         privateKey: null,
-        strictHostKeyChecking: null,
+        strictHostKeyChecking: "yes",
         multiplex: null,
         cephadmUrl: "https://download.example.com/cephadm",
         throwOnFail: null,
@@ -667,4 +667,26 @@ Deno.test("verifyPackageSource records first, then throws, when throwOnFail is u
     "pkgsource.check",
   );
   assertEquals(getWrittenResources().length, 1);
+});
+
+Deno.test("every mutating method is declared an action", () => {
+  const mutating = [
+    "cephHostPrep",
+    "wipeDiskToRaw",
+    "cephBootstrap",
+    "cephDistributeKey",
+    "cephHostAdd",
+    "cephApplyMon",
+    "cephApplyMgr",
+    "cephApplyMds",
+    "cephApplyOsd",
+    "cephCreatePool",
+    "cephCreateFs",
+    "cephCreateCsiUser",
+    "cephDeleteFs",
+    "cephRemoveOsds",
+  ];
+  const methods = model.methods as unknown as Record<string, { kind?: string }>;
+  for (const name of mutating) assertEquals(methods[name].kind, "action", name);
+  assertEquals(methods.cephGetConnBundle.kind, undefined);
 });

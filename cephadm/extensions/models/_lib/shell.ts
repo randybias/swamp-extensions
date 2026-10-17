@@ -100,6 +100,22 @@ export function writeScriptCommand(path: string, mode = "0700"): string {
   }`;
 }
 
+/** The fixed prefix every private cephadm-shell directory must use. */
+export const SHELL_DIR_PREFIX = "/tmp/cephadm-shell.";
+
+/** Validates `mktemp -d` output, accepting exactly one directory under the fixed prefix. */
+export function parseMktempDir(stdout: string, phase: string): string {
+  const value = stdout.trim();
+  if (!value.startsWith(SHELL_DIR_PREFIX) || value.includes("\n")) {
+    fail(`${phase}.mktemp`, "mktemp returned an unexpected directory path");
+  }
+  const suffix = value.slice(SHELL_DIR_PREFIX.length);
+  if (!/^[A-Za-z0-9]{6,}$/.test(suffix)) {
+    fail(`${phase}.mktemp`, "mktemp returned an unexpected directory path");
+  }
+  return value;
+}
+
 /** The remote command that runs a mounted script inside cephadm shell. */
 export function shellRunCommand(dir: string, scriptPath: string): string {
   return `cephadm shell --mount ${quote(`${dir}:${dir}`)} -- bash ${
@@ -146,12 +162,11 @@ export async function runCephScript(
     });
   }
   const dirResult = await runStep(deps, session, {
-    command: "mktemp -d",
+    command: `mktemp -d ${SHELL_DIR_PREFIX}XXXXXXXXXX`,
     phase: `${opts.phase}.mktemp`,
     resend: "any",
   });
-  const dir = dirResult.stdout.trim();
-  if (dir === "") fail(`${opts.phase}.mktemp`, "mktemp -d returned no path");
+  const dir = parseMktempDir(dirResult.stdout, opts.phase);
   const scriptPath = `${dir}/run-${randomHex(deps.random, 12)}.sh`;
   let result: CephRunResult;
   try {
@@ -193,7 +208,7 @@ export async function runCephScript(
     // Best effort: a removal failure must not mask the command's own result.
     try {
       await session.run({
-        command: `rm -rf ${quote(dir)}`,
+        command: `rm -rf -- ${quote(dir)}`,
         allowNonZero: true,
       });
     } catch {

@@ -240,10 +240,34 @@ function isBootTarget(target: string): boolean {
     target.startsWith("/boot/");
 }
 
+/** Finds a node whose path or kernel name is one of `candidates`. */
+export function findNodeByAny(
+  nodes: LsblkNode[],
+  candidates: Set<string>,
+): LsblkNode | null {
+  for (const node of nodes) {
+    if (
+      (node.path && candidates.has(node.path)) ||
+      (node.name && candidates.has(node.name))
+    ) {
+      return node;
+    }
+    const found = node.children
+      ? findNodeByAny(node.children, candidates)
+      : null;
+    if (found) return found;
+  }
+  return null;
+}
+
 /**
  * Builds the protected-device set from the mounted and configured root/boot
- * filesystems and the member devices of any array that backs them. Runs before
- * any mutation and is not recomputed from a later tree.
+ * filesystems. It walks the whole storage dependency graph in both directions
+ * from each source, so a root on LVM over md protects the md device and every
+ * physical member behind it, and a root on a plain partition protects the
+ * whole disk. md devices anywhere in the graph are recorded so an inactive
+ * array is still caught by serial membership. Runs before any mutation and is
+ * not recomputed from a later tree.
  */
 export async function detectProtectedSet(
   session: SshSession,
@@ -251,33 +275,60 @@ export async function detectProtectedSet(
 ): Promise<ProtectedSet> {
   const devices = new Set<string>();
   const arrays = new Set<string>();
-  const addSource = async (source: string): Promise<void> => {
-    if (!source.startsWith("/dev/")) return;
-    const resolved = await session.run({
-      command: `readlink -f ${quote(source)}`,
-      allowNonZero: true,
-    });
-    const device = resolved.stdout.trim() || source;
-    devices.add(device);
-    const node = findNode(tree, device);
-    if (node) {
-      for (const p of subtreePaths(node)) devices.add(p);
-      const top = findTopLevel(tree, device);
-      if (top) { for (const p of subtreePaths(top)) devices.add(p); }
+
+  // Undirected adjacency keyed by path; duplicate md nodes under each member
+  // merge because the key is the path.
+  const adjacency = new Map<string, Set<string>>();
+  const edge = (a: string, b: string): void => {
+    if (!adjacency.has(a)) adjacency.set(a, new Set());
+    if (!adjacency.has(b)) adjacency.set(b, new Set());
+    adjacency.get(a)!.add(b);
+    adjacency.get(b)!.add(a);
+  };
+  const index = (node: LsblkNode): void => {
+    for (const child of node.children ?? []) {
+      if (node.path && child.path) edge(node.path, child.path);
+      index(child);
     }
-    if (device.startsWith("/dev/md")) {
-      arrays.add(device);
-      const detail = await session.run({
-        command: `mdadm --detail ${quote(device)}`,
-        sudo: true,
-        allowNonZero: true,
-      });
-      for (const line of detail.stdout.split("\n")) {
-        const fields = line.trim().split(/\s+/);
-        const last = fields.at(-1) ?? "";
-        if (last.startsWith("/dev/")) devices.add(last);
+  };
+  for (const node of tree) index(node);
+
+  const protectComponent = (seed: string): void => {
+    const queue = [seed];
+    const seen = new Set([seed]);
+    while (queue.length > 0) {
+      const path = queue.shift()!;
+      devices.add(path);
+      if (path.startsWith("/dev/md")) arrays.add(path);
+      for (const neighbour of adjacency.get(path) ?? []) {
+        if (!seen.has(neighbour)) {
+          seen.add(neighbour);
+          queue.push(neighbour);
+        }
       }
     }
+  };
+
+  const addSource = async (source: string): Promise<void> => {
+    if (!source.startsWith("/dev/")) return;
+    const resolved = (
+      await session.run({
+        command: `readlink -f ${quote(source)}`,
+        allowNonZero: true,
+      })
+    ).stdout.trim();
+    const device = resolved || source;
+    const candidates = new Set(
+      [
+        source,
+        device,
+        source.split("/").at(-1) ?? "",
+        device.split("/").at(-1) ?? "",
+      ]
+        .filter((c) => c !== ""),
+    );
+    const node = findNodeByAny(tree, candidates);
+    protectComponent(node?.path ?? device);
   };
 
   const readMounts = async (command: string): Promise<void> => {

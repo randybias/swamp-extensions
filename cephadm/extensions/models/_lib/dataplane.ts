@@ -239,24 +239,58 @@ export async function createPool(
       );
       if (
         dump === null ||
-        (dump as { rule_id?: number }).rule_id !== existing.crush_rule
+        (dump as { rule_id?: number }).rule_id !== existing.crush_rule ||
+        !ruleMatches(dump, args.failureDomain)
       ) {
         fail(
           "cephCreatePool",
           "the existing pool uses a different CRUSH rule",
           {
             name: args.name,
-            expected: rule,
+            expected: `${rule} choosing ${args.failureDomain}`,
             actual: String(existing.crush_rule),
           },
         );
       }
-    } else if (existing.erasure_code_profile !== profile) {
-      fail("cephCreatePool", "the existing pool uses a different EC profile", {
-        name: args.name,
-        expected: profile,
-        actual: existing.erasure_code_profile ?? "",
-      });
+    } else {
+      if (existing.erasure_code_profile !== profile) {
+        fail(
+          "cephCreatePool",
+          "the existing pool uses a different EC profile",
+          {
+            name: args.name,
+            expected: profile,
+            actual: existing.erasure_code_profile ?? "",
+          },
+        );
+      }
+      // A profile with the right name can hold anything; check its content.
+      const get = await readJson(
+        deps,
+        session,
+        `osd erasure-code-profile get ${quote(profile!)}`,
+        { phase: "cephCreatePool.profile" },
+        log,
+      );
+      if (
+        !profileMatches(
+          get,
+          args.erasureProfile!.k,
+          args.erasureProfile!.m,
+          args.failureDomain,
+        )
+      ) {
+        fail(
+          "cephCreatePool",
+          "the existing EC profile does not match the request",
+          {
+            name: args.name,
+            expected: `k=${args.erasureProfile!.k} m=${
+              args.erasureProfile!.m
+            } crush-failure-domain=${args.failureDomain}`,
+          },
+        );
+      }
     }
   }
 
@@ -815,9 +849,21 @@ export async function removeOsds(
   log?: Logger,
 ): Promise<OsdRemoveRecord> {
   const requested = [...new Set(args.osdIds)].sort((a, b) => a - b);
+  if (requested.length > 256) {
+    fail("cephRemoveOsds", "too many OSD ids requested", {
+      count: requested.length,
+      max: 256,
+    });
+  }
   const zap = args.zap ?? true;
   const maxPolls = args.maxPolls ?? 60;
   const pollIntervalMs = args.pollIntervalMs ?? 15_000;
+  if (maxPolls > 10_000 || pollIntervalMs > 3_600_000) {
+    fail("cephRemoveOsds", "poll budget out of range", {
+      maxPolls,
+      pollIntervalMs,
+    });
+  }
   const present = await presentOsdIds(deps, session, log);
   const presentIds = requested.filter((id) => present.has(id));
   const skippedAbsent = requested.filter((id) => !present.has(id));
@@ -912,6 +958,12 @@ export async function deleteFs(
   }
   const maxPolls = args.maxPolls ?? 30;
   const pollIntervalMs = args.pollIntervalMs ?? 10_000;
+  if (maxPolls > 10_000 || pollIntervalMs > 3_600_000) {
+    fail("cephDeleteFs", "poll budget out of range", {
+      maxPolls,
+      pollIntervalMs,
+    });
+  }
   const fsList = (await readJson(
     deps,
     session,

@@ -30,14 +30,14 @@ function adminSession(
   let dir = 0;
   let scriptBody = "";
   const session: SshSession = {
-    target: { host: "192.0.2.10", user: "admin" },
+    target: { host: "192.0.2.10", user: "admin", strictHostKeyChecking: "yes" },
     controlPath: null,
     run: (opts) => {
-      if (opts.command === "mktemp -d") {
+      if (opts.command.startsWith("mktemp -d")) {
         dir++;
         return Promise.resolve({
           code: 0,
-          stdout: `/tmp/tmp.${dir}\n`,
+          stdout: `/tmp/cephadm-shell.ABCDE${dir}\n`,
           stderr: "",
         });
       }
@@ -66,7 +66,7 @@ function adminSession(
 /** A fake target session for the serial resolver. */
 function targetSession(device = "/dev/nvme0n1"): SshSession {
   return {
-    target: { host: "192.0.2.50", user: "admin" },
+    target: { host: "192.0.2.50", user: "admin", strictHostKeyChecking: "yes" },
     controlPath: null,
     run: (opts: RunOptions) => {
       if (opts.command === listByIdCommand()) {
@@ -332,7 +332,7 @@ Deno.test("a resolution failure leaves the cluster untouched", async () => {
     return { code: 0, stdout: "[]", stderr: "" };
   });
   const badTarget: SshSession = {
-    target: { host: "192.0.2.50", user: "admin" },
+    target: { host: "192.0.2.50", user: "admin", strictHostKeyChecking: "yes" },
     controlPath: null,
     run: (opts: RunOptions) =>
       Promise.resolve(
@@ -384,4 +384,7 @@ Deno.test("a leftover service is force-removed before the apply", async () => {
   assertEquals(r.staleServicesRemoved, ["osd.by-serial-node1-old"]);
   assertEquals(removed, ["old"]);
   assertEquals(r.applied, true);
+  const applyAt = admin.bodies.findIndex((b) => b.includes("orch apply -i"));
+  const rmAt = admin.bodies.findIndex((b) => b.includes("orch rm"));
+  assertEquals(applyAt >= 0 && applyAt < rmAt, true);
 });

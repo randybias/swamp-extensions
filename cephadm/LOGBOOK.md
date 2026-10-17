@@ -78,6 +78,23 @@ Not packaged. Notes for whoever maintains this extension.
   cephVerifyCsiUsers. The package-source record now shares the same resource.
   Remaining verify checks, maintenance/teardown, RGW and the workflow catalog
   are next.
+- 2026-10-17: checkpoint-review fixes (codex astra+terra through group 04).
+  CRITICAL: the boot-protection gate now walks the whole storage dependency
+  graph in both directions from every mounted and configured root/boot source,
+  so root on LVM over md protects md and every physical member (previously only
+  a source beginning /dev/md was interrogated). Tests: root-on-plain-md and
+  root-on-LVM-over-md both refuse the member disk. HIGH: mktemp output is
+  validated against a fixed /tmp/cephadm-shell.* prefix and rm -rf uses the
+  validated dir; osd selector mode applies the desired spec before removing
+  stale services; existing-pool convergence validates CRUSH rule structure and
+  EC profile content; host_key_policy is now a required explicit input (no
+  silent default); control sockets are keyed by policy and credential identity;
+  URLs are never echoed in errors and the download URL travels on stdin; proxy
+  redaction covers quoted assignments; every mutating method is kind:"action";
+  README example no longer passes --json. MEDIUM: osdIds/maxPolls/poll-interval
+  bounds added in schema and at run time. NOTE: making host_key_policy required
+  deviates from 00-overview section 3 (which defaults absent to yes); done per
+  the review's explicit request.
 - The SQLite `pvs`/`mdadm` discovery, the atomic mdadm.conf rewrite and the
   boot-protection gate are unit-tested with scripted sessions; the live twin
   checks in the spec's [twin] items still apply.

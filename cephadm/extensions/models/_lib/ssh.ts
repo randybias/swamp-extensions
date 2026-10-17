@@ -44,8 +44,8 @@ export interface Target {
   keyPath?: string;
   /** Private-key content; mutually exclusive with {@link keyPath}. */
   privateKey?: string;
-  /** `yes` (default) or an explicit `no`. */
-  strictHostKeyChecking?: "yes" | "no";
+  /** `yes` (strict) or an explicit `no`. Required. */
+  strictHostKeyChecking: "yes" | "no";
 }
 
 /** An already-spawned child with a writable stdin; injectable for tests. */
@@ -122,6 +122,15 @@ export function toTarget(fields: {
   privateKey?: string | null;
   strictHostKeyChecking?: "yes" | "no" | null;
 }): Target {
+  if (
+    fields.strictHostKeyChecking !== "yes" &&
+    fields.strictHostKeyChecking !== "no"
+  ) {
+    fail("validate", "strictHostKeyChecking is required (yes or no)", {
+      field: "strictHostKeyChecking",
+      value: fields.strictHostKeyChecking ?? "absent",
+    });
+  }
   const clean = (v: string | null | undefined): string | undefined =>
     v === null || v === undefined || v === "" ? undefined : v;
   const user = clean(fields.sshUser) ?? "";
@@ -144,18 +153,16 @@ export function toTarget(fields: {
       value: truncate(keyPath),
     });
   }
-  const target: Target = { host: fields.host, user };
+  const target: Target = {
+    host: fields.host,
+    user,
+    strictHostKeyChecking: fields.strictHostKeyChecking as "yes" | "no",
+  };
   if (fields.port !== undefined && fields.port !== null) {
     target.port = fields.port;
   }
   if (keyPath !== undefined) target.keyPath = keyPath;
   if (privateKey !== undefined) target.privateKey = privateKey;
-  if (
-    fields.strictHostKeyChecking !== undefined &&
-    fields.strictHostKeyChecking !== null
-  ) {
-    target.strictHostKeyChecking = fields.strictHostKeyChecking;
-  }
   return target;
 }
 
@@ -188,7 +195,7 @@ function connectionArgs(
   const args: string[] = ["-p", String(targetPort(target))];
   args.push("-o", "BatchMode=yes");
   args.push("-o", "PreferredAuthentications=publickey");
-  const strict = target.strictHostKeyChecking ?? "yes";
+  const strict = target.strictHostKeyChecking;
   args.push("-o", `StrictHostKeyChecking=${strict}`);
   if (strict === "no") {
     args.push("-o", "UserKnownHostsFile=/dev/null");
@@ -235,8 +242,19 @@ export async function controlSocketPath(
   target: Target,
   env: (key: string) => string | undefined = (k) => Deno.env.get(k),
 ): Promise<ControlSocket> {
+  // A master is reusable only within one trust and one credential identity,
+  // so a strict connection can never ride a master opened with checking off.
+  const identity = target.keyPath !== undefined
+    ? `path:${target.keyPath}`
+    : target.privateKey !== undefined
+    ? `inline:${target.privateKey}`
+    : "agent";
   const name = `${
-    (await shortHash(`${target.user}@${target.host}:${targetPort(target)}`))
+    (await shortHash(
+      `${target.user}@${target.host}:${
+        targetPort(target)
+      }|strict=${target.strictHostKeyChecking}|id=${identity}`,
+    ))
       .slice(0, 12)
   }.sock`;
   const base = env("XDG_RUNTIME_DIR") ?? env("TMPDIR") ?? "/tmp";

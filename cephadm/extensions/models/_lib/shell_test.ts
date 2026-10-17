@@ -1,9 +1,14 @@
-import { assertEquals, assertRejects } from "jsr:@std/assert@1.0.19";
+import {
+  assertEquals,
+  assertRejects,
+  assertThrows,
+} from "jsr:@std/assert@1.0.19";
 import { PhaseError } from "./errors.ts";
 import type { CommandResult, RunOptions, SshSession } from "./ssh.ts";
 import {
   cephScriptBody,
   parseCephJson,
+  parseMktempDir,
   randomHex,
   runCeph,
   shellRunCommand,
@@ -15,7 +20,7 @@ function fakeSession(
 ): { session: SshSession; calls: RunOptions[] } {
   const calls: RunOptions[] = [];
   const session: SshSession = {
-    target: { host: "192.0.2.10", user: "admin" },
+    target: { host: "192.0.2.10", user: "admin", strictHostKeyChecking: "yes" },
     controlPath: null,
     run: (opts) => {
       calls.push(opts);
@@ -71,8 +76,8 @@ Deno.test(
   async () => {
     const warns: string[] = [];
     const { session, calls } = fakeSession((opts) => {
-      if (opts.command === "mktemp -d") {
-        return { code: 0, stdout: "/tmp/tmp.ABCD\n", stderr: "" };
+      if (opts.command.startsWith("mktemp -d")) {
+        return { code: 0, stdout: "/tmp/cephadm-shell.ABCDEF\n", stderr: "" };
       }
       if (opts.command.startsWith("umask 022")) {
         return { code: 0, stdout: "", stderr: "" };
@@ -94,7 +99,7 @@ Deno.test(
     assertEquals(out.json, { ok: true });
     const write = calls.find((c) => c.command.startsWith("umask 022"))!;
     assertEquals(
-      /\/tmp\/tmp\.ABCD\/run-[0-9a-f]{12}\.sh/.test(write.command),
+      /\/tmp\/cephadm-shell\.ABCDEF\/run-[0-9a-f]{12}\.sh/.test(write.command),
       true,
     );
     assertEquals(
@@ -111,8 +116,8 @@ Deno.test(
 Deno.test("the cephadm-shell budget floor is raised and warned", async () => {
   const warns: string[] = [];
   const { session, calls } = fakeSession((opts) => {
-    if (opts.command === "mktemp -d") {
-      return { code: 0, stdout: "/tmp/tmp.X\n", stderr: "" };
+    if (opts.command.startsWith("mktemp -d")) {
+      return { code: 0, stdout: "/tmp/cephadm-shell.ABCDEX\n", stderr: "" };
     }
     if (opts.command.startsWith("umask 022")) {
       return { code: 0, stdout: "", stderr: "" };
@@ -130,8 +135,8 @@ Deno.test("the cephadm-shell budget floor is raised and warned", async () => {
   assertEquals(warns.length, 1);
 
   const { session: s2, calls: c2 } = fakeSession((opts) => {
-    if (opts.command === "mktemp -d") {
-      return { code: 0, stdout: "/tmp/tmp.Y\n", stderr: "" };
+    if (opts.command.startsWith("mktemp -d")) {
+      return { code: 0, stdout: "/tmp/cephadm-shell.ABCDEY\n", stderr: "" };
     }
     if (opts.command.startsWith("umask 022")) {
       return { code: 0, stdout: "", stderr: "" };
@@ -151,8 +156,8 @@ Deno.test("the cephadm-shell budget floor is raised and warned", async () => {
 Deno.test("a removal failure warns and does not mask the command result", async () => {
   const warns: string[] = [];
   const { session } = fakeSession((opts) => {
-    if (opts.command === "mktemp -d") {
-      return { code: 0, stdout: "/tmp/tmp.Z\n", stderr: "" };
+    if (opts.command.startsWith("mktemp -d")) {
+      return { code: 0, stdout: "/tmp/cephadm-shell.ABCDEZ\n", stderr: "" };
     }
     if (opts.command.startsWith("umask 022")) {
       return { code: 0, stdout: "", stderr: "" };
@@ -172,8 +177,8 @@ Deno.test("a removal failure warns and does not mask the command result", async 
 
 Deno.test("a non-JSON shell read fails with a phase-attributed error", async () => {
   const { session } = fakeSession((opts) => {
-    if (opts.command === "mktemp -d") {
-      return { code: 0, stdout: "/tmp/tmp.Q\n", stderr: "" };
+    if (opts.command.startsWith("mktemp -d")) {
+      return { code: 0, stdout: "/tmp/cephadm-shell.ABCDEQ\n", stderr: "" };
     }
     if (opts.command.startsWith("umask 022")) {
       return { code: 0, stdout: "", stderr: "" };
@@ -189,3 +194,25 @@ Deno.test("a non-JSON shell read fails with a phase-attributed error", async () 
     "pkgsource.json",
   );
 });
+
+Deno.test(
+  "mktemp output must be one directory under the fixed prefix", // leak-allow(decision D7)
+  () => {
+    assertEquals(
+      parseMktempDir("/tmp/cephadm-shell.ABCDEF\n", "x"),
+      "/tmp/cephadm-shell.ABCDEF",
+    );
+    for (
+      const bad of [
+        "/home/admin\n",
+        "/tmp/cephadm-shell.ABCDEF\n/tmp/other\n",
+        "/tmp/evil.ABCDEF\n",
+        "/tmp/cephadm-shell.\n",
+        "/tmp/cephadm-shell.AB\n",
+        "",
+      ]
+    ) {
+      assertThrows(() => parseMktempDir(bad, "x"), PhaseError);
+    }
+  },
+);

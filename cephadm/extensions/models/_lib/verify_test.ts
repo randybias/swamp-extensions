@@ -28,14 +28,14 @@ function vSession(route: (body: string) => CommandResult): SshSession {
   let dir = 0;
   let scriptBody = "";
   return {
-    target: { host: "192.0.2.10", user: "admin" },
+    target: { host: "192.0.2.10", user: "admin", strictHostKeyChecking: "yes" },
     controlPath: null,
     run: (opts) => {
-      if (opts.command === "mktemp -d") {
+      if (opts.command.startsWith("mktemp -d")) {
         dir++;
         return Promise.resolve({
           code: 0,
-          stdout: `/tmp/tmp.${dir}\n`,
+          stdout: `/tmp/cephadm-shell.ABCDE${dir}\n`,
           stderr: "",
         });
       }
@@ -529,7 +529,7 @@ Deno.test("host-noout verifies the expectation in both directions", async () => 
 /** A plain read-only session for host checks. */
 function plainSession(route: (command: string) => CommandResult): SshSession {
   return {
-    target: { host: "192.0.2.10", user: "admin" },
+    target: { host: "192.0.2.10", user: "admin", strictHostKeyChecking: "yes" },
     controlPath: null,
     run: (opts) => Promise.resolve(route(opts.command)),
     close: () => Promise.resolve({ closed: false, detail: "not multiplexed" }),

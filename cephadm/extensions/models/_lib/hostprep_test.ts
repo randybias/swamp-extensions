@@ -27,7 +27,7 @@ function fakeSession(
 ): { session: SshSession; calls: RunOptions[] } {
   const calls: RunOptions[] = [];
   const session: SshSession = {
-    target: { host, user: "admin" },
+    target: { host, user: "admin", strictHostKeyChecking: "yes" },
     controlPath: null,
     run: async (opts) => {
       calls.push(opts);
@@ -366,7 +366,7 @@ Deno.test("a cephadm reporting the wrong version is reinstalled", async () => {
           : "cephadm version 19.2.1 (x)",
       );
     }
-    if (opts.command.startsWith("curl ")) return ok();
+    if (opts.command === "bash -s --") return ok();
     if (opts.command.startsWith("chmod ")) return ok();
     throw new Error(`unexpected ${opts.command}`);
   });
@@ -375,13 +375,18 @@ Deno.test("a cephadm reporting the wrong version is reinstalled", async () => {
     version: "19.2.1",
   });
   assertEquals(result.reinstalledBroken, true);
-  assertEquals(calls.some((c) => c.command.startsWith("curl ")), true);
+  assertEquals(
+    calls.some((c) =>
+      c.command === "bash -s --" && (c.stdin ?? "").includes("curl ")
+    ),
+    true,
+  );
 });
 
 Deno.test("a fresh install that still reports the wrong version throws", async () => {
   const { session } = fakeSession((opts) => {
     if (opts.command.startsWith("test -x ")) return ok("", 1);
-    if (opts.command.startsWith("curl ")) return ok();
+    if (opts.command === "bash -s --") return ok();
     if (opts.command.startsWith("chmod ")) return ok();
     if (opts.command.endsWith(" version")) {
       return ok("cephadm version 19.2.0 (x)");

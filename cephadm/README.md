@@ -56,7 +56,7 @@ swamp behavior run cephadm cephHostPrep --input host=node1.example.com \
   --input 'privateKey=${{ vault.get("default", "NODE1_KEY") }}' \
   --input 'packages:json=["chrony","lvm2","podman"]' \
   --input cephadmUrl=https://download.example.com/ceph/19.2.1/el9/noarch/cephadm \
-  --input cephadmVersion=19.2.1 --input timeSyncService=chrony.service --json
+  --input cephadmVersion=19.2.1 --input timeSyncService=chrony.service
 ```
 
 ## How it works

@@ -100,8 +100,8 @@ export const SSH_FIELDS = {
   }).describe(
     "OpenSSH private key content, normally a vault reference; mutually exclusive with keyPath.",
   ),
-  strictHostKeyChecking: z.enum(["yes", "no"]).nullish().describe(
-    "Host-key policy; absent means yes (strict). no is explicit and loads no real known_hosts.",
+  strictHostKeyChecking: z.enum(["yes", "no"]).describe(
+    "Host-key policy: yes (strict) or no (explicitly insecure). Required; there is no silent default.",
   ),
   multiplex: z.boolean().nullish().describe(
     "Reuse one authenticated SSH master per host; absent means false.",

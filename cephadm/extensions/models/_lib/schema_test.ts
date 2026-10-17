@@ -33,7 +33,7 @@ Deno.test(
       port: null,
       keyPath: null,
       privateKey: null,
-      strictHostKeyChecking: null,
+      strictHostKeyChecking: "yes",
       multiplex: null,
     };
     assertEquals(SshObject.safeParse(allNull).success, true);
@@ -49,8 +49,18 @@ Deno.test(
       }).success,
       true,
     );
-    // Omitted optional fields are accepted.
-    assertEquals(SshObject.safeParse({ sshUser: "admin" }).success, true);
+    // Optional fields may be omitted, but the host-key policy must be given.
+    assertEquals(
+      SshObject.safeParse({ sshUser: "admin", strictHostKeyChecking: "yes" })
+        .success,
+      true,
+    );
+    assertEquals(SshObject.safeParse({ sshUser: "admin" }).success, false);
+    assertEquals(
+      SshObject.safeParse({ sshUser: "admin", strictHostKeyChecking: null })
+        .success,
+      false,
+    );
   },
 );
 
@@ -68,6 +78,8 @@ Deno.test("the shared SSH family rejects widened and off-menu values", () => {
       { sshUser: "admin", multiplex: "yes" },
       { sshUser: "" },
       { sshUser: "1admin" },
+      { sshUser: "admin" },
+      { sshUser: "admin", strictHostKeyChecking: null },
     ]
   ) {
     assertEquals(SshObject.safeParse(bad).success, false);
@@ -76,9 +88,18 @@ Deno.test("the shared SSH family rejects widened and off-menu values", () => {
 
 Deno.test("privateKey is optional, nullish and marked sensitive", () => {
   // The field parses without it, and with an explicit null.
-  assertEquals(SshObject.safeParse({ sshUser: "admin" }).success, true);
   assertEquals(
-    SshObject.safeParse({ sshUser: "admin", privateKey: null }).success,
+    SshObject.safeParse({ sshUser: "admin", strictHostKeyChecking: "yes" })
+      .success,
+    true,
+  );
+  assertEquals(
+    SshObject.safeParse({
+      sshUser: "admin",
+      strictHostKeyChecking: "yes",
+      privateKey: null,
+    })
+      .success,
     true,
   );
   const meta = (SSH_FIELDS.privateKey as unknown as {

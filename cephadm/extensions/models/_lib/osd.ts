@@ -395,12 +395,8 @@ export async function applyOsd(
 
   const staleServicesRemoved: string[] = [];
   try {
-    for (const name of leftovers) {
-      await runCeph(deps, session, `orch rm ${quote(name)} --force`, {
-        phase: "cephApplyOsd.rm",
-      }, log);
-      staleServicesRemoved.push(name);
-    }
+    // Apply the desired service first, so a failure cannot leave the host
+    // with no managed OSD service; only then remove the stale specs.
     if (!converged) {
       await runCephScript(
         deps,
@@ -411,6 +407,12 @@ export async function applyOsd(
         },
         log,
       );
+    }
+    for (const name of leftovers) {
+      await runCeph(deps, session, `orch rm ${quote(name)} --force`, {
+        phase: "cephApplyOsd.rm",
+      }, log);
+      staleServicesRemoved.push(name);
     }
   } catch (e) {
     fail(

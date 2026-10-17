@@ -412,10 +412,10 @@ const DeleteFsArgs = z.strictObject({
   confirmFsName: z.string().min(1).max(128).describe(
     "The target named a second time.",
   ),
-  maxPolls: z.number().int().positive().nullish().describe(
+  maxPolls: z.number().int().positive().max(10000).nullish().describe(
     "MDS-removal poll budget.",
   ),
-  pollIntervalMs: z.number().int().positive().nullish().describe(
+  pollIntervalMs: z.number().int().positive().max(3600000).nullish().describe(
     "Time between polls, in milliseconds.",
   ),
 });
@@ -423,16 +423,16 @@ const DeleteFsArgs = z.strictObject({
 const RemoveOsdsArgs = z.strictObject({
   host: HOST_FIELD.describe("Admin host."),
   ...SSH_FIELDS,
-  osdIds: z.array(z.number().int().min(0)).min(1).describe(
+  osdIds: z.array(z.number().int().min(0)).min(1).max(256).describe(
     "OSD ids to remove.",
   ),
   zap: z.boolean().nullish().describe(
     "Add --zap to the orchestrator removal; defaults to true.",
   ),
-  maxPolls: z.number().int().positive().nullish().describe(
+  maxPolls: z.number().int().positive().max(10000).nullish().describe(
     "Effect poll budget.",
   ),
-  pollIntervalMs: z.number().int().positive().nullish().describe(
+  pollIntervalMs: z.number().int().positive().max(3600000).nullish().describe(
     "Time between polls, in milliseconds.",
   ),
 });
@@ -672,6 +672,7 @@ export function createCephadmModel(overrides: Partial<CephadmDeps> = {}) {
 
   const methods = {
     cephHostPrep: {
+      kind: "action" as const,
       description:
         "Ensure the named packages, the pinned cephadm binary (at the exact pinned version) and an active time-sync service on one host. Idempotent: a ready host issues no apt, download or enable call. Writes a hostPrepResult with per-package and phase evidence.",
       arguments: HostPrepArgs,
@@ -791,6 +792,7 @@ export function createCephadmModel(overrides: Partial<CephadmDeps> = {}) {
     },
 
     wipeDiskToRaw: {
+      kind: "action" as const,
       description:
         "DESTRUCTIVE. Tear down LVM, md-RAID, filesystem and partition state on disks named by serial, leaving them raw for Ceph OSDs, while keeping the host's boot RAID intact. Idempotent and re-runnable; dryRun runs every gate and reports the plan.",
       arguments: WipeArgsSchema,
@@ -845,6 +847,7 @@ export function createCephadmModel(overrides: Partial<CephadmDeps> = {}) {
     },
 
     cephBootstrap: {
+      kind: "action" as const,
       description:
         "Bootstrap a new standalone cephadm cluster on one host, or do nothing when one already exists there. Idempotent; the result carries a path reference to the admin keyring, never its contents.",
       arguments: BootstrapArgs,
@@ -902,6 +905,7 @@ export function createCephadmModel(overrides: Partial<CephadmDeps> = {}) {
     },
 
     cephDistributeKey: {
+      kind: "action" as const,
       description:
         "Append the cluster public key to sshUser's authorized_keys on every listed host, deduplicated, with a backup taken on every run. Idempotent; processes every host and fails at the end if any host did not verify.",
       arguments: DistributeKeyArgs,
@@ -978,6 +982,7 @@ export function createCephadmModel(overrides: Partial<CephadmDeps> = {}) {
     },
 
     cephHostAdd: {
+      kind: "action" as const,
       description:
         "Enrol a host with the orchestrator after confirming the admin host is attached to the expected cluster, then read the host list back. Idempotent; a host already registered at the same address is a no-op.",
       arguments: HostAddArgs,
@@ -1022,6 +1027,7 @@ export function createCephadmModel(overrides: Partial<CephadmDeps> = {}) {
     },
 
     cephApplyMon: {
+      kind: "action" as const,
       description:
         "Converge mon placement to an explicit host list, refusing a change that would leave fewer than a strict majority of the current in-quorum mons unless allowQuorumRisk is set. Idempotent; a count-based spec is replaced.",
       arguments: ApplyMonArgs,
@@ -1071,6 +1077,7 @@ export function createCephadmModel(overrides: Partial<CephadmDeps> = {}) {
     },
 
     cephApplyMgr: {
+      kind: "action" as const,
       description:
         "Converge mgr placement to an explicit host list, never a count. Idempotent; a count-based spec is replaced and recorded.",
       arguments: ApplyMgrArgs,
@@ -1121,6 +1128,7 @@ export function createCephadmModel(overrides: Partial<CephadmDeps> = {}) {
     },
 
     cephApplyMds: {
+      kind: "action" as const,
       description:
         "Converge one filesystem's MDS placement to an explicit host list. Idempotent; sets only where MDS daemons run, never max_mds or standby_count_wanted.",
       arguments: ApplyMdsArgs,
@@ -1172,6 +1180,7 @@ export function createCephadmModel(overrides: Partial<CephadmDeps> = {}) {
     },
 
     cephApplyOsd: {
+      kind: "action" as const,
       description:
         "Apply an OSD service: fleet-wide all-available devices, or one by-serial service per disk-owning host. All-available mode is presence-only: once the service exists, a changed exclude list or new disks never trigger a re-apply. Selector mode resolves every serial to a by-id path first, so a resolution failure leaves the cluster untouched.",
       arguments: ApplyOsdArgs,
@@ -1240,6 +1249,7 @@ export function createCephadmModel(overrides: Partial<CephadmDeps> = {}) {
     },
 
     cephCreatePool: {
+      kind: "action" as const,
       description:
         "Ensure a replicated or erasure-coded pool exists with the requested redundancy, CRUSH failure domain and application. Idempotent; an existing pool that matches is left in place, and a mismatched pool is refused rather than converged.",
       arguments: CreatePoolArgs,
@@ -1281,6 +1291,7 @@ export function createCephadmModel(overrides: Partial<CephadmDeps> = {}) {
     },
 
     cephCreateFs: {
+      kind: "action" as const,
       description:
         "Ensure a CephFS volume exists and its MDS daemons are placed on an explicit host list, creating the volume or adopting pre-created pools. Idempotent; the MDS placement is re-applied on every run.",
       arguments: CreateFsArgs,
@@ -1319,6 +1330,7 @@ export function createCephadmModel(overrides: Partial<CephadmDeps> = {}) {
     },
 
     cephCreateCsiUser: {
+      kind: "action" as const,
       description:
         "Create a Ceph client entity, or set an existing one's caps to exactly the request, then read the caps back. Idempotent; never returns a key.",
       arguments: CreateCsiUserArgs,
@@ -1429,6 +1441,7 @@ export function createCephadmModel(overrides: Partial<CephadmDeps> = {}) {
     },
 
     cephDeleteFs: {
+      kind: "action" as const,
       description:
         "DESTRUCTIVE. Delete a CephFS volume and its backing pools, after a double confirmation, proven MDS removal and a pool-delete gate that is always closed again. A no-op when the volume is absent.",
       arguments: DeleteFsArgs,
@@ -1468,6 +1481,7 @@ export function createCephadmModel(overrides: Partial<CephadmDeps> = {}) {
     },
 
     cephRemoveOsds: {
+      kind: "action" as const,
       description:
         "DESTRUCTIVE. Remove OSDs through the orchestrator (draining and, by default, zapping the disks) and prove they are gone from the OSD tree. Idempotent per id.",
       arguments: RemoveOsdsArgs,

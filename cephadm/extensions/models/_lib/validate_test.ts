@@ -425,6 +425,12 @@ Deno.test(
       true,
     );
     assertEquals(redactUrl("https://user:pass@host/x"), "https://host/x");
+    try {
+      assertHttpUrl("url", "https://user:pass@download.test/x");
+      throw new Error("should throw");
+    } catch (e) {
+      assertEquals((e as Error).message.includes("user:pass"), false);
+    }
   },
 );
 

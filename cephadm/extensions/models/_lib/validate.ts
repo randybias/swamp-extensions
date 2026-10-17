@@ -351,12 +351,15 @@ export function assertIpv4Cidr(field: string, value: string): string {
 
 /** Runtime assertion: `value` is a V8 HTTP(S) URL. */
 export function assertHttpUrl(field: string, value: string): string {
-  return assertGrammar(
-    field,
-    value,
-    isHttpUrl(value),
-    "an absolute http or https URL with no shell metacharacters",
-  );
+  if (!isHttpUrl(value)) {
+    // Never echo the URL: it can carry credentials in userinfo or a query.
+    fail("validate", `invalid ${field}`, {
+      field,
+      rule:
+        "an absolute http or https URL with no userinfo or shell metacharacters",
+    });
+  }
+  return value;
 }
 
 /** Runtime assertion: `value` is a V9 SSH public key line. */

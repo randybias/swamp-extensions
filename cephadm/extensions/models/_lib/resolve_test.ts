@@ -17,7 +17,7 @@ function fakeSession(
 ): { session: SshSession; calls: RunOptions[] } {
   const calls: RunOptions[] = [];
   const session: SshSession = {
-    target: { host, user: "admin" },
+    target: { host, user: "admin", strictHostKeyChecking: "yes" },
     controlPath: null,
     run: (opts) => {
       calls.push(opts);

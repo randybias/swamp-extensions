@@ -505,10 +505,13 @@ export async function ensureCephadm(
     reinstalledBroken = true;
     alreadyPresent = false;
   }
+  // The URL is delivered on stdin, not on the ssh argv, so a query token is
+  // never visible in the process list.
   const curl = await session.run({
-    command: `curl --fail --silent --show-error -o ${CEPHADM_PATH} ${
+    command: "bash -s --",
+    stdin: `curl --fail --silent --show-error -o ${CEPHADM_PATH} ${
       quote(opts.url)
-    }`,
+    }\n`,
     sudo: true,
     allowNonZero: true,
   });
@@ -619,11 +622,14 @@ function addUrl(out: Endpoint[], raw: string): void {
 /** Strips credentials from one apt proxy configuration line before storing it. */
 export function sanitizeProxyLine(line: string): string {
   return line
+    // Remove userinfo from any URL, quoted or not.
     .replace(/([A-Za-z][A-Za-z0-9+.-]*:\/\/)[^@\s"]*@/g, "$1")
+    // Redact a value assigned to a secret-shaped key, quoted or bare.
     .replace(
-      /(password|passwd|secret|token|user)[ \t]*=[ \t]*[^\s;"]+/gi,
+      /(password|passwd|secret|token|user)[ \t]*=[ \t]*("[^"]*"|'[^']*'|\S+)/gi,
       "$1=<redacted>",
     )
+    // Belt and braces: any remaining `user:pass@` inside a URL.
     .replace(/([A-Za-z][A-Za-z0-9+.-]*:\/\/)[^\s"]*:(\S+)@/g, "$1<redacted>@");
 }
 

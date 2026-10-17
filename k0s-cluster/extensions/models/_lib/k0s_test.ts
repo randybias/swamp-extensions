@@ -502,12 +502,15 @@ Deno.test("HA config inputs render only when set, leaving the base byte-identica
   const cplb = renderK0sConfig({
     ...BASE,
     control_plane_load_balancing: {
-      virtual_ip: "192.0.2.10",
+      virtual_ips: ["192.0.2.10/24"],
       auth_pass: "abc12345",
     },
   });
   assertEquals(cplb.includes("controlPlaneLoadBalancing:"), true);
   assertEquals(cplb.includes("authPass: abc12345"), true);
+  assertEquals(cplb.includes("vrrpInstances:"), true);
+  assertEquals(cplb.includes('- "192.0.2.10/24"'), true);
+  assertEquals(cplb.includes("virtualIP:"), false);
   const ext = renderK0sConfig({ ...BASE, external_address: "192.0.2.10" });
   assertEquals(ext.includes('externalAddress: "192.0.2.10"'), true);
 });

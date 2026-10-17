@@ -85,8 +85,8 @@ export interface K0sConfigInput {
   external_address?: string;
   /** Enable node-local load balancing; omit or false keeps the default. */
   node_local_load_balancing?: boolean;
-  /** Control-plane keepalived VIP; omit for none. */
-  control_plane_load_balancing?: { virtual_ip: string; auth_pass: string };
+  /** Control-plane keepalived VIPs (CIDR); omit for none. */
+  control_plane_load_balancing?: { virtual_ips: string[]; auth_pass: string };
   /** Helm extensions to declare. */
   helm: HelmChartInput[];
 }
@@ -431,19 +431,22 @@ export function renderK0sConfig(input: K0sConfigInput): string {
   lines.push(`    podCIDR: ${yamlScalar(input.pod_cidr)}`);
   lines.push(`    serviceCIDR: ${yamlScalar(input.service_cidr)}`);
   if (input.control_plane_load_balancing) {
+    // k0s puts authPass and the CIDR virtualIPs on the keepalived vrrpInstance,
+    // not on controlPlaneLoadBalancing; a top-level virtualIP is ignored.
     lines.push("    controlPlaneLoadBalancing:");
     lines.push("      enabled: true");
     lines.push("      type: Keepalived");
-    lines.push(
-      `      virtualIP: ${
-        yamlScalar(input.control_plane_load_balancing.virtual_ip)
-      }`,
-    );
-    lines.push(
-      `      authPass: ${
-        yamlScalar(input.control_plane_load_balancing.auth_pass)
-      }`,
-    );
+    lines.push("      keepalived:");
+    lines.push("        vrrpInstances:");
+    for (const vip of input.control_plane_load_balancing.virtual_ips) {
+      lines.push("          - virtualIPs:");
+      lines.push(`              - ${yamlScalar(vip)}`);
+      lines.push(
+        `            authPass: ${
+          yamlScalar(input.control_plane_load_balancing.auth_pass)
+        }`,
+      );
+    }
   }
   if (input.node_local_load_balancing) {
     lines.push("    nodeLocalLoadBalancing:");

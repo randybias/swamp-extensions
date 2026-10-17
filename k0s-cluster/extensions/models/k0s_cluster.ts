@@ -185,19 +185,37 @@ const clusterFields = {
   telemetry_enabled: z.boolean().default(false).describe(
     "Whether anonymous telemetry is enabled.",
   ),
-  external_address: z.string().max(253).describe(
+  external_address: z.string().max(253).refine(
+    (v) => isIp(v) || HOST_RE.test(v),
+    "must be an IP address or hostname",
+  ).describe(
     "Advertised API address for clients, for example an external load balancer or VIP; written to spec.api.externalAddress. Do not combine with node_local_load_balancing.",
   ).nullish(),
   node_local_load_balancing: z.boolean().default(false).describe(
     "Enable k0s node-local load balancing (EnvoyProxy) so every node reaches the API locally; off keeps the previous behaviour.",
   ),
   control_plane_load_balancing: z.strictObject({
-    virtual_ip: z.string().max(45).refine(isIp, "must be an IP address")
-      .describe("VIP shared by the controllers (keepalived)."),
+    virtual_ips: z.array(
+      z.string().max(64).refine(isCidr, "must be a CIDR"),
+    ).min(1).max(16).describe("VIPs shared by the controllers, as CIDRs."),
     auth_pass: z.string().min(1).max(8).meta({ sensitive: true }).describe(
       "keepalived VRRP auth password, at most 8 characters; wire with a vault reference.",
     ),
   }).describe("Control-plane keepalived VIP; omit for none.").nullish(),
+};
+
+const externalAndLocalLbRefine = (v: {
+  external_address?: string | null;
+  node_local_load_balancing?: boolean;
+}, ctx: z.RefinementCtx) => {
+  if (v.external_address && v.node_local_load_balancing) {
+    ctx.addIssue({
+      code: "custom",
+      message:
+        "external_address and node_local_load_balancing cannot be combined; k0s refuses node-local load balancing with an external API address",
+      path: ["node_local_load_balancing"],
+    });
+  }
 };
 
 const RenderArgs = z.strictObject({
@@ -209,7 +227,7 @@ const RenderArgs = z.strictObject({
   helm: z.array(HELM_CHART).max(64).default([]).describe(
     "Helm extensions declared in k0s.yaml.",
   ),
-});
+}).superRefine(externalAndLocalLbRefine);
 
 const InstallArgs = z.strictObject({
   ssh: SSH,
@@ -239,7 +257,7 @@ const InstallArgs = z.strictObject({
   helm: z.array(HELM_CHART).max(64).default([]).describe(
     "Helm extensions declared in k0s.yaml.",
   ),
-});
+}).superRefine(externalAndLocalLbRefine);
 
 const WaitReadyArgs = z.strictObject({
   ssh: SSH,
@@ -604,7 +622,7 @@ function renderInput(args: {
   external_address?: string | null;
   node_local_load_balancing?: boolean;
   control_plane_load_balancing?: {
-    virtual_ip: string;
+    virtual_ips: string[];
     auth_pass: string;
   } | null;
   helm: z.infer<typeof HELM_CHART>[];
@@ -1006,23 +1024,30 @@ function buildK0sModel(deps: K0sDeps) {
           const hasValues = args.helm.some((chart) =>
             chart.values != null && Object.keys(chart.values).length > 0
           );
-          // Helm values often carry passwords, so a render that includes them
-          // is never persisted or returned; callers get a redacted copy and a
-          // flag saying so.
-          const returnedYaml = hasValues
+          const hasCplb = input.control_plane_load_balancing != null;
+          const hasSecrets = hasValues || hasCplb;
+          // Helm values and the keepalived auth password are secrets, so a
+          // render that holds them is never returned or persisted; callers get
+          // a redacted copy, and the digest covers that copy, so state and logs
+          // reveal nothing about the secret.
+          const returnedYaml = hasSecrets
             ? renderK0sConfig({
               ...input,
               helm: input.helm.map((chart) => ({
                 ...chart,
                 values: undefined,
               })),
+              control_plane_load_balancing: hasCplb
+                ? {
+                  ...input.control_plane_load_balancing!,
+                  auth_pass: "REDACTED",
+                }
+                : undefined,
             })
             : yaml;
-          // The digest covers the values-free render, so it reveals nothing
-          // about chart values that may be secret.
           const configSha = await sha256Hex(encoder.encode(returnedYaml));
           const dataHandles: unknown[] = [];
-          if (!hasValues) {
+          if (!hasSecrets) {
             const writer = context.createFileWriter(
               "config",
               `${instanceName(args.cluster_name)}-config`,
@@ -1046,7 +1071,7 @@ function buildK0sModel(deps: K0sDeps) {
               k0s_version: args.k0s_version,
               k0s_yaml: returnedYaml,
               config_sha256: configSha,
-              values_redacted: hasValues,
+              values_redacted: hasSecrets,
               manifests: manifestPlan,
               helm_charts: args.helm.map((chart) => ({
                 chart: chart.chart,
@@ -2092,4 +2117,17 @@ export const model = {
   ...buildK0sModel(defaultK0sDeps),
   type: "@randybias/k0s-cluster",
   version: "2026.10.17.3",
+  upgrades: [
+    {
+      toVersion: "2026.10.17.2",
+      description:
+        "reset now also removes /etc/k0s and the k0s binary it installed; stored attributes are unchanged",
+      upgradeAttributes: (old: Record<string, unknown>) => old,
+    },
+    {
+      toVersion: "2026.10.17.3",
+      description: "optional HA config inputs; stored attributes are unchanged",
+      upgradeAttributes: (old: Record<string, unknown>) => old,
+    },
+  ],
 } satisfies K0sClusterModel;

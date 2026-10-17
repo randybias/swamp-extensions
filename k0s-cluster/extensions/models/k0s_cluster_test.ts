@@ -293,6 +293,67 @@ Deno.test("render_config renders the golden and stores the file", async () => {
   assertEquals(fake.execs.length, 0);
 });
 
+Deno.test("render_config with a keepalived VIP never exposes authPass", async () => {
+  const secret = "abc12345";
+  const fake = makeDeps();
+  const model = createModel(fake.deps);
+  const args = model.methods.render_config.arguments.parse({
+    k0s_version: VERSION,
+    ...CLUSTER,
+    manifests: [],
+    helm: [],
+    control_plane_load_balancing: {
+      virtual_ips: ["192.0.2.10/24"],
+      auth_pass: secret,
+    },
+  });
+  const { context, getWrittenFiles } = createModelTestContext();
+  const out = await model.methods.render_config.execute(args, context);
+  assertEquals(out.result.values_redacted, true);
+  assertEquals(out.result.k0s_yaml.includes(secret), false);
+  assertEquals(out.result.k0s_yaml.includes("authPass: REDACTED"), true);
+  assertEquals(out.result.k0s_yaml.includes("vrrpInstances:"), true);
+  assertEquals(out.result.k0s_yaml.includes("virtualIPs:"), true);
+  assertEquals(
+    out.result.config_sha256,
+    await sha256Hex(encoder.encode(out.result.k0s_yaml)),
+  );
+  assertEquals(getWrittenFiles().length, 0);
+});
+
+Deno.test("external_address and node_local_load_balancing are rejected together", () => {
+  const model = createModel(makeDeps().deps);
+  const bad = model.methods.render_config.arguments.safeParse({
+    k0s_version: VERSION,
+    ...CLUSTER,
+    manifests: [],
+    helm: [],
+    external_address: "192.0.2.10",
+    node_local_load_balancing: true,
+  });
+  assertEquals(bad.success, false);
+});
+
+Deno.test("external_address must be an IP or hostname", () => {
+  const model = createModel(makeDeps().deps);
+  const bad = model.methods.render_config.arguments.safeParse({
+    k0s_version: VERSION,
+    ...CLUSTER,
+    manifests: [],
+    helm: [],
+    external_address: "bad host\nname",
+  });
+  assertEquals(bad.success, false);
+  const ok = model.methods.render_config.arguments.safeParse({
+    k0s_version: VERSION,
+    ...CLUSTER,
+    manifests: [],
+    helm: [],
+    external_address: "lb.example.com",
+  });
+  assertEquals(ok.success, true);
+});
+
 Deno.test("install verifies, uploads and starts a single-node cluster", async () => {
   const fake = makeDeps({
     exec: installRouter,

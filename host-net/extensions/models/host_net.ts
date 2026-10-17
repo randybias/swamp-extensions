@@ -210,6 +210,10 @@ const RevertSchema = z.strictObject({
   operation: z.string().optional(),
   /** The full owned set after this change commits. */
   owned: z.array(z.string()).optional(),
+  /** Previously owned devices this change deletes (put back on revert). */
+  staleDevices: z.array(z.string()).optional(),
+  /** Previously owned files this change removes (put back on revert). */
+  staleFiles: z.array(z.string()).optional(),
   /** The devices this change itself creates (restored/deleted on revert). */
   created: z.array(z.string()).optional(),
   createdBridges: z.array(z.string()).optional(),

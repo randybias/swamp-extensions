@@ -145,9 +145,27 @@ case "$now" in ""|*'"linkdown"'*|*'"dead"'*) ;; *)
   fi ;;
 esac`;
 
-/** Reads a recorded checks file into CHECK without trusting it: anything but a clean pass is fail. */
-const RUN_CHECKS = String
-  .raw`CHECK="$( ( CHECK=fail; . "$DIR/checks.sh"; printf '%s' "$CHECK" ) 2>/dev/null || true )"
+/**
+ * Reads a recorded checks file into CHECK without trusting it: anything but a
+ * clean pass is fail. The checks run right after a network apply, while a link
+ * (a cloud-init match+set-name NIC especially) is still re-settling, so they are
+ * retried every 2 s for up to 30 s (15 tries) and fail only if they still fail
+ * at the deadline. HOST_NET_SETTLE_TRIES / HOST_NET_SETTLE_SLEEP override this
+ * for tests.
+ */
+const RUN_CHECKS = String.raw`tries="$(printenv HOST_NET_SETTLE_TRIES || true)"
+case "$tries" in ""|*[!0-9]*) tries=15 ;; esac
+nap="$(printenv HOST_NET_SETTLE_SLEEP || true)"
+case "$nap" in ""|*[!0-9.]*) nap=2 ;; esac
+attempt=0
+CHECK=fail
+while :; do
+  CHECK="$( ( CHECK=fail; . "$DIR/checks.sh"; printf '%s' "$CHECK" ) 2>/dev/null || true )"
+  [ "$CHECK" = pass ] && break
+  attempt=$((attempt + 1))
+  [ "$attempt" -ge "$tries" ] && break
+  sleep "$nap"
+done
 [ "$CHECK" = pass ] || CHECK=fail`;
 
 /**

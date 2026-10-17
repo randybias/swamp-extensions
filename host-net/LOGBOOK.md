@@ -256,3 +256,9 @@ Every one of those tests fails on the previous round's code.
   The sim hangs up the session on `netplan apply` to model it. `commit` only
   stops the timer; `apply` and `remove` still run their forward `netplan apply`
   in-session (an armed revert covers a dropped session).
+- Live fix 2: the post-restore checks raced the link re-settling after
+  `netplan apply` (a cloud-init match+set-name NIC), so a correct restore could
+  record fail. The checks (restore and clear) are retried every 2 s for up to
+  30 s and fail only at the deadline. The `revert` resource schema now lists
+  `staleDevices` and `staleFiles`, and a test validates every written record
+  against its schema.

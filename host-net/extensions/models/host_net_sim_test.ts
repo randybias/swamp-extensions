@@ -134,6 +134,8 @@ async function world(): Promise<World> {
         SIMROOT: root,
         SIMBIN: bin,
         SSH_CONNECTION: await sshConnection(root),
+        HOST_NET_SETTLE_TRIES: "3",
+        HOST_NET_SETTLE_SLEEP: "0.2",
       },
       clearEnv: true,
     }).spawn();
@@ -784,6 +786,94 @@ Deno.test("revert_now survives the apply killing the SSH session: the restore ru
     // next apply is accepted (this one's NIC no longer bounces).
     await Deno.remove(`${w.root}/state/apply_kills_session`);
     await w.call("apply", net("netplan", [A, B]));
+  } finally {
+    await w.cleanup();
+  }
+});
+
+Deno.test("checks that fail while the link re-settles are retried and then pass; they fail only at the deadline", async () => {
+  if (!await simAvailable()) return;
+  const w = await world();
+  try {
+    // The sim settles after 3 tries. The first 2 lookups find nothing: pass.
+    const armed = await w.call("apply", net("netplan", [A]));
+    await Deno.writeTextFile(`${w.root}/state/flaky_route`, "2");
+    await Deno.writeTextFile(`${w.root}/state/apply_fails`, "");
+    const fired = await w.call("revert_now", {
+      ...SSH,
+      token: armed.revert_token,
+    });
+    assertEquals(fired.result, "pass");
+    assertEquals(w.store.get(`revert-${KEY}`)!.result, "pass");
+  } finally {
+    await w.cleanup();
+  }
+  // Still failing on the last try: fail, and the host is fail-closed.
+  const w2 = await world();
+  try {
+    const armed = await w2.call("apply", net("netplan", [A]));
+    await Deno.writeTextFile(`${w2.root}/state/flaky_route`, "3");
+    await assertRejects(
+      () => w2.call("revert_now", { ...SSH, token: armed.revert_token }),
+      Error,
+      "restore reported fail",
+    );
+    assertEquals(w2.store.get(`revert-${KEY}`)!.result, "fail");
+  } finally {
+    await w2.cleanup();
+  }
+});
+
+Deno.test("every record the model writes validates against its resource schema", async () => {
+  if (!await simAvailable()) return;
+  const w = await world();
+  const model = createModel({
+    run: () => Promise.resolve({ code: 0, stdout: "", stderr: "" }),
+  });
+  try {
+    // Armed, committed (config + revert), a dropped VLAN (stale devices),
+    // then a fired revert and a cleared one.
+    await w.call("apply", net("netplan", [A, B]));
+    await w.call("commit", net("netplan", [A, B]));
+    const armed = await w.call("apply", net("netplan", [B]));
+    await w.call("revert_now", { ...SSH, token: armed.revert_token });
+    await w.call("apply", net("netplan", [A]));
+    await Deno.writeTextFile(`${w.root}/state/no_route`, "");
+    await assertRejects(() =>
+      w.call("revert_now", {
+        ...SSH,
+        token: w.store.get(`revert-${KEY}`)!.token as string,
+      })
+    );
+    await Deno.remove(`${w.root}/state/no_route`);
+    await w.call("clear_failed_revert", { ...SSH });
+    const resources = model.resources as Record<
+      string,
+      {
+        schema: {
+          safeParse(v: unknown): { success: boolean; error?: unknown };
+        };
+      }
+    >;
+    let checked = 0;
+    for (const [name, data] of w.store) {
+      const spec = name.startsWith("revert-")
+        ? "revert"
+        : name.startsWith("config-")
+        ? "config"
+        : null;
+      if (!spec) continue;
+      const parsed = resources[spec].schema.safeParse(data);
+      assertEquals(
+        parsed.success,
+        true,
+        `${name}: ${JSON.stringify(parsed.error)}`,
+      );
+      checked++;
+    }
+    assert(checked >= 2);
+    // The stale fields are present in a record that dropped a VLAN.
+    assert(Array.isArray(w.store.get(`revert-${KEY}`)!.staleDevices));
   } finally {
     await w.cleanup();
   }

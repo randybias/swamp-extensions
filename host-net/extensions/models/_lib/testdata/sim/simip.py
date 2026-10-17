@@ -37,6 +37,12 @@ def main():
             print(json.dumps([{"ifname": a[4], "addr_info": [{"family": fam, "local": ip, "prefixlen": pl, "scope": scope}]}])); return 0
         if a[:3] == ["-j", "route", "get"]:
             if flag("no_route"): print("[]"); return 0
+            fr = R + "/state/flaky_route"
+            if os.path.exists(fr):
+                # The link is still re-settling: the first N lookups find nothing.
+                n = int(open(fr).read().strip() or "0")
+                if n > 0:
+                    open(fr, "w").write(str(n - 1)); print("[]"); return 0
             out = {"dst": a[3], **path()}
             if "from" in a:
                 # Like the kernel: with a source given there is no prefsrc, and

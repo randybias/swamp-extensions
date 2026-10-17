@@ -53,6 +53,8 @@ interface Call {
   args: string[];
   stdin?: Uint8Array | string;
   env?: Record<string, string>;
+  timeoutMs?: number;
+  truncate?: boolean;
 }
 
 /** A fake runner that answers ssh-agent/ssh-add and delegates ssh/keyscan. */
@@ -65,7 +67,14 @@ function fakeRun(
   } = {},
 ): CommandRunner {
   return (cmd, args, options = {}) => {
-    calls.push({ cmd, args, stdin: options.stdin, env: options.env });
+    calls.push({
+      cmd,
+      args,
+      stdin: options.stdin,
+      env: options.env,
+      timeoutMs: options.timeoutMs,
+      truncate: options.truncate,
+    });
     if (cmd === "ssh-agent" && args[0] === "-s") {
       return Promise.resolve({
         code: 0,
@@ -346,7 +355,13 @@ Deno.test("exec quotes the argv and never puts the key on the command line", asy
   const calls: Call[] = [];
   const deps = fakeDeps(fakeRun(calls));
   const result = await exec(deps, STRICT_TARGET, ["echo", "; rm -rf /"]);
-  assertEquals(result, { stdout: "ok\n", stderr: "", exit_code: 0 });
+  assertEquals(result, {
+    stdout: "ok\n",
+    stderr: "",
+    exit_code: 0,
+    truncated: false,
+    duration_ms: 0,
+  });
 
   const ssh = calls.find((c) => c.cmd === "ssh");
   assert(ssh);
@@ -404,6 +419,8 @@ Deno.test("exec returns a non-zero remote exit as data, not an error", async () 
     stdout: "",
     stderr: "boom\n",
     exit_code: 1,
+    truncated: false,
+    duration_ms: 0,
   });
 });
 
@@ -429,6 +446,141 @@ Deno.test("exec treats any ssh exit 255 as a transport error, not data", async (
     SshError,
     "transport failed",
   );
+});
+
+/**
+ * The exact ssh argv a no-options exec produced before the options extension,
+ * with the transport-internal random known_hosts path masked.
+ */
+const GOLDEN_EXEC_ARGS = [
+  "-F",
+  "/dev/null",
+  "-o",
+  "IdentityFile=none",
+  "-o",
+  "StrictHostKeyChecking=yes",
+  "-o",
+  "UserKnownHostsFile=<tmp>",
+  "-o",
+  "GlobalKnownHostsFile=/dev/null",
+  "-o",
+  "ConnectTimeout=15",
+  "-o",
+  "ServerAliveInterval=5",
+  "-o",
+  "ServerAliveCountMax=2",
+  "-o",
+  "IdentityAgent=/tmp/agent.test",
+  "-o",
+  "BatchMode=yes",
+  "-o",
+  "PreferredAuthentications=publickey",
+  "-p",
+  "22",
+  "-l",
+  "root",
+  HOST,
+  "'echo' 'hi'",
+];
+
+Deno.test("exec without options spawns the byte-identical pre-extension argv", async () => {
+  const calls: Call[] = [];
+  const deps = fakeDeps(fakeRun(calls));
+  const result = await exec(deps, STRICT_TARGET, ["echo", "hi"]);
+  assertEquals(result, {
+    stdout: "ok\n",
+    stderr: "",
+    exit_code: 0,
+    truncated: false,
+    duration_ms: 0,
+  });
+  const ssh = calls.find((c) => c.cmd === "ssh");
+  assert(ssh);
+  assertEquals(
+    ssh.args.map((a) =>
+      a.startsWith("UserKnownHostsFile=") ? "UserKnownHostsFile=<tmp>" : a
+    ),
+    GOLDEN_EXEC_ARGS,
+  );
+  assertEquals(ssh.stdin, undefined);
+  assertEquals(ssh.timeoutMs, undefined);
+  assertEquals(ssh.truncate, undefined);
+});
+
+Deno.test("exec streams stdin byte-exact, including NUL, and never on argv", async () => {
+  const payload = new Uint8Array([0, 1, 2, 255, 0, 65, 0, 10]);
+  const calls: Call[] = [];
+  const deps = fakeDeps(fakeRun(calls));
+  await exec(deps, STRICT_TARGET, ["sha256sum"], { stdin: payload });
+  const ssh = calls.find((c) => c.cmd === "ssh");
+  assert(ssh);
+  assert(ssh.stdin instanceof Uint8Array);
+  assertEquals([...(ssh.stdin as Uint8Array)], [...payload]);
+  for (const call of calls) {
+    assertEquals(call.args.join(" ").includes("\u0000"), false);
+  }
+});
+
+Deno.test("exec streams a large stdin payload byte-exact", async () => {
+  const payload = new Uint8Array(256 * 1024);
+  for (let i = 0; i < payload.length; i++) payload[i] = i % 256;
+  const calls: Call[] = [];
+  const deps = fakeDeps(fakeRun(calls));
+  await exec(deps, STRICT_TARGET, ["cat"], { stdin: payload });
+  const ssh = calls.find((c) => c.cmd === "ssh");
+  assert(ssh);
+  const sent = ssh.stdin as Uint8Array;
+  assertEquals(sent.byteLength, payload.byteLength);
+  assertEquals(sent[255], 255);
+  assertEquals(sent[256], 0);
+});
+
+Deno.test("exec timeout kills ssh and raises a typed timeout", async () => {
+  const calls: Call[] = [];
+  const deps = fakeDeps(fakeRun(calls, {
+    ssh: () => ({ code: -1, stdout: "partial", stderr: "", timedOut: true }),
+  }));
+  const err = await assertRejects(
+    () => exec(deps, STRICT_TARGET, ["sleep", "5"], { timeoutMs: 50 }),
+    SshError,
+  ) as SshError;
+  assertEquals(err.kind, "timeout");
+  assertStringIncludes(err.message, "timed out");
+  assertEquals(calls.find((c) => c.cmd === "ssh")?.timeoutMs, 50);
+});
+
+Deno.test("exec truncates and flags instead of throwing when maxOutputBytes is set", async () => {
+  const calls: Call[] = [];
+  const deps = fakeDeps(fakeRun(calls, {
+    ssh: () => ({ code: 0, stdout: "0123", stderr: "", truncated: true }),
+  }));
+  const result = await exec(deps, STRICT_TARGET, ["true"], {
+    maxOutputBytes: 4,
+  });
+  assertEquals(result, {
+    stdout: "0123",
+    stderr: "",
+    exit_code: 0,
+    truncated: true,
+    duration_ms: 0,
+  });
+  assertEquals(calls.find((c) => c.cmd === "ssh")?.truncate, true);
+});
+
+Deno.test("a secret in stdin never appears on argv or in a transport error", async () => {
+  const secret = "PLACEHOLDER-SECRET-VALUE";
+  const calls: Call[] = [];
+  const deps = fakeDeps(fakeRun(calls, {
+    ssh: () => ({ code: 255, stdout: "", stderr: "Connection refused" }),
+  }));
+  const err = await assertRejects(
+    () => exec(deps, STRICT_TARGET, ["cat"], { stdin: secret }),
+    SshError,
+  ) as SshError;
+  assertEquals(err.message.includes(secret), false);
+  for (const call of calls) {
+    assertEquals(call.args.join(" ").includes(secret), false);
+  }
 });
 
 Deno.test("strict needs pinned keys and rejects two credentials at once", async () => {

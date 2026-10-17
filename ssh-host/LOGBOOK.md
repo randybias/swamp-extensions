@@ -345,3 +345,23 @@ commits as deletions and was discarded):
   control host (4,502 samples) and the target (1,798 samples, plus execsnoop)
   never showed the secret, its SHA-256 or its base64. Every live cell of the
   matrix now passes on 2026.10.17.2, so it was promoted from beta to stable.
+
+## 2026.10.17.3 — additive exec options
+
+- Extended `exec()` with an optional `{ stdin?, timeoutMs?, maxOutputBytes? }`
+  object. No-options calls take the exact pre-extension code path, so the ssh
+  argv and the stdout/stderr/exit code are unchanged; a test pins the full ssh
+  argv (masking only the transport-internal random known_hosts path).
+- `stdin` is streamed to ssh's stdin and never placed on argv. `timeoutMs` kills
+  ssh (`AbortSignal.timeout` on the spawned process) and raises `SshError` with
+  `kind: "timeout"`; a timeout never returns partial output. `maxOutputBytes`
+  caps stdout/stderr and sets `truncated: true` instead of throwing; the runner
+  drains past the cap so the child can exit. `ExecResult` gained `truncated` and
+  `duration_ms`. Exit 255 is still a transport error and no content hash or
+  secret ever reaches argv.
+- Real ssh round trip against a throwaway `ubuntu:24.04` sshd (openssh-server,
+  pinned host key, key over ssh-agent): `exec` with stdin containing a NUL piped
+  to `sha256sum` matched locally; a 64 KiB stdin payload matched; a 128-byte cap
+  on `seq 1 100000` returned 128 bytes with `truncated: true` and exit 0;
+  `sleep 30` with `timeoutMs: 1500` raised `SshError` kind `timeout`.
+- This becomes the new canonical transport; vendors re-vendor it one by one.

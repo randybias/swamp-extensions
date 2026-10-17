@@ -26,6 +26,10 @@ export interface CommandResult {
   stdout: string;
   /** Captured standard error. */
   stderr: string;
+  /** Set when the output cap was reached in truncate mode. */
+  truncated?: boolean;
+  /** Set when the command was killed for exceeding its timeout. */
+  timedOut?: boolean;
 }
 
 /** Options for one external command. */
@@ -36,6 +40,10 @@ export interface RunOptions {
   env?: Record<string, string>;
   /** Cap in bytes on each captured stream; the runner throws when exceeded. */
   maxOutputBytes?: number;
+  /** Stop at `maxOutputBytes` and mark the result truncated instead of throwing. */
+  truncate?: boolean;
+  /** Kill the command after this many milliseconds and mark it timed out. */
+  timeoutMs?: number;
 }
 
 /** Runs an external command; injectable so tests spawn no process. */
@@ -85,6 +93,20 @@ export interface ExecResult {
   stderr: string;
   /** Remote exit code; a non-zero value is data, not an error. */
   exit_code: number;
+  /** True when stdout or stderr reached the capture cap. */
+  truncated: boolean;
+  /** Wall-clock milliseconds spent in the transport. */
+  duration_ms: number;
+}
+
+/** Optional per-call controls for {@link exec}. */
+export interface ExecOptions {
+  /** Bytes or text streamed to ssh's stdin; never placed on argv. */
+  stdin?: Uint8Array | string;
+  /** Kill ssh after this many milliseconds and raise a timeout. */
+  timeoutMs?: number;
+  /** Capture cap; exceeding it sets `truncated` instead of throwing. */
+  maxOutputBytes?: number;
 }
 
 /** Result of pushing bytes to a remote path. */
@@ -154,12 +176,18 @@ export class SshConfigError extends Error {
   }
 }
 
+/** A distinguishable reason a call failed. */
+export type SshErrorKind = "timeout";
+
 /** A transport failure: unreachable host, rejected credential or key mismatch. */
 export class SshError extends Error {
-  /** Creates a transport error. */
-  constructor(message: string) {
+  /** The failure kind, when a caller should branch on it. */
+  readonly kind?: SshErrorKind;
+  /** Creates a transport error, optionally typed by kind. */
+  constructor(message: string, kind?: SshErrorKind) {
     super(message);
     this.name = "SshError";
+    this.kind = kind;
   }
 }
 
@@ -468,30 +496,43 @@ async function readCappedStream(
   stream: ReadableStream<Uint8Array>,
   cap: number,
   label: string,
-): Promise<Uint8Array> {
+  truncate: boolean,
+): Promise<{ bytes: Uint8Array; truncated: boolean }> {
   const reader = stream.getReader();
   const chunks: Uint8Array[] = [];
-  let total = 0;
+  let stored = 0;
+  let truncated = false;
   try {
     while (true) {
       const { done, value } = await reader.read();
       if (done) break;
-      total += value.byteLength;
-      if (total > cap) {
-        throw new SshError(`${label} exceeded the ${cap}-byte capture limit`);
+      // Once truncated, keep draining so the child can finish and exit.
+      if (truncated) continue;
+      if (stored + value.byteLength > cap) {
+        if (!truncate) {
+          throw new SshError(`${label} exceeded the ${cap}-byte capture limit`);
+        }
+        const keep = cap - stored;
+        if (keep > 0) {
+          chunks.push(value.subarray(0, keep));
+          stored += keep;
+        }
+        truncated = true;
+        continue;
       }
       chunks.push(value);
+      stored += value.byteLength;
     }
   } finally {
     await reader.cancel().catch(() => undefined);
   }
-  const out = new Uint8Array(total);
+  const out = new Uint8Array(stored);
   let offset = 0;
   for (const chunk of chunks) {
     out.set(chunk, offset);
     offset += chunk.byteLength;
   }
-  return out;
+  return { bytes: out, truncated };
 }
 
 /** Default command runner backed by `Deno.Command`. */
@@ -499,6 +540,16 @@ export const denoRunner: CommandRunner = async (cmd, args, options = {}) => {
   // Only ssh, ssh-agent, ssh-add and ssh-keyscan are run, with arguments
   // validated by the grammars above; credentials go via stdin or the
   // environment, never argv.
+  const signal = options.timeoutMs === undefined
+    ? undefined
+    : AbortSignal.timeout(options.timeoutMs);
+  const timedOut = (): CommandResult => ({
+    code: -1,
+    stdout: "",
+    stderr: "",
+    timedOut: true,
+  });
+  const decode = (bytes: Uint8Array): string => new TextDecoder().decode(bytes);
   let child: Deno.ChildProcess;
   try {
     // swamp-quality-ignore deno-command
@@ -508,6 +559,7 @@ export const denoRunner: CommandRunner = async (cmd, args, options = {}) => {
       stdout: "piped",
       stderr: "piped",
       env: options.env,
+      signal,
     }).spawn();
   } catch (e) {
     if (e instanceof Deno.errors.NotFound) {
@@ -518,36 +570,42 @@ export const denoRunner: CommandRunner = async (cmd, args, options = {}) => {
   const stdin = (async (): Promise<void> => {
     if (options.stdin === undefined) return;
     const writer = child.stdin.getWriter();
-    await writer.write(
-      typeof options.stdin === "string"
-        ? new TextEncoder().encode(options.stdin)
-        : options.stdin,
-    );
-    await writer.close();
+    try {
+      await writer.write(
+        typeof options.stdin === "string"
+          ? new TextEncoder().encode(options.stdin)
+          : options.stdin,
+      );
+      await writer.close();
+    } catch {
+      // The child exited before reading all input; the result still counts.
+    }
   })();
   const cap = options.maxOutputBytes;
-  if (cap === undefined) {
-    await stdin;
-    const out = await child.output();
-    return {
-      code: out.code,
-      stdout: new TextDecoder().decode(out.stdout),
-      stderr: new TextDecoder().decode(out.stderr),
-    };
-  }
-  const stdout = readCappedStream(child.stdout, cap, `${cmd} stdout`);
-  const stderr = readCappedStream(child.stderr, cap, `${cmd} stderr`);
   try {
-    const [, stdoutBytes, stderrBytes] = await Promise.all([
-      stdin,
-      stdout,
-      stderr,
+    if (cap === undefined) {
+      await stdin;
+      const out = await child.output();
+      if (signal?.aborted) return timedOut();
+      return {
+        code: out.code,
+        stdout: decode(out.stdout),
+        stderr: decode(out.stderr),
+      };
+    }
+    const truncate = options.truncate ?? false;
+    const [stdout, stderr] = await Promise.all([
+      readCappedStream(child.stdout, cap, `${cmd} stdout`, truncate),
+      readCappedStream(child.stderr, cap, `${cmd} stderr`, truncate),
     ]);
+    await stdin;
     const status = await child.status;
+    if (signal?.aborted) return timedOut();
     return {
       code: status.code,
-      stdout: new TextDecoder().decode(stdoutBytes),
-      stderr: new TextDecoder().decode(stderrBytes),
+      stdout: decode(stdout.bytes),
+      stderr: decode(stderr.bytes),
+      truncated: stdout.truncated || stderr.truncated,
     };
   } catch (e) {
     try {
@@ -555,8 +613,8 @@ export const denoRunner: CommandRunner = async (cmd, args, options = {}) => {
     } catch {
       // already gone
     }
-    await Promise.allSettled([stdin, stdout, stderr]);
     await child.status.catch(() => undefined);
+    if (signal?.aborted) return timedOut();
     throw e;
   }
 };
@@ -729,12 +787,21 @@ function transportFailure(
  * caller supplies the keys it recorded on first use — the host is verified
  * against exactly those keys and a change is refused.
  */
+/** Per-call limits the public entry points may pass to {@link runRemote}. */
+interface RunLimits {
+  stdin?: Uint8Array | string;
+  maxOutputBytes?: number;
+  truncate?: boolean;
+  timeoutMs?: number;
+}
+
 async function runRemote(
   deps: SshDeps,
   target: SshTarget,
   remoteCommand: string,
-  stdin?: Uint8Array | string,
+  limits?: RunLimits,
 ): Promise<ExecResult> {
+  const started = deps.now();
   const t = normalizeTarget(target);
   const knownHosts = await Deno.makeTempFile({ prefix: "ssh-host-kh-" });
   const cleanups: Array<() => Promise<void>> = [
@@ -796,24 +863,37 @@ async function runRemote(
     }
 
     args.push("-p", String(t.port), "-l", t.user, t.host, remoteCommand);
-    const res = await deps.run("ssh", args, {
-      stdin,
-      env,
-      maxOutputBytes: t.max_output_bytes,
-    });
+    const cap = limits?.maxOutputBytes ?? t.max_output_bytes;
+    const runOptions: RunOptions = { env, maxOutputBytes: cap };
+    if (limits?.stdin !== undefined) runOptions.stdin = limits.stdin;
+    if (limits?.truncate) runOptions.truncate = true;
+    if (limits?.timeoutMs !== undefined) {
+      runOptions.timeoutMs = limits.timeoutMs;
+    }
+    const res = await deps.run("ssh", args, runOptions);
+    if (res.timedOut) {
+      throw new SshError(`ssh to ${t.host}:${t.port} timed out`, "timeout");
+    }
     const failure = transportFailure(t, res);
     if (failure) throw failure;
+    const truncated = res.truncated ?? false;
     // Defense in depth for an injected runner: a production runner enforces
     // the cap while streaming, so this only fires for one that does not.
     if (
-      utf8Length(res.stdout) > t.max_output_bytes ||
-      utf8Length(res.stderr) > t.max_output_bytes
+      !truncated &&
+      (utf8Length(res.stdout) > cap || utf8Length(res.stderr) > cap)
     ) {
       throw new SshError(
-        `output from ${t.host}:${t.port} exceeded the ${t.max_output_bytes}-byte capture limit`,
+        `output from ${t.host}:${t.port} exceeded the ${cap}-byte capture limit`,
       );
     }
-    return { stdout: res.stdout, stderr: res.stderr, exit_code: res.code };
+    return {
+      stdout: res.stdout,
+      stderr: res.stderr,
+      exit_code: res.code,
+      truncated,
+      duration_ms: deps.now() - started,
+    };
   } finally {
     for (const cleanup of cleanups.reverse()) await cleanup();
   }
@@ -828,8 +908,25 @@ export async function exec(
   deps: SshDeps,
   target: SshTarget,
   argv: string[],
+  options: ExecOptions = {},
 ): Promise<ExecResult> {
-  return await runRemote(deps, target, quoteArgv(argv));
+  if (
+    options.stdin === undefined &&
+    options.timeoutMs === undefined &&
+    options.maxOutputBytes === undefined
+  ) {
+    // No options: the pre-extension call, byte-identical argv.
+    return await runRemote(deps, target, quoteArgv(argv));
+  }
+  return await runRemote(deps, target, quoteArgv(argv), {
+    ...(options.stdin !== undefined ? { stdin: options.stdin } : {}),
+    ...(options.maxOutputBytes !== undefined
+      ? { maxOutputBytes: options.maxOutputBytes, truncate: true }
+      : {}),
+    ...(options.timeoutMs !== undefined
+      ? { timeoutMs: options.timeoutMs }
+      : {}),
+  });
 }
 
 /** Returns the UTF-8 byte length of `text` without allocating a buffer. */
@@ -943,7 +1040,7 @@ export async function upload(
     `m=$( { stat -c %a "$f" 2>/dev/null || stat -f %Lp "$f" 2>/dev/null; } )`,
     `printf '%s %s\n' "\${h:-none}" "\${m:-none}"`,
   ].join("\n");
-  const res = await runRemote(deps, target, script, bytes);
+  const res = await runRemote(deps, target, script, { stdin: bytes });
   if (res.exit_code !== 0) {
     if (res.stdout.includes(UNSUPPORTED_PLATFORM)) {
       throw new SshConfigError(

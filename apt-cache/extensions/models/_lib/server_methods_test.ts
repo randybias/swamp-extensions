@@ -1,69 +1,32 @@
+/**
+ * Server-method behaviour tests for `@randybias/apt-cache`: the schema
+ * preconditions, install/render/apply/remove, the read-only get/sync/stats
+ * probes, managed-file ownership, and the guarded real-acng route check.
+ *
+ * @module
+ */
+
 import {
   assertEquals,
   assertRejects,
   assertThrows,
 } from "jsr:@std/assert@1.0.19";
-import { createModelTestContext } from "jsr:@swamp-club/swamp-testing@0.20261014.55";
-import { SshError } from "./_lib/ssh.ts";
-import { renderBackendFiles, renderServerFragment } from "./_lib/apt.ts";
-import { createModel, model, setDeps } from "./apt_cache.ts";
+import { SshError } from "./ssh.ts";
 import {
+  renderBackendFiles,
+  renderServerFragment,
+  SECURITY_CONF_PATH,
+} from "./apt.ts";
+import { createModel, model, setDeps } from "../apt_cache.ts";
+import {
+  boxFake,
   fakeApt,
   has,
   hasTok,
   type Resp,
-  TEST_NOW,
   useFake,
-} from "./_lib/test_support.ts";
-
-const NOW = TEST_NOW;
-const SSH = {
-  host: "192.0.2.20",
-  port: 22,
-  user: "root",
-  host_key_policy: "strict" as const,
-  host_keys: ["192.0.2.20 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFakeKey"],
-  ssh_key_ref: { vault: "default", key: "APT_SSH" },
-  connect_timeout_s: 15,
-};
-
-const SERVER = {
-  listen: ["192.0.2.20"],
-  https_policy: "direct" as const,
-  passthrough_hosts: [] as string[],
-  backends: { debian: ["http://deb.debian.org/debian/"] },
-  expire_days: 4,
-  cache_dir: "/var/cache/apt-cacher-ng",
-};
-const CLIENT = {
-  proxy_url: "http://192.0.2.20:3142",
-  https_policy: "direct" as const,
-  bypass_hosts: [] as string[],
-  fallback_direct: false,
-  verify_update: false,
-};
-
-function ctx(
-  options: Record<string, unknown> = {},
-  extraContext: Record<string, unknown> = {},
-) {
-  const base = createModelTestContext({ globalArgs: {}, ...options });
-  return {
-    ...base,
-    context: {
-      // A default query API so configure_client's policy check runs; tests that
-      // exercise the failure path override it.
-      queryData: () => Promise.resolve([]),
-      ...base.context,
-      ...extraContext,
-    },
-  };
-}
-
-/** SERVER with overrides; avoids duplicate-key literals under strict TS. */
-function serverArgs(overrides: Record<string, unknown> = {}) {
-  return Object.assign({}, SERVER, overrides);
-}
+} from "./test_support.ts";
+import { ctx, SERVER, serverArgs, SSH } from "./model_test_support.ts";
 
 Deno.test("createModel returns the model", () => {
   assertEquals(createModel().type, "@randybias/apt-cache");
@@ -204,35 +167,6 @@ Deno.test("in-method: backend scheme must match the HTTPS policy", async () => {
     Error,
     "plain http mirror",
   );
-});
-
-Deno.test("grammar: injection in names, URLs and paths is refused", () => {
-  for (
-    const bad of [
-      { ssh: { ...SSH, host: "192.0.2.20; id" } },
-      { ssh: { ...SSH, user: "root$(id)" } },
-      { proxy_url: "http://192.0.2.20:3142/; id" },
-      { proxy_url: "http://user:pass@192.0.2.20:3142" },
-      { proxy_url: "http://x$({touch,pwned})y:3142" },
-      { proxy_url: 'http://x"y:3142' },
-      { ...CLIENT, proxy_url: "https://192.0.2.20:3142" },
-      { ...CLIENT, bypass_hosts: ["*.example.test"] },
-      { listen: ["192.0.2.20\n0.0.0.0"] },
-      { cache_dir: "/var/../etc" },
-      { cache_dir: "/var" },
-    ]
-  ) {
-    const merged = Object.assign({}, SERVER, CLIENT, bad) as Record<
-      string,
-      unknown
-    >;
-    assertThrows(() =>
-      model.methods.configure_client.arguments.parse({
-        ssh: SSH,
-        ...merged,
-      })
-    );
-  }
 });
 
 // --- render_server ----------------------------------------------------------
@@ -549,6 +483,92 @@ Deno.test("remove_server refuses a mismatched confirm_host", async () => {
   );
 });
 
+/** A responder for the host probes apply_server and remove_server need. */
+function serverResponder(command: string): Resp {
+  if (command.includes("is-active")) return { code: 0, stdout: "active\n" };
+  if (command.includes("-ltn")) {
+    return {
+      code: 0,
+      stdout:
+        "State Recv-Q Send-Q Local Address:Port Peer Address:Port\nLISTEN 0 4096 192.0.2.20:3142 0.0.0.0:*\n",
+    };
+  }
+  if (command.includes("dpkg-query")) {
+    return { code: 0, stdout: "install ok installed\n" };
+  }
+  return {};
+}
+
+const FRAGMENT = "/etc/apt-cacher-ng/zzzz-apt-cache.conf";
+const BACKENDS_DEBIAN = "/etc/apt-cacher-ng/backends_debian";
+const BACKUP_DEBIAN = `${BACKENDS_DEBIAN}.apt-cache.bak`;
+
+Deno.test("apply twice then remove deletes the model's files and restores the original", async () => {
+  const box = boxFake(
+    { [BACKENDS_DEBIAN]: "original debian mirror\n" },
+    serverResponder,
+  );
+  useFake(box.fake);
+  const c = ctx();
+  const args = model.methods.apply_server.arguments.parse({
+    ssh: SSH,
+    ...serverArgs({ listen: ["192.0.2.20"] }),
+  });
+  await model.methods.apply_server.execute(args, c.context);
+  await model.methods.apply_server.execute(args, c.context);
+  // The original was saved once, on the first apply; the second must not back
+  // up the model's own output.
+  assertEquals(
+    box.files.get(BACKUP_DEBIAN)?.content,
+    "original debian mirror\n",
+  );
+
+  const out = await model.methods.remove_server.execute(
+    model.methods.remove_server.arguments.parse({
+      ssh: SSH,
+      confirm_host: "192.0.2.20",
+      purge_cache_ack: true,
+    }),
+    c.context,
+  );
+  assertEquals(out.result.removed, true);
+  assertEquals(box.files.has(FRAGMENT), false, "fragment left behind");
+  assertEquals(
+    box.files.get(BACKENDS_DEBIAN)?.content,
+    "original debian mirror\n",
+    "original backend file not restored",
+  );
+  assertEquals(box.files.has(BACKUP_DEBIAN), false);
+});
+
+Deno.test("a later apply clears a dropped admin credential", async () => {
+  const box = boxFake({}, serverResponder);
+  useFake(box.fake);
+  setDeps({ resolveSecret: () => Promise.resolve("admin:s3cret") });
+  const c = ctx();
+  await model.methods.apply_server.execute(
+    model.methods.apply_server.arguments.parse({
+      ssh: SSH,
+      ...serverArgs({
+        listen: ["192.0.2.20"],
+        admin_auth_ref: { vault: "default", key: "ADMIN" },
+      }),
+    }),
+    c.context,
+  );
+  assertEquals(box.files.has(SECURITY_CONF_PATH), true);
+  await model.methods.apply_server.execute(
+    model.methods.apply_server.arguments.parse({
+      ssh: SSH,
+      ...serverArgs({ listen: ["192.0.2.20"] }),
+    }),
+    c.context,
+  );
+  // security.conf was absent before, so dropping the credential removes it
+  // instead of leaving the old admin credential in place forever.
+  assertEquals(box.files.has(SECURITY_CONF_PATH), false);
+});
+
 // --- sync -------------------------------------------------------------------
 
 Deno.test("sync reports a widened passthrough and a missing fragment", async () => {
@@ -584,7 +604,7 @@ Deno.test("sync reports a widened passthrough and a missing fragment", async () 
 
 Deno.test("stats reads the request log and fails closed on a bad log", async () => {
   const log = await Deno.readTextFile(
-    new URL("./_lib/testdata/apt-cacher.log.txt", import.meta.url),
+    new URL("./testdata/apt-cacher.log.txt", import.meta.url),
   );
   const fake = fakeApt((command) => {
     if (command.includes("cat")) return { code: 0, stdout: log };
@@ -627,319 +647,24 @@ Deno.test("stats reads the request log and fails closed on a bad log", async () 
     "unrecognised",
   );
   assertEquals(c2.getWrittenResources().length, 0);
-});
 
-// --- configure_client / client_get / unconfigure_client ---------------------
-
-Deno.test("configure_client writes and verifies the snippet", async () => {
-  const fake = fakeApt((command) => {
-    if (command.includes(".ssh-host-upload")) return { code: 0 };
-    if (command.includes("sha256sum")) return { code: 1 };
-    if (command.includes("grep -lE")) return { code: 0, stdout: "" };
-    if (command.includes("apt-config")) {
-      return {
-        code: 0,
-        stdout:
-          `Acquire::http::Proxy "http://192.0.2.20:3142";\nAcquire::https::Proxy "DIRECT";\n`,
-      };
+  // A corrupt rotation exits 4, which is a distinct error from a missing log.
+  const corrupt = fakeApt((command) => {
+    if (command.includes("gzip -dc") || command.includes("cat")) {
+      return { code: 4, stdout: "", stderr: "corrupt log" };
     }
     return { code: 0 };
   });
-  useFake(fake);
-  const c = ctx();
-  const out = await model.methods.configure_client.execute(
-    model.methods.configure_client.arguments.parse({ ssh: SSH, ...CLIENT }),
-    c.context,
-  );
-  assertEquals(out.result.verified, true);
-  assertEquals(
-    fake.uploads.some((u) => u.path.endsWith("90apt-cache-proxy")),
-    true,
-  );
-  assertEquals(c.getWrittenResources()[0].data.present, true);
-});
-
-Deno.test("configure_client refuses a conflict without ack", async () => {
-  const fake = fakeApt((command) => {
-    if (command.includes("grep -lE")) {
-      return { code: 0, stdout: "/etc/apt/apt.conf.d/02proxy\n" };
-    }
-    return { code: 0 };
-  });
-  useFake(fake);
+  useFake(corrupt);
   await assertRejects(
     () =>
-      model.methods.configure_client.execute(
-        model.methods.configure_client.arguments.parse({ ssh: SSH, ...CLIENT }),
+      model.methods.stats.execute(
+        model.methods.stats.arguments.parse({ ssh: SSH, window: "today" }),
         ctx().context,
       ),
     Error,
-    "override_existing_ack",
+    "corrupt",
   );
-  assertEquals(
-    fake.uploads.some((u) => u.path.endsWith("90apt-cache-proxy")),
-    false,
-  );
-});
-
-Deno.test("configure_client refuses a policy that disagrees with the server", async () => {
-  const fake = fakeApt(() => ({}));
-  useFake(fake);
-  const c = ctx({}, {
-    queryData: () =>
-      Promise.resolve([{
-        attributes: {
-          host: "192.0.2.20",
-          listen: ["192.0.2.20"],
-          https_policy: "passthrough",
-        },
-      }]),
-  });
-  await assertRejects(
-    () =>
-      model.methods.configure_client.execute(
-        model.methods.configure_client.arguments.parse({ ssh: SSH, ...CLIENT }),
-        c.context,
-      ),
-    Error,
-    "does not match the recorded server policy",
-  );
-});
-
-Deno.test("configure_client rolls the snippet back on a failed verify", async () => {
-  const fake = fakeApt((command) => {
-    if (command.startsWith("'test' '-e'")) return { code: 1 };
-    if (command.includes("cat")) return { code: 1 };
-    if (command.includes("sha256sum")) return { code: 1 };
-    if (command.includes("grep -lE")) return { code: 0, stdout: "" };
-    if (command.includes("apt-config")) {
-      return {
-        code: 0,
-        stdout: `Acquire::http::Proxy "http://192.0.2.9:3142";\n`,
-      };
-    }
-    return { code: 0 };
-  });
-  useFake(fake);
-  const c = ctx();
-  await assertRejects(
-    () =>
-      model.methods.configure_client.execute(
-        model.methods.configure_client.arguments.parse({ ssh: SSH, ...CLIENT }),
-        c.context,
-      ),
-    Error,
-    "not the proxy",
-  );
-  assertEquals(
-    fake.removed.includes("/etc/apt/apt.conf.d/90apt-cache-proxy"),
-    true,
-  );
-  assertEquals(c.getWrittenResources().length, 0);
-});
-
-Deno.test("configure_client fails a key mismatch even with fallback_direct", async () => {
-  const fake = fakeApt((command) => {
-    if (command.startsWith("'test' '-e'")) return { code: 1 };
-    if (command.includes("cat")) return { code: 1 };
-    if (command.includes("sha256sum")) return { code: 1 };
-    if (command.includes("grep -lE")) return { code: 0, stdout: "" };
-    if (command.includes("apt-config")) {
-      return {
-        code: 0,
-        stdout: `Acquire::http::Proxy "http://192.0.2.9:3142";\n`,
-      };
-    }
-    return { code: 0 };
-  });
-  useFake(fake);
-  await assertRejects(
-    () =>
-      model.methods.configure_client.execute(
-        model.methods.configure_client.arguments.parse({
-          ssh: SSH,
-          ...CLIENT,
-          fallback_direct: true,
-        }),
-        ctx().context,
-      ),
-    Error,
-    "not the proxy",
-  );
-});
-
-Deno.test("configure_client restores the prior snippet on a failed re-run", async () => {
-  const prior =
-    '// prior snippet\nAcquire::http::Proxy "http://old.example.test:3142";\n';
-  const fake = fakeApt((command) => {
-    if (command.includes("cat") && command.includes("90apt-cache-proxy")) {
-      return { code: 0, stdout: prior };
-    }
-    if (command.startsWith("'test' '-e'")) return { code: 1 };
-    if (command.includes("cat")) return { code: 1 };
-    if (command.includes("sha256sum")) return { code: 1 };
-    if (command.includes("grep -lE")) return { code: 0, stdout: "" };
-    if (command.includes("apt-config")) {
-      return {
-        code: 0,
-        stdout: `Acquire::http::Proxy "http://192.0.2.9:3142";\n`,
-      };
-    }
-    return { code: 0 };
-  });
-  useFake(fake);
-  await assertRejects(
-    () =>
-      model.methods.configure_client.execute(
-        model.methods.configure_client.arguments.parse({ ssh: SSH, ...CLIENT }),
-        ctx().context,
-      ),
-    Error,
-    "not the proxy",
-  );
-  assertEquals(
-    fake.uploads.some((u) =>
-      u.path.endsWith("90apt-cache-proxy") && u.content === prior
-    ),
-    true,
-  );
-});
-
-Deno.test("configure_client requires an ack when the policy cannot be checked", async () => {
-  const fake = fakeApt((command) => {
-    if (command.includes("sha256sum")) return { code: 1 };
-    if (command.includes("grep -lE")) return { code: 0, stdout: "" };
-    if (command.includes("apt-config")) {
-      return {
-        code: 0,
-        stdout:
-          `Acquire::http::Proxy "http://192.0.2.20:3142";\nAcquire::https::Proxy "DIRECT";\n`,
-      };
-    }
-    return { code: 0 };
-  });
-  useFake(fake);
-  await assertRejects(
-    () =>
-      model.methods.configure_client.execute(
-        model.methods.configure_client.arguments.parse({ ssh: SSH, ...CLIENT }),
-        ctx({}, { queryData: undefined }).context,
-      ),
-    Error,
-    "policy_check_ack",
-  );
-  const out = await model.methods.configure_client.execute(
-    model.methods.configure_client.arguments.parse({
-      ssh: SSH,
-      ...CLIENT,
-      policy_check_ack: true,
-    }),
-    ctx({}, { queryData: undefined }).context,
-  );
-  assertEquals(out.result.verified, true);
-});
-
-Deno.test("configure_client refuses when the policy query throws", async () => {
-  useFake(fakeApt(() => ({})));
-  await assertRejects(
-    () =>
-      model.methods.configure_client.execute(
-        model.methods.configure_client.arguments.parse({ ssh: SSH, ...CLIENT }),
-        ctx({}, {
-          queryData: () => Promise.reject(new Error("query backend down")),
-        }).context,
-      ),
-    Error,
-    "could not query recorded servers",
-  );
-});
-
-Deno.test("a plain-object vaultService resolves the key when none is injected", async () => {
-  const fake = fakeApt((command) => {
-    if (command.includes("dpkg-query") && command.includes("-f=${Status}")) {
-      return { code: 1, stdout: "" };
-    }
-    if (command.includes("-f=${Version}")) {
-      return { code: 0, stdout: "3.7.4-1\n" };
-    }
-    return { code: 0 };
-  });
-  setDeps({
-    run: fake.run,
-    now: () => NOW,
-    sleep: () => Promise.resolve(),
-    resolveSecret: undefined,
-  });
-  const service = {
-    get: (_vault: string, _key: string) => Promise.resolve("PLACEHOLDER-KEY"),
-  };
-  const out = await model.methods.install_server.execute(
-    model.methods.install_server.arguments.parse({ ssh: SSH }),
-    ctx({}, { vaultService: service }).context,
-  );
-  assertEquals(out.result.version, "3.7.4-1");
-});
-
-Deno.test("client_get reports effective proxies, conflicts and force", async () => {
-  const fake = fakeApt((command) => {
-    if (command.includes("apt-config")) {
-      return {
-        code: 0,
-        stdout:
-          `Acquire::http::Proxy "http://192.0.2.20:3142";\nAcquire::https::Proxy "DIRECT";\n`,
-      };
-    }
-    if (command.includes("sha256sum")) return { code: 1 };
-    if (command.includes("grep -lE")) {
-      return { code: 0, stdout: "/etc/apt/apt.conf.d/02proxy\n" };
-    }
-    return { code: 0 };
-  });
-  useFake(fake);
-  const out = await model.methods.client_get.execute(
-    model.methods.client_get.arguments.parse({ ssh: SSH }),
-    ctx().context,
-  );
-  assertEquals(
-    out.result.proxy_values!["Acquire::http::Proxy"],
-    "http://192.0.2.20:3142",
-  );
-  assertEquals(out.result.managed_snippet_in_force, false);
-  assertEquals(out.result.conflicts, ["/etc/apt/apt.conf.d/02proxy"]);
-});
-
-Deno.test("unconfigure_client removes once then no-ops", async () => {
-  const present = fakeApt((command) => {
-    if (command.includes("cat") && command.includes("90apt-cache-proxy")) {
-      return { code: 0, stdout: "snippet\n" };
-    }
-    if (command.includes("apt-config")) {
-      return { code: 0, stdout: `Acquire::http::Proxy "DIRECT";\n` };
-    }
-    if (command.includes("grep -lE")) return { code: 0, stdout: "" };
-    return { code: 0 };
-  });
-  useFake(present);
-  const out = await model.methods.unconfigure_client.execute(
-    model.methods.unconfigure_client.arguments.parse({ ssh: SSH }),
-    ctx().context,
-  );
-  assertEquals(out.result.removed, true);
-  assertEquals(
-    present.removed.includes("/etc/apt/apt.conf.d/90apt-cache-proxy"),
-    true,
-  );
-
-  const absent = fakeApt((command) => {
-    if (command.includes("90apt-cache-proxy")) return { code: 1 };
-    return { code: 0 };
-  });
-  useFake(absent);
-  const out2 = await model.methods.unconfigure_client.execute(
-    model.methods.unconfigure_client.arguments.parse({ ssh: SSH }),
-    ctx().context,
-  );
-  assertEquals(out2.result.removed, false);
 });
 
 // --- transport and parsing helpers ------------------------------------------

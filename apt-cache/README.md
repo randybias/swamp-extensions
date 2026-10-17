@@ -175,7 +175,8 @@ fragment.
   and `.N.gz` files (logrotate rotates at 10 MB, keeping 7), and derives the
   same hit/miss and byte totals the maintenance page shows, without invoking its
   `Count Data` action (which is off by default, so the page's log-analysis table
-  is usually empty). It fails closed if too many rows are unrecognisable.
+  is usually empty). It fails closed if too many rows are unrecognisable or a
+  rotated gzip is corrupt.
 - `remove_server` uses `apt-get remove` unless `purge_cache_ack` is set: the
   package's `purge` deletes the cache directory, `remove` does not. A package
   left in `deinstall ok config-files` by an earlier remove is still purged. The

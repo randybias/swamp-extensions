@@ -180,6 +180,11 @@ export async function installServer(
     ]),
     "dpkg-query apt-cacher-ng",
   ).stdout.trim();
+  // Preserve the ownership map from a prior apply: install only adds the
+  // package, and dropping the map would leave remove_server unable to clean up.
+  const prior = await context.readResource(serverName(t)) as
+    | ServerState
+    | null;
   const handle = await context.writeResource(
     "server",
     serverName(t),
@@ -188,6 +193,7 @@ export async function installServer(
       host: t.host,
       installed: true,
       version,
+      managed_files: prior?.managed_files,
       observed_at: iso(deps.now()),
     }),
   );
@@ -253,13 +259,25 @@ export async function applyServer(
     args.backends,
     schemeOf(args.https_policy),
   );
+  const prior = await context.readResource(serverName(t)) as
+    | ServerState
+    | null;
+  const priorManaged = prior?.managed_files ?? {};
   const { managed, changed } = await writeServerFiles(
     t,
     fragment,
     backendFiles,
     args,
     context,
+    priorManaged,
   );
+  // A path written by an earlier apply that this one does not write (a dropped
+  // backend key, or dropped admin_auth_ref) is restored or removed now, so its
+  // ownership digest does not linger in the record forever.
+  for (const [path, sha] of Object.entries(priorManaged)) {
+    if (path in managed) continue;
+    await removeOrRestoreManaged(deps, t, path, sha);
+  }
   if (changed) {
     requireOk(
       await exec(deps, t, ["systemctl", "restart", "apt-cacher-ng"]),
@@ -304,6 +322,7 @@ async function writeServerFiles(
   backendFiles: { path: string; text: string }[],
   args: ApplyServerArgs,
   context: Ctx,
+  priorManaged: Record<string, string>,
 ): Promise<{ managed: Record<string, string>; changed: boolean }> {
   const managed: Record<string, string> = {};
   let changed = false;
@@ -316,12 +335,26 @@ async function writeServerFiles(
   };
   record(
     FRAGMENT_PATH,
-    await writeManagedFile(deps, t, FRAGMENT_PATH, fragment, "0644"),
+    await writeManagedFile(
+      deps,
+      t,
+      FRAGMENT_PATH,
+      fragment,
+      "0644",
+      priorManaged[FRAGMENT_PATH],
+    ),
   );
   for (const file of backendFiles) {
     record(
       file.path,
-      await writeManagedFile(deps, t, file.path, file.text, "0644"),
+      await writeManagedFile(
+        deps,
+        t,
+        file.path,
+        file.text,
+        "0644",
+        priorManaged[file.path],
+      ),
     );
   }
   if (args.admin_auth_ref) {
@@ -330,7 +363,14 @@ async function writeServerFiles(
     );
     record(
       SECURITY_CONF_PATH,
-      await writeManagedFile(deps, t, SECURITY_CONF_PATH, body, "0600"),
+      await writeManagedFile(
+        deps,
+        t,
+        SECURITY_CONF_PATH,
+        body,
+        "0600",
+        priorManaged[SECURITY_CONF_PATH],
+      ),
     );
     requireOk(
       await exec(deps, t, [
@@ -505,11 +545,12 @@ async function removeManagedFiles(context: Ctx, t: SshTarget): Promise<void> {
     | ServerState
     | null;
   const recorded = record?.managed_files ?? {};
+  // Only ever touch the fixed managed set: a tampered record must not turn a
+  // resource field into an arbitrary remote path.
   const paths = new Set([
     FRAGMENT_PATH,
     SECURITY_CONF_PATH,
     ...listManagedConfNames().map((name) => `${ACNG_CONF_DIR}/${name}`),
-    ...Object.keys(recorded),
   ]);
   for (const path of paths) {
     const result = await removeOrRestoreManaged(deps, t, path, recorded[path]);
@@ -633,8 +674,10 @@ export async function statsServer(args: StatsArgs, context: Ctx) {
   ]);
   if (log.exit_code !== 0) {
     throw new AptCacheError(
-      "log_missing",
-      `could not read ${APT_CACHER_LOG_PATH} (exit ${log.exit_code})`,
+      log.exit_code === 4 ? "log_corrupt" : "log_missing",
+      log.exit_code === 4
+        ? `a rotated log under ${APT_CACHER_LOG_PATH} is corrupt; refusing to report a partial window`
+        : `could not read ${APT_CACHER_LOG_PATH} (exit ${log.exit_code})`,
     );
   }
   let totals;

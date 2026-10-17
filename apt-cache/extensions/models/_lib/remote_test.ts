@@ -7,7 +7,7 @@ import {
   removeOrRestoreManaged,
   writeManagedFile,
 } from "./remote.ts";
-import { fakeApt, hasTok, TEST_NOW } from "./test_support.ts";
+import { boxFake, TEST_NOW } from "./test_support.ts";
 
 const T: SshTarget = {
   host: "192.0.2.20",
@@ -21,10 +21,8 @@ const T: SshTarget = {
 
 const PATH = "/etc/apt-cacher-ng/backends_debian";
 const BACKUP = backupPath(PATH);
-const SHA_A = "a".repeat(64);
-const SHA_B = "b".repeat(64);
 
-/** A dependency object with the fake runner and a fixed clock. */
+/** A dependency object with the in-memory box runner and a fixed clock. */
 function depsOf(run: SshDeps["run"]): SshDeps {
   return { run, now: () => TEST_NOW, sleep: () => Promise.resolve() };
 }
@@ -33,22 +31,10 @@ async function sha(text: string): Promise<string> {
   return await sha256Hex(new TextEncoder().encode(text));
 }
 
-Deno.test("writeManagedFile backs up a pre-existing file exactly once", async () => {
-  let backedUp = false;
-  const fake = fakeApt((command) => {
-    if (command.includes("sha256sum") && command.includes(BACKUP)) {
-      return backedUp ? { code: 0, stdout: `${SHA_B}\n` } : { code: 1 };
-    }
-    if (command.startsWith("'sha256sum'")) return { code: 1 };
-    if (command.startsWith("'cat'")) return { code: 0, stdout: "original\n" };
-    if (command.startsWith("'cp' ")) {
-      backedUp = true;
-      return { code: 0 };
-    }
-    return { code: 0 };
-  });
+Deno.test("writeManagedFile adopts a pre-existing file and backs it up once", async () => {
+  const box = boxFake({ [PATH]: "original\n" });
   const first = await writeManagedFile(
-    depsOf(fake.run),
+    depsOf(box.fake.run),
     T,
     PATH,
     "ours\n",
@@ -56,92 +42,89 @@ Deno.test("writeManagedFile backs up a pre-existing file exactly once", async ()
   );
   assertEquals(first.sha256, await sha("ours\n"));
   assertEquals(first.changed, true);
+  assertEquals(box.files.get(BACKUP)?.content, "original\n");
+  assertEquals(box.files.get(PATH)?.content, "ours\n");
+  // A second write is idempotent and must not touch the saved original.
   const second = await writeManagedFile(
-    depsOf(fake.run),
+    depsOf(box.fake.run),
     T,
     PATH,
     "ours\n",
     "0644",
   );
-  assertEquals(second.sha256, await sha("ours\n"));
-  assertEquals(
-    fake.commands.filter((c) => c.startsWith("'cp' ")).length,
-    1,
-    "the original was backed up more than once",
+  assertEquals(second.changed, false);
+  assertEquals(box.files.get(BACKUP)?.content, "original\n");
+});
+
+Deno.test("writeManagedFile never backs up the model's own bytes", async () => {
+  // The file already holds exactly what we are about to write.
+  const same = boxFake({ [PATH]: "ours\n" });
+  await writeManagedFile(depsOf(same.fake.run), T, PATH, "ours\n", "0644");
+  assertEquals(same.files.has(BACKUP), false);
+  // The file holds a prior generation this model wrote (recorded digest).
+  const prior = boxFake({ [PATH]: "previous\n" });
+  await writeManagedFile(
+    depsOf(prior.fake.run),
+    T,
+    PATH,
+    "next\n",
+    "0644",
+    await sha("previous\n"),
   );
+  assertEquals(prior.files.has(BACKUP), false);
 });
 
-Deno.test("writeManagedFile does not back up a file that is absent", async () => {
-  const fake = fakeApt((command) => {
-    if (command.startsWith("'sha256sum'")) return { code: 1 };
-    if (command.startsWith("'cat'")) return { code: 1 };
-    if (command.startsWith("'test' '-e'")) return { code: 1 };
-    return { code: 0 };
-  });
-  await writeManagedFile(depsOf(fake.run), T, PATH, "ours\n", "0644");
-  assertEquals(fake.commands.some((c) => c.startsWith("'cp' ")), false);
-});
-
-Deno.test("removeOrRestoreManaged restores the backup when the bytes match", async () => {
-  const fake = fakeApt((command) => {
-    if (command.includes("sha256sum") && command.includes(BACKUP)) {
-      return { code: 0, stdout: `${SHA_B}\n` };
-    }
-    if (command.startsWith("'sha256sum'")) {
-      return { code: 0, stdout: `${SHA_A}\n` };
-    }
-    return { code: 0 };
-  });
+Deno.test("removeOrRestoreManaged restores a backup when the bytes match", async () => {
+  const box = boxFake({ [PATH]: "ours\n", [BACKUP]: "original\n" });
   assertEquals(
-    await removeOrRestoreManaged(depsOf(fake.run), T, PATH, SHA_A),
+    await removeOrRestoreManaged(
+      depsOf(box.fake.run),
+      T,
+      PATH,
+      await sha("ours\n"),
+    ),
     "restored",
   );
-  assertEquals(hasTok(fake, "'mv'", "-f"), true);
-  assertEquals(fake.removed.includes(PATH), false);
+  assertEquals(box.files.get(PATH)?.content, "original\n");
+  assertEquals(box.files.has(BACKUP), false);
 });
 
 Deno.test("removeOrRestoreManaged removes when there is no backup", async () => {
-  const fake = fakeApt((command) => {
-    if (command.includes("sha256sum") && command.includes(BACKUP)) {
-      return { code: 1 };
-    }
-    if (command.startsWith("'sha256sum'")) {
-      return { code: 0, stdout: `${SHA_A}\n` };
-    }
-    return { code: 0 };
-  });
+  const box = boxFake({ [PATH]: "ours\n" });
   assertEquals(
-    await removeOrRestoreManaged(depsOf(fake.run), T, PATH, SHA_A),
+    await removeOrRestoreManaged(
+      depsOf(box.fake.run),
+      T,
+      PATH,
+      await sha("ours\n"),
+    ),
     "removed",
   );
-  assertEquals(fake.removed.includes(PATH), true);
+  assertEquals(box.files.has(PATH), false);
 });
 
 Deno.test("removeOrRestoreManaged keeps a file whose bytes changed", async () => {
-  const fake = fakeApt((command) => {
-    if (command.startsWith("'sha256sum'")) {
-      return { code: 0, stdout: `${SHA_B}\n` };
-    }
-    return { code: 0 };
-  });
+  const box = boxFake({ [PATH]: "edited by hand\n" });
   assertEquals(
-    await removeOrRestoreManaged(depsOf(fake.run), T, PATH, SHA_A),
+    await removeOrRestoreManaged(
+      depsOf(box.fake.run),
+      T,
+      PATH,
+      await sha("ours\n"),
+    ),
     "kept",
   );
-  assertEquals(fake.removed.includes(PATH), false);
-  assertEquals(fake.commands.some((c) => c.startsWith("'mv'")), false);
+  assertEquals(box.files.get(PATH)?.content, "edited by hand\n");
+  assertEquals(box.fake.removed.includes(PATH), false);
 });
 
 Deno.test("removeOrRestoreManaged is a no-op when the file is gone", async () => {
-  const fake = fakeApt((command) => {
-    if (command.startsWith("'sha256sum'")) return { code: 1 };
-    return { code: 0 };
-  });
+  const box = boxFake();
   assertEquals(
-    await removeOrRestoreManaged(depsOf(fake.run), T, PATH, SHA_A),
+    await removeOrRestoreManaged(depsOf(box.fake.run), T, PATH, await sha("x")),
     "removed",
   );
-  assertEquals(fake.removed.includes(PATH), false);
+  assertEquals(box.fake.removed.includes(PATH), false);
 });
 
 Deno.test("parseSsListen and parseAptConfigDump read real tool shapes", () => {

@@ -238,16 +238,28 @@ export async function readRemoteFile(
   );
 }
 
-/** Returns the remote SHA-256 of `path`, or null when it is absent. */
+/**
+ * Returns the remote SHA-256 of `path`, or null when it is absent. A
+ * `sha256sum` that fails on a file that exists is a typed error, not absence:
+ * conflating the two would let a failed probe overwrite a backup or report a
+ * file removed that is still there.
+ */
 export async function remoteSha(
   run: SshDeps,
   t: SshTarget,
   path: string,
 ): Promise<string | null> {
   const res = await exec(run, t, ["sha256sum", "--", path]);
-  if (res.exit_code !== 0) return null;
-  const match = /[0-9a-f]{64}/i.exec(res.stdout);
-  return match ? match[0].toLowerCase() : null;
+  if (res.exit_code === 0) {
+    const match = /[0-9a-f]{64}/i.exec(res.stdout);
+    if (match) return match[0].toLowerCase();
+  }
+  const exists = await exec(run, t, ["test", "-e", path]);
+  if (exists.exit_code === 1) return null;
+  throw new AptCacheError(
+    "remote_failed",
+    `could not hash ${path} (exit ${res.exit_code})`,
+  );
 }
 
 /** Uploads a file only when its bytes changed. Returns `true` when written. */
@@ -471,10 +483,11 @@ interface ManagedWrite {
 }
 
 /**
- * Writes a managed file, saving any pre-existing content to a sidecar once,
- * and returns the SHA-256 of the bytes written. `remove_server` compares that
- * digest before it deletes or restores anything, so an admin's later edit is
- * never discarded.
+ * Writes a managed file, saving pre-existing content to a sidecar once, and
+ * returns the SHA-256 of the bytes written. A file that is absent, or whose
+ * digest equals what this model last recorded for it (`priorSha`) or is about
+ * to write, is not backed up: those bytes are the model's own, so a second
+ * apply must not turn them into a "backup" that a later remove restores.
  */
 export async function writeManagedFile(
   run: SshDeps,
@@ -482,22 +495,20 @@ export async function writeManagedFile(
   path: string,
   content: string,
   mode: string,
+  priorSha?: string,
 ): Promise<ManagedWrite> {
+  const sha256 = await sha256Hex(new TextEncoder().encode(content));
+  const current = await remoteSha(run, t, path);
+  const ours = current === null || current === sha256 || current === priorSha;
   const backup = backupPath(path);
-  if ((await remoteSha(run, t, backup)) === null) {
-    const original = await readRemoteFile(run, t, path);
-    if (original !== null) {
-      requireOk(
-        await exec(run, t, ["cp", "-p", "--", path, backup]),
-        `back up ${path}`,
-      );
-    }
+  if (!ours && (await remoteSha(run, t, backup)) === null) {
+    requireOk(
+      await exec(run, t, ["cp", "-p", "--", path, backup]),
+      `back up ${path}`,
+    );
   }
   const changed = await uploadIfChanged(run, t, path, content, mode);
-  return {
-    sha256: await sha256Hex(new TextEncoder().encode(content)),
-    changed,
-  };
+  return { sha256, changed };
 }
 
 /**

@@ -230,6 +230,38 @@ rotations.
 **Client restore.** `restoreClient` checks the exit status of its `rm`, like its
 uploads.
 
+## Round-2 delta review fixes (2026-10-17)
+
+- **A second apply backed up the model's own output (HIGH).** `writeManagedFile`
+  now skips the backup when the file is absent, when its digest equals the
+  content about to be written, or when it equals the prior digest recorded for
+  that path (`priorSha`). Only a pre-existing file the model did not write is
+  saved to `<path>.apt-cache.bak`. `remove_server` then deletes the model's own
+  files and restores the originals; the double-apply case is covered by a test
+  built on the new in-memory `boxFake`.
+- **Ownership records were lost (HIGH).** `install_server` carries the prior
+  `managed_files` map forward instead of dropping it, and `apply_server` reads
+  the prior map, passes each path's previous digest to `writeManagedFile`, and
+  guarded-removes/restores any path this apply no longer writes (a dropped
+  backend key, or dropped `admin_auth_ref`). So `remove_server` no longer keeps
+  an old fragment or admin credential forever.
+- **`unconfigure_client` ignored `rm` (HIGH).** Both `rm` calls are checked and
+  the snippet's absence is verified before state is written.
+- **Recorded paths had no allowlist (MEDIUM).** `removeManagedFiles` only ever
+  touches the fixed managed set (`FRAGMENT_PATH`, `SECURITY_CONF_PATH`, and the
+  `listManagedConfNames()` files); a tampered record cannot name an arbitrary
+  remote path.
+- **`remoteSha` conflated absence with failure (MEDIUM).** A failed `sha256sum`
+  on a file that exists now throws; only a confirmed-absent (`test -e` rc 1)
+  path returns null. This stops a failed probe from overwriting a backup or
+  reporting a still-present file as removed.
+- **Test file over 800 lines (MEDIUM).** `apt_cache_test.ts` was split into
+  `_lib/server_methods_test.ts` and `_lib/client_methods_test.ts`, sharing
+  `_lib/model_test_support.ts` (fixtures plus a context that makes writes
+  readable) and `_lib/test_support.ts` (which gained the stateful `boxFake`).
+- **Corrupt rotation error (LOW).** `stats` maps the log reader's exit 4 to a
+  distinct `log_corrupt` code.
+
 ## Fixtures
 
 - All addresses are RFC 5737 (`192.0.2.0/24`, `198.51.100.0/24`) or the IPv6

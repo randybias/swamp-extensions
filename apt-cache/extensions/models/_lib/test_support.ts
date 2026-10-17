@@ -42,6 +42,12 @@ function parseUploadPath(command: string): string {
   return /^f='([^']+)'/m.exec(command)?.[1] ?? "";
 }
 
+/** The last single-quoted word of a quoted argv (paths never contain quotes). */
+function lastQuoted(command: string): string {
+  const matches = command.match(/'[^']*'/g);
+  return matches ? matches[matches.length - 1].slice(1, -1) : "";
+}
+
 async function sha256HexLocal(bytes: Uint8Array): Promise<string> {
   const input = new Uint8Array(bytes);
   const digest = await crypto.subtle.digest("SHA-256", input.buffer);
@@ -57,6 +63,11 @@ export function fakeApt(respond: Respond): Fake {
   const commands: string[] = [];
   const uploads: { path: string; content: string }[] = [];
   const removed: string[] = [];
+  // `remoteSha` reads a file's digest and, when that probe fails, checks that
+  // the file is really absent. A responder that does not model a file returns
+  // success with no hash, which is not a real sha256sum outcome; remember the
+  // per-path result so the follow-up `test -e` answers consistently.
+  const shaExists = new Map<string, boolean>();
   const run: CommandRunner = async (cmd, args, options = {}) => {
     if (cmd === "ssh-agent") {
       return args[0] === "-s"
@@ -91,6 +102,34 @@ export function fakeApt(respond: Respond): Fake {
       const mode = /chmod '([0-7]{3,4})'/.exec(command)?.[1] ?? "0644";
       return { code: 0, stdout: `${digest} ${mode}\n`, stderr: "" };
     }
+    if (/^'sha256sum' /.test(command)) {
+      const r = respond(command);
+      shaExists.set(
+        lastQuoted(command),
+        (r.code ?? 0) === 0 && /[0-9a-f]{64}/i.test(r.stdout ?? ""),
+      );
+      return {
+        code: r.code ?? 0,
+        stdout: r.stdout ?? "",
+        stderr: r.stderr ?? "",
+      };
+    }
+    if (/^'test' '-e' /.test(command)) {
+      const r = respond(command);
+      const explicit = (r.code ?? 0) !== 0 || (r.stdout ?? "") !== "" ||
+        (r.stderr ?? "") !== "";
+      if (!explicit) {
+        const known = shaExists.get(lastQuoted(command));
+        if (known !== undefined) {
+          return { code: known ? 0 : 1, stdout: "", stderr: "" };
+        }
+      }
+      return {
+        code: r.code ?? 0,
+        stdout: r.stdout ?? "",
+        stderr: r.stderr ?? "",
+      };
+    }
     const r = respond(command);
     return {
       code: r.code ?? 0,
@@ -109,6 +148,136 @@ export function useFake(fake: Fake, now = TEST_NOW): void {
     sleep: () => Promise.resolve(),
     resolveSecret: () => Promise.resolve("PLACEHOLDER-KEY"),
   });
+}
+
+/** Every single-quoted word of a quoted argv (paths never contain quotes). */
+function argvOf(command: string): string[] {
+  return (command.match(/'[^']*'/g) ?? []).map((t) => t.slice(1, -1));
+}
+
+/** A fake target with an in-memory filesystem. */
+export interface Box {
+  /** The current remote files, by absolute path. */
+  files: Map<string, { content: string; mode: string }>;
+  /** The transport fake, for transcript assertions. */
+  fake: Fake;
+}
+
+/**
+ * A transport fake backed by an in-memory filesystem, so uploads, `sha256sum`,
+ * `test`, `cp`, `rm` and `mv` are consistent across calls. Use it for any test
+ * whose behaviour depends on what is on disk (backups, ownership, removal).
+ * Commands it does not model are answered by `respond`.
+ */
+export function boxFake(
+  initial: Record<string, string> = {},
+  respond: Respond = () => ({}),
+): Box {
+  const files = new Map<string, { content: string; mode: string }>();
+  for (const [path, content] of Object.entries(initial)) {
+    files.set(path, { content, mode: "0644" });
+  }
+  const commands: string[] = [];
+  const uploads: { path: string; content: string }[] = [];
+  const removed: string[] = [];
+  const ok = { code: 0, stdout: "", stderr: "" };
+  const run: CommandRunner = async (cmd, args, options = {}) => {
+    if (cmd === "ssh-agent") {
+      return args[0] === "-s"
+        ? {
+          code: 0,
+          stdout:
+            "SSH_AUTH_SOCK=/tmp/a.sock; export SSH_AUTH_SOCK;\nSSH_AGENT_PID=1; export SSH_AGENT_PID;\n",
+          stderr: "",
+        }
+        : ok;
+    }
+    if (cmd === "ssh-add" || cmd !== "ssh") return ok;
+    const command = args[args.length - 1];
+    commands.push(command);
+    if (command.includes(".ssh-host-upload")) {
+      const path = parseUploadPath(command);
+      const bytes = options.stdin === undefined
+        ? new Uint8Array()
+        : typeof options.stdin === "string"
+        ? new TextEncoder().encode(options.stdin)
+        : options.stdin;
+      const content = new TextDecoder().decode(bytes);
+      const mode = /chmod '([0-7]{3,4})'/.exec(command)?.[1] ?? "0644";
+      files.set(path, { content, mode });
+      uploads.push({ path, content });
+      return {
+        code: 0,
+        stdout: `${await sha256HexLocal(bytes)} ${mode}\n`,
+        stderr: "",
+      };
+    }
+    const argv = argvOf(command);
+    const verb = argv[0];
+    const target = (path: string) => {
+      const file = files.get(path);
+      return file ?? null;
+    };
+    switch (verb) {
+      case "cat": {
+        const file = target(argv[2]);
+        return file
+          ? { code: 0, stdout: file.content, stderr: "" }
+          : { code: 1, stdout: "", stderr: "No such file" };
+      }
+      case "sha256sum": {
+        const file = target(argv[2]);
+        if (!file) return { code: 1, stdout: "", stderr: "No such file" };
+        const digest = await sha256HexLocal(
+          new TextEncoder().encode(file.content),
+        );
+        return { code: 0, stdout: `${digest}  ${argv[2]}\n`, stderr: "" };
+      }
+      case "test": {
+        const file = target(argv[2]);
+        if (argv[1] === "-e") {
+          return file ? ok : { code: 1, stdout: "", stderr: "" };
+        }
+        if (argv[1] === "-L" || argv[1] === "-d") {
+          return { code: 1, stdout: "", stderr: "" };
+        }
+        return ok;
+      }
+      case "cp": {
+        const file = target(argv[3]);
+        if (!file) return { code: 1, stdout: "", stderr: "No such file" };
+        files.set(argv[4], { ...file });
+        return ok;
+      }
+      case "rm": {
+        for (const path of argv.slice(3)) {
+          if (files.delete(path)) removed.push(path);
+        }
+        return ok;
+      }
+      case "mv": {
+        const file = target(argv[3]);
+        if (!file) return { code: 1, stdout: "", stderr: "No such file" };
+        files.delete(argv[3]);
+        files.set(argv[4], file);
+        return ok;
+      }
+      case "chmod": {
+        const file = target(argv[3]);
+        if (file) file.mode = argv[1];
+        return ok;
+      }
+      default: {
+        const r = respond(command);
+        return {
+          code: r.code ?? 0,
+          stdout: r.stdout ?? "",
+          stderr: r.stderr ?? "",
+        };
+      }
+    }
+  };
+  return { files, fake: { run, commands, uploads, removed } };
 }
 
 /** True when any recorded command contains `sub`. */

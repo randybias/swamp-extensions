@@ -232,8 +232,20 @@ export async function unconfigureClient(
   const t = targetOf(args.ssh, key);
   const present = (await readRemoteFile(deps, t, CLIENT_SNIPPET_PATH)) !== null;
   if (present) {
-    await exec(deps, t, ["rm", "-f", "--", CLIENT_SNIPPET_PATH]);
-    await exec(deps, t, ["rm", "-f", "--", DETECT_PATH]);
+    requireOk(
+      await exec(deps, t, ["rm", "-f", "--", CLIENT_SNIPPET_PATH]),
+      "rm client snippet",
+    );
+    requireOk(
+      await exec(deps, t, ["rm", "-f", "--", DETECT_PATH]),
+      "rm auto-detect script",
+    );
+    if ((await readRemoteFile(deps, t, CLIENT_SNIPPET_PATH)) !== null) {
+      throw new AptCacheError(
+        "verify_failed",
+        "the managed snippet is still present after removal",
+      );
+    }
     const dump = requireOk(
       await exec(deps, t, ["apt-config", "dump"]),
       "apt-config dump",

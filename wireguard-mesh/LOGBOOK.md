@@ -360,3 +360,17 @@ guards) are unchanged; only delivery changed:
   time.
 - **Docs (LOW).** The README no longer claims the key is "never at rest"; it now
   says the file stays on disk only for the upload-to-unlink window.
+
+## Round 4 (r3 review, lane/b2-wg)
+
+- HIGH: the TOFU pin was one `<node>-hostkeys` record, so a run for another host
+  or port re-learned and overwrote it (a MITM window on every alternate run).
+  Pins are now `<node>-hostkeys-<host>-<port>`, never overwritten across
+  endpoints; a 2026.10.17.4 per-node record pins its own endpoint and moves to
+  the keyed record on first use. An existing record that fails the schema, names
+  another endpoint, or has no usable line is "unreadable; delete it to
+  re-learn".
+- MEDIUM: the signal traps now exit (129/130/143) and the EXIT trap does the
+  cleanup; tested under the system sh (dash).
+- MEDIUM: legacy `{type,key}` host keys must be exactly those two string keys.
+- LOW: the "never at rest" wording corrected.

@@ -130,7 +130,7 @@ function knownHostsLines(
  * `known_hosts`, `[host]:port` for a non-default port) and pins them for the
  * rest of the operation; `stdin` is written to a private `mktemp -d` directory
  * and the script unlinks it as soon as it is opened on fd 3, so the key and
- * config are never at rest and never on argv. An ssh exit 255 is the canonical
+ * config are unlinked before the script runs (removed by a checked cleanup) and never on argv. An ssh exit 255 is the canonical
  * typed `SshError`, rethrown here as a `TransportError`.
  */
 export function sshTransport(t: SshTarget, deps: SshDeps): Transport {
@@ -205,7 +205,12 @@ export function sshTransport(t: SshTarget, deps: SshDeps): Transport {
         `exec 3<'${tmp}' || exit 70`,
         `rm -f -- '${tmp}' || exit 70`,
         `[ ! -e '${tmp}' ] || exit 70`,
-        `trap 'rm -f -- "${tmp}"; rmdir -- "${dir}" 2>/dev/null || true' EXIT HUP INT TERM`,
+        // The EXIT trap does the cleanup; a signal makes the shell exit (with
+        // the conventional status) so the trap runs and the script stops.
+        `trap 'rm -f -- "${tmp}"; rmdir -- "${dir}" 2>/dev/null || true' EXIT`,
+        "trap 'exit 129' HUP",
+        "trap 'exit 130' INT",
+        "trap 'exit 143' TERM",
         "{",
         script,
         "} <&3",

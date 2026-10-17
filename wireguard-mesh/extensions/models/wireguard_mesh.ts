@@ -37,6 +37,15 @@ import {
 
 const GlobalArgsSchema = z.strictObject({});
 
+/** A legacy `{type, key}` host key: exactly those two keys, both strings. */
+function isLegacyKey(v: unknown): v is { type: string; key: string } {
+  if (v === null || typeof v !== "object" || Array.isArray(v)) return false;
+  const keys = Object.keys(v);
+  const o = v as Record<string, unknown>;
+  return keys.length === 2 && keys.includes("type") && keys.includes("key") &&
+    typeof o.type === "string" && typeof o.key === "string";
+}
+
 const SshSchema = z.strictObject({
   host: z.string().min(1).max(253),
   user: z.string().regex(/^[a-z_][a-z0-9_-]{0,31}$/),
@@ -60,14 +69,7 @@ const SshSchema = z.strictObject({
   host_keys: z.preprocess(
     (v) =>
       Array.isArray(v)
-        ? v.map((item) =>
-          item !== null && typeof item === "object" && "type" in item &&
-            "key" in item
-            ? `${(item as { type: unknown }).type} ${
-              (item as { key: unknown }).key
-            }`
-            : item
-        )
+        ? v.map((item) => isLegacyKey(item) ? `${item.type} ${item.key}` : item)
         : v,
     z.array(z.string().max(8192).refine(isHostKeyLine, "an ssh-keyscan line"))
       .max(64).default([]),
@@ -127,6 +129,29 @@ const LiveSchema = z.strictObject({
   })),
   observed_at: z.string(),
 });
+
+/** What may be read back: 2026.10.17.4 stored `{type, key}` objects. */
+const StoredHostKeysSchema = z.strictObject({
+  node: z.string(),
+  host: z.string(),
+  port: z.number().int(),
+  host_keys: z.array(
+    z.union([
+      z.string().max(8192),
+      z.strictObject({ type: z.string().max(64), key: z.string().max(8192) }),
+    ]),
+  ).max(64),
+  observed_at: z.string(),
+});
+
+/** A resource-name-safe key for one host and port; injective for valid hosts. */
+function endpointKey(host: string, port: number): string {
+  const h = host.toLowerCase().replace(
+    /[^a-z0-9.-]/g,
+    (c) => `_${c.charCodeAt(0).toString(16)}_`,
+  );
+  return `${h}-${port}`;
+}
 
 const HostKeysSchema = z.strictObject({
   node: z.string(),
@@ -322,38 +347,59 @@ export function createModel(deps: Partial<Deps> = {}) {
     if (ssh.host_key_policy !== "insecure_tofu") {
       return { target: ssh, remember: () => Promise.resolve(ssh) };
     }
-    const stored = await context.readResource(`${name}-hostkeys`) as
-      | z.infer<typeof HostKeysSchema>
-      | null;
-    if (
-      stored && stored.host === ssh.host && stored.port === ssh.port &&
-      stored.host_keys.length > 0
-    ) {
+    const recordName = `${name}-hostkeys-${endpointKey(ssh.host, ssh.port)}`;
+    const unreadable = () =>
+      new TransportError(
+        "host-key",
+        `stored host-key record for ${name} (${ssh.host}:${ssh.port}) is unreadable; delete it to re-learn`,
+      );
+    // The pin for THIS endpoint: its own keyed record, else a per-node record
+    // written by 2026.10.17.4 and earlier when it names the same host and port.
+    // A record for another endpoint is never read here and never overwritten.
+    let stored: z.infer<typeof StoredHostKeysSchema> | undefined;
+    let legacy = false;
+    const keyed = await context.readResource(recordName);
+    if (keyed !== null && keyed !== undefined) {
+      const parsed = StoredHostKeysSchema.safeParse(keyed);
+      if (
+        !parsed.success || parsed.data.host !== ssh.host ||
+        parsed.data.port !== ssh.port
+      ) throw unreadable();
+      stored = parsed.data;
+    } else {
+      const old = await context.readResource(`${name}-hostkeys`);
+      if (old !== null && old !== undefined) {
+        const parsed = StoredHostKeysSchema.safeParse(old);
+        if (!parsed.success) throw unreadable();
+        if (parsed.data.host === ssh.host && parsed.data.port === ssh.port) {
+          stored = parsed.data;
+          legacy = true;
+        }
+      }
+    }
+    if (stored) {
       const lines = normalizeStoredKeys(
         stored.host_keys as unknown[],
         stored.host,
         stored.port,
       );
-      if (lines.length === 0) {
-        // A record exists for this host/port but nothing in it is a usable pin.
-        // Fail closed rather than re-learning (and overwriting) on a later run.
-        throw new TransportError(
-          "host-key",
-          `stored host-key record for ${name} is unreadable; delete it to re-learn`,
-        );
-      }
+      // A record exists for this endpoint but nothing in it is a usable pin.
+      // Fail closed rather than re-learning (and overwriting) on a later run.
+      if (lines.length === 0) throw unreadable();
+      const pinned = stored;
       return {
         target: { ...ssh, host_key_policy: "strict", host_keys: lines },
-        // A published 17.4 record stored objects; rewrite it only after the
-        // operation has succeeded.
+        // Move a per-node (or object-form) record to this endpoint's own key
+        // only after the operation has succeeded.
         remember: async () => {
           if (
-            (stored.host_keys as unknown[]).some((k) => typeof k !== "string")
+            legacy ||
+            (pinned.host_keys as unknown[]).some((k) => typeof k !== "string")
           ) {
-            await context.writeResource("hostkeys", `${name}-hostkeys`, {
+            await context.writeResource("hostkeys", recordName, {
               node: name,
-              host: stored.host,
-              port: stored.port,
+              host: pinned.host,
+              port: pinned.port,
               host_keys: lines,
               observed_at: d.now().toISOString(),
             });
@@ -379,7 +425,7 @@ export function createModel(deps: Partial<Deps> = {}) {
             "no host key was recorded for this first connection; later steps need a pinned key",
           );
         }
-        await context.writeResource("hostkeys", `${name}-hostkeys`, {
+        await context.writeResource("hostkeys", recordName, {
           node: name,
           host: ssh.host,
           port: ssh.port,
@@ -418,7 +464,7 @@ export function createModel(deps: Partial<Deps> = {}) {
       {
         toVersion: "2026.10.17.5",
         description:
-          "Replaced the local SSH transport with the canonical vendored ssh.ts (typed exit-255 error, authoritative host-key pins, no content digest on argv); host_key_policy is strict|insecure_tofu (accept-new maps to insecure_tofu, insecure is refused); legacy {type,key} host_keys are converted to ssh-keyscan lines on read. A <node>-hostkeys record written by 2026.10.17.4 is migrated in place on first use.",
+          "Replaced the local SSH transport with the canonical vendored ssh.ts (typed exit-255 error, authoritative host-key pins, no content digest on argv); host_key_policy is strict|insecure_tofu (accept-new maps to insecure_tofu, insecure is refused); legacy {type,key} host_keys are converted to ssh-keyscan lines on read. TOFU pins are kept per node, host and port (<node>-hostkeys-<host>-<port>); a <node>-hostkeys record written by 2026.10.17.4 pins its own host and port and moves to the keyed record on first use, and a record for another endpoint is never overwritten.",
         upgradeAttributes: (old: Record<string, unknown>) => old,
       },
     ],

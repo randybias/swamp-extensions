@@ -1,0 +1,90 @@
+{
+  "extension": "@randybias/wireguard-mesh",
+  "version": "2026.10.17.5",
+  "reviewedAt": "2026-10-17T16:06:40Z",
+  "dimensions": [
+    {
+      "id": "credentials-secrets",
+      "verdict": "pass",
+      "note": "The WireGuard private key and the SSH private key are sensitive-marked vault references. The WireGuard key reaches the node over stdin into a 0600 key file read by PostUp, never in the rendered config, on argv or in a resource. 2026.10.17.5 moves the push onto the canonical ssh-host transport (blob fe0139f0): no content-derived hash on any local argv or remote script text. Live cell F: 0 hits for either private key or its sha256 in about 2,900 sampled argv lines on both nodes, and no /tmp/wgmesh.* left behind. README examples use vault references only (swamp-club lab 3555)."
+    },
+    {
+      "id": "logging-quality",
+      "verdict": "pass",
+      "note": "Each method logs once with the node name and outcome (changed / no change); no key material, config text or host keys in log fields."
+    },
+    {
+      "id": "error-handling",
+      "verdict": "pass",
+      "note": "SSH exit 255 is a typed TransportError (unreachable / host-key); remote exit codes 75 (no flock), 3 (confirm after rollback) and 4 (superseded) map to typed errors; signal traps exit 129/130/143 and the EXIT trap cleans up (tested under dash). A failed reload, route or interface check runs fail_restore. Host-key records that fail the schema, name another endpoint or have no usable line fail closed as unreadable. Residual MEDIUM (terra): a malformed per-node record for another endpoint blocks first use on a new endpoint. Residual MEDIUM: if wg-quick down and ip link delete both fail, delete removes the files before detecting the interface is still up (the armed rollback restores them)."
+    },
+    {
+      "id": "testing-completeness",
+      "verdict": "pass",
+      "note": "112 unit/contract tests pass plus an opt-in netns suite (3 ignored without WG_MESH_NETNS=1): render goldens, push script behaviour, the vendored ssh transport, allowlist, plain-object context through createModelTestContext, and the 2026.10.17.4 pin migration (legacy {type,key} record converted to a port-aware line; a per-node record pins only its own endpoint and is never overwritten; per-port pins; tampered records fail closed). Live 2026.10.17.5: 12/12 on two VPS, including the upgrade from the published 2026.10.17.4 with no edits. The 2026.10.17.4 untested cells (self-severing delete, delete's own rollback firing) still block stable."
+    },
+    {
+      "id": "idempotency-resilience",
+      "verdict": "pass",
+      "note": "apply is a no-op when files, addresses and live peers match (live A2, A3, B3); delete again is a no-op (G); every live change arms a generation-checked rollback before mutating, disarmed only by a fresh-connection confirmation (live C: an unconfirmed address change reverted after 120 s). TOFU pins are per node, host and port and are never re-learned on re-runs (live E). Residuals: runs are about 3x slower than 2026.10.17.4 (15-20 s vs about 6 s); extra routes through wg0 are not detected; a failed retry restores to the retry's own backup."
+    },
+    {
+      "id": "api-contracts",
+      "verdict": "pass",
+      "note": "wg-quick / wg syncconf / wg set / ip, wireguard-tools 1.0.20210914 on Ubuntu 24.04 (live). Address or route changes recreate the interface; peer-only changes use syncconf. Drift is compared on the tool's own read-back (wg showconf peers, ip addr), not on the render text."
+    },
+    {
+      "id": "resource-management",
+      "verdict": "pass",
+      "note": "One flock per node, one SSH connection per step; each converged re-apply leaves one disarmed rollback for the 120 s window, which then removes its directory (live). Residual LOW: delete leaves .wg0.epoch and .wg0.lock in /etc/wireguard; migrated 2026.10.17.4 per-node pin records stay in data."
+    },
+    {
+      "id": "published-surface-hygiene",
+      "verdict": "pass",
+      "note": "Manifest @randybias/wireguard-mesh 2026.10.17.5, two-sentence description, Apache-2.0, additionalFiles README.md and LICENSE.txt. apply and delete are DESTRUCTIVE actions, delete requires acknowledge_reachability_risk=true; render and get are READ-ONLY. Leak scan, gitleaks and fixture guard pass; live receipts in LOGBOOK use redacted hosts and addresses."
+    },
+    {
+      "id": "schema-strictness",
+      "verdict": "pass",
+      "note": "Global arguments are an empty strictObject; every argument and resource schema is strict; keys, CIDRs, interface names, endpoints and host keys carry grammars and bounds; peers must be on peers_allowlist. host_key_policy is strict | insecure_tofu; legacy accept-new is read as insecure_tofu and insecure is refused at validation (live A4); legacy host-key objects must be exactly {type, key} strings. Residual LOW: different spellings of one IPv6 address and a trailing-dot name get separate pins; host capitalization fails closed (astra, Medium)."
+    },
+    {
+      "id": "lifetime-gc",
+      "verdict": "pass",
+      "note": "state infinite/10, rendered infinite/5, live infinite/5, hostkeys infinite/10."
+    },
+    {
+      "id": "crud-completeness",
+      "verdict": "pass",
+      "note": "render, apply (create or converge), get (live read-back) and delete (an action; deleting an absent interface is a no-op). No method uses kind delete, so no verb tombstones the definition."
+    },
+    {
+      "id": "preflight-checks",
+      "verdict": "pass",
+      "note": "Inputs, allowlist, relay exclusion and the delete acknowledgement are validated before any connection; the remote script refuses without flock (exit 75); host keys are passed to the canonical transport as authoritative pins, and a wrong pin refuses before any upload (live D). Under insecure_tofu the first accepted key is pinned for the rest of the operation and the confirmation connection uses it."
+    },
+    {
+      "id": "instance-names",
+      "verdict": "pass",
+      "note": "state, rendered and live are keyed by node name; host-key pins by <node>-hostkeys-<host>-<port>, so one definition serves every node and endpoint of a mesh without collision; a run against another host or port can no longer overwrite a pin."
+    },
+    {
+      "id": "data-access",
+      "verdict": "pass",
+      "note": "Mesh data, SSH target and keys arrive as method arguments; the only data read back is this model's own host-key records (keyed, then the 2026.10.17.4 per-node record for the same endpoint)."
+    },
+    {
+      "id": "version-upgrades",
+      "verdict": "pass",
+      "note": "upgrades[] has an entry for 2026.10.17.5 (no stored-attribute change); a 2026.10.17.4 <node>-hostkeys record pins its own host and port, its {type,key} objects are converted to ssh-keyscan lines on read, and it moves to the keyed record on first use; a record for another endpoint is never overwritten. Unit-tested and live: upgrading from the published 2026.10.17.4 with no edits re-used the pins as strict and wrote matching keyed records (A1 to A3). Residual: the old per-node record is left in data."
+    }
+  ],
+  "panel": {
+    "codex-astra": "codex gpt-6-astra conformance seat at f70424d (lane/b2-wg, after the d4 escalation): 0 Critical/High; 1 Medium (the keyed record name lowercases the host but the stored host is compared as given, so a pin reused with different DNS capitalization fails closed as unreadable), 1 Low (duplicate pinned/stored binding and redundant casts). Recorded as LOGBOOK residuals.",
+    "codex-terra": "codex gpt-5.6-terra adversarial seat at f70424d: 0 Critical/High; 2 Medium (a migrated 2026.10.17.4 per-node record is left in data, so deleting the keyed record to re-learn after a real host-key rotation reads the stale pin again; a malformed per-node record for another endpoint blocks first use on a new endpoint). Both fail closed, neither weakens a pin; recorded as LOGBOOK residuals.",
+    "escalation": "lane/d4-wg rounds r1 to r3 (c3755de, ce0a7b0, 0659709) left a High open (one per-node TOFU pin overwritten by runs against another host or port) and were escalated; lane/b2-wg fixed it with per-endpoint pins and a 2026.10.17.4 record migration (f70424d, verdict CLEAN).",
+    "merge-prep": "No code change at merge. Vendored _lib/ssh.ts is the canonical ssh-host blob fe0139f0, so transport findings are covered by the ssh-host review. 112 tests pass (3 netns ignored), gates 0 to 6 pass.",
+    "live-e2e": "Two throwaway VPS at f70424d, upgrading from the published 2026.10.17.4: 12 pass, 0 fail, 0 blocked (pins migrated, strict, armed revert, wrong pin, per-port pins, argv scan 0 hits, delete). The 2026.10.17.4 untested cells (self-severing delete, delete's rollback firing) remain untested, so the channel stays beta.",
+    "ocr-llm": "OCR sonnet5 and glm seats were not run in the final rounds"
+  }
+}

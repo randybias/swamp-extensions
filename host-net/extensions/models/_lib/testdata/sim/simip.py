@@ -18,26 +18,36 @@ def main():
         if s == "-d -j link": print(json.dumps(l)); return 0
         if s == "-j addr": print(json.dumps([{"ifname":"enp1s0","addr_info":[{"family":"inet","local":"192.0.2.10","prefixlen":24}]}])); return 0
         v6 = flag("v6only") and not flag("lost_v6")
+        def devaddr():
+            if v6: return ("2001:db8::10", "inet6", "global", 64)
+            if flag("other_addr"): return ("203.0.113.9", "inet", "global", 24)
+            if flag("ll_only"): return ("2001:db8::1", "inet6", "link", 24)
+            return ("192.0.2.20", "inet", "global", 25 if flag("prefix_changed") else 24)
         def path():
-            if v6: return {"dev": "enp1s0", "gateway": "2001:db8::1", "prefsrc": "2001:db8::10", "flags": []}
-            p = {"dev": "enp1s0", "gateway": "192.0.2.1", "prefsrc": "192.0.2.10", "flags": []}
+            if v6: return {"dev": "enp1s0", "gateway": "2001:db8::1", "flags": []}
+            p = {"dev": "enp1s0", "gateway": "192.0.2.1", "flags": []}
             if flag("nondefault"): del p["gateway"]
             if flag("route_other_dev"): p["dev"] = "enp9s0"
             if flag("gw_changed"): p["gateway"] = "192.0.2.254"
             if flag("linkdown"): p["flags"] = ["linkdown"]
             return p
         if a[:3] == ["-j", "addr", "show"]:
-            def info(ip, fam, scope, pl=24): return [{"family": fam, "local": ip, "prefixlen": pl, "scope": scope}]
             if flag("no_addr"): print("[]"); return 0
-            if flag("other_addr"): ai = info("203.0.113.9", "inet", "global")
-            elif flag("ll_only"): ai = info("2001:db8::1", "inet6", "link")
-            elif flag("prefix_changed"): ai = info("192.0.2.10", "inet", "global", 25)
-            elif v6: ai = info("2001:db8::10", "inet6", "global", 64)
-            else: ai = info("192.0.2.10", "inet", "global")
-            print(json.dumps([{"ifname": a[4], "addr_info": ai}])); return 0
+            ip, fam, scope, pl = devaddr()
+            print(json.dumps([{"ifname": a[4], "addr_info": [{"family": fam, "local": ip, "prefixlen": pl, "scope": scope}]}])); return 0
         if a[:3] == ["-j", "route", "get"]:
             if flag("no_route"): print("[]"); return 0
-            print(json.dumps([path()])); return 0
+            out = {"dst": a[3], **path()}
+            if "from" in a:
+                # Like the kernel: with a source given there is no prefsrc, and
+                # a source that is not configured locally is refused.
+                frm = a[a.index("from") + 1]
+                if frm != devaddr()[0] or flag("no_addr"):
+                    print("RTNETLINK answers: Invalid argument", file=sys.stderr); return 2
+                out["from"] = frm
+            else:
+                out["prefsrc"] = devaddr()[0]
+            print(json.dumps([out])); return 0
         if s in ("-j route show default", "-j -4 route show default", "-j -6 route show default"):
             print("[]" if flag("no_route") else json.dumps([{"dst": "default", "gateway": "192.0.2.1", "dev": "enp1s0"}])); return 0
         if a[:3] == ["link", "show", "dev"]:

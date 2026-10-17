@@ -62,6 +62,15 @@ interface World {
   cleanup: () => Promise<void>;
 }
 
+/** The SSH_CONNECTION the host sees; a test may write another into state/. */
+async function sshConnection(root: string): Promise<string> {
+  try {
+    return (await Deno.readTextFile(`${root}/state/ssh_connection`)).trim();
+  } catch {
+    return "192.0.2.99 1 192.0.2.20 22";
+  }
+}
+
 async function world(): Promise<World> {
   const root = await Deno.makeTempDir({ prefix: "host-net-sim-" });
   const bin = `${root}/bin`;
@@ -122,7 +131,7 @@ async function world(): Promise<World> {
         PATH: `${bin}:/usr/bin:/bin`,
         SIMROOT: root,
         SIMBIN: bin,
-        SSH_CONNECTION: "192.0.2.99 1 192.0.2.20 22",
+        SSH_CONNECTION: await sshConnection(root),
       },
       clearEnv: true,
     }).spawn();
@@ -523,6 +532,7 @@ for (
     const w = await world();
     try {
       // The flag is in place before the arm, so the arm records that path.
+      if (flagName === "v6only") await v6Connection(w.root);
       await Deno.writeTextFile(`${w.root}/state/${flagName}`, "");
       const armed = await w.call("apply", net("netplan", [A]));
       await Deno.writeTextFile(`${w.root}/state/apply_fails`, "");
@@ -541,6 +551,7 @@ Deno.test("losing the IPv6 path while IPv4 stays up is judged fail on a dual-sta
   if (!await simAvailable()) return;
   const w = await world();
   try {
+    await v6Connection(w.root);
     await Deno.writeTextFile(`${w.root}/state/v6only`, "");
     const armed = await w.call("apply", net("netplan", [A]));
     await Deno.writeTextFile(`${w.root}/state/lost_v6`, "");
@@ -595,6 +606,70 @@ Deno.test("a tampered or empty checks.sh makes the clear exit as a failed check,
       );
       assertEquals(w.store.get(`revert-${KEY}`)!.clearedAt, undefined);
     }
+  } finally {
+    await w.cleanup();
+  }
+});
+
+function v6Connection(root: string): Promise<void> {
+  return Deno.writeTextFile(
+    `${root}/state/ssh_connection`,
+    "2001:db8::99 1 2001:db8::10 22",
+  );
+}
+
+Deno.test("the arm works through the shape real ip produces: no prefsrc when from is given", async () => {
+  if (!await simAvailable()) return;
+  const w = await world();
+  try {
+    const armed = await w.call("apply", net("netplan", [A]));
+    const checks = await Deno.readTextFile(
+      `${w.root}/var/lib/host-net/revert/${armed.revert_token}/checks.sh`,
+    );
+    assert(checks.includes("SRC='192.0.2.20'"));
+    assert(!checks.includes("prefsrc"));
+  } finally {
+    await w.cleanup();
+  }
+});
+
+for (
+  const conn of [
+    "127.0.0.1 1 127.0.0.1 22",
+    "::1 1 ::1 22",
+    `::ffff:${"127"}.0.0.1 1 ::ffff:${"127"}.0.0.1 22`,
+  ]
+) {
+  Deno.test(`a loopback session (${conn}) is refused at the arm, changing nothing`, async () => {
+    if (!await simAvailable()) return;
+    const w = await world();
+    try {
+      await Deno.writeTextFile(`${w.root}/state/ssh_connection`, conn);
+      await assertRejects(
+        () => w.call("apply", net("netplan", [A])),
+        Error,
+        "management path could not be recorded",
+      );
+      assertEquals(await w.files(), []);
+    } finally {
+      await w.cleanup();
+    }
+  });
+}
+
+Deno.test("a local address that is not on the route's device is refused at the arm", async () => {
+  if (!await simAvailable()) return;
+  const w = await world();
+  try {
+    await Deno.writeTextFile(
+      `${w.root}/state/ssh_connection`,
+      "192.0.2.99 1 192.0.2.77 22",
+    );
+    await assertRejects(
+      () => w.call("apply", net("netplan", [A])),
+      Error,
+      "management path could not be recorded",
+    );
   } finally {
     await w.cleanup();
   }

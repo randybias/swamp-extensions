@@ -96,7 +96,8 @@ function ownedList(ctx: RevertContext): string {
 /**
  * Shell (inside the arm script) that records the management path the SSH
  * session actually uses: the peer address, and the device, gateway and source
- * address `ip route get <peer>` picks for it, with the source's prefix length.
+ * address (the connection's own local address, which must be on that device) that `ip route get <peer> from <local>`
+ * reports, with the source's prefix length. A loopback path is refused.
  * It refuses (exit 77) when it cannot, or when the checks it writes do not pass
  * against the state as it is now, so no change is ever made that could not be
  * judged afterwards. Works for IPv4 and IPv6 alike.
@@ -109,7 +110,10 @@ case "$peer$local_ip" in ""|*[!0-9A-Fa-f:.]*) echo 'host-net: cannot determine t
 [ -n "$peer" ] && [ -n "$local_ip" ] || { echo 'host-net: cannot determine the management peer' >&2; rm -rf "$DIR"; exit 77; }
 rg="$(ip -j route get "$peer" from "$local_ip" 2>/dev/null | tr -d ' ' || true)"
 pick() { printf '%s' "$rg" | sed -n "s/.*\"$1\":\"\([^\"]*\)\".*/\1/p" | head -n 1; }
-pdev="$(pick dev)"; pgw="$(pick gateway)"; psrc="$(pick prefsrc)"
+pdev="$(pick dev)"; pgw="$(pick gateway)"; psrc="$local_ip"
+# With "from" the kernel reports no prefsrc: the source is the connection's own
+# local address, which must be configured on the device the route leaves by.
+case "$pdev:$psrc" in lo:*|*:127.*|*:::1|*:::ffff:127.*|*:0:0:0:0:0:0:1) pdev= ;; esac
 ppl="$(ip -j addr show dev "$pdev" 2>/dev/null | tr -d ' ' | sed -n "s/.*\"local\":\"$psrc\",\"prefixlen\":\([0-9]*\).*/\1/p" | head -n 1)"
 case "$pdev" in ""|*[!A-Za-z0-9._@:-]*) pdev= ;; esac
 case "$pgw$psrc" in *[!0-9A-Fa-f:.]*) pdev= ;; esac
@@ -127,15 +131,15 @@ HOST_NET_CHECKS
 /**
  * The checks proper, run on the host with the PEER/DEV/GW/SRC/PL values the
  * arm script wrote above them. CHECK=pass only when the path to the SSH peer
- * leaves through the same device, via the same gateway, from the same source
- * address, that source is still configured with the same prefix length, and
+ * leaves through the same device, via the same gateway, and the connection's
+ * source address is still configured on that device with the same prefix length, and
  * the route is not marked dead or linkdown.
  */
 const POST_CHECKS_BODY = String.raw`CHECK=fail
 now="$(ip -j route get "$PEER" from "$LOCAL" 2>/dev/null | tr -d ' ' || true)"
 pick() { printf '%s' "$now" | sed -n "s/.*\"$1\":\"\([^\"]*\)\".*/\1/p" | head -n 1; }
 case "$now" in ""|*'"linkdown"'*|*'"dead"'*) ;; *)
-  if [ "$(pick dev)" = "$DEV" ] && [ "$(pick gateway)" = "$GW" ] && [ "$(pick prefsrc)" = "$SRC" ]; then
+  if [ "$(pick dev)" = "$DEV" ] && [ "$(pick gateway)" = "$GW" ]; then
     addrs="$(ip -j addr show dev "$DEV" 2>/dev/null | tr -d ' ' || true)"
     case "$addrs" in *"\"local\":\"$SRC\",\"prefixlen\":$PL,"*) CHECK=pass ;; esac
   fi ;;

@@ -55,14 +55,11 @@ export interface KeaDeps extends SshDeps {
   token: () => string;
 }
 
-/** The production wiring: the real transport plus a random token. */
-const productionDeps: KeaDeps = {
+/** The active dependencies: the real transport plus a random token until `setDeps`. */
+export let deps: KeaDeps = {
   ...denoDeps,
   token: () => crypto.randomUUID(),
 };
-
-/** The active dependencies. Reassigned only by `setDeps`. */
-export let deps: KeaDeps = productionDeps;
 
 /** Replaces the model dependencies (tests only). Returns the previous ones. */
 export function setDeps(next: Partial<KeaDeps>): KeaDeps {

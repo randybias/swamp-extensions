@@ -131,6 +131,23 @@ async function claimRevert(
   }
 }
 
+/** Records a revert as cancelled. */
+async function recordCancelled(
+  context: MethodContext,
+  key: string,
+  token: string,
+  revert: RevertState,
+): Promise<void> {
+  await context.writeResource(
+    "revert",
+    revertName(key, token),
+    RevertStateSchema.parse({
+      ...revert,
+      cancelled_at: new Date(deps.now()).toISOString(),
+    }),
+  );
+}
+
 /** Removes the claim's marker and records the revert as cancelled. */
 async function abortClaim(
   context: MethodContext,
@@ -143,14 +160,7 @@ async function abortClaim(
   await sshExec(deps, target, ["rm", "-rf", dir]).catch(() => undefined);
   await sshExec(deps, target, ["rm", "-f", `${REVERT_ROOT}/active.json`])
     .catch(() => undefined);
-  await context.writeResource(
-    "revert",
-    revertName(instanceKey(args), token),
-    RevertStateSchema.parse({
-      ...revert,
-      cancelled_at: new Date(deps.now()).toISOString(),
-    }),
-  );
+  await recordCancelled(context, instanceKey(args), token, revert);
 }
 
 /** Uploads the restore assets and arms the host-side revert timer. */
@@ -249,15 +259,7 @@ async function claimAndArm(
     revertName(instanceKey(args), opts.token),
     RevertStateSchema.parse(revert),
   );
-  await armRevert(context, target, args, {
-    token: opts.token,
-    dir: opts.dir,
-    socket: opts.socket,
-    priorActive: opts.priorActive,
-    priorEnabled: opts.priorEnabled,
-    revertAfterS: opts.revertAfterS,
-    revert,
-  });
+  await armRevert(context, target, args, { ...opts, revert });
   return revert;
 }
 
@@ -395,14 +397,7 @@ async function disarmAndRestore(
     .catch(() => undefined);
   await sshExec(deps, target, ["rm", "-f", `${REVERT_ROOT}/active.json`])
     .catch(() => undefined);
-  await context.writeResource(
-    "revert",
-    revertName(instanceKey(args), token),
-    RevertStateSchema.parse({
-      ...revert,
-      cancelled_at: new Date(deps.now()).toISOString(),
-    }),
-  );
+  await recordCancelled(context, instanceKey(args), token, revert);
 }
 
 /** Runs every apply step in order and returns the revert and observation. */
@@ -580,7 +575,6 @@ async function assertCanaries(
   }
 }
 
-/** `commit`: gate on verify, then take the lock and cancel the revert. */
 /** Reads and validates the armed revert, adopting a fired marker. */
 async function loadArmedRevert(
   context: MethodContext,
@@ -678,14 +672,7 @@ async function recordCommitted(
   storedConfig: PendingState | null,
   removal: boolean,
 ): Promise<void> {
-  await context.writeResource(
-    "revert",
-    revertName(key, token),
-    RevertStateSchema.parse({
-      ...revert,
-      cancelled_at: new Date(deps.now()).toISOString(),
-    }),
-  );
+  await recordCancelled(context, key, token, revert);
   await persistCommitted(context, args, {
     config_sha256: observation.file_sha256 ?? "",
     kea_hash: observation.kea_hash,

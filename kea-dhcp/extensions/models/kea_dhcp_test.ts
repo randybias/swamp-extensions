@@ -147,10 +147,7 @@ function fakeHost(): {
     }
     if (cmd === "ssh-add") return OK;
     if (cmd !== "ssh") return OK;
-    for (const [match, handler] of overrides) {
-      if (matches(match, command)) return await handler(options.stdin, command);
-    }
-    for (const [match, handler] of base) {
+    for (const [match, handler] of [...overrides, ...base]) {
       if (matches(match, command)) return await handler(options.stdin, command);
     }
     return OK;

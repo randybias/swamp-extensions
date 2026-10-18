@@ -1,0 +1,82 @@
+{
+  "extension": "@randybias/ssh-secret-file",
+  "version": "2026.10.17.1",
+  "reviewedAt": "2026-10-18T05:20:00Z",
+  "dimensions": [
+    {
+      "id": "credentials-secrets",
+      "verdict": "pass",
+      "note": "content, content_base64, entries, private_key and hmac_key are sensitive schema fields passed as vault references; the private key is loaded into a short-lived ssh-agent over stdin by the canonical ssh-host 2026.10.17.3 transport (ssh.ts blob 8f132c4329c9e64bed686731cd5a0e02980194ea, ssh_test.ts 4e8ac15fcd6bce797c523a221fe58fe9a8d9b386, byte-identical, so transport findings are judged in its owner), and the value is streamed on the exec stdin of one remote sh -c script that stages it under mktemp 0600 in the destination directory, applies owner and group, then the mode, and renames with mv -T; no transport upload temp file exists. No content hash reaches argv or the remote command text: the staged byte count is the only length on the remote line and the SHA-256 comparison runs locally against the host's own sha256sum output. State holds metadata and at most a keyed HMAC-SHA256 (hmac_key given), never the value or a plain hash; thrown errors are '<what> failed (exit N)' with no remote stderr, so a hostile target cannot reflect the secret into the operator's output (round-2 fix, tested by feeding the secret back on stderr). host_key_policy accepts only strict with required host_keys. Live run 2: 74 swamp commands and 185 scratch files scanned against the run's private key, both API tokens and the value marker, 0 hits; 4145 ps -eo args samples on the target at 0.1 s, 0 argv hits, 0 hits in /tmp, /var/tmp or /dev/shm, the .secret-stage-* file seen only inside the destination directory and none left. README examples use vault references only and say why (the CLI prints literal sensitive arguments under --json)."
+    },
+    {
+      "id": "logging-quality",
+      "verdict": "pass",
+      "note": "Logs and method results carry only path, mode, owner, group, byte count, change and match flags and the state status; the value, its hash and remote stderr never appear (round-2 fix verified by a test asserting no logger call contains the secret). Failures are typed SshError values whose messages are fixed text plus an exit code. Residual LOW (kept): the anchored scripts' distinct exit codes 2-7 are not decoded into typed messages at the call sites, so a symlinked component in verify or remove surfaces as 'read <path> failed (exit 7)'; a path with repeated slashes fails the pwd -P anchor with the same misleading exit 2."
+    },
+    {
+      "id": "error-handling",
+      "verdict": "pass",
+      "note": "Every remote script is POSIX sh under set -eu, executed under a real dash in tests, with traps that remove the staged temp on any failure and map HUP/INT/TERM to exit 1; the rename happens only after the staged byte count equals the value length (exit 5 otherwise), so a dropped or killed session keeps the previous file. Every script first cd's into the destination directory and refuses a pwd -P mismatch (exit 2), so a symlinked ancestor at any depth cannot redirect the stage, the rename, the read or the unlink (round-1 and round-2 fixes; live: symlinked ancestor refused for write and remove with the real file intact). A group- or world-writable directory, or one not owned by the running user or root, is refused (exit 3 and 4); a symlink or directory destination is refused with a typed error before staging; an unsearchable parent is a typed error, never 'absent'; chown runs before chmod so set-ID modes publish exactly and the staged file stays 0600 until the rename (round-3 fix). Every probe carries a timeout (30 s probes, 120 s write, 60 s read). Residual MEDIUM (kept, lead ruling): a FIFO, device or socket at path is not refused, so the read hashes it (a FIFO stalls until the 60 s timeout with no typed error; a small device is replaced by mv -T); planting one needs write access to a directory the script already refuses, so the cost is a bounded stall of the operator's own run. Residual LOW (kept): after a successful stage, a post-write read error throws before the record is written, so the host holds the new file and state keeps the old record until a re-run; a non-root runner writing a mode without the owner read bit hits exactly that path."
+    },
+    {
+      "id": "testing-completeness",
+      "verdict": "pass",
+      "note": "82 offline tests: schema refusals (two content forms, none, relative and .. paths, non-octal mode, unknown keys, newline in an entry value, 257 entries, hmac_key on verify), entries rendering and quoting, the instance key and two-path collision, resolveContent byte caps, script-text assertions (anchor lines, chown before chmod, symlink refusal string, no bare rm argv), fake-runner contract tests for write, verify and remove including exit 7, malformed stat lines, the unpadded GNU stat mode, an unsearchable parent and the secret echoed on stderr, and dash-runner tests that execute the generated scripts under a real dash for the normal, short-read, symlink, directory, symlinked-ancestor and set-ID cases; the vendored transport's own tests run with it. Gates: deno, swamp fmt, quality, leak scan, gitleaks, fixture guard, naming, registry-lint, dash-runner, bashisms, fixture-provenance, workflow-edges, realtool, dry run. Live on throwaway Ubuntu 24.04 VPS: run 1 at the previous head 28 pass, 1 fail (modes 0060/0040 unparsed), 1 untested; the fail fixed and run 2 at this contentHash 30 pass, 0 fail, 1 untested (upgrade: no earlier version under this name), covering fresh, rerun, existing, bad-input and failure-path cells for write, verify and remove, with a 0-line host baseline diff. Residual LOW (kept): the dash set-ID test passes no owner spec, so chown-before-chmod is proven at runtime by nothing but the script text; two tests duplicate the test context and the removal responder."
+    },
+    {
+      "id": "idempotency-resilience",
+      "verdict": "pass",
+      "note": "write converges by content SHA-256, mode, owner and group (numeric ids and names both compared against the live file) and an identical re-run is a no-op: live run 2 recorded changed false on 8 reruns across the content, owner/group, set-ID, entries and low-mode cells with inode and mtime unchanged, and numeric 65534:65534 over nobody:nogroup as a no-op. A value, mode or owner change re-stages and renames atomically (new inode, old file intact until the rename). remove is idempotent (already absent: changed false, status not_found) and verify twice gives the same result without touching the file. A failed write (short read, chown failure, refused directory) leaves the previous file and no staged temp (live: unknown owner, killed sessions in the predecessor's run)."
+    },
+    {
+      "id": "api-contracts",
+      "verdict": "pass",
+      "note": "The target contract is GNU coreutils on Linux (stat -c, sha256sum, mv -T), stated in the README after the round-2 fix removed a false shasum fallback; the first probe fails with a typed error on a BSD userland. stat output is parsed by projecting six validated tokens (mode 1-4 octal digits after the live fix, owner and group against the identity grammar, numeric ids and byte count); a malformed line is 'could not parse stat output', never a plausible identity. entries renders POSIX-shell KEY='value' lines (single quotes escaped) documented as sourceable by sh and bash and not a systemd EnvironmentFile; the rendering was proven live by comparing the host file's sha256 with an in-process render. Residual LOW (kept): the identity grammar rejects '.' and a trailing '$', both legal in Linux account names, so such an owner cannot converge."
+    },
+    {
+      "id": "resource-management",
+      "verdict": "pass",
+      "note": "The only host artifact is the destination file; the staged temp lives in the destination directory under mktemp and is removed by the EXIT trap on every failure path (live: 0 stage files left after any cell, none ever seen outside the destination directory). remove unlinks the file and proves absence in the same anchored script; on a symlink destination it removes only the link (live: /etc/hostname target unchanged). Live run 2's before/after host baseline diff was 0 lines after the extension removed every file it wrote. No ssh-agent survives a call (the transport kills its own agent). Residual LOW (kept): remove re-probes existence after its script already proved absence, and a fresh write opens up to six SSH sessions before the stdin-fed script."
+    },
+    {
+      "id": "published-surface-hygiene",
+      "verdict": "pass",
+      "note": "Manifest: @randybias/ssh-secret-file 2026.10.17.1, two-sentence description, Apache-2.0, additionalFiles README.md and LICENSE.txt (LOGBOOK not packaged), labels and runner platforms set. Method descriptions start DESTRUCTIVE. (write, remove) and READ-ONLY. (verify) and are one to three sentences. The README names the GNU coreutils dependency, shows one definition written per host with vault references and the required host_keys, documents the record key and the --json caveat, and carries no status or roadmap language. Fixtures use RFC 5737 addresses and .test names; leak scan, gitleaks, fixture guard and the naming check pass. The LOGBOOK carries the visibility and audience lines, the five naming answers for the confirmed rename from secret-file, a moving-from-secret-file note, every review round's dispositions, the residuals and the live matrices with addresses, hostnames and provider ids redacted. The name was confirmed and the predecessor's public versions stay published for later deprecation."
+    },
+    {
+      "id": "schema-strictness",
+      "verdict": "pass",
+      "note": "WRITE_ARGS, VERIFY_ARGS, REMOVE_ARGS and FileStateSchema are z.strictObject; path must be absolute without '..' components, mode matches 3-4 octal digits, owner and group follow an identity grammar, host_key_policy is the literal strict with a non-empty host_keys list, exactly one content form is required (two or none refused before any connection), content and the decoded content_base64 are capped at 1 MiB of bytes (the base64 maximum sized for that cap), entries is capped at 256 keys in the schema with values free of newlines, hmac_key is refused on verify. Live bad-input cells: 8 write refusals, 2 verify refusals and 2 remove refusals, each before any connection in under 2 s. Argument types are inferred from the schemas. Residual LOW (kept): repeated slashes pass the path grammar and then fail the anchor with a misleading exit code; a mode without the owner read bit is accepted."
+    },
+    {
+      "id": "lifetime-gc",
+      "verdict": "pass",
+      "note": "The one resource (the secret-file state record) declares lifetime infinite and garbageCollection 10; every observation (write, verify, remove) persists a new version, so a consumer reads data.latest."
+    },
+    {
+      "id": "crud-completeness",
+      "verdict": "pass",
+      "note": "write (action, create and update by convergence, adopts a pre-existing foreign file atomically), verify (read-only; persists its observation as a record so the live state is readable with swamp data get), remove (action; already-absent is a clean no-op). Live run 2 covered the lifecycle in order: fresh write for the content, entries and base64 forms, verify match and mismatch, identical re-run, value, mode and owner changes, adoption, remove and remove again. Residual LOW (kept): verify with no content form, mode, owner or group records matches true although nothing was compared."
+    },
+    {
+      "id": "preflight-checks",
+      "verdict": "pass",
+      "note": "Schema validation and resolveContent (form choice, byte cap, entries rendering) run before any vault read or connection; the host key is verified against the pins before authentication and host_keys that do not apply to the target are refused before connecting (live: wrong pin, wrong user, bad private key and a non-matching port each refused with nothing written); the destination is checked no-follow for a symlink or directory before staging; the directory's ownership and write bits are checked inside the anchored script before mktemp; the staged length is checked before the rename. Residual MEDIUM (kept): no regular-file check, see error-handling."
+    },
+    {
+      "id": "instance-names",
+      "verdict": "pass",
+      "note": "The record name is secret-<32 hex> from sha256(host NUL port NUL user NUL path), so one definition serves many hosts and paths, two paths cannot collide (tested) and the name contains no path characters; a distinct-names test asserts the exact instance key and shape. Each method writes exactly one record per run."
+    },
+    {
+      "id": "data-access",
+      "verdict": "pass",
+      "note": "globalArguments is an empty strict object; every target (host, port, user, key, path) arrives as method arguments and each method reads and writes only its own record for that instance key. verify persists match flags and metadata only; the README documents reading the record with data.latest and the key derivation."
+    },
+    {
+      "id": "version-upgrades",
+      "verdict": "pass",
+      "note": "export const model is a plain object literal with literal type, version 2026.10.17.1 and upgrades: [] (createModel spreads it for tests); registry-lint and the dry run are clean. This is the first version under the ssh-secret-file name, so there is nothing to upgrade from; the record shape equals the predecessor secret-file 2026.10.17.2's, and the LOGBOOK's moving note explains that a definition changes type and re-runs write once as a no-op on the host. The upgrade live cell is recorded untested with that reason."
+    }
+  ]
+}

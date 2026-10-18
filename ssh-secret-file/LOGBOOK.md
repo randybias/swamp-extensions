@@ -417,25 +417,262 @@ mode for `@swamp/ssh`.
 - residual low: `dash-runner` reports three LOWs because its container has no
   `/etc/example` directory; the anchored scripts refuse fail-closed there.
 
-## Live test matrix
+## Moving from secret-file
 
-One row per public method and the symlink-race attempt; the live lane fills
-`result`, `run_id`, `test_cell` and `content_hash_proved`. `untested` is never a
-pass.
+`@randybias/ssh-secret-file` is `@randybias/secret-file` under its confirmed
+name. The model type, methods (`write`, `verify`, `remove`), inputs and stored
+record shape are the same, so a definition moves by changing the type name;
+state does not carry over, because the record names are keyed by the type's own
+instance key and this package starts at version 2026.10.17.1 with
+`upgrades: []`. Re-run `write` once per file under the new type: the content,
+mode, owner and group already converge, so the first run is a no-op on the host
+and only creates the record. The public `secret-file` versions stay published
+and are deprecated afterwards, never deleted.
 
-| method_or_workflow | scenario     | result   | run_id | test_cell | content_hash_proved | note                          |
-| ------------------ | ------------ | -------- | ------ | --------- | ------------------- | ----------------------------- |
-| write              | fresh        | untested |        |           |                     | write a new file, mode 0600   |
-| write              | rerun        | untested |        |           |                     | identical re-write is a no-op |
-| write              | existing     | untested |        |           |                     | value change replaces content |
-| write              | existing     | untested |        |           |                     | mode change only re-stages    |
-| write              | existing     | untested |        |           |                     | owner/group converge          |
-| write              | failure-path | untested |        |           |                     | symlink race attempt refused  |
-| verify             | existing     | untested |        |           |                     | match and mismatch            |
-| verify             | failure-path | untested |        |           |                     | two content forms refused     |
-| remove             | fresh        | untested |        |           |                     | file removed                  |
-| remove             | rerun        | untested |        |           |                     | already absent is a no-op     |
+## Review rounds (run sp-2) dispositions
+
+Five triage rounds on `lane/d1-secret-file-stdin`, each with the conformance,
+adversarial and tightness seats at rc=0 plus an advisory seat. Findings in the
+vendored `_lib/ssh.ts` at the canonical blob `8f132c43...` (an IPv6 host
+grammar, `SSH_ASKPASS_SECRET` in the child environment, the agent fallback,
+`insecure_tofu` and a swallowed `ssh-agent -k` failure) were dropped in every
+round under the vendored-transport rule and go to the transport's owner.
+
+- Round 1 (head 7da733d). Routed and fixed in 9e591de: HIGH diff scope (the
+  branch edited the predecessor `secret-file`, whose 2026.10.17.2 is published;
+  reverted, the diff is this package plus its `release.yaml` stanza); security
+  HIGH ancestor-symlink swap (the directory checks and the staged write resolved
+  the parent by name each time, so a writable ancestor could be swapped for a
+  symlink after the check; fixed with `cd "$d"`, `[ "$(pwd -P)" = "$d" ]` and
+  every later operation anchored on `.`); MEDIUM three unused vendored harness
+  files (dropped); MEDIUM unbounded `stat`/`test`/`rm` probes (30 s
+  `PROBE_TIMEOUT_MS`); MEDIUM `exists` read an unsearchable parent as absent
+  (typed error); LOW UTF-16 caps, base64 maximum, hand-written argument types,
+  dead fake branches, naming docs. Refuted: a local timeout before the remote
+  `mv` (the traps clean up), an FD-anchored helper (not required, the shell
+  anchor closes the race), the version-1 lineage note.
+- Round 2 (head 9e591de). Routed and fixed in 5862ada: security HIGH `remove`
+  unlinked by name in a separate call after the probe (a symlinked ancestor
+  redirected the unlink; now one anchored script); security HIGH `requireOk`
+  embedded remote stderr in thrown errors (a hostile target could reflect the
+  secret; now `<what> failed (exit N)` with distinct exit codes 2-6); MEDIUM
+  README claimed a `shasum` fallback (GNU coreutils named); MEDIUM duplicated
+  convergence predicate (one `converged()`); LOW computed model export (plain
+  literal), four-sentence description, `entries` key cap in the schema with
+  `resolveContent` before the first probe, dead fake branches, lineage
+  paragraph. Refuted: an armed revert for an `authorized_keys` lockout (wrong
+  layer for a generic file writer), darwin in `platforms` (the runner, not the
+  target), a new record version per run (read-only methods persist their
+  observation by design).
+- Round 3 (head 5862ada). Routed and fixed in 34480cd: security HIGH `chmod`
+  before `chown` (a group or other read bit was briefly held under the running
+  user's group, and a chown clears set-ID bits so 4755/2750 never converged; now
+  chown first, the staged file stays 0600 until the rename); MEDIUM `verify` on
+  a symlink paired the link's metadata with the target's hash (refused with exit
+  7); MEDIUM stat tokens were stored unvalidated (every token validated,
+  `FileStateSchema` bounded); LOW `verify` resolved the content form after
+  recording `not_found`, the `not_found` record stored the requested mode, a
+  vacuous distinct-names test, a dead `-d` fake branch. Refuted: the stat/sha
+  race inside one anchored script (only the file's owner can replace it), the
+  window before `mv -T` (needs a writer in a directory the script refuses), the
+  byte count on argv (already a record attribute; not a content hash).
+- Round 4 (head 34480cd). CLEAN, no Critical or High. Lows carried: the stat
+  mode token check required three digits (this became the live fail), the set-ID
+  dash test passes no owner spec, up to six SSH sessions before the stdin-fed
+  script, anchored exit codes not decoded into messages, `hmac_key` `min(1)`, a
+  duplicated `ContentInput` type, a copied test context. Refuted: concurrent
+  replacement between stat and sha256sum (owner only), the distinct-names test
+  (resolved by the round-3 option taken).
+- Live run 1 (head 34480cd): 28 pass, 1 fail, 1 untested. The fail: `write` with
+  mode `0060` or `0040` wrote the file correctly, then failed to parse GNU
+  `stat %a`'s unpadded `60`/`40` and wrote no record. Fixed in cf558bf (the read
+  accepts 1-4 octal digits, compared through `normalizeMode`; the input schema
+  still requires 3-4) with a unit test.
+- Round 5 (head cf558bf). CLEAN, no Critical or High; the delta from 34480cd is
+  the stat-token fix, one test and a LOGBOOK note. One MEDIUM tagged security by
+  the adversarial seat and eleven Lows, all recorded as residuals below by the
+  lead's ruling rather than routed, because the head had already run live and a
+  further code change would have needed a third live run.
+
+## Residuals at merge (2026.10.17.1)
+
+Known and accepted for this beta; backlog for the next version.
+
+- MEDIUM (security-tagged, lead ruling: residual). A FIFO, device or socket at
+  `path` is not refused: `assertReplaceable` checks `-L` and `-d` only, so
+  `readFileScript` runs `sha256sum` on it (a FIFO blocks until the 60 s read
+  timeout with no typed error; a small device such as `/dev/null` hashes, then
+  `mv -T` replaces the node with the secret file). Not an attacker path:
+  planting a special file needs write access to a directory the stage script
+  already refuses (exit 3 or 4), so the cost is a bounded stall of the
+  operator's own run against a target the operator named. Fix: `[ -f ]` after
+  the `-L` check in `readFileScript` and again before `mv -T`, with a new exit
+  code and a fake-runner test.
+- LOW A non-root runner writing a mode without the owner read bit publishes the
+  file, then the post-write read fails with no record (root is unaffected; the
+  live 0060/0040 cells ran as root).
+- LOW `IDENTITY_RE` rejects `.` and a trailing `$`, both legal in Linux account
+  names, so a file owned by such an account cannot converge.
+- LOW The path grammar accepts repeated slashes; the `pwd -P` anchor then
+  differs and every anchored script exits 2 with a misleading message.
+- LOW After a successful stage, a post-write read error throws before the record
+  is written, so the host has the new file and state keeps the old record until
+  a re-run.
+- LOW `verify` with no content form, mode, owner or group records
+  `matches: true` although nothing was compared.
+- LOW A fresh `write` opens up to six SSH sessions before the stdin-fed script;
+  `remove` re-probes after its script already proved absence.
+- LOW The anchored scripts' exit codes 2-7 are not decoded into typed messages.
+- LOW `hmac_key` accepts one character while the README's brute-force claim
+  presupposes a strong key.
+- LOW The dash-runner set-ID test passes no owner spec, so chown-before-chmod is
+  proven at runtime by nothing but the script text.
+- LOW A hand-written `ContentInput` duplicates schema-inferred fields; two tests
+  copy the test context and the removal responder.
+- LOW Spec section 4 says a dangling symlink destination is replaced; the code
+  refuses every symlink destination (the safer behaviour, live-tested); the spec
+  file still carries the `secret-file` name.
+- LOW After a local timeout the remote write script runs until stdin closes.
+
+## 2026-10-18 live e2e (run sp-2)
+
+Two live runs on throwaway hourly VPS (1 vCPU, 1 GB, Ubuntu 24.04, kernel
+6.8.0-142, GNU coreutils 9.4), user root, strict host-key pins learned by
+`ssh-keyscan` on first contact, the SSH key and every content value as vault
+references, inputs by `--input-file`, no `--json` on any run. No container cell:
+the control host has no systemd-nspawn and the extension is SSH-only. Every real
+address, hostname and provider id is redacted (`<vps>` is the target). The run-1
+lane rotated the host's provider-set root password over stdin before any cell
+after a poller printed the provider record into a transcript; the host was
+deleted at teardown.
+
+Run 1, head 34480cd, 03:23Z to 03:55Z: 28 pass, 1 fail, 1 untested. The fail
+(modes `0060` and `0040`, see the round-5 dispositions) left two residue files
+on that host; everything else the extension wrote was removed. Argv scan: 74
+swamp commands and 159 scratch files, 0 hits; 4741 `ps -eo args` samples on the
+target at 0.1 s, 0 hits for the value marker, 0 hits in `/tmp`, `/var/tmp` or
+`/dev/shm`; the `.secret-stage-*` file was seen only inside the destination
+directory (9 samples) and none remained.
+
+Run 2, head cf558bf, contentHash
+`c6ff3b4e1804312f1568ff29f61e3e963fb5004c2701adab6365d13ab2064e05`, 04:47Z to
+05:02Z, the second and last live run: 30 pass, 0 fail, 1 untested. The run-1
+fail cells were re-run first on fresh and on existing paths. Baseline diff
+before and after: 0 lines (no change in packages, units, listeners, users,
+groups, mounts, netplan, cron or timers; no extension residue). Argv scan: 74
+swamp commands and 185 scratch files, 0 secret hits; 4145 `ps` samples, 0 marker
+hits, 0 hits in the temp directories, staging seen only inside the destination
+directory (14 samples), none left. `untested` is never a pass.
+
+| method_or_workflow | scenario     | result   | run_id | test_cell | content_hash_proved | note                                                                                                                                                                                                                                    |
+| ------------------ | ------------ | -------- | ------ | --------- | ------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| write              | fresh        | pass     | sp-2   | vps-small | c6ff3b4e...         | mode 0060 root:nogroup and mode 0040 on fresh paths: rc 0, changed true, second-session `stat %a` 60 and 40, 60 bytes, sha256 equals value A; the run-1 defect is fixed                                                                 |
+| write              | existing     | pass     | sp-2   | vps-small | c6ff3b4e...         | mode 0060 then 0040 over an existing 0600 file: changed true each, `stat %a` 60 then 40, content hash unchanged, no residue                                                                                                             |
+| write              | rerun        | pass     | sp-2   | vps-small | c6ff3b4e...         | identical re-run of the 0060 and 0040 cells on fresh and existing paths: changed false (4 reruns), inode and mtime unchanged                                                                                                            |
+| write              | fresh        | pass     | sp-2   | vps-small | c6ff3b4e...         | content form: `<vps>:/srv/secrets/a.key` 0600 root:root 60 bytes, changed true; second-session stat and sha256 equal the vault value's hash                                                                                             |
+| write              | fresh        | pass     | sp-2   | vps-small | c6ff3b4e...         | entries form with `hmac_key`: `app.env` 0640, 130 bytes, sha256 equals the in-process `KEY='value'` rendering (a quote in a value escaped), changed true                                                                                |
+| write              | fresh        | pass     | sp-2   | vps-small | c6ff3b4e...         | `content_base64` form: `bin.dat` 0600, 54 bytes, sha256 equals the decoded vault value's hash, changed true                                                                                                                             |
+| write              | rerun        | pass     | sp-2   | vps-small | c6ff3b4e...         | identical re-run of the content, owner/group, set-ID and entries cells: changed false each time, inode and mtime unchanged (8 reruns in all)                                                                                            |
+| write              | rerun        | pass     | sp-2   | vps-small | c6ff3b4e...         | numeric owner/group 65534:65534 over a file at nobody:nogroup: changed false (converges by id or name)                                                                                                                                  |
+| write              | existing     | pass     | sp-2   | vps-small | c6ff3b4e...         | value change A to B (from the 0040 state, mode back to 0600): changed true, new inode, sha256 equals value B                                                                                                                            |
+| write              | existing     | pass     | sp-2   | vps-small | c6ff3b4e...         | mode-only change 0600 to 0640: changed true, re-staged (new inode), content hash unchanged                                                                                                                                              |
+| write              | existing     | pass     | sp-2   | vps-small | c6ff3b4e...         | owner/group change to nobody:nogroup: changed true, stat shows uid 65534 gid 65534 mode 640, content unchanged                                                                                                                          |
+| write              | existing     | pass     | sp-2   | vps-small | c6ff3b4e...         | set-ID modes with owner and group: 4750 root:nogroup then 2640 root:nogroup publish exactly (`stat %a` 4750, 2640); rerun of 4750 changed false                                                                                         |
+| write              | existing     | pass     | sp-2   | vps-small | c6ff3b4e...         | adopt a pre-existing 0644 file with other content: replaced atomically, 0600 root:root, sha256 equals value A, changed true                                                                                                             |
+| write              | bad-input    | pass     | sp-2   | vps-small | c6ff3b4e...         | 8 refusals before any connection: two content forms, no content form, relative path, `..` component, non-octal mode, unknown key, newline in an entry value, 257 entries                                                                |
+| write              | failure-path | pass     | sp-2   | vps-small | c6ff3b4e...         | symlink destination (link to `/etc/hostname`) refused "is a symlink"; link intact and the target's hash unchanged before, after the refusal and after the matrix                                                                        |
+| write              | failure-path | pass     | sp-2   | vps-small | c6ff3b4e...         | dangling symlink destination refused "is a symlink" (code behaviour; spec section 4 wording says replaced), link left intact                                                                                                            |
+| write              | failure-path | pass     | sp-2   | vps-small | c6ff3b4e...         | symlinked ancestor (`/srv/slink -> /srv/secrets`): anchored script exit 2, nothing written through the link                                                                                                                             |
+| write              | failure-path | pass     | sp-2   | vps-small | c6ff3b4e...         | directory destination refused; missing destination directory refused ("could not search ... refusing to report absent"); group/world-writable directory exit 3, no file                                                                 |
+| write              | failure-path | pass     | sp-2   | vps-small | c6ff3b4e...         | unknown owner: chown fails, write exit 1, no destination file and no staging file left                                                                                                                                                  |
+| write              | failure-path | pass     | sp-2   | vps-small | c6ff3b4e...         | wrong host key "host key verification failed; refusing to connect"; wrong user "authentication failed"; bad private key "ssh-add rejected the private key"; port 2 refused before connecting ("host_keys were supplied but none apply") |
+| write              | failure-path | pass     | sp-2   | vps-small | c6ff3b4e...         | secret never on argv or in a remote temp file: 4145 ps samples 0 marker hits, 0 hits in /tmp /var/tmp /dev/shm, staging seen only inside the destination directory (14 samples), 0 left; local scan 74 commands 185 files 0 hits        |
+| verify             | existing     | pass     | sp-2   | vps-small | c6ff3b4e...         | match: content+mode+owner+group true; mismatch false for a wrong content, a wrong mode and a wrong owner (3 cells); entries form against `app.env` true                                                                                 |
+| verify             | fresh        | pass     | sp-2   | vps-small | c6ff3b4e...         | never-written path: matches false, status not_found, changed false; metadata-only verify of an existing file matches true                                                                                                               |
+| verify             | rerun        | pass     | sp-2   | vps-small | c6ff3b4e...         | identical verify twice: same result, changed false, file untouched (inode and mtime unchanged)                                                                                                                                          |
+| verify             | bad-input    | pass     | sp-2   | vps-small | c6ff3b4e...         | two content forms refused before connecting; `hmac_key` refused by the schema                                                                                                                                                           |
+| verify             | failure-path | pass     | sp-2   | vps-small | c6ff3b4e...         | symlink destination refused (read exit 7); wrong host key refused before connecting                                                                                                                                                     |
+| remove             | fresh        | pass     | sp-2   | vps-small | c6ff3b4e...         | `a.key`, `app.env`, `bin.dat`, `low.key` and `low40.key` removed, status removed, changed true; second-session stat ENOENT each                                                                                                         |
+| remove             | rerun        | pass     | sp-2   | vps-small | c6ff3b4e...         | already absent: changed false, status not_found                                                                                                                                                                                         |
+| remove             | existing     | pass     | sp-2   | vps-small | c6ff3b4e...         | adopted foreign file removed; symlink destination: the link itself is unlinked, the `/etc/hostname` target's hash unchanged                                                                                                             |
+| remove             | bad-input    | pass     | sp-2   | vps-small | c6ff3b4e...         | relative path refused by the schema; unknown input (`mode`) refused                                                                                                                                                                     |
+| remove             | failure-path | pass     | sp-2   | vps-small | c6ff3b4e...         | symlinked ancestor on an existing file: anchored script exit 2, file intact (stat and hash unchanged); wrong host key refused before connecting                                                                                         |
+| upgrade            | existing     | untested | sp-2   | vps-small | c6ff3b4e...         | the manifest has no `upgrades[]` entry and no version of `@randybias/ssh-secret-file` was published before this one; nothing to upgrade from (the predecessor `secret-file` is a different package name)                                |
+
+Result: 30 pass, 0 fail, 1 untested, 0 inconclusive. Full receipts with the
+baselines, the argv scans and the provider accounting are kept outside the
+package in the repository's `receipts/` notes.
+
+## 2026-10-18 merge prep (main)
+
+- Final verify at cf558bf: the round-5 ledger is CLEAN (no unrefuted Critical or
+  High); the branch diff against main touches only `ssh-secret-file/` plus its
+  own `release.yaml` stanza (`channel: beta`, `ci: false`, `published: {}`).
+  Only files under `ssh-secret-file/` were ever added on the branch (Apache-2.0
+  `LICENSE.txt`, no other licence), so no licence-history squash was needed;
+  merged with `--no-ff`.
+- Post-live freeze: nothing under `ssh-secret-file/` other than this LOGBOOK
+  (not packaged) changed after cf558bf; the merged tree is byte-identical to the
+  live-tested head. The dry run at merge gave contentHash
+  `c6ff3b4e1804312f1568ff29f61e3e963fb5004c2701adab6365d13ab2064e05`, equal to
+  the live-tested hash; `version-exists` passed, so 2026.10.17.1 is new under
+  this name.
+- Transport: `_lib/ssh.ts` blob `8f132c4329c9e64bed686731cd5a0e02980194ea`
+  (canonical, ssh-host 2026.10.17.3), `_lib/ssh_test.ts`
+  `4e8ac15fcd6bce797c523a221fe58fe9a8d9b386`; harness `recording-runner.ts`
+  `943857c8b6dbbc365523ee0cfafd1b0fe0c0054f`.
+- Gate-7 mechanics in place: plain `export const model = {...}`, literal
+  `upgrades: []`, a sibling `_test.ts` for every model file.
+- Review report for the hash committed as
+  `reviews/ssh-secret-file/c6ff3b4e1804312f1568ff29f61e3e963fb5004c2701adab6365d13ab2064e05.json`,
+  written from the five rounds' seat outputs, the dispositions above and the
+  live receipts.
+- Published with
+  `swamp extension push manifest.yaml --repo-dir ssh-secret-file --channel beta --yes`
+  as `@randybias/ssh-secret-file@2026.10.17.1`, channel beta, visibility public.
+  The `release.yaml` record (published hash, `ci: true` and the release note) is
+  the commit after this one; gates were re-run on it before the push of main.
 
 ## Factory events
 
-Merge-prep copies the item's events here from the conductor's event records.
+Run sp-2, item `ssh-secret-file next`, from the conductor's event log (UTC). The
+version was built on DeepSeek lane d1 as a new package from the `secret-file`
+2026.10.17.2 head; five review rounds (round 1 routed two Highs, round 2 two,
+round 3 one, rounds 4 and 5 clean) and two live runs (28/1 then 30/0) preceded
+the merge.
+
+| At                   | Stage      | Rung      | Head         | Reason         |
+| -------------------- | ---------- | --------- | ------------ | -------------- |
+| 2026-10-17T21:58:08Z | spec       | prior-art |              | spec-ok        |
+| 2026-10-17T22:36:16Z | building   | fix       |              | prior-art-fail |
+| 2026-10-17T23:06:11Z | checks     | gates     | a0e8cace3019 | new-head       |
+| 2026-10-17T23:18:21Z | building   | fix       | a0e8cace3019 | gates-fail     |
+| 2026-10-17T23:21:49Z | checks     | gates     | 15b09f68c64d | new-head       |
+| 2026-10-17T23:30:13Z | checks     | realtool  | 15b09f68c64d | gates-pass     |
+| 2026-10-17T23:35:33Z | review     | review    | 15b09f68c64d | realtool-pass  |
+| 2026-10-17T23:43:53Z | building   | build     |              | resume         |
+| 2026-10-17T23:56:02Z | checks     | gates     | 6a1df60c2ee9 | head-reported  |
+| 2026-10-18T00:00:42Z | building   | fix       | 6a1df60c2ee9 | gates-fail     |
+| 2026-10-18T00:04:33Z | checks     | gates     | 7da733d27a96 | new-head       |
+| 2026-10-18T00:16:16Z | checks     | realtool  | 7da733d27a96 | gates-pass     |
+| 2026-10-18T00:25:44Z | review     | review    | 7da733d27a96 | realtool-pass  |
+| 2026-10-18T00:52:36Z | building   | fix       | 7da733d27a96 | triage:routed  |
+| 2026-10-18T00:55:38Z | checks     | gates     | 9e591dee864d | new-head       |
+| 2026-10-18T01:03:55Z | checks     | realtool  | 9e591dee864d | gates-pass     |
+| 2026-10-18T01:11:45Z | review     | review    | 9e591dee864d | realtool-pass  |
+| 2026-10-18T01:33:25Z | building   | fix       | 9e591dee864d | triage:routed  |
+| 2026-10-18T01:38:11Z | checks     | gates     | 5862adadf7cb | new-head       |
+| 2026-10-18T01:48:56Z | checks     | realtool  | 5862adadf7cb | gates-pass     |
+| 2026-10-18T01:55:54Z | review     | review    | 5862adadf7cb | realtool-pass  |
+| 2026-10-18T02:26:28Z | building   | fix       | 5862adadf7cb | triage:routed  |
+| 2026-10-18T02:29:53Z | checks     | gates     | 34480cdd6208 | new-head       |
+| 2026-10-18T02:41:19Z | checks     | realtool  | 34480cdd6208 | gates-pass     |
+| 2026-10-18T02:52:38Z | review     | review    | 34480cdd6208 | realtool-pass  |
+| 2026-10-18T03:22:16Z | live test  | live      | 34480cdd6208 | triage:clean   |
+| 2026-10-18T03:54:47Z | building   | fix       | 34480cdd6208 | live-fail      |
+| 2026-10-18T03:57:50Z | checks     | gates     | cf558bf1fbdd | new-head       |
+| 2026-10-18T04:04:32Z | checks     | realtool  | cf558bf1fbdd | gates-pass     |
+| 2026-10-18T04:11:08Z | review     | review    | cf558bf1fbdd | realtool-pass  |
+| 2026-10-18T04:46:35Z | paused     | escalated | cf558bf1fbdd | round-cap:3    |
+| 2026-10-18T04:50:21Z | live test  | live      | cf558bf1fbdd | resume         |
+| 2026-10-18T05:09:20Z | publishing | merge     | cf558bf1fbdd | live-pass      |

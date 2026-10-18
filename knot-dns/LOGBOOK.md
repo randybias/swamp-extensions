@@ -432,3 +432,38 @@ Live testing is for the reset-failed fix and the strict schemas merged in
 - LOW description length: the `remove_zone` description is three sentences.
 - LOW test hygiene: the purge container cell interpolates `APEX` rather than a
   hardcoded zone; `cidrContains` drops its `/0` mask special case.
+
+## Live round 1 (HEAD 3b87cf4, sp-2 vps-small) dispositions
+
+The live matrix was 44 pass / 4 fail / 1 untested / 2 inconclusive. All four
+fails are fixed here.
+
+- FAIL `apply_zone` port-53 precheck: `ss` prints the resolved stub as
+  `127.0.0.53%lo:53`; the awk comparison kept the `%lo` scope, so the precheck
+  missed it and knotd restarted into a failed bind before rolling back. The
+  address scope is stripped before the comparison, and `PORT_BUSY` now names the
+  holding process. Container cell fakes a scoped `ss` line.
+- FAIL `apply_resolver` overlap: a resolver listen held by knotd was not refused
+  as an overlap (`apply_zone` refuses the mirror case). `apply_resolver` now
+  runs the same `assertListenAcceptable` against the applied zones' requested
+  listens, before any host work.
+- FAIL `apply_resolver` wildcard: `listen_any_ack` was never enforced on the
+  resolver; the same precheck refuses a wildcard without the ack before dialling
+  (the old path connected first and only failed at the bind).
+- FAIL `apply_resolver` busy port: there was no port precheck at all. It now
+  runs `portCheckScript` with the resolver's own process allowed (`kresd`,
+  `knot-resolver`) and knotd not, so a foreign holder is a typed `port_busy`
+  before the config is staged.
+- FAIL `ksk_submitted` rerun: the second call surfaced `knotc`'s
+  `(no key ready
+  for submission)` as exit 1. That is the already-done state,
+  so the script now exits 0 with `submitted=already`; a real error still
+  propagates.
+- Observation: `ZONE_ABSENT` now maps to `invalid_input`.
+- Observation: `install` no longer rewrites `knot.conf`'s mtime on a no-op run
+  (`[ -e ] || : >` replaces `touch`).
+- Left as noted: `render_resolver` persists no render (two inconclusive rows,
+  LOW in `receipts-exist`; the bad-input pass covers the method);
+  `remove_resolver`'s second call stays a refusal; knot-resolver6's
+  `supervisor.service` is an install artifact; `sync` lists a served-but-
+  undeclared record under `removed`.

@@ -108,6 +108,12 @@ changes on reload) and the apply then queries every listen address with `kdig`
 (`install` adds `knot-dnsutils`). Forwards always render an explicit `dnssec`
 setting, because Knot Resolver 6 validates by default.
 
+Like `apply_zone`, `apply_resolver` refuses before any host work a wildcard
+listen without `listen_any_ack`, a listen an applied zone already holds, and a
+port held by a process other than the resolver — the `PORT_BUSY` error names the
+holder. `ksk_submitted` is a no-op when Knot has no key waiting for submission,
+so it can be called again after the DS is at the parent.
+
 `apply_resolver` proves the new configuration with an SOA query on a listen
 address `allow_query_from` permits (the default access list is loopback plus the
 listen addresses, so a resolver always answers its own self-test; an explicit

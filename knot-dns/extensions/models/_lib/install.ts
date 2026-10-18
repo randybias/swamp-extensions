@@ -119,7 +119,9 @@ export function installScript(opts: { resolver: boolean }): string {
     ...(opts.resolver ? RESOLVER_INSTALL : []),
     `mkdir -p ${shq(KNOT_CONF_DIR)} ${shq(ZONE_DIR)}`,
     "command -v chown >/dev/null 2>&1 && chown knot:knot /var/lib/knot/zones 2>/dev/null || true",
-    `touch ${shq(KNOT_CONF)}`,
+    // Create the file only when absent: a no-op install must not rewrite the
+    // config's mtime.
+    `[ -e ${shq(KNOT_CONF)} ] || : > ${shq(KNOT_CONF)}`,
     `if ! grep -qF ${shq(INCLUDE_LINE)} ${
       shq(KNOT_CONF)
     }; then printf '%s\\n' ${shq(INCLUDE_LINE)} >> ${shq(KNOT_CONF)}; fi`,

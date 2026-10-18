@@ -228,6 +228,34 @@ Deno.test({
 });
 
 Deno.test({
+  name: "portCheck: an ss scope is stripped and the owner is named",
+  ignore: !available,
+  fn: async () => {
+    // The live host printed the resolved stub as `127.0.0.53%lo:53`, which the
+    // old comparison missed; the resolver precheck must also allow kresd.
+    const fakeSs = "#!/bin/sh\n" +
+      "printf '%s\\n' 'tcp LISTEN 0 4096 127.0.0.53%lo:53 0.0.0.0:* users:((\"systemd-resolve\",pid=1,fd=1))'\n" +
+      "printf '%s\\n' 'tcp LISTEN 0 4096 127.0.0.3:53 0.0.0.0:* users:((\"kresd\",pid=2,fd=1))'\n";
+    const r = await box(
+      [
+        put("/usr/local/bin/ss", fakeSs),
+        "chmod +x /usr/local/bin/ss",
+      ].join("\n"),
+      [
+        ["busy", portCheckScript(["127.0.0.53"])],
+        ["own", portCheckScript(["127.0.0.3"], ["kresd", "knot-resolver"])],
+        ["foreign", portCheckScript(["127.0.0.3"])],
+      ],
+    );
+    assertEquals(r.busy.rc, 9);
+    assertStringIncludes(r.busy.err, "PORT_BUSY 127.0.0.53:53");
+    assertStringIncludes(r.busy.err, "owner=systemd-resolve");
+    assertEquals(r.own.rc, 0, r.own.err);
+    assertEquals(r.foreign.rc, 9);
+  },
+});
+
+Deno.test({
   name:
     "apply: a listen change restarts knotd and is answered; no-op and shrink",
   ignore: !available,

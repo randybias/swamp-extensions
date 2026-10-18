@@ -467,6 +467,86 @@ Deno.test("allow_transfer and notify_secondaries take addresses, never free text
   }
 });
 
+Deno.test("apply_resolver refuses a wildcard listen without an ack", async () => {
+  const host = fakeHost(() => ({}));
+  try {
+    const c = vaultContext();
+    const e = await assertRejects(() =>
+      model.methods.apply_resolver.execute(
+        {
+          ssh: ZONE_ARGS.ssh,
+          resolver: { listen: ["0.0.0.0@53"] },
+        } as never,
+        c.context,
+      )
+    ) as { code?: string; message: string };
+    assertEquals(e.code, "invalid_input");
+    assert(e.message.includes("listen_any_ack"));
+    assertEquals(host.commands.length, 0);
+  } finally {
+    host.restore();
+  }
+});
+
+Deno.test("apply_resolver refuses a listen an applied zone holds", async () => {
+  const host = fakeHost(() => ({}));
+  try {
+    const c = vaultContext();
+    (c.context as { readModelData?: unknown }).readModelData = () =>
+      Promise.resolve([
+        {
+          attributes: {
+            host: ZONE_ARGS.ssh.host,
+            apex: "a.example.test.",
+            status: "applied",
+            requested_listen: ["127.0.0.1"],
+          },
+        },
+      ]);
+    const e = await assertRejects(() =>
+      model.methods.apply_resolver.execute(
+        {
+          ssh: ZONE_ARGS.ssh,
+          resolver: { listen: ["127.0.0.1@53"] },
+        } as never,
+        c.context,
+      )
+    ) as { code?: string; message: string };
+    assertEquals(e.code, "invalid_input");
+    assert(e.message.includes("overlap"));
+    assertEquals(host.commands.length, 0);
+  } finally {
+    host.restore();
+  }
+});
+
+Deno.test("apply_resolver refuses a port a foreign process holds", async () => {
+  const host = fakeHost((command) =>
+    command.includes("ss -lntupH")
+      ? {
+        code: 9,
+        stderr: "PORT_BUSY 127.0.0.3:53 127.0.0.3:53 owner=systemd-resolve\n",
+      }
+      : {}
+  );
+  try {
+    const c = vaultContext();
+    const e = await assertRejects(() =>
+      model.methods.apply_resolver.execute(
+        {
+          ssh: ZONE_ARGS.ssh,
+          resolver: { listen: ["127.0.0.3@53"] },
+        } as never,
+        c.context,
+      )
+    ) as { code?: string; message: string };
+    assertEquals(e.code, "port_busy");
+    assert(e.message.includes("systemd-resolve"));
+  } finally {
+    host.restore();
+  }
+});
+
 Deno.test("install records its versions as an outcome", async () => {
   const host = fakeHost(() => ({
     stdout:

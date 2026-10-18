@@ -5,8 +5,10 @@ import {
   applyZoneScript,
   discoverZonesScript,
   getDsScript,
+  kskSubmittedScript,
   observeScript,
   parseKeyValues,
+  portCheckScript,
   removeResolverScript,
   removeZoneScript,
   resolverObserveScript,
@@ -79,6 +81,31 @@ Deno.test("every host script is valid sh syntax", async () => {
   for (const [name, script] of SCRIPTS) {
     assertEquals(await shSyntax(script), 0, name);
   }
+});
+
+Deno.test("port check strips an ss scope and reports the owner", () => {
+  const s = portCheckScript(["127.0.0.53:53"]);
+  // `ss` prints `127.0.0.53%lo:53`; the scope must not defeat the comparison.
+  assert(s.includes('sub(/%.*$/, "", addr)'));
+  assert(s.includes('owner="?"'));
+  assert(s.includes("PORT_BUSY ${waddr}:${wport} ${foreign}"));
+  // The authoritative precheck allows knotd; the resolver precheck allows the
+  // resolver's own process and never knotd.
+  assert(s.includes("own_list='knotd'"));
+  assert(s.includes("owner==O[i]"));
+  const resolver = portCheckScript(["127.0.0.3:53"], [
+    "kresd",
+    "knot-resolver",
+  ]);
+  assert(resolver.includes("own_list='kresd,knot-resolver'"));
+  assert(!resolver.includes("own_list='knotd'"));
+});
+
+Deno.test("ksk_submitted treats a missing ready key as already done", () => {
+  const s = kskSubmittedScript("example.com.");
+  assert(s.includes("no key ready for submission"));
+  assert(s.includes("submitted=already"));
+  assert(s.includes("ZONE_ABSENT"));
 });
 
 Deno.test("zone paths and quoting are stable", () => {

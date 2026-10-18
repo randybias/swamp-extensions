@@ -81,14 +81,28 @@ function restoreLine(backupVar: string, path: string): string {
 }
 
 /**
- * Precheck that each requested listen address/port is free or held by Knot.
- * `ss -H` drops the header; `-p` adds the owning process, which is how a
- * socket already held by knotd is told apart from a foreign one. A socket
- * whose owner cannot be seen counts as foreign, so an unprivileged probe
- * fails closed.
+ * Precheck that each requested listen address/port is free or held by the
+ * named process. `ss -H` drops the header; `-p` adds the owning process, which
+ * is how the server's own socket is told apart from a foreign one, and the
+ * owner is reported in `PORT_BUSY` so the operator sees who holds it. `ss`
+ * prints an interface scope on some addresses (`127.0.0.53%lo:53`), which is
+ * stripped before the comparison. A socket whose owner cannot be seen counts
+ * as foreign, so an unprivileged probe fails closed.
  */
-export function portCheckScript(listens: string[]): string {
+export function portCheckScript(
+  listens: string[],
+  allow: string[] = ["knotd"],
+): string {
   const wants = listens.map(shq).join(" ");
+  const own = allow.map((p) => p.replace(/[^A-Za-z0-9_-]/g, "")).join(",");
+  const awk = [
+    '{ loc=$5; n=split(loc, x, ":"); port=x[n]; addr=loc; sub(":" port "$", "", addr);',
+    '  sub(/%.*$/, "", addr); gsub(/[][]/, "", addr);',
+    '  owner="?"; o=index($0, "users:((");',
+    '  if (o>0) { r=substr($0, o+9); q=index(r, "\\""); if (q>1) owner=substr(r, 1, q-1) }',
+    '  isown=0; no=split(own_list, O, ","); for (i=1;i<=no;i++) if (owner==O[i]) isown=1;',
+    `  if (port==p && (addr==a || addr=="0.0.0.0" || addr=="*" || addr=="::" || a=="0.0.0.0" || a=="::") && !isown) print addr ":" port " owner=" owner }`,
+  ].join("\n");
   return [
     "set -eu",
     "rc=0",
@@ -96,11 +110,8 @@ export function portCheckScript(listens: string[]): string {
     "  waddr=${want%@*}; wport=${want#*@}",
     '  [ "$want" = "$waddr" ] && wport=53',
     "  ss=$(ss -lntupH) || { echo PROBE_FAILED >&2; exit 11; }",
-    '  foreign=$(printf \'%s\\n\' "$ss" | awk -v a="$waddr" -v p="$wport" \'',
-    '    { loc=$5; n=split(loc, x, ":"); port=x[n]; addr=loc; sub(":" port "$", "", addr);',
-    '      gsub(/[][]/, "", addr)',
-    '      if (port==p && (addr==a || addr=="0.0.0.0" || addr=="*" || addr=="::" || a=="0.0.0.0" || a=="::") && $0 !~ /users:\\(\\("knotd"/) print addr ":" port }\')',
-    '  if [ -n "$foreign" ]; then echo "PORT_BUSY ${waddr}:${wport}" >&2; rc=1; fi',
+    `  foreign=$(printf '%s\\n' "$ss" | awk -v a="$waddr" -v p="$wport" -v own_list='${own}' '${awk}')`,
+    '  if [ -n "$foreign" ]; then echo "PORT_BUSY ${waddr}:${wport} ${foreign}" >&2; rc=1; fi',
     "done",
     '[ "$rc" = 0 ] || exit 9',
   ].join("\n");
@@ -346,14 +357,21 @@ export function getDsScript(apex: string): string {
   ].join("\n");
 }
 
-/** Script that tells Knot the KSK's DS is at the parent. */
+/**
+ * Script that tells Knot the KSK's DS is at the parent. Knot refuses a second
+ * confirmation with `(no key ready for submission)`; that is the already-done
+ * state, so it is a no-op and not an error.
+ */
 export function kskSubmittedScript(apex: string): string {
   return [
     "set -eu",
     `[ -f ${
       shq(zonePaths(apex).fragment)
     } ] || { echo ZONE_ABSENT >&2; exit 3; }`,
-    `knotc -b zone-ksk-submitted ${shq(apex)} >/dev/null`,
+    `if ! out=$(knotc -b zone-ksk-submitted ${shq(apex)} 2>&1); then`,
+    '  case "$out" in *"no key ready for submission"*) echo "submitted=already"; exit 0 ;; esac',
+    '  echo "$out" >&2; exit 1',
+    "fi",
     "echo submitted=yes",
   ].join("\n");
 }

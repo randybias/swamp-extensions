@@ -26,6 +26,7 @@ import {
   renderResolverYaml,
 } from "./resolver.ts";
 import {
+  assertPortsFree,
   type Ctx,
   deps,
   instanceName,
@@ -33,6 +34,7 @@ import {
   servedApexes,
   sshTarget,
 } from "./runtime.ts";
+import { assertListenAcceptable, otherZoneListens } from "./listen.ts";
 
 /** Live resolver configuration path. */
 const RESOLVER_YAML = "/etc/knot-resolver/config.yaml";
@@ -57,9 +59,21 @@ async function applyResolver(
   context: Ctx,
 ) {
   const a = ApplyResolverArgs.parse(args);
+  // A wildcard without an ack, or a listen the applied authoritative zones
+  // already hold, is refused before any host work.
+  assertListenAcceptable(
+    { listen: a.resolver.listen, listen_any_ack: a.resolver.listen_any_ack },
+    await otherZoneListens(context, a.ssh.host, ""),
+  );
   const yaml = renderResolverYaml(a.resolver);
   const sha = await sha256Hex(yaml);
   const target = await sshTarget(context, a.ssh);
+  // The resolver's own socket is allowed (a re-apply); a foreign holder, e.g.
+  // the systemd-resolved stub, is a port_busy error instead of a failed bind.
+  await assertPortsFree(target, a.resolver.listen, [
+    "kresd",
+    "knot-resolver",
+  ]);
   const testListen = pickTestListen(a.resolver);
   if (testListen === null) {
     throw new KnotError(

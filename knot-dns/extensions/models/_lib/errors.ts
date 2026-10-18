@@ -114,6 +114,12 @@ export function mapScriptError(stderr: string, exit: number): KnotError {
   if (stderr.includes("TEST_QUERY_FAILED")) {
     return new KnotError("verify_failed", "the resolver test query failed");
   }
+  if (stderr.includes("ZONE_ABSENT")) {
+    return new KnotError(
+      "invalid_input",
+      "the zone is not present on the host",
+    );
+  }
   if (stderr.includes("DNSSEC_UNSIGN_ACK_REQUIRED")) {
     return new KnotError(
       "invalid_input",

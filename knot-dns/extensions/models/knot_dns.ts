@@ -20,6 +20,7 @@ import {
 } from "./_lib/ssh.ts";
 import { KnotError, resolveSecret } from "./_lib/vault.ts";
 import {
+  assertPortsFree,
   type Ctx,
   deps,
   instanceName,
@@ -38,7 +39,6 @@ import {
   observeScript,
   parseKeyValues,
   parseServed,
-  portCheckScript,
   removeZoneScript,
   resolverObserveScript,
   restoreZoneScript,
@@ -143,25 +143,6 @@ async function persistZone(
 ) {
   const name = await instanceName(["zone", host, zone]);
   return await context.writeResource("zone", name, data);
-}
-
-/** Precheck that each requested listen address/port is free or held by Knot. */
-async function assertPortsFree(
-  target: SshTarget,
-  listens: string[],
-): Promise<void> {
-  const res = await sshExec(deps, target, [
-    "sh",
-    "-c",
-    portCheckScript(listens),
-  ]);
-  if (res.exit_code !== 0) {
-    const detail = res.stderr.split("\n").find((l) => l.includes("PORT_BUSY"));
-    throw new KnotError(
-      "port_busy",
-      detail ?? "a requested listen port is busy",
-    );
-  }
 }
 
 /** A fresh id that keeps one run's staged files apart from any other's. */

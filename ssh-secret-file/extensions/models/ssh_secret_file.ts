@@ -156,6 +156,9 @@ export const MAX_CONTENT_BYTES = 1_048_576;
 /** Maximum number of dotenv entries. */
 export const MAX_ENTRIES = 256;
 
+/** Owner/group grammar: a POSIX name or a numeric id. */
+const IDENTITY_RE = /^(?:[A-Za-z_][A-Za-z0-9_-]{0,31}|\d{1,10})$/;
+
 const CONTENT_FIELDS = {
   path: z.string().regex(
     /^\/[A-Za-z0-9._\/-]{1,4095}$/,
@@ -185,10 +188,12 @@ const CONTENT_FIELDS = {
   mode: z.string().regex(MODE_RE).default("0600").describe(
     "Octal file mode applied before the atomic rename.",
   ),
-  owner: z.string().regex(/^(?:[A-Za-z_][A-Za-z0-9_-]{0,31}|\d{1,10})$/)
-    .nullish().describe("Owner user name or numeric uid."),
-  group: z.string().regex(/^(?:[A-Za-z_][A-Za-z0-9_-]{0,31}|\d{1,10})$/)
-    .nullish().describe("Owner group name or numeric gid."),
+  owner: z.string().regex(IDENTITY_RE).nullish().describe(
+    "Owner user name or numeric uid.",
+  ),
+  group: z.string().regex(IDENTITY_RE).nullish().describe(
+    "Owner group name or numeric gid.",
+  ),
   hmac_key: z.string().min(1).max(4096).meta({ sensitive: true }).nullish()
     .describe(
       "Optional key for a keyed HMAC of the content, stored instead of any plain hash.",
@@ -228,8 +233,8 @@ const FileStateSchema = z.strictObject({
   user: z.string(),
   path: z.string(),
   mode: z.string(),
-  owner: z.string().optional(),
-  group: z.string().optional(),
+  owner: z.string().regex(IDENTITY_RE).optional(),
+  group: z.string().regex(IDENTITY_RE).optional(),
   bytes: z.number().int().optional(),
   changed: z.boolean(),
   content_hmac: z.string().optional(),
@@ -299,7 +304,8 @@ export const PROBE_TIMEOUT_MS = 30_000;
  * targets `./<basename>`. A user who can write an ancestor cannot swap a path
  * component for a symlink after the check and redirect the write. A directory
  * that is group- or world-writable, or not owned by the running user or root,
- * is refused.
+ * is refused. Owner and group are applied before the mode (a chown clears
+ * set-ID bits), and the staged file stays 0600 until the rename.
  */
 /** The `cd` + canonical-path refusal shared by the anchored remote scripts. */
 function anchorLines(dir: string): string[] {
@@ -332,10 +338,14 @@ export function stageWriteScript(
     "trap 'exit 1' HUP INT TERM",
     'cat > "$t"',
     `[ "$(wc -c < "$t" | tr -d '[:space:]')" -eq ${expectedBytes} ] || { echo 'short read; refusing' >&2; exit 5; }`,
-    `chmod ${posixQuote(mode)} "$t"`,
   ];
+  // chown first, then chmod: Linux clears the set-ID bits on any chown, even
+  // one that sets the same owner and group, so chmod last publishes the
+  // requested mode exactly. mktemp's 0600 keeps the bytes unreadable until the
+  // rename.
   if (spec !== undefined) lines.push(`chown -h ${posixQuote(spec)} "$t"`);
   lines.push(
+    `chmod ${posixQuote(mode)} "$t"`,
     // Re-check the destination with no-follow immediately before the rename.
     `[ ! -L ${target} ] || { echo 'destination changed; refusing' >&2; exit 6; }`,
     `[ ! -d ${target} ] || { echo 'destination changed; refusing' >&2; exit 6; }`,
@@ -531,6 +541,9 @@ export function readFileScript(path: string): string {
   return [
     "set -eu",
     ...anchorLines(dir),
+    // stat is no-follow but sha256sum follows, so refuse a link before either
+    // runs: a symlink would pair the link's metadata with the target's bytes.
+    `[ ! -L ${target} ] || { echo 'destination is a symlink; refusing' >&2; exit 7; }`,
     `stat -c '%a %U %G %u %g %s' ${target}`,
     `sha256sum ${target}`,
   ].join("\n");
@@ -558,7 +571,12 @@ async function readFile(
   const [mode, owner, group, ownerId, groupId, bytes] = (lines[0] ?? "")
     .trim().split(/\s+/);
   if (
-    !mode || !owner || !ownerId || !group || !groupId || bytes === undefined
+    mode === undefined || !/^[0-7]{3,4}$/.test(mode) ||
+    owner === undefined || !IDENTITY_RE.test(owner) ||
+    ownerId === undefined || !/^\d{1,10}$/.test(ownerId) ||
+    group === undefined || !IDENTITY_RE.test(group) ||
+    groupId === undefined || !/^\d{1,10}$/.test(groupId) ||
+    bytes === undefined || !/^\d{1,10}$/.test(bytes)
   ) {
     throw new SshError(`could not parse stat output for ${path}`);
   }
@@ -778,10 +796,15 @@ function methodsFor(deps: SshDeps): Record<string, SecretFileMethod> {
         }
         const target = toTarget(args);
         const observedAt = new Date(deps.now()).toISOString();
+        // Resolve the content form first: an invalid value must not touch the
+        // host, and the not_found record must not reflect a requested mode.
+        const expected = contentCount(args) === 1
+          ? await sha256Hex(resolveContent(args))
+          : undefined;
         if (!await exists(deps, target, args.path)) {
           const handle = await writeState(context, args, {
             path: args.path,
-            mode: args.mode ?? "",
+            mode: "",
             bytes: undefined,
             changed: false,
             matches: false,
@@ -796,9 +819,6 @@ function methodsFor(deps: SshDeps): Record<string, SecretFileMethod> {
           };
         }
         const { stat, sha } = await readFile(deps, target, args.path);
-        const expected = contentCount(args) === 1
-          ? await sha256Hex(resolveContent(args))
-          : undefined;
         const matches = (expected === undefined || expected === sha) &&
           (args.mode == null ||
             normalizeMode(stat.mode) === normalizeMode(args.mode)) &&

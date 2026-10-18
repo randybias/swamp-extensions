@@ -389,6 +389,17 @@ mode for `@swamp/ssh`.
   and drops the unused `shasum` alternative.
 - 2026-10-18: the `entries` key cap is enforced in the schema and
   `resolveContent` runs before the first remote probe.
+- 2026-10-18: `stageWriteScript` applies owner and group before the mode. A
+  chown clears the set-ID bits, so chmod last publishes the requested mode
+  exactly; the staged file stays mktemp's 0600 until the rename, so a mode with
+  a group or other read bit is never briefly readable under the wrong group.
+- 2026-10-18: `readFileScript` refuses a symlink before stat and sha256sum, so
+  the metadata and the content hash always describe the same regular file.
+- 2026-10-18: `readFile` validates every stat token (mode, owner, group, ids,
+  bytes) and `FileStateSchema` bounds owner and group, so a hostile target
+  cannot land an arbitrary token in state or `--json`.
+- 2026-10-18: `verify` resolves the supplied content form before it probes the
+  host and stores `""` (not the requested mode) in a not_found record.
 - residual low: the spec file and LOGBOOK lineage still say `secret-file`; a
   `docs/specs/ssh-secret-file.md` rename is a separate docs change and would
   widen this branch's diff scope.

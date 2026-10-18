@@ -310,6 +310,10 @@ Deno.test("stageWriteScript writes, chmods, chowns and renames atomically", () =
   assert(script.includes("-eq 18"));
   assert(script.includes(`chmod '0600' "$t"`));
   assert(script.includes(`chown -h '1000:svc' "$t"`));
+  assert(
+    script.indexOf(`chown -h '1000:svc'`) < script.indexOf(`chmod '0600'`),
+    "chown must precede chmod so a chown cannot clear the set-ID bits",
+  );
   assert(script.includes('mv -T "$t"'));
   assert(script.includes("trap - EXIT"));
   assert(script.includes("stat -c '%a'"));
@@ -332,6 +336,7 @@ Deno.test("stageWriteScript writes, chmods, chowns and renames atomically", () =
   assert(read.includes("stat -c"));
   assert(read.includes("sha256sum './secret.env'"));
   assert(read.includes("pwd -P"));
+  assert(read.includes("destination is a symlink"));
 });
 
 /** The first POSIX shell available, preferring dash. */
@@ -469,6 +474,28 @@ Deno.test("stageWriteScript runs under a real POSIX sh", async () => {
     );
     assertEquals(remOk.code, 0, remOk.stderr);
     assertEquals(await localExists(victim), false);
+
+    // readFileScript refuses a symlink so stat and sha256sum describe one file.
+    const readTarget = `${dir}/read-target.env`;
+    await Deno.writeTextFile(readTarget, "DATA\n");
+    const readLink = `${dir}/read-link.env`;
+    await Deno.symlink(readTarget, readLink);
+    const readRes = await runScript(
+      shell,
+      readFileScript(readLink),
+      new Uint8Array(),
+    );
+    assert(readRes.code !== 0, "read must refuse a symlink");
+
+    // A set-ID mode survives because chown runs before chmod.
+    const setgid = `${dir}/setgid.env`;
+    const sgRes = await runScript(
+      shell,
+      stageWriteScript(setgid, "2750", bytes.length),
+      bytes,
+    );
+    assertEquals(sgRes.code, 0, sgRes.stderr);
+    assertEquals((await Deno.stat(setgid)).mode! & 0o7777, 0o2750);
   } finally {
     await Deno.remove(dir, { recursive: true });
   }
@@ -745,9 +772,6 @@ Deno.test("write refuses a directory destination", async () => {
     if (command.includes("'test'") && command.includes("'-L'")) {
       return { code: 1, stdout: "", stderr: "" };
     }
-    if (command.includes("'test'") && command.includes("'-d'")) {
-      return { code: 0, stdout: "", stderr: "" };
-    }
     return { code: 0, stdout: "", stderr: "" };
   });
   const m = createModel(deps(run));
@@ -835,6 +859,70 @@ Deno.test("one method run writes distinct state names", async () => {
   await m.methods.write.execute(WRITE, context);
   const names = written.map((w) => w.name);
   assertEquals(new Set(names).size, names.length, "names must be unique");
+  assert(/^secret-[0-9a-f]{32}$/.test(names[0]), names[0]);
+  assertEquals(names[0], await secretInstanceName(HOST, 22, "root", PATH));
+});
+
+Deno.test("verify refuses a symlink destination", async () => {
+  const { run, calls } = fakeRun((command) => {
+    if (command.includes("'test'")) {
+      return { code: 0, stdout: "", stderr: "" };
+    }
+    if (command.includes("stat -c") && command.includes("sha256sum")) {
+      return {
+        code: 7,
+        stdout: "",
+        stderr: "destination is a symlink; refusing",
+      };
+    }
+    return { code: 0, stdout: "", stderr: "" };
+  });
+  const m = createModel(deps(run));
+  const { context, written } = testContext();
+  await assertRejects(
+    () =>
+      m.methods.verify.execute(
+        { ...BASE, path: PATH, content: SECRET },
+        context,
+      ),
+    SshError,
+    "read",
+  );
+  assertEquals(
+    calls.some((c) => c.command.includes("stat -c")),
+    true,
+    "the anchored read ran",
+  );
+  assertEquals(written.length, 0);
+});
+
+Deno.test("verify rejects a malformed stat line", async () => {
+  const { run } = fakeRun((command) => {
+    if (command.includes("'test'")) {
+      return { code: 0, stdout: "", stderr: "" };
+    }
+    if (command.includes("stat -c") && command.includes("sha256sum")) {
+      return {
+        code: 0,
+        stdout:
+          "notamode root root 0 0 18\n0000000000000000000000000000000000000000000000000000000000000000  x\n",
+        stderr: "",
+      };
+    }
+    return { code: 0, stdout: "", stderr: "" };
+  });
+  const m = createModel(deps(run));
+  const { context, written } = testContext();
+  await assertRejects(
+    () =>
+      m.methods.verify.execute(
+        { ...BASE, path: PATH, content: SECRET },
+        context,
+      ),
+    SshError,
+    "could not parse stat output",
+  );
+  assertEquals(written.length, 0);
 });
 
 /** Captures the anchored remove script for the dash-runner and bashisms gates. */

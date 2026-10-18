@@ -4,9 +4,18 @@ Not packaged. Notes for whoever maintains this extension.
 
 - 2026-10-17 (lane/d2-knot-dns, base origin/main): built `@randybias/knot-dns`
   from the approved clean-room spec only. Transport `_lib/ssh.ts` and its
-  `_lib/ssh_test.ts` are vendored byte-identical from `@randybias/ssh-host`
-  (blob `fe0139f08c42e3fdae0061b9688fb5c534174957`); implementers never read the
-  old source.
+  `_lib/ssh_test.ts` are vendored byte-identical from `@randybias/ssh-host`;
+  re-vendored for 2026.10.17.2 to blob
+  `8f132c4329c9e64bed686731cd5a0e02980194ea` (ssh-host 2026.10.17.3);
+  implementers never read the old source.
+
+## Vendored
+
+| File                                 | Blob (git hash-object)                     | Source                             |
+| ------------------------------------ | ------------------------------------------ | ---------------------------------- |
+| `extensions/models/_lib/ssh.ts`      | `8f132c4329c9e64bed686731cd5a0e02980194ea` | `@randybias/ssh-host` 2026.10.17.3 |
+| `extensions/models/_lib/ssh_test.ts` | `4e8ac15fcd6bce797c523a221fe58fe9a8d9b386` | `@randybias/ssh-host` 2026.10.17.3 |
+
 - Design: managed zones are whole-file declarations rendered deterministically
   and loaded with Knot's `zonefile-sync: -1`,
   `zonefile-load:
@@ -344,18 +353,54 @@ Result: 13/13. Cell 8 confirmed the pinned key fingerprint on the host, knot
 held at 3.3.4 with knot-resolver6 6.5.0 from CZ.NIC, and a self-test name of
 `a.example.test.` chosen from the served zones.
 
+## 2026.10.17.2 (lane/d2-knot-dns): next build
+
+Re-vendored the canonical transport and closed the three Lows the backlog named.
+Live testing is for the reset-failed fix and the strict schemas merged in
+2026.10.17.1, plus these changes.
+
+- **Transport.** `_lib/ssh.ts` and `_lib/ssh_test.ts` are byte-identical to
+  `@randybias/ssh-host` 2026.10.17.3 (blob `8f132c43...`); the SSH key reaches
+  `ssh-agent` over stdin and uploads stream over stdin, so no secret byte
+  touches an argv or a remote temp file. No knot code needed a change: the
+  transport's public shape is unchanged.
+- **`remove_zone` KASP purge.** The old `purge_keys_ack` ran `knotc zone-purge`
+  without `-f` _after_ the zone had been removed, so Knot answered "force option
+  required" and "no such zone found" and the `|| true` swallowed both. With the
+  ack the script now runs `knotc -f zone-purge` while the zone is still
+  configured (data, journal, timers, KASP), then removes the zone, then runs
+  `keymgr <zone> delete` for every key the signer regenerated, and retries the
+  key purge on a `present=no` re-run. Without the ack neither runs, so the
+  journal and keys survive a remove. Covered by a new real-container
+  `host_test.ts` cell (`remove: purge_keys_ack removes the zone's KASP keys`)
+  that signs a zone, removes it, and asserts `keymgr -l` no longer lists it.
+- **`parent_ds_check` dropped.** It had no Knot policy key (review round 1), so
+  the schema dropped it; a caller that still passes it is refused rather than
+  silently ignored.
+- **Resolver self-test.** `apply_resolver` now tests the first listen address
+  `allow_query_from` permits (`pickTestListen`); the default access list is
+  loopback plus each listen address as a host route, matching the spec's
+  "loopback + the listen subnets" without opening a wider network. An explicit
+  list that excludes every listen address is refused before any host work with
+  `invalid_input`, instead of swapping a config that fails its own test and
+  rolls back.
+- **README.** Secondaries are documented as configuration only.
+- **Harness capture (deliberate).** The tests exercise the rendered host scripts
+  against real `knotd`/`kzonecheck`/`kresctl`/`kdig` in a container and validate
+  every script with `sh -n`; they do not vendor `_lib/bogworks/` and so write no
+  `BOGWORKS_CAPTURE_SCRIPTS`. The `dash-runner` and `bashisms` gates report that
+  as a MEDIUM (they pass). The capture harness is a larger refactor than this
+  item's transport re-vendor, so it is left for a follow-up.
+
 ## Residuals (beta)
 
-- `remove_zone` does not purge the zone's KASP keys; use `keymgr` if they must
-  go.
-- `parent_ds_check` is accepted but not rendered into the Knot config.
 - `install resolver: true` installs `ca-certificates curl gnupg`, which upgraded
   curl and libcurl as a dependency side effect live (`--no-upgrade` would avoid
   it).
 - The resolver unit read `failed` after install live (the package's start could
   not bind 127.0.0.1:53 held by knotd). The quality pass adds
-  `systemctl reset-failed`; not re-run live.
-- The resolver self-test queries the first listen address; when
-  `allow_query_from` excludes that address the query is refused and the apply
-  rolls back (documented in the README: add the address to `allow_query_from`).
+  `systemctl reset-failed`; this version's live run covers that path.
 - Unsigning drops DNSKEY and RRSIG immediately (no delete-algorithm path).
+- `purge_keys_ack` removes the active KASP keys with `keymgr`; deleted keys can
+  remain in keymgr's "trash bin" until `keymgr <zone> trash-discard` (kept as a
+  rollover safety net, not a live secret).

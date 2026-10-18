@@ -392,7 +392,7 @@ Deno.test({
       ["apply", applyZoneScript({ apex: APEX, run, listens: l })],
       [
         "keys_before",
-        'for i in 1 2 3 4 5 6 7 8 9 10; do n=$(keymgr example.com. list 2>/dev/null | wc -l); [ "$n" -ge 2 ] && break; sleep 1; done; echo "$n"',
+        `for i in 1 2 3 4 5 6 7 8 9 10; do n=$(keymgr ${APEX} list 2>/dev/null | wc -l); [ "$n" -ge 2 ] && break; sleep 1; done; echo "$n"`,
       ],
       ["stage_remove", put(stagedListen("p2"), "")],
       [
@@ -404,7 +404,7 @@ Deno.test({
           unsigned: true,
         }),
       ],
-      ["keys_after", "keymgr example.com. list 2>/dev/null | wc -l"],
+      ["keys_after", `keymgr ${APEX} list 2>/dev/null | wc -l`],
       ["zones_left", "keymgr -l 2>/dev/null | grep -c '^example.com' || true"],
     ]);
     assertEquals(r.apply.rc, 0, r.apply.err);
@@ -413,6 +413,34 @@ Deno.test({
     assertStringIncludes(r.remove.out, "removed=yes");
     assertEquals(r.keys_after.out.trim(), "0");
     assertEquals(r.zones_left.out.trim(), "0");
+  },
+});
+
+Deno.test({
+  name:
+    "remove: a failed keymgr list fails the purge instead of reporting success",
+  ignore: !available,
+  fn: async () => {
+    const r = await box(
+      [
+        put("/usr/local/bin/keymgr", "#!/bin/sh\nexit 1\n"),
+        "chmod +x /usr/local/bin/keymgr",
+      ].join("\n"),
+      [
+        [
+          "rm",
+          removeZoneScript({
+            apex: APEX,
+            run: "k1",
+            purgeKeysAck: true,
+            unsigned: true,
+          }),
+        ],
+      ],
+    );
+    // The list failure must not read as "no keys": the action fails.
+    assertEquals(r.rm.rc, 16);
+    assertStringIncludes(r.rm.err, "PURGE_KEYS_FAILED");
   },
 });
 

@@ -518,22 +518,32 @@ export const model = {
     remove_zone: {
       kind: "action" as const,
       description:
-        "DESTRUCTIVE. Stop serving one managed zone and remove its zone file, config fragment and TSIG fragment. A signed zone is refused unless dnssec_unsign_ack is set; with purge_keys_ack the journal, timers and KASP keys are purged. A second call is a no-op.",
+        "DESTRUCTIVE. Stop serving one managed zone, remove its zone file, config fragment and TSIG fragment, and no-op a second call. A signed zone is refused unless dnssec_unsign_ack is set; purge_keys_ack, only for a zone this model applied, purges the journal, timers and KASP keys irreversibly.",
       arguments: RemoveZoneArgs,
       execute: async (args: z.input<typeof RemoveZoneArgs>, context: Ctx) => {
         const a = RemoveZoneArgs.parse(args);
         const zone = normalizeApex(a.zone);
-        const target = await sshTarget(context, a.ssh);
         const name = await instanceName(["zone", a.ssh.host, zone]);
         const stored = await context.readResource(name) as
           | z.infer<typeof StateZoneSchema>
           | null;
+        // purge_keys_ack authorises destroying a zone's KASP keys, so it may
+        // only be used on a zone this model applied; a rendered-but-never-
+        // applied, or unknown, apex must not have its keys touched here.
+        const managed = stored !== null && stored.status !== "rendered";
+        if (a.purge_keys_ack && !managed) {
+          throw new KnotError(
+            "invalid_input",
+            "purge_keys_ack only applies to a zone this model applied on this host; use keymgr for a zone it does not manage",
+          );
+        }
         if (stored?.dnssec && !a.dnssec_unsign_ack) {
           throw new KnotError(
             "invalid_input",
             "the zone is recorded as signed; pass dnssec_unsign_ack to remove it",
           );
         }
+        const target = await sshTarget(context, a.ssh);
         // The shared listen fragment shrinks to what the other zones need.
         const listens = hostListens(
           [],

@@ -37,7 +37,10 @@ destructive. Secondaries are configuration only: `notify_secondaries`,
 `allow_transfer` and `tsig_keys` render into the zone fragment, but the model is
 primary-focused and never verifies or manages a secondary. `remove_zone` keeps
 the zone's journal and KASP keys by default; `purge_keys_ack: true` purges both
-(timers and data come from `knotc -f zone-purge`, keys from `keymgr`).
+(timers and data come from `knotc -f zone-purge`, keys from `keymgr`). The ack
+applies only to a zone this model applied on this host; the key purge is
+irreversible, so if the remove then fails and rolls the files back the keys are
+still gone — re-run `remove_zone` with the ack to finish the removal.
 
 ## Dependencies
 

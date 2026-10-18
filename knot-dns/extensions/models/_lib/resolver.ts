@@ -127,8 +127,7 @@ export function cidrContains(cidr: string, addr: string): boolean {
   const bits = slash === -1 ? width : Number(cidr.slice(slash + 1));
   if (!Number.isInteger(bits) || bits < 0 || bits > width) return false;
   const shift = BigInt(width - bits);
-  const mask = bits === 0 ? 0n : ((1n << BigInt(bits)) - 1n) << shift;
-  return (ipToNumber(base) & mask) === (ipToNumber(addr) & mask);
+  return (ipToNumber(base) >> shift) === (ipToNumber(addr) >> shift);
 }
 
 /**

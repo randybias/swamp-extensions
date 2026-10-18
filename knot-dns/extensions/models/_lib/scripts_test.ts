@@ -124,12 +124,23 @@ Deno.test("remove with purge_keys_ack purges zone data and KASP keys", async () 
   // -f is required: without it `knotc zone-purge` refuses and does nothing.
   assert(acked.includes('knotc -f zone-purge "$apex"'));
   assert(acked.includes('keymgr "$apex" delete "$id"'));
+  // A failed list must fail the purge, not read as "no keys".
+  assert(acked.includes('ids=$(keymgr "$apex" list 2>/dev/null) || return 1'));
+  // Key ids are hex; a remote-derived token is grammar-checked before a tool.
+  assert(acked.includes('case "$id" in *[!0-9a-fA-F]*) return 1 ;; esac'));
+  // delete must not inherit the list pipe as stdin.
+  assert(acked.includes("</dev/null"));
+  // After the zone is gone, a failed key purge removes the backup and fails.
+  assert(
+    acked.includes('purge_keys || { rm -rf "${b:?}"; echo PURGE_KEYS_FAILED'),
+  );
+  // A reload failure after the irreversible purge says so.
+  assert(acked.includes("RELOAD_FAILED_KEYS_PURGED"));
   // The zone data purge runs while the zone is still configured (before the
   // fragment is removed), and the key purge retries on a present=no re-run.
   assert(
     acked.indexOf("zone-purge") < acked.indexOf('rm -f "$z" "$f" "$t"'),
   );
-  assert(acked.includes("PURGE_KEYS_FAILED"));
   assertEquals(await shSyntax(acked), 0);
 });
 

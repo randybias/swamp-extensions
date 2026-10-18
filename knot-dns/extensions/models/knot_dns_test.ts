@@ -193,7 +193,60 @@ Deno.test("remove_zone refuses a recorded signed zone without an ack", async () 
     )
   ) as Error;
   assert(e.message.includes("dnssec_unsign_ack"));
-  assertEquals(asked, [["ops", "ssh"]]);
+  // The refusal happens before the transport is built, so the vault is never
+  // read for a call the method rejects.
+  assertEquals(asked, []);
+});
+
+Deno.test("remove_zone refuses to purge keys for a zone it never applied", async () => {
+  const host = fakeHost(() => ({}));
+  try {
+    // (a) No record at all: an apex this model does not manage.
+    const bare = vaultContext();
+    const e1 = await assertRejects(() =>
+      model.methods.remove_zone.execute(
+        {
+          ssh: ZONE_ARGS.ssh,
+          zone: "other.example.test",
+          purge_keys_ack: true,
+        } as never,
+        bare.context,
+      )
+    ) as { code?: string; message: string };
+    assertEquals(e1.code, "invalid_input");
+    assert(e1.message.includes("purge_keys_ack"));
+    // (b) A render-only record: the zone was never applied on the host.
+    const name = await instanceName([
+      "zone",
+      ZONE_ARGS.ssh.host,
+      "example.test.",
+    ]);
+    const rendered = createModelTestContext({
+      globalArgs: {},
+      storedResources: {
+        [name]: { status: "rendered", rendered_sha256: "placeholder" },
+      },
+    });
+    (rendered.context as { vaultService?: unknown }).vaultService = {
+      get: () => Promise.resolve("PLACEHOLDER-KEY"),
+      put: () => Promise.resolve(),
+    };
+    const e2 = await assertRejects(() =>
+      model.methods.remove_zone.execute(
+        {
+          ssh: ZONE_ARGS.ssh,
+          zone: "example.test",
+          purge_keys_ack: true,
+        } as never,
+        rendered.context,
+      )
+    ) as { code?: string };
+    assertEquals(e2.code, "invalid_input");
+    // Fail before any host work: no keymgr, no script.
+    assertEquals(host.commands.length, 0);
+  } finally {
+    host.restore();
+  }
 });
 
 Deno.test("apply_zone refuses to turn a recorded signed zone off without an ack", async () => {

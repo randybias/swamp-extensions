@@ -404,3 +404,31 @@ Live testing is for the reset-failed fix and the strict schemas merged in
 - `purge_keys_ack` removes the active KASP keys with `keymgr`; deleted keys can
   remain in keymgr's "trash bin" until `keymgr <zone> trash-discard` (kept as a
   rollover safety net, not a live secret).
+
+## Review round 1 (HEAD 8bf261f) dispositions
+
+- HIGH unmanaged KASP purge: `remove_zone` passed `purge_keys_ack` straight to
+  the script, whose `present=no` branch purged any apex's keys with `keymgr`, so
+  an apex this model never managed could lose its active keys while the call
+  reported `removed=no`. The method now permits the ack only when the stored
+  zone record exists and is not `rendered` (applied or removed), and refuses
+  otherwise with `invalid_input` before any host work; the `present=no` retry
+  still works for a zone this model applied. New unit test covers both the
+  missing-record and render-only cases.
+- MEDIUM swallowed `keymgr list` failure: the list is captured and its status
+  checked (`ids=$(keymgr ...) || return 1`), so a missing or locked KASP DB, an
+  absent `keymgr` or a permission error fails the action (`PURGE_KEYS_FAILED`,
+  exit 16) instead of reporting `removed=yes` with the keys still on disk;
+  `keymgr delete` reads `/dev/null` rather than the list pipe, and the
+  after-backup retry removes the backup directory before it exits. Covered by a
+  new container cell with a failing `keymgr` stub.
+- MEDIUM irreversible purge ordering documented: `knotc -f zone-purge` runs
+  while the zone is configured, so a later reload failure rolls the files back
+  but not the keys; the rollback now prints `RELOAD_FAILED_KEYS_PURGED` (typed
+  `reload_failed`, keys gone) and the README says to re-run `remove_zone` to
+  finish the removal.
+- LOW key-id grammar: a key id read back from `keymgr` is checked against
+  `[0-9a-fA-F]` before it reaches `keymgr delete`.
+- LOW description length: the `remove_zone` description is three sentences.
+- LOW test hygiene: the purge container cell interpolates `APEX` rather than a
+  hardcoded zone; `cidrContains` drops its `/0` mask special case.

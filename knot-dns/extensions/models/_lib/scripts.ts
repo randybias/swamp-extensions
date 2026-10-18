@@ -278,23 +278,34 @@ export function removeZoneScript(opts: {
   // zone is still configured (and needs -f). Run both: purge data, journal and
   // timers while configured, then drop the keys the signer may have
   // regenerated with keymgr. An earlier run that failed after removing the
-  // zone leaves `present=no`, so the key purge is retried there too.
+  // zone leaves `present=no`, so the key purge is retried there too. A failed
+  // `keymgr list` is a failure, not an empty zone: the whole point of the ack
+  // is that no key is silently left behind.
   const purgeKeys = [
     "purge_keys() {",
-    '  keymgr "$apex" list 2>/dev/null | while read -r id rest; do',
+    '  ids=$(keymgr "$apex" list 2>/dev/null) || return 1',
+    '  [ -n "$ids" ] || return 0',
+    "  printf '%s\\n' \"$ids\" | while read -r id rest; do",
     '    [ -n "$id" ] || continue',
-    '    keymgr "$apex" delete "$id" >/dev/null 2>&1 || return 1',
+    '    case "$id" in *[!0-9a-fA-F]*) return 1 ;; esac',
+    '    keymgr "$apex" delete "$id" >/dev/null 2>&1 </dev/null || return 1',
     "  done",
     "}",
   ];
   const keyRetry = opts.purgeKeysAck
     ? ["purge_keys || { echo PURGE_KEYS_FAILED >&2; exit 16; }"]
     : [];
+  const keyRetryAfterBackup = opts.purgeKeysAck
+    ? [
+      'purge_keys || { rm -rf "${b:?}"; echo PURGE_KEYS_FAILED >&2; exit 16; }',
+    ]
+    : [];
   const purgeZone = opts.purgeKeysAck
     ? [
       'knotc -f zone-purge "$apex" >/dev/null 2>&1 || rollback PURGE_FAILED 15',
+      "keys_purged=yes",
     ]
-    : [];
+    : ["keys_purged=no"];
   const inner = [
     ...zoneHead({ apex: opts.apex, run: opts.run, reloadZone: false }),
     ...(opts.purgeKeysAck ? purgeKeys : []),
@@ -316,8 +327,9 @@ export function removeZoneScript(opts: {
     'rm -f "$z" "$f" "$t"',
     'if [ "$want_listen" = yes ]; then mv "$lst" "$l"; else rm -f "$l" "$lst"; fi',
     'own_all "$l" || rollback CHOWN_FAILED 10',
-    "reload_knot || rollback RELOAD_FAILED 5",
-    ...keyRetry,
+    'if [ "$keys_purged" = yes ]; then remove_fail=RELOAD_FAILED_KEYS_PURGED; else remove_fail=RELOAD_FAILED; fi',
+    'reload_knot || rollback "$remove_fail" 5',
+    ...keyRetryAfterBackup,
     'rm -rf "${b:?}"',
     'echo "removed=yes"',
   ].join("\n");

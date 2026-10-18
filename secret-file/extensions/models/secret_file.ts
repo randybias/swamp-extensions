@@ -118,7 +118,7 @@ export interface SecretFileModel {
   /** One-line summary. */
   description: string;
   /** Version migrations. */
-  readonly upgrades: Upgrade[];
+  upgrades: Upgrade[];
   /** Empty globals. */
   globalArguments: z.ZodType;
   /** Resource specs. */
@@ -612,6 +612,16 @@ async function writeState(
   );
 }
 
+/** Attribute migrations; identity because the method inputs are unchanged. */
+const UPGRADES: Upgrade[] = [
+  {
+    toVersion: "2026.10.17.2",
+    description:
+      "Re-vendored the canonical ssh transport and stream the secret straight on stdin into one remote write script instead of the transport upload temp file; no stored-attribute changes",
+    upgradeAttributes: (old: Record<string, unknown>) => old,
+  },
+];
+
 /**
  * Builds the model with injectable dependencies. The production export is
  * `createModel()`; tests pass a fake runner, clock and sleep so no process is
@@ -623,14 +633,7 @@ export function createModel(deps: SshDeps = denoDeps): SecretFileModel {
     version: "2026.10.17.2",
     description:
       "Write a secret file onto one host over SSH from vault values delivered over stdin, atomically and idempotently by content hash, with settable owner and group and a remove action. State holds metadata and at most a keyed HMAC of the content, never the value.",
-    upgrades: [
-      {
-        toVersion: "2026.10.17.2",
-        description:
-          "Re-vendored the canonical ssh transport and stream the secret straight on stdin into one remote write script instead of the transport upload temp file; no stored-attribute changes",
-        upgradeAttributes: (old: Record<string, unknown>) => old,
-      },
-    ],
+    upgrades: UPGRADES,
     globalArguments: z.strictObject({}),
     resources: {
       secretFile: {
@@ -860,4 +863,5 @@ export const model = {
   ...createModel(),
   type: "@randybias/secret-file",
   version: "2026.10.17.2",
+  upgrades: UPGRADES,
 } satisfies SecretFileModel;

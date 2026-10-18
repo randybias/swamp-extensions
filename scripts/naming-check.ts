@@ -83,6 +83,11 @@ export const WORKFLOW_EXCEPTIONS = new Set([
   // moving to the private repo, see STATUS
   "server-stack-provision-host",
   "server-stack-teardown-host",
+  // documented exceptions (spec naming answers, LOGBOOK): add/remove/reset are
+  // the honest verbs; join, drain and delete would misdescribe them
+  "k0s-multinode-add-node",
+  "k0s-multinode-remove-node",
+  "k0s-multinode-reset-cluster",
 ]);
 
 /** Extensions whose LOGBOOK predates the visibility:/audience: lines. Under audit, see STATUS. */

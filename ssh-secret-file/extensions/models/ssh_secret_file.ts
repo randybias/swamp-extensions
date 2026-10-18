@@ -21,7 +21,6 @@ import {
   denoDeps,
   exec as sshExec,
   HOST_RE,
-  type HostKeyPolicy,
   MODE_RE,
   posixQuote,
   sha256Hex,
@@ -151,6 +150,9 @@ const SSH_FIELDS = {
   ),
 };
 
+/** Maximum content size in bytes (1 MiB), enforced on the resolved bytes. */
+export const MAX_CONTENT_BYTES = 1_048_576;
+
 const CONTENT_FIELDS = {
   path: z.string().regex(
     /^\/[A-Za-z0-9._\/-]{1,4095}$/,
@@ -161,10 +163,13 @@ const CONTENT_FIELDS = {
     (value) => !value.split("/").some((part) => part === "." || part === ".."),
     "path must not contain . or .. components",
   ).describe("Absolute remote path of the file."),
-  content: z.string().max(1_048_576).meta({ sensitive: true }).nullish()
-    .describe("Literal file content. Wire a vault reference."),
-  content_base64: z.string().max(1_398_102).meta({ sensitive: true }).nullish()
-    .describe("Base64 file content, for binary values."),
+  content: z.string().max(MAX_CONTENT_BYTES).meta({ sensitive: true })
+    .nullish()
+    .describe("Literal file content, at most 1 MiB. Wire a vault reference."),
+  content_base64: z.string().max(1_398_104).meta({ sensitive: true }).nullish()
+    .describe(
+      "Base64 file content, for binary values; at most 1 MiB decoded.",
+    ),
   entries: z.record(
     z.string().max(128),
     z.string().max(65_536).meta({ sensitive: true }),
@@ -230,44 +235,12 @@ const FileStateSchema = z.strictObject({
 /** Stored state of one secret file. */
 export type SecretFileState = z.infer<typeof FileStateSchema>;
 
+// The argument types are inferred from the zod schemas so they cannot drift.
+type WriteArgs = z.infer<typeof WRITE_ARGS>;
+type VerifyArgs = z.infer<typeof VERIFY_ARGS>;
+type RemoveArgs = z.infer<typeof REMOVE_ARGS>;
 /** Arguments shared by every method. */
-interface TargetArgs {
-  host: string;
-  port: number;
-  user: string;
-  host_key_policy: HostKeyPolicy;
-  host_keys?: string[] | null;
-  private_key?: string | null;
-  password?: string | null;
-  connect_timeout_s: number;
-}
-
-interface ContentArgs {
-  path: string;
-  content?: string | null;
-  content_base64?: string | null;
-  entries?: Record<string, string> | null;
-  mode: string;
-  owner?: string | null;
-  group?: string | null;
-  hmac_key?: string | null;
-}
-
-interface WriteArgs extends TargetArgs, ContentArgs {}
-
-interface VerifyArgs extends TargetArgs {
-  path: string;
-  content?: string | null;
-  content_base64?: string | null;
-  entries?: Record<string, string> | null;
-  mode?: string | null;
-  owner?: string | null;
-  group?: string | null;
-}
-
-interface RemoveArgs extends TargetArgs {
-  path: string;
-}
+type TargetArgs = Pick<WriteArgs, keyof typeof SSH_FIELDS>;
 
 const DOTENV_KEY_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
 const MAX_ENTRIES = 256;
@@ -305,15 +278,23 @@ export function renderEntries(entries: Record<string, string>): string {
 export const WRITE_TIMEOUT_MS = 120_000;
 /** Budget for hashing the destination file, in milliseconds. */
 export const SHA_TIMEOUT_MS = 60_000;
+/** Budget for one short probe (`stat`, `test`, `rm`), in milliseconds. */
+export const PROBE_TIMEOUT_MS = 30_000;
 
 /**
  * The remote script that turns the secret streamed on stdin into the
  * destination. An atomic publish needs a temp in the destination directory; the
  * temp and its cleanup stay on the remote, and the script refuses a short read
- * or a symlink/directory destination before the rename. It first verifies the
- * destination directory is owned by the running user or root and is not group-
- * or world-writable, so a symlink cannot be planted between the check and the
- * rename.
+ * or a symlink/directory destination before the rename.
+ *
+ * It changes into the destination directory first and refuses a path whose
+ * canonical form differs, which catches a symlinked component at any depth. It
+ * then anchors every later operation on the current directory inode: the
+ * mode/owner checks read `.`, the stage file is created in `.`, and the rename
+ * targets `./<basename>`. A user who can write an ancestor cannot swap a path
+ * component for a symlink after the check and redirect the write. A directory
+ * that is group- or world-writable, or not owned by the running user or root,
+ * is refused.
  */
 export function stageWriteScript(
   path: string,
@@ -321,18 +302,20 @@ export function stageWriteScript(
   expectedBytes: number,
   spec?: string,
 ): string {
-  const f = posixQuote(path);
   const dir = path.slice(0, path.lastIndexOf("/")) || "/";
+  const base = path.slice(path.lastIndexOf("/") + 1);
+  const target = posixQuote(`./${base}`);
   const lines = [
     "set -eu",
-    `f=${f}`,
     `d=${posixQuote(dir)}`,
-    "dmode=$(stat -c '%a' \"$d\")",
-    "downer=$(stat -c '%u' \"$d\")",
+    'cd "$d"',
+    '[ "$(pwd -P)" = "$d" ] || { echo \'destination directory has a symlinked path component; refusing\' >&2; exit 1; }',
+    "dmode=$(stat -c '%a' .)",
+    "downer=$(stat -c '%u' .)",
     "duid=$(id -u)",
     "[ \"$((0$dmode & 022))\" -eq 0 ] || { echo 'destination directory is group- or world-writable; refusing' >&2; exit 1; }",
     '[ "$downer" = "$duid" ] || [ "$downer" = 0 ] || { echo \'destination directory is not owned by the running user or root; refusing\' >&2; exit 1; }',
-    't=$(mktemp "$d/.secret-stage-XXXXXXXX")',
+    "t=$(mktemp ./.secret-stage-XXXXXXXX)",
     "trap 'rm -f \"$t\"' EXIT",
     "trap 'exit 1' HUP INT TERM",
     'cat > "$t"',
@@ -342,9 +325,9 @@ export function stageWriteScript(
   if (spec !== undefined) lines.push(`chown -h ${posixQuote(spec)} "$t"`);
   lines.push(
     // Re-check the destination with no-follow immediately before the rename.
-    '[ ! -L "$f" ]',
-    '[ ! -d "$f" ]',
-    'mv -T "$t" "$f"',
+    `[ ! -L ${target} ]`,
+    `[ ! -d ${target} ]`,
+    `mv -T "$t" ${target}`,
     "trap - EXIT",
   );
   return lines.join("\n");
@@ -370,7 +353,7 @@ function contentCount(args: ContentInput): number {
     .filter(Boolean).length;
 }
 
-/** Resolves the file bytes from exactly one content form. */
+/** Resolves the file bytes from exactly one content form, capped at 1 MiB. */
 export function resolveContent(args: ContentInput): Uint8Array {
   const count = contentCount(args);
   if (count !== 1) {
@@ -378,9 +361,17 @@ export function resolveContent(args: ContentInput): Uint8Array {
       "pass exactly one of content, entries or content_base64",
     );
   }
-  if (args.content != null) return new TextEncoder().encode(args.content);
-  if (args.content_base64 != null) return base64Decode(args.content_base64);
-  return new TextEncoder().encode(renderEntries(args.entries ?? {}));
+  const bytes = args.content != null
+    ? new TextEncoder().encode(args.content)
+    : args.content_base64 != null
+    ? base64Decode(args.content_base64)
+    : new TextEncoder().encode(renderEntries(args.entries ?? {}));
+  if (bytes.length > MAX_CONTENT_BYTES) {
+    throw new SshConfigError(
+      `content must be at most ${MAX_CONTENT_BYTES} bytes`,
+    );
+  }
+  return bytes;
 }
 
 /** Builds a `chown` target from an owner and/or group. */
@@ -505,7 +496,7 @@ async function statFile(
     "-c",
     "%a %U %G %u %g %s",
     path,
-  ]);
+  ], { timeoutMs: PROBE_TIMEOUT_MS });
   requireOk(result, `stat ${path}`);
   const [mode, owner, group, ownerId, groupId, bytes] = result.stdout.trim()
     .split(/\s+/);
@@ -553,15 +544,30 @@ async function exists(
   target: SshTarget,
   path: string,
 ): Promise<boolean> {
-  const entry = await sshExec(deps, target, ["test", "-e", path]);
+  const entry = await sshExec(deps, target, ["test", "-e", path], {
+    timeoutMs: PROBE_TIMEOUT_MS,
+  });
   if (entry.exit_code === 0) return true;
   if (entry.exit_code !== 1) {
     throw new SshError(`could not test ${path} (exit ${entry.exit_code})`);
   }
-  const link = await sshExec(deps, target, ["test", "-L", path]);
+  const link = await sshExec(deps, target, ["test", "-L", path], {
+    timeoutMs: PROBE_TIMEOUT_MS,
+  });
   if (link.exit_code === 0) return true;
   if (link.exit_code !== 1) {
     throw new SshError(`could not test ${path} (exit ${link.exit_code})`);
+  }
+  // `test` exits 1 for any stat failure, including a parent the running user
+  // cannot search. Only a searchable parent with no entry is absent.
+  const dir = path.slice(0, path.lastIndexOf("/")) || "/";
+  const parent = await sshExec(deps, target, ["test", "-x", dir], {
+    timeoutMs: PROBE_TIMEOUT_MS,
+  });
+  if (parent.exit_code !== 0) {
+    throw new SshError(
+      `could not search ${dir} (exit ${parent.exit_code}); refusing to report ${path} absent`,
+    );
   }
   return false;
 }
@@ -575,7 +581,9 @@ async function assertReplaceable(
   target: SshTarget,
   path: string,
 ): Promise<void> {
-  const link = await sshExec(deps, target, ["test", "-L", path]);
+  const link = await sshExec(deps, target, ["test", "-L", path], {
+    timeoutMs: PROBE_TIMEOUT_MS,
+  });
   if (link.exit_code === 0) {
     throw new SshError(
       `secret file destination ${path} is a symlink; refusing to replace it`,
@@ -584,7 +592,9 @@ async function assertReplaceable(
   if (link.exit_code !== 1) {
     throw new SshError(`could not test ${path} (exit ${link.exit_code})`);
   }
-  const dir = await sshExec(deps, target, ["test", "-d", path]);
+  const dir = await sshExec(deps, target, ["test", "-d", path], {
+    timeoutMs: PROBE_TIMEOUT_MS,
+  });
   if (dir.exit_code === 0) {
     throw new SshError(
       `secret file destination ${path} is a directory; refusing to replace it`,
@@ -831,7 +841,9 @@ export function createModel(deps: SshDeps = denoDeps): SecretFileModel {
             };
           }
           requireOk(
-            await sshExec(deps, target, ["rm", "-f", args.path]),
+            await sshExec(deps, target, ["rm", "-f", args.path], {
+              timeoutMs: PROBE_TIMEOUT_MS,
+            }),
             `rm ${args.path}`,
           );
           if (await exists(deps, target, args.path)) {

@@ -1,6 +1,3 @@
 bogworks-harness-version: 9a7119bdbeee
-vendored: 2026-10-17T23:46:31Z
+vendored: 2026-10-17T23:45:20Z
 blob: 943857c8b6dbbc365523ee0cfafd1b0fe0c0054f recording-runner.ts
-blob: fd692dfb897fadc2c3dfcbae68d11d470e2f303b remote-script.ts
-blob: 53ebb3ab561dc6afdb9b0043522ef96015377d12 containers.ts
-blob: 9ae3ee762fa3f912db2bea8230c9a9b31bd6ee99 mod.ts

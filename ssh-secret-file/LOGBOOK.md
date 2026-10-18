@@ -53,13 +53,10 @@ reviewed once and shared.
 - `extensions/models/_lib/ssh_test.ts` — the canonical transport's own tests,
   vendored with it so the helper stays covered here.
 - `extensions/models/_lib/bogworks/recording-runner.ts` — blob
-  `943857c8b6dbbc365523ee0cfafd1b0fe0c0054f`.
-- `extensions/models/_lib/bogworks/remote-script.ts` — blob
-  `fd692dfb897fadc2c3dfcbae68d11d470e2f303b`.
-- `extensions/models/_lib/bogworks/containers.ts` — blob
-  `53ebb3ab561dc6afdb9b0043522ef96015377d12`.
-- `extensions/models/_lib/bogworks/mod.ts` — blob
-  `9ae3ee762fa3f912db2bea8230c9a9b31bd6ee99`.
+  `943857c8b6dbbc365523ee0cfafd1b0fe0c0054f`. Only the recording runner is
+  vendored: this package renders no config for a real-tool validator and uses
+  the transport's own quoting helper, so `remote-script.ts`, `containers.ts` and
+  `mod.ts` would be dead code in the archive.
 
 ## Notes
 
@@ -354,14 +351,34 @@ mode for `@swamp/ssh`.
 - 2026-10-17: built as a new package from the `secret-file` 2026.10.17.2 head
   under the confirmed name `ssh-secret-file`; the public `secret-file` versions
   are deprecated afterwards and never deleted.
-- 2026-10-17: implemented the next-version Medium from the spec — the remote
-  write script now verifies the destination directory is owned by the running
-  user or root and is not group- or world-writable before it creates the stage
-  file, so a symlink cannot be planted between the no-follow check and the
-  rename. A destination directory that fails either test is refused with a
-  non-zero exit and no file is written.
+- 2026-10-17: implemented the next-version Medium from the spec and the review's
+  security High. The remote write script `cd`s into the destination directory
+  and refuses a path whose `pwd -P` differs (a symlinked component at any
+  depth), then anchors every later operation on the current directory inode: the
+  mode/owner checks read `.`, the stage file is created with
+  `mktemp ./.secret-stage-XXXXXXXX`, and the rename targets `./<basename>`. A
+  directory that is group- or world-writable, or not owned by the running user
+  or root, is refused.
+- 2026-10-17: every short remote probe (`stat`, `test`, `rm`) now carries a 30 s
+  `PROBE_TIMEOUT_MS`; only the write script and the `sha256sum` read were
+  bounded before.
+- 2026-10-17: `exists` no longer treats exit 1 from `test` as absent when the
+  parent is unsearchable; it probes the parent and raises a typed `SshError`.
+- 2026-10-17: only `recording-runner.ts` is vendored from the harness; the
+  unused `remote-script.ts`, `containers.ts` and `mod.ts` would ship dead code.
+- 2026-10-17: the argument types are inferred from the zod schemas and the
+  content cap is enforced on the resolved bytes (1 MiB), with the base64 max
+  sized for that cap.
+- 2026-10-17: kept the branch scope to this package (reverted the predecessor
+  edits); a secret-file registry-lint fix, if wanted, belongs on main.
 - 2026-10-17: the value is still delivered only over stdin; no content hash,
   plain or keyed, reaches argv or a remote command line.
+- residual low: `export const model` still spreads `createModel()` rather than
+  being a plain object literal (registry-lint MEDIUM; rulings L8) — fix before
+  merge-prep if a plain literal can avoid duplicating the definition.
+- residual low: the spec file and LOGBOOK lineage still say `secret-file`; a
+  `docs/specs/ssh-secret-file.md` rename is a separate docs change and would
+  widen this branch's diff scope.
 - residual low: after a local timeout the remote write script runs until stdin
   closes (the transport timeout kills the local ssh, not the remote shell).
 - residual low: `dash-runner` reports one LOW because its container has no

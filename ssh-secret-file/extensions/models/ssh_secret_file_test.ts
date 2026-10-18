@@ -82,10 +82,10 @@ function stagedRunner(options: {
   onWrite?: (stdin?: Uint8Array | string) => void;
 }): (command: string, stdin?: Uint8Array | string) => CommandResult {
   return (command, stdin) => {
-    if (command.includes("DIRECTORY") || command.includes("MISSING")) {
-      return { code: 0, stdout: "MISSING\n", stderr: "" };
-    }
     if (command.includes("'test'")) {
+      if (command.includes("'-x'")) {
+        return { code: 0, stdout: "", stderr: "" };
+      }
       if (command.includes("'-L'") || command.includes("'-d'")) {
         return { code: 1, stdout: "", stderr: "" };
       }
@@ -320,6 +320,11 @@ Deno.test("stageWriteScript writes, chmods, chowns and renames atomically", () =
   assert(script.includes("stat -c '%a'"));
   assert(script.includes("group- or world-writable"));
   assert(script.includes("not owned by the running user or root"));
+  assert(script.includes('cd "$d"'));
+  assert(script.includes("pwd -P"));
+  assert(script.includes("symlinked path component"));
+  assert(script.includes("mktemp ./.secret-stage-"));
+  assert(script.includes(`mv -T "$t" './secret.env'`));
   assertEquals(stageWriteScript(PATH, "0640", 18).includes("chown"), false);
 });
 
@@ -420,6 +425,20 @@ Deno.test("stageWriteScript runs under a real POSIX sh", async () => {
       "a group- or world-writable parent must be refused",
     );
     assertEquals(await localExists(`${worldWritable}/secret.env`), false);
+
+    // A pre-planted symlinked ancestor is caught by the pwd -P anchor, and a
+    // component swapped after the check cannot move the cwd inode.
+    const realDir = `${dir}/real-dir`;
+    await Deno.mkdir(realDir);
+    const linkDir = `${dir}/link-dir`;
+    await Deno.symlink(realDir, linkDir);
+    const ancRes = await runScript(
+      shell,
+      stageWriteScript(`${linkDir}/secret.env`, "0600", bytes.length),
+      bytes,
+    );
+    assert(ancRes.code !== 0, "a symlinked ancestor must be refused");
+    assertEquals(await localExists(`${realDir}/secret.env`), false);
   } finally {
     await Deno.remove(dir, { recursive: true });
   }
@@ -481,9 +500,6 @@ Deno.test("write re-chowns only when the live owner differs", async () => {
   const sha = await sha256Hex(SECRET);
   let chowned = false;
   const { run, calls } = fakeRun((command) => {
-    if (command.includes("DIRECTORY") || command.includes("MISSING")) {
-      return { code: 0, stdout: "MISSING\n", stderr: "" };
-    }
     if (command.includes("'test'")) {
       return {
         code: command.includes("'-L'") || command.includes("'-d'") ? 1 : 0,
@@ -588,6 +604,32 @@ Deno.test("verify rejects two content forms and absent files", async () => {
   assertEquals(absentCtx.written[0].data.status, "not_found");
 });
 
+Deno.test("verify refuses to report absent when the parent is unsearchable", async () => {
+  const { run, calls } = fakeRun((command) => {
+    if (command.includes("'test'")) {
+      return { code: 1, stdout: "", stderr: "" };
+    }
+    return { code: 0, stdout: "", stderr: "" };
+  });
+  const m = createModel(deps(run));
+  const { context, written } = testContext();
+  await assertRejects(
+    () =>
+      m.methods.verify.execute(
+        { ...BASE, path: PATH, content: SECRET },
+        context,
+      ),
+    SshError,
+    "could not search",
+  );
+  assertEquals(written.length, 0);
+  assert(
+    calls.some((c) =>
+      c.command.includes("'test'") && c.command.includes("'-x'")
+    ),
+  );
+});
+
 Deno.test("remove is a clean no-op when the file is gone", async () => {
   const sha = await sha256Hex(SECRET);
   const { run, calls } = fakeRun(stagedRunner({ sha, present: false }));
@@ -611,6 +653,7 @@ Deno.test("remove deletes and proves it is gone", async () => {
       return { code: 0, stdout: "", stderr: "" };
     }
     if (command.includes("'test'")) {
+      if (command.includes("'-x'")) return { code: 0, stdout: "", stderr: "" };
       return { code: removed ? 1 : 0, stdout: "", stderr: "" };
     }
     return { code: 0, stdout: "", stderr: "" };
@@ -652,11 +695,7 @@ Deno.test("the factory returns an independent model", () => {
 });
 
 Deno.test("write refuses a symlink destination without following it", async () => {
-  const { run, calls } = fakeRun((command) =>
-    command.includes("'test'") && command.includes("'-L'")
-      ? { code: 0, stdout: "", stderr: "" }
-      : { code: 0, stdout: "", stderr: "" }
-  );
+  const { run, calls } = fakeRun(() => ({ code: 0, stdout: "", stderr: "" }));
   const m = createModel(deps(run));
   const { context, written } = testContext();
   await assertRejects(

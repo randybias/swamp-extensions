@@ -84,6 +84,24 @@ export function mapScriptError(stderr: string, exit: number): KnotError {
       "kdig is not installed; run install first",
     );
   }
+  if (stderr.includes("PURGE_KEYS_FAILED")) {
+    return new KnotError(
+      "tool_failed",
+      "the zone was removed but purging its KASP keys failed; re-run remove_zone with purge_keys_ack to retry",
+    );
+  }
+  if (stderr.includes("RELOAD_FAILED_KEYS_PURGED")) {
+    return new KnotError(
+      "reload_failed",
+      "the remove failed and the previous files were restored, but the zone's KASP keys were already purged and cannot be recovered",
+    );
+  }
+  if (stderr.includes("PURGE_FAILED")) {
+    return new KnotError(
+      "tool_failed",
+      "knotc zone-purge failed; the zone was not removed",
+    );
+  }
   if (stderr.includes("RELOAD_FAILED")) {
     return new KnotError(
       "reload_failed",
@@ -95,6 +113,12 @@ export function mapScriptError(stderr: string, exit: number): KnotError {
   }
   if (stderr.includes("TEST_QUERY_FAILED")) {
     return new KnotError("verify_failed", "the resolver test query failed");
+  }
+  if (stderr.includes("ZONE_ABSENT")) {
+    return new KnotError(
+      "invalid_input",
+      "the zone is not present on the host",
+    );
   }
   if (stderr.includes("DNSSEC_UNSIGN_ACK_REQUIRED")) {
     return new KnotError(

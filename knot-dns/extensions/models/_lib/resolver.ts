@@ -87,6 +87,86 @@ export function isWildcard(host: string): boolean {
   return host === "0.0.0.0" || host === "::";
 }
 
+/** The loopback address a wildcard listen is tested on (`kdig` cannot use `::`). */
+export function wildcardTestHost(host: string): string {
+  return host === "::" ? "::1" : "127.0.0.1";
+}
+
+/** Parses a validated IPv4 literal to an unsigned integer. */
+function ipv4ToInt(s: string): number {
+  return s.split(".").reduce((n, o) => (n << 8) | Number(o), 0) >>> 0;
+}
+
+/** Expands a validated IPv6 literal to eight 16-bit groups. */
+function ipv6Groups(s: string): number[] {
+  const dbl = s.indexOf("::");
+  if (dbl === -1) return s.split(":").map((g) => parseInt(g, 16));
+  const head = s.slice(0, dbl).split(":").filter((g) => g !== "");
+  const tail = s.slice(dbl + 2).split(":").filter((g) => g !== "");
+  return [
+    ...head.map((g) => parseInt(g, 16)),
+    ...new Array(8 - head.length - tail.length).fill(0),
+    ...tail.map((g) => parseInt(g, 16)),
+  ];
+}
+
+/** An IP literal as a big-endian integer (32 or 128 bits). */
+function ipToNumber(s: string): bigint {
+  if (isIpv4(s)) return BigInt(ipv4ToInt(s));
+  let v = 0n;
+  for (const g of ipv6Groups(s)) v = (v << 16n) | BigInt(g);
+  return v;
+}
+
+/** True when `addr` (a validated literal) is inside `cidr` of the same family. */
+export function cidrContains(cidr: string, addr: string): boolean {
+  const slash = cidr.indexOf("/");
+  const base = slash === -1 ? cidr : cidr.slice(0, slash);
+  if (isIpv4(base) !== isIpv4(addr)) return false;
+  const width = isIpv4(base) ? 32 : 128;
+  const bits = slash === -1 ? width : Number(cidr.slice(slash + 1));
+  if (!Number.isInteger(bits) || bits < 0 || bits > width) return false;
+  const shift = BigInt(width - bits);
+  return (ipToNumber(base) >> shift) === (ipToNumber(addr) >> shift);
+}
+
+/**
+ * The access-control list actually rendered. The spec's default is loopback
+ * plus the listen addresses: a resolver that listens on an address but refuses
+ * its own queries can never pass its self-test. The listen host is added as a
+ * host route (`/32` or `/128`), the narrowest reading of "the listen subnets",
+ * so the default never opens a wider network than the resolver itself.
+ */
+export function effectiveAllowQueryFrom(input: ResolverInput): string[] {
+  if (input.allow_query_from) return input.allow_query_from;
+  const out = ["127.0.0.0/8", "::1/128"];
+  for (const listen of input.listen) {
+    const { host } = splitListen(listen);
+    if (isWildcard(host)) continue;
+    if (!out.some((c) => cidrContains(c, host))) {
+      out.push(`${host}/${isIpv4(host) ? 32 : 128}`);
+    }
+  }
+  return out;
+}
+
+/**
+ * Picks the listen address the apply self-test should query: the first one the
+ * access-control list permits (a wildcard is tested on loopback, where the
+ * script sends it). Returns null when `allow_query_from` excludes every listen
+ * address, so the caller can refuse instead of swapping in an untestable
+ * configuration.
+ */
+export function pickTestListen(input: ResolverInput): string | null {
+  const allow = effectiveAllowQueryFrom(input);
+  for (const listen of input.listen) {
+    const { host } = splitListen(listen);
+    const probe = isWildcard(host) ? wildcardTestHost(host) : host;
+    if (allow.some((c) => cidrContains(c, probe))) return listen;
+  }
+  return null;
+}
+
 /** Quotes one YAML scalar. */
 function yamlString(s: string): string {
   return JSON.stringify(s);
@@ -129,7 +209,7 @@ export function renderResolverYaml(input: ResolverInput): string {
       if (f.authoritative) lines.push("      authoritative: true");
     }
   }
-  const allow = input.allow_query_from ?? ["127.0.0.0/8", "::1/128"];
+  const allow = effectiveAllowQueryFrom(input);
   lines.push("views:");
   lines.push("  - subnets:");
   for (const cidr of allow) lines.push(`      - ${yamlString(cidr)}`);

@@ -81,14 +81,28 @@ function restoreLine(backupVar: string, path: string): string {
 }
 
 /**
- * Precheck that each requested listen address/port is free or held by Knot.
- * `ss -H` drops the header; `-p` adds the owning process, which is how a
- * socket already held by knotd is told apart from a foreign one. A socket
- * whose owner cannot be seen counts as foreign, so an unprivileged probe
- * fails closed.
+ * Precheck that each requested listen address/port is free or held by the
+ * named process. `ss -H` drops the header; `-p` adds the owning process, which
+ * is how the server's own socket is told apart from a foreign one, and the
+ * owner is reported in `PORT_BUSY` so the operator sees who holds it. `ss`
+ * prints an interface scope on some addresses (`127.0.0.53%lo:53`), which is
+ * stripped before the comparison. A socket whose owner cannot be seen counts
+ * as foreign, so an unprivileged probe fails closed.
  */
-export function portCheckScript(listens: string[]): string {
+export function portCheckScript(
+  listens: string[],
+  allow: string[] = ["knotd"],
+): string {
   const wants = listens.map(shq).join(" ");
+  const own = allow.map((p) => p.replace(/[^A-Za-z0-9_-]/g, "")).join(",");
+  const awk = [
+    '{ loc=$5; n=split(loc, x, ":"); port=x[n]; addr=loc; sub(":" port "$", "", addr);',
+    '  sub(/%.*$/, "", addr); gsub(/[][]/, "", addr);',
+    '  owner="?"; o=index($0, "users:((");',
+    '  if (o>0) { r=substr($0, o+9); q=index(r, "\\""); if (q>1) owner=substr(r, 1, q-1) }',
+    '  isown=0; no=split(own_list, O, ","); for (i=1;i<=no;i++) if (owner==O[i]) isown=1;',
+    `  if (port==p && (addr==a || addr=="0.0.0.0" || addr=="*" || addr=="::" || a=="0.0.0.0" || a=="::") && !isown) print addr ":" port " owner=" owner }`,
+  ].join("\n");
   return [
     "set -eu",
     "rc=0",
@@ -96,11 +110,8 @@ export function portCheckScript(listens: string[]): string {
     "  waddr=${want%@*}; wport=${want#*@}",
     '  [ "$want" = "$waddr" ] && wport=53',
     "  ss=$(ss -lntupH) || { echo PROBE_FAILED >&2; exit 11; }",
-    '  foreign=$(printf \'%s\\n\' "$ss" | awk -v a="$waddr" -v p="$wport" \'',
-    '    { loc=$5; n=split(loc, x, ":"); port=x[n]; addr=loc; sub(":" port "$", "", addr);',
-    '      gsub(/[][]/, "", addr)',
-    '      if (port==p && (addr==a || addr=="0.0.0.0" || addr=="*" || addr=="::" || a=="0.0.0.0" || a=="::") && $0 !~ /users:\\(\\("knotd"/) print addr ":" port }\')',
-    '  if [ -n "$foreign" ]; then echo "PORT_BUSY ${waddr}:${wport}" >&2; rc=1; fi',
+    `  foreign=$(printf '%s\\n' "$ss" | awk -v a="$waddr" -v p="$wport" -v own_list='${own}' '${awk}')`,
+    '  if [ -n "$foreign" ]; then echo "PORT_BUSY ${waddr}:${wport} ${foreign}" >&2; rc=1; fi',
     "done",
     '[ "$rc" = 0 ] || exit 9',
   ].join("\n");
@@ -273,14 +284,48 @@ export function removeZoneScript(opts: {
   purgeKeysAck: boolean;
   unsigned: boolean;
 }): string {
-  const purge = opts.purgeKeysAck
-    ? `knotc zone-purge "$apex" 2>/dev/null || true`
-    : "true";
+  // `keymgr` reads the KASP database directly, so it still removes a zone's
+  // keys after the zone is unloaded; `knotc zone-purge` only works while the
+  // zone is still configured (and needs -f). Run both: purge data, journal and
+  // timers while configured, then drop the keys the signer may have
+  // regenerated with keymgr. An earlier run that failed after removing the
+  // zone leaves `present=no`, so the key purge is retried there too. A failed
+  // `keymgr list` is a failure, not an empty zone: the whole point of the ack
+  // is that no key is silently left behind.
+  const purgeKeys = [
+    "purge_keys() {",
+    '  ids=$(keymgr "$apex" list 2>/dev/null) || return 1',
+    '  [ -n "$ids" ] || return 0',
+    "  printf '%s\\n' \"$ids\" | while read -r id rest; do",
+    '    [ -n "$id" ] || continue',
+    '    case "$id" in *[!0-9a-fA-F]*) return 1 ;; esac',
+    '    keymgr "$apex" delete "$id" >/dev/null 2>&1 </dev/null || return 1',
+    "  done",
+    "}",
+  ];
+  const keyRetry = opts.purgeKeysAck
+    ? ["purge_keys || { echo PURGE_KEYS_FAILED >&2; exit 16; }"]
+    : [];
+  const keyRetryAfterBackup = opts.purgeKeysAck
+    ? [
+      'purge_keys || { rm -rf "${b:?}"; echo PURGE_KEYS_FAILED >&2; exit 16; }',
+    ]
+    : [];
+  const purgeZone = opts.purgeKeysAck
+    ? [
+      'knotc -f zone-purge "$apex" >/dev/null 2>&1 || rollback PURGE_FAILED 15',
+      "keys_purged=yes",
+    ]
+    : ["keys_purged=no"];
   const inner = [
     ...zoneHead({ apex: opts.apex, run: opts.run, reloadZone: false }),
+    ...(opts.purgeKeysAck ? purgeKeys : []),
     "present=no",
     '[ -f "$f" ] && present=yes',
-    `if [ "$present" = no ]; then echo "removed=no"; exit 0; fi`,
+    'if [ "$present" = no ]; then',
+    ...keyRetry.map((l) => `  ${l}`),
+    '  echo "removed=no"; exit 0',
+    "fi",
     'if [ -f "$z" ]; then',
     `  signed=$(grep -c 'dnssec-signing: on' "$f" 2>/dev/null || true)`,
     `  if [ "$signed" != "0" ] && [ ${
@@ -289,12 +334,14 @@ export function removeZoneScript(opts: {
     "fi",
     "listen_diff",
     ...BACKUP_LINES,
+    ...purgeZone,
     'rm -f "$z" "$f" "$t"',
     'if [ "$want_listen" = yes ]; then mv "$lst" "$l"; else rm -f "$l" "$lst"; fi',
     'own_all "$l" || rollback CHOWN_FAILED 10',
-    "reload_knot || rollback RELOAD_FAILED 5",
+    'if [ "$keys_purged" = yes ]; then remove_fail=RELOAD_FAILED_KEYS_PURGED; else remove_fail=RELOAD_FAILED; fi',
+    'reload_knot || rollback "$remove_fail" 5',
+    ...keyRetryAfterBackup,
     'rm -rf "${b:?}"',
-    purge,
     'echo "removed=yes"',
   ].join("\n");
   return underLock(KNOT_LOCK, inner);
@@ -310,14 +357,21 @@ export function getDsScript(apex: string): string {
   ].join("\n");
 }
 
-/** Script that tells Knot the KSK's DS is at the parent. */
+/**
+ * Script that tells Knot the KSK's DS is at the parent. Knot refuses a second
+ * confirmation with `(no key ready for submission)`; that is the already-done
+ * state, so it is a no-op and not an error.
+ */
 export function kskSubmittedScript(apex: string): string {
   return [
     "set -eu",
     `[ -f ${
       shq(zonePaths(apex).fragment)
     } ] || { echo ZONE_ABSENT >&2; exit 3; }`,
-    `knotc -b zone-ksk-submitted ${shq(apex)} >/dev/null`,
+    `if ! out=$(knotc -b zone-ksk-submitted ${shq(apex)} 2>&1); then`,
+    '  case "$out" in *"no key ready for submission"*) echo "submitted=already"; exit 0 ;; esac',
+    '  echo "$out" >&2; exit 1',
+    "fi",
     "echo submitted=yes",
   ].join("\n");
 }

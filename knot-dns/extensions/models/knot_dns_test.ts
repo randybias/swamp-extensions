@@ -29,7 +29,7 @@ const ZONE_ARGS = {
 
 Deno.test("model is a plain object with the expected type and methods", () => {
   assertEquals(model.type, "@randybias/knot-dns");
-  assertEquals(model.version, "2026.10.17.1");
+  assertEquals(model.version, "2026.10.17.2");
   const methods = Object.keys(model.methods);
   assertEquals(
     methods.sort(),
@@ -193,7 +193,60 @@ Deno.test("remove_zone refuses a recorded signed zone without an ack", async () 
     )
   ) as Error;
   assert(e.message.includes("dnssec_unsign_ack"));
-  assertEquals(asked, [["ops", "ssh"]]);
+  // The refusal happens before the transport is built, so the vault is never
+  // read for a call the method rejects.
+  assertEquals(asked, []);
+});
+
+Deno.test("remove_zone refuses to purge keys for a zone it never applied", async () => {
+  const host = fakeHost(() => ({}));
+  try {
+    // (a) No record at all: an apex this model does not manage.
+    const bare = vaultContext();
+    const e1 = await assertRejects(() =>
+      model.methods.remove_zone.execute(
+        {
+          ssh: ZONE_ARGS.ssh,
+          zone: "other.example.test",
+          purge_keys_ack: true,
+        } as never,
+        bare.context,
+      )
+    ) as { code?: string; message: string };
+    assertEquals(e1.code, "invalid_input");
+    assert(e1.message.includes("purge_keys_ack"));
+    // (b) A render-only record: the zone was never applied on the host.
+    const name = await instanceName([
+      "zone",
+      ZONE_ARGS.ssh.host,
+      "example.test.",
+    ]);
+    const rendered = createModelTestContext({
+      globalArgs: {},
+      storedResources: {
+        [name]: { status: "rendered", rendered_sha256: "placeholder" },
+      },
+    });
+    (rendered.context as { vaultService?: unknown }).vaultService = {
+      get: () => Promise.resolve("PLACEHOLDER-KEY"),
+      put: () => Promise.resolve(),
+    };
+    const e2 = await assertRejects(() =>
+      model.methods.remove_zone.execute(
+        {
+          ssh: ZONE_ARGS.ssh,
+          zone: "example.test",
+          purge_keys_ack: true,
+        } as never,
+        rendered.context,
+      )
+    ) as { code?: string };
+    assertEquals(e2.code, "invalid_input");
+    // Fail before any host work: no keymgr, no script.
+    assertEquals(host.commands.length, 0);
+  } finally {
+    host.restore();
+  }
 });
 
 Deno.test("apply_zone refuses to turn a recorded signed zone off without an ack", async () => {
@@ -310,6 +363,41 @@ Deno.test("apply_resolver tests a name the upstream serves, and records what it 
   }
 });
 
+Deno.test("every resource name written in one apply_resolver run is unique", async () => {
+  const host = fakeHost((command) =>
+    command.includes("50-managed-*.conf")
+      ? { stdout: "a.example.test.\n" }
+      : command.includes("kresctl")
+      ? { stdout: "changed=yes\n" }
+      : {}
+  );
+  try {
+    const c = vaultContext();
+    await model.methods.apply_resolver.execute(
+      RESOLVER_ARGS as never,
+      c.context,
+    );
+    const records = c.getWrittenResources();
+    assertEquals(records.length, 2);
+    // The per-method spec names are distinct ...
+    assertEquals(new Set(records.map((r) => r.specName)).size, records.length);
+    // ... and so are the state instance names they are keyed by.
+    const resolverName = await instanceName([
+      "resolver",
+      RESOLVER_ARGS.ssh.host,
+    ]);
+    const outcomeName = await instanceName([
+      "outcome",
+      "apply_resolver",
+      RESOLVER_ARGS.ssh.host,
+      "",
+    ]);
+    assertEquals(resolverName === outcomeName, false);
+  } finally {
+    host.restore();
+  }
+});
+
 Deno.test("a failed apply_resolver removes the staged file and records nothing", async () => {
   const host = fakeHost((command) =>
     command.includes("kresctl") ? { code: 4, stderr: "KRESCTL_FAILED\n" } : {}
@@ -376,6 +464,86 @@ Deno.test("allow_transfer and notify_secondaries take addresses, never free text
       true,
       `${field}: ${value}`,
     );
+  }
+});
+
+Deno.test("apply_resolver refuses a wildcard listen without an ack", async () => {
+  const host = fakeHost(() => ({}));
+  try {
+    const c = vaultContext();
+    const e = await assertRejects(() =>
+      model.methods.apply_resolver.execute(
+        {
+          ssh: ZONE_ARGS.ssh,
+          resolver: { listen: ["0.0.0.0@53"] },
+        } as never,
+        c.context,
+      )
+    ) as { code?: string; message: string };
+    assertEquals(e.code, "invalid_input");
+    assert(e.message.includes("listen_any_ack"));
+    assertEquals(host.commands.length, 0);
+  } finally {
+    host.restore();
+  }
+});
+
+Deno.test("apply_resolver refuses a listen an applied zone holds", async () => {
+  const host = fakeHost(() => ({}));
+  try {
+    const c = vaultContext();
+    (c.context as { readModelData?: unknown }).readModelData = () =>
+      Promise.resolve([
+        {
+          attributes: {
+            host: ZONE_ARGS.ssh.host,
+            apex: "a.example.test.",
+            status: "applied",
+            requested_listen: ["127.0.0.1"],
+          },
+        },
+      ]);
+    const e = await assertRejects(() =>
+      model.methods.apply_resolver.execute(
+        {
+          ssh: ZONE_ARGS.ssh,
+          resolver: { listen: ["127.0.0.1@53"] },
+        } as never,
+        c.context,
+      )
+    ) as { code?: string; message: string };
+    assertEquals(e.code, "invalid_input");
+    assert(e.message.includes("overlap"));
+    assertEquals(host.commands.length, 0);
+  } finally {
+    host.restore();
+  }
+});
+
+Deno.test("apply_resolver refuses a port a foreign process holds", async () => {
+  const host = fakeHost((command) =>
+    command.includes("ss -lntupH")
+      ? {
+        code: 9,
+        stderr: "PORT_BUSY 127.0.0.3:53 127.0.0.3:53 owner=systemd-resolve\n",
+      }
+      : {}
+  );
+  try {
+    const c = vaultContext();
+    const e = await assertRejects(() =>
+      model.methods.apply_resolver.execute(
+        {
+          ssh: ZONE_ARGS.ssh,
+          resolver: { listen: ["127.0.0.3@53"] },
+        } as never,
+        c.context,
+      )
+    ) as { code?: string; message: string };
+    assertEquals(e.code, "port_busy");
+    assert(e.message.includes("systemd-resolve"));
+  } finally {
+    host.restore();
   }
 });
 

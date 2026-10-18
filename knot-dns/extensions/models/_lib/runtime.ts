@@ -14,8 +14,8 @@ import {
   type SshDeps,
   type SshTarget,
 } from "./ssh.ts";
-import { resolveSecret } from "./vault.ts";
-import { discoverZonesScript } from "./scripts.ts";
+import { KnotError, resolveSecret } from "./vault.ts";
+import { discoverZonesScript, portCheckScript } from "./scripts.ts";
 import { mapScriptError } from "./errors.ts";
 import { type Outcome, type SshOnlyArgs } from "./schemas.ts";
 
@@ -74,6 +74,30 @@ export async function recordOutcome(context: Ctx, outcome: Outcome) {
     zone,
   ]);
   return await context.writeResource("outcome", name, outcome);
+}
+
+/**
+ * Precheck that each requested listen address/port is free or held by the
+ * named server process. A foreign holder is a typed `port_busy` error that
+ * names it, before anything is staged or swapped.
+ */
+export async function assertPortsFree(
+  target: SshTarget,
+  listens: string[],
+  allow: string[] = ["knotd"],
+): Promise<void> {
+  const res = await sshExec(deps, target, [
+    "sh",
+    "-c",
+    portCheckScript(listens, allow),
+  ]);
+  if (res.exit_code !== 0) {
+    const detail = res.stderr.split("\n").find((l) => l.includes("PORT_BUSY"));
+    throw new KnotError(
+      "port_busy",
+      detail ?? "a requested listen port is busy",
+    );
+  }
 }
 
 /** The apexes of the zones this model serves on the host. */

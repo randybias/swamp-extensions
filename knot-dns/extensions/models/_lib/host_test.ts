@@ -228,6 +228,34 @@ Deno.test({
 });
 
 Deno.test({
+  name: "portCheck: an ss scope is stripped and the owner is named",
+  ignore: !available,
+  fn: async () => {
+    // The live host printed the resolved stub as `127.0.0.53%lo:53`, which the
+    // old comparison missed; the resolver precheck must also allow kresd.
+    const fakeSs = "#!/bin/sh\n" +
+      "printf '%s\\n' 'tcp LISTEN 0 4096 127.0.0.53%lo:53 0.0.0.0:* users:((\"systemd-resolve\",pid=1,fd=1))'\n" +
+      "printf '%s\\n' 'tcp LISTEN 0 4096 127.0.0.3:53 0.0.0.0:* users:((\"kresd\",pid=2,fd=1))'\n";
+    const r = await box(
+      [
+        put("/usr/local/bin/ss", fakeSs),
+        "chmod +x /usr/local/bin/ss",
+      ].join("\n"),
+      [
+        ["busy", portCheckScript(["127.0.0.53"])],
+        ["own", portCheckScript(["127.0.0.3"], ["kresd", "knot-resolver"])],
+        ["foreign", portCheckScript(["127.0.0.3"])],
+      ],
+    );
+    assertEquals(r.busy.rc, 9);
+    assertStringIncludes(r.busy.err, "PORT_BUSY 127.0.0.53:53");
+    assertStringIncludes(r.busy.err, "owner=systemd-resolve");
+    assertEquals(r.own.rc, 0, r.own.err);
+    assertEquals(r.foreign.rc, 9);
+  },
+});
+
+Deno.test({
   name:
     "apply: a listen change restarts knotd and is answered; no-op and shrink",
   ignore: !available,
@@ -361,6 +389,86 @@ Deno.test({
     assertEquals(r.rm.rc, 0, r.rm.err);
     assertStringIncludes(r.rm.out, "removed=yes");
     assertEquals(r.bound.out.trim(), "0");
+  },
+});
+
+Deno.test({
+  name: "remove: purge_keys_ack removes the zone's KASP keys",
+  ignore: !available,
+  fn: async () => {
+    const l = ["127.0.0.1@5353"];
+    const run = "p1";
+    const p = zonePaths(APEX, run);
+    const { file } = zoneFixture(1, []);
+    const signed = renderZoneConfig({
+      apex: APEX,
+      file: zonePaths(APEX).zoneFile,
+      signed: true,
+      dnssec: { algorithm: "ecdsap256sha256", nsec3: false },
+      notifySecondaries: [],
+      allowTransfer: [],
+      tsigKeyNames: [],
+    }).trimEnd();
+    const stageSigned = [
+      put(stagedListen(run), listenFragment(l).trimEnd()),
+      put(p.stagedZone, file),
+      put(p.stagedFragment, signed),
+      `: > '${p.stagedTsig}'`,
+    ].join("\n");
+    const r = await box("", [
+      ["stage", stageSigned],
+      ["apply", applyZoneScript({ apex: APEX, run, listens: l })],
+      [
+        "keys_before",
+        `for i in 1 2 3 4 5 6 7 8 9 10; do n=$(keymgr ${APEX} list 2>/dev/null | wc -l); [ "$n" -ge 2 ] && break; sleep 1; done; echo "$n"`,
+      ],
+      ["stage_remove", put(stagedListen("p2"), "")],
+      [
+        "remove",
+        removeZoneScript({
+          apex: APEX,
+          run: "p2",
+          purgeKeysAck: true,
+          unsigned: true,
+        }),
+      ],
+      ["keys_after", `keymgr ${APEX} list 2>/dev/null | wc -l`],
+      ["zones_left", "keymgr -l 2>/dev/null | grep -c '^example.com' || true"],
+    ]);
+    assertEquals(r.apply.rc, 0, r.apply.err);
+    assert(Number(r.keys_before.out.trim()) >= 2, r.keys_before.out);
+    assertEquals(r.remove.rc, 0, r.remove.err);
+    assertStringIncludes(r.remove.out, "removed=yes");
+    assertEquals(r.keys_after.out.trim(), "0");
+    assertEquals(r.zones_left.out.trim(), "0");
+  },
+});
+
+Deno.test({
+  name:
+    "remove: a failed keymgr list fails the purge instead of reporting success",
+  ignore: !available,
+  fn: async () => {
+    const r = await box(
+      [
+        put("/usr/local/bin/keymgr", "#!/bin/sh\nexit 1\n"),
+        "chmod +x /usr/local/bin/keymgr",
+      ].join("\n"),
+      [
+        [
+          "rm",
+          removeZoneScript({
+            apex: APEX,
+            run: "k1",
+            purgeKeysAck: true,
+            unsigned: true,
+          }),
+        ],
+      ],
+    );
+    // The list failure must not read as "no keys": the action fails.
+    assertEquals(r.rm.rc, 16);
+    assertStringIncludes(r.rm.err, "PURGE_KEYS_FAILED");
   },
 });
 

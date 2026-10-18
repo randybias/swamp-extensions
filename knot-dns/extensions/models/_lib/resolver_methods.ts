@@ -20,8 +20,13 @@ import {
   StateResolverSchema,
 } from "./schemas.ts";
 import { mapScriptError } from "./errors.ts";
-import { pickTestQuery, renderResolverYaml } from "./resolver.ts";
 import {
+  pickTestListen,
+  pickTestQuery,
+  renderResolverYaml,
+} from "./resolver.ts";
+import {
+  assertPortsFree,
   type Ctx,
   deps,
   instanceName,
@@ -29,6 +34,7 @@ import {
   servedApexes,
   sshTarget,
 } from "./runtime.ts";
+import { assertListenAcceptable, otherZoneListens } from "./listen.ts";
 
 /** Live resolver configuration path. */
 const RESOLVER_YAML = "/etc/knot-resolver/config.yaml";
@@ -53,9 +59,28 @@ async function applyResolver(
   context: Ctx,
 ) {
   const a = ApplyResolverArgs.parse(args);
+  // A wildcard without an ack, or a listen the applied authoritative zones
+  // already hold, is refused before any host work.
+  assertListenAcceptable(
+    { listen: a.resolver.listen, listen_any_ack: a.resolver.listen_any_ack },
+    await otherZoneListens(context, a.ssh.host, ""),
+  );
   const yaml = renderResolverYaml(a.resolver);
   const sha = await sha256Hex(yaml);
   const target = await sshTarget(context, a.ssh);
+  // The resolver's own socket is allowed (a re-apply); a foreign holder, e.g.
+  // the systemd-resolved stub, is a port_busy error instead of a failed bind.
+  await assertPortsFree(target, a.resolver.listen, [
+    "kresd",
+    "knot-resolver",
+  ]);
+  const testListen = pickTestListen(a.resolver);
+  if (testListen === null) {
+    throw new KnotError(
+      "invalid_input",
+      "allow_query_from permits none of the resolver listen addresses, so the apply self-test would be refused; add a listen address (or loopback) to allow_query_from",
+    );
+  }
   const testName = pickTestQuery(a.resolver, await servedApexes(target));
   let res;
   try {
@@ -71,7 +96,7 @@ async function applyResolver(
         liveYaml: RESOLVER_YAML,
         packageBackup: RESOLVER_PACKAGE_BACKUP,
         stagedYaml: RESOLVER_YAML_STAGED,
-        testListen: a.resolver.listen[0],
+        testListen,
         testName,
       }),
     ]);
@@ -176,7 +201,7 @@ export const resolverMethods = {
   apply_resolver: {
     kind: "action" as const,
     description:
-      "DESTRUCTIVE. Validate with kresctl, back up the package config, atomically swap the resolver config.yaml, reload and verify a test query on a name the forwarded upstream serves, restoring the previous config on failure. Idempotent: an unchanged render is a no-op.",
+      "DESTRUCTIVE. Validate with kresctl, back up the package config, atomically swap the resolver config.yaml, reload and verify a test query on a listen address allow_query_from permits, restoring the previous config on failure. Idempotent: an unchanged render is a no-op.",
     arguments: ApplyResolverArgs,
     execute: applyResolver,
   },

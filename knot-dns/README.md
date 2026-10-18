@@ -22,7 +22,7 @@ host over stdin, never on an argv, in a log or in stored state.
 | `install`         | Install Knot and the include line; idempotent                                    |
 | `render_zone`     | Render the canonical zone file, fragment and sha256 without a host (read-only)   |
 | `apply_zone`      | Validate, atomically swap, reload and verify one whole zone                      |
-| `remove_zone`     | Remove one managed zone; signed zones need an explicit ack (destructive)         |
+| `remove_zone`     | Remove one managed zone; signed zones and key purges need an ack (destructive)   |
 | `get_ds`          | Read the DS records for a signed zone (read-only)                                |
 | `ksk_submitted`   | Tell Knot the KSK DS is at the parent (destructive)                              |
 | `render_resolver` | Render the resolver `config.yaml` and sha256 without a host (read-only)          |
@@ -33,7 +33,14 @@ host over stdin, never on an argv, in a log or in stored state.
 
 A managed zone is owned whole: records not declared are removed, and dynamic
 updates (RFC 2136) are refused by ACL. `apply_zone` prunes, so it is
-destructive.
+destructive. Secondaries are configuration only: `notify_secondaries`,
+`allow_transfer` and `tsig_keys` render into the zone fragment, but the model is
+primary-focused and never verifies or manages a secondary. `remove_zone` keeps
+the zone's journal and KASP keys by default; `purge_keys_ack: true` purges both
+(timers and data come from `knotc -f zone-purge`, keys from `keymgr`). The ack
+applies only to a zone this model applied on this host; the key purge is
+irreversible, so if the remove then fails and rolls the files back the keys are
+still gone — re-run `remove_zone` with the ack to finish the removal.
 
 ## Dependencies
 
@@ -101,13 +108,22 @@ changes on reload) and the apply then queries every listen address with `kdig`
 (`install` adds `knot-dnsutils`). Forwards always render an explicit `dnssec`
 setting, because Knot Resolver 6 validates by default.
 
-`apply_resolver` proves the new configuration with an SOA query on the
-resolver's own listen address. An authoritative upstream answers REFUSED (the
-resolver reports SERVFAIL) for names outside the zones it serves, so the name is
-the caller's `resolver.test_name`, else the forwarded subtree when this host
-serves it, else a zone this host serves below the subtree, else the subtree.
-Every action also persists an `outcome` record (`changed`, `removed`, versions)
-because the CLI shows resources, not a method's result.
+Like `apply_zone`, `apply_resolver` refuses before any host work a wildcard
+listen without `listen_any_ack`, a listen an applied zone already holds, and a
+port held by a process other than the resolver — the `PORT_BUSY` error names the
+holder. `ksk_submitted` is a no-op when Knot has no key waiting for submission,
+so it can be called again after the DS is at the parent.
+
+`apply_resolver` proves the new configuration with an SOA query on a listen
+address `allow_query_from` permits (the default access list is loopback plus the
+listen addresses, so a resolver always answers its own self-test; an explicit
+list that excludes every listen address is refused before anything is swapped).
+An authoritative upstream answers REFUSED (the resolver reports SERVFAIL) for
+names outside the zones it serves, so the name is the caller's
+`resolver.test_name`, else the forwarded subtree when this host serves it, else
+a zone this host serves below the subtree, else the subtree. Every action also
+persists an `outcome` record (`changed`, `removed`, versions) because the CLI
+shows resources, not a method's result.
 
 ## License
 

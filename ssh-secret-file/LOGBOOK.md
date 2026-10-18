@@ -163,7 +163,7 @@ Delta review of 34dd922 over 770114a: 0 Critical/High. Residuals carried:
 - LOW (astra): the symlink test's fake runner returns the same result on both
   branches of its condition (dead code).
 
-## 2026.10.17.2 transport and delivery hardening
+## secret-file 2026.10.17.2 transport and delivery hardening (lineage)
 
 - Re-vendored the canonical `_lib/ssh.ts` byte-identical from `ssh-host` on
   `origin/main` (blob `8f132c4329c9e64bed686731cd5a0e02980194ea`) plus its
@@ -178,8 +178,9 @@ Delta review of 34dd922 over 770114a: 0 Critical/High. Residuals carried:
   own directory for the atomic rename, so the verified `mktemp` + `trap` path is
   kept and this is why.
 - The write and the `sha256sum` read now carry `timeoutMs` (120s and 60s).
-- Version `2026.10.17.2`; inputs unchanged, so the `upgrades[]` entry (literal
-  on the export) is a no-op identity.
+- That release was `secret-file` `2026.10.17.2`; its inputs were unchanged, so
+  its `upgrades[]` entry was a no-op identity. This package first ships
+  `2026.10.17.1` with `upgrades: []` (no prior version under its own name).
 
 ### Old vs new command recording
 
@@ -373,16 +374,28 @@ mode for `@swamp/ssh`.
   edits); a secret-file registry-lint fix, if wanted, belongs on main.
 - 2026-10-17: the value is still delivered only over stdin; no content hash,
   plain or keyed, reaches argv or a remote command line.
-- residual low: `export const model` still spreads `createModel()` rather than
-  being a plain object literal (registry-lint MEDIUM; rulings L8) — fix before
-  merge-prep if a plain literal can avoid duplicating the definition.
+- 2026-10-18: `export const model` is now a plain object literal with literal
+  `type`, `version` and `upgrades: []`; the methods are built by `methodsFor`
+  and `createModel` spreads the literal for tests. registry-lint is clean.
+- 2026-10-18: `remove` runs one anchored `sh -c` script (`cd` + `pwd -P` +
+  relative unlink) and `verify`/`write` read metadata and SHA-256 from one
+  anchored script, so a symlinked ancestor can no longer redirect the unlink or
+  make `matches` wrong.
+- 2026-10-18: `requireOk` no longer embeds remote stderr, and the remote scripts
+  use distinct exit codes (2 symlinked component, 3 writable directory, 4
+  ownership, 5 short read, 6 destination changed); a hostile target cannot
+  reflect stdin or file bytes into the operator's error output.
+- 2026-10-18: the README names GNU coreutils (`stat -c`, `sha256sum`, `mv -T`)
+  and drops the unused `shasum` alternative.
+- 2026-10-18: the `entries` key cap is enforced in the schema and
+  `resolveContent` runs before the first remote probe.
 - residual low: the spec file and LOGBOOK lineage still say `secret-file`; a
   `docs/specs/ssh-secret-file.md` rename is a separate docs change and would
   widen this branch's diff scope.
 - residual low: after a local timeout the remote write script runs until stdin
   closes (the transport timeout kills the local ssh, not the remote shell).
-- residual low: `dash-runner` reports one LOW because its container has no
-  `/etc/example` directory; the script refuses fail-closed there.
+- residual low: `dash-runner` reports three LOWs because its container has no
+  `/etc/example` directory; the anchored scripts refuse fail-closed there.
 
 ## Live test matrix
 

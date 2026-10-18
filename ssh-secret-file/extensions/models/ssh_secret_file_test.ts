@@ -19,6 +19,8 @@ import {
   createModel,
   type MethodContext,
   model,
+  readFileScript,
+  removeScript,
   renderEntries,
   resolveContent,
   secretInstanceName,
@@ -81,6 +83,7 @@ function stagedRunner(options: {
   failStat?: boolean;
   onWrite?: (stdin?: Uint8Array | string) => void;
 }): (command: string, stdin?: Uint8Array | string) => CommandResult {
+  const statLine = options.statLine ?? "600 root root 0 0 18\n";
   return (command, stdin) => {
     if (command.includes("'test'")) {
       if (command.includes("'-x'")) {
@@ -95,23 +98,15 @@ function stagedRunner(options: {
       options.onWrite?.(stdin);
       return { code: 0, stdout: `${options.sha} 600\n`, stderr: "" };
     }
-    if (command.includes("'chown'") || command.includes("'mv'")) {
-      return { code: 0, stdout: "", stderr: "" };
-    }
-    if (command.includes("'stat'")) {
+    // One anchored read script emits a stat line then the sha256sum line.
+    if (command.includes("stat -c") && command.includes("sha256sum")) {
       return options.failStat
         ? { code: 1, stdout: "", stderr: "permission denied" }
         : {
           code: 0,
-          stdout: options.statLine ?? "600 root root 0 0 18\n",
+          stdout: `${statLine}${options.sha}  ${PATH}\n`,
           stderr: "",
         };
-    }
-    if (command.includes("'sha256sum'")) {
-      return { code: 0, stdout: `${options.sha}  ${PATH}\n`, stderr: "" };
-    }
-    if (command.includes("'rm'")) {
-      return { code: 0, stdout: "", stderr: "" };
     }
     return { code: 0, stdout: "", stderr: "" };
   };
@@ -326,6 +321,17 @@ Deno.test("stageWriteScript writes, chmods, chowns and renames atomically", () =
   assert(script.includes("mktemp ./.secret-stage-"));
   assert(script.includes(`mv -T "$t" './secret.env'`));
   assertEquals(stageWriteScript(PATH, "0640", 18).includes("chown"), false);
+
+  const remove = removeScript(PATH);
+  assert(remove.includes('cd "$d"'));
+  assert(remove.includes("pwd -P"));
+  assert(remove.includes("rm -f './secret.env'"));
+  assertEquals(remove.includes("'rm'"), false, "no bare rm argv");
+
+  const read = readFileScript(PATH);
+  assert(read.includes("stat -c"));
+  assert(read.includes("sha256sum './secret.env'"));
+  assert(read.includes("pwd -P"));
 });
 
 /** The first POSIX shell available, preferring dash. */
@@ -439,6 +445,30 @@ Deno.test("stageWriteScript runs under a real POSIX sh", async () => {
     );
     assert(ancRes.code !== 0, "a symlinked ancestor must be refused");
     assertEquals(await localExists(`${realDir}/secret.env`), false);
+
+    // remove refuses a symlinked ancestor and leaves the real file intact.
+    const removeReal = `${dir}/remove-real`;
+    await Deno.mkdir(removeReal);
+    const victim = `${removeReal}/keep.env`;
+    await Deno.writeTextFile(victim, "KEEP\n");
+    const removeLink = `${dir}/remove-link`;
+    await Deno.symlink(removeReal, removeLink);
+    const remRes = await runScript(
+      shell,
+      removeScript(`${removeLink}/keep.env`),
+      new Uint8Array(),
+    );
+    assert(remRes.code !== 0, "remove must refuse a symlinked ancestor");
+    assertEquals(await Deno.readTextFile(victim), "KEEP\n");
+
+    // The same remove succeeds in the real directory.
+    const remOk = await runScript(
+      shell,
+      removeScript(victim),
+      new Uint8Array(),
+    );
+    assertEquals(remOk.code, 0, remOk.stderr);
+    assertEquals(await localExists(victim), false);
   } finally {
     await Deno.remove(dir, { recursive: true });
   }
@@ -512,17 +542,14 @@ Deno.test("write re-chowns only when the live owner differs", async () => {
       chowned = command.includes("chown -h");
       return { code: 0, stdout: `${sha} 600\n`, stderr: "" };
     }
-    if (command.includes("'stat'")) {
+    if (command.includes("stat -c") && command.includes("sha256sum")) {
       return {
         code: 0,
-        stdout: chowned
-          ? "600 svc svc 1000 1000 18\n"
-          : "600 root root 0 0 18\n",
+        stdout: `${
+          chowned ? "600 svc svc 1000 1000 18\n" : "600 root root 0 0 18\n"
+        }${sha}  ${PATH}\n`,
         stderr: "",
       };
-    }
-    if (command.includes("'sha256sum'")) {
-      return { code: 0, stdout: `${sha}  ${PATH}\n`, stderr: "" };
     }
     return { code: 0, stdout: "", stderr: "" };
   });
@@ -546,7 +573,7 @@ Deno.test("write fails closed without state when a live stat fails", async () =>
   await assertRejects(
     () => m.methods.write.execute(WRITE, context),
     Error,
-    "stat",
+    "read",
   );
   assertEquals(written.length, 0);
 });
@@ -640,7 +667,7 @@ Deno.test("remove is a clean no-op when the file is gone", async () => {
     context,
   );
   assertEquals((result.result as { removed: boolean }).removed, false);
-  assertEquals(calls.some((c) => c.command.includes("'rm'")), false);
+  assertEquals(calls.some((c) => c.command.includes("rm -f")), false);
   assertEquals(written[0].data.status, "not_found");
 });
 
@@ -648,7 +675,7 @@ Deno.test("remove deletes and proves it is gone", async () => {
   const sha = await sha256Hex(SECRET);
   let removed = false;
   const { run, calls } = fakeRun((command) => {
-    if (command.includes("'rm'")) {
+    if (command.includes("rm -f")) {
       removed = true;
       return { code: 0, stdout: "", stderr: "" };
     }
@@ -665,7 +692,13 @@ Deno.test("remove deletes and proves it is gone", async () => {
     context,
   );
   assertEquals((result.result as { removed: boolean }).removed, true);
-  assertEquals(calls.some((c) => c.command.includes("'rm'")), true);
+  assertEquals(calls.some((c) => c.command.includes("rm -f")), true);
+  // No bare `rm` argv: the unlink is one anchored sh -c script.
+  assertEquals(
+    calls.some((c) => c.command.includes("'rm'")),
+    false,
+    "no bare rm argv",
+  );
   assertEquals(written[0].data.status, "removed");
   assertEquals(sha.length, 64);
 });
@@ -750,4 +783,86 @@ Deno.test("write renders one stdin-fed script through the vendored harness", asy
   assertEquals((result.result as { changed: boolean }).changed, true);
   await assertNoSecretOnArgv(harness.recording, [SECRET]);
   await assertNoRemoteSecretWrite(harness.recording, [SECRET]);
+});
+
+Deno.test("write never reflects remote stderr into an error or a log", async () => {
+  const logs: string[] = [];
+  const { run } = fakeRun((command) => {
+    if (command.includes("'test'")) {
+      if (command.includes("'-x'")) return { code: 0, stdout: "", stderr: "" };
+      return { code: 1, stdout: "", stderr: "" };
+    }
+    if (command.includes("mktemp")) {
+      return {
+        code: 1,
+        stdout: `oops ${SECRET}`,
+        stderr: `reflected ${SECRET}`,
+      };
+    }
+    return { code: 0, stdout: "", stderr: "" };
+  });
+  const m = createModel(deps(run));
+  const context: MethodContext = {
+    logger: {
+      info: (_message, fields) => logs.push(JSON.stringify(fields ?? {})),
+      warn: (_message, fields) => logs.push(JSON.stringify(fields ?? {})),
+    },
+    writeResource: (specName, name) =>
+      Promise.resolve({
+        name,
+        specName,
+        kind: "resource",
+        dataId: "d0",
+        version: 1,
+        size: 0,
+      }),
+  };
+  const error = await assertRejects(
+    () => m.methods.write.execute(WRITE, context),
+    SshError,
+  );
+  assert(!error.message.includes(SECRET), "error must not carry remote stderr");
+  for (const line of logs) {
+    assert(!line.includes(SECRET), "a log must not carry remote stderr");
+  }
+});
+
+Deno.test("one method run writes distinct state names", async () => {
+  const sha = await sha256Hex(SECRET);
+  const { run } = fakeRun(stagedRunner({ sha, present: false }));
+  const m = createModel(deps(run));
+  const { context, written } = testContext();
+  await m.methods.write.execute(WRITE, context);
+  const names = written.map((w) => w.name);
+  assertEquals(new Set(names).size, names.length, "names must be unique");
+});
+
+/** Captures the anchored remove script for the dash-runner and bashisms gates. */
+Deno.test("remove renders one anchored script through the vendored harness", async () => {
+  let removed = false;
+  const harness = createRecordingRunner({
+    respond: (call) => {
+      if (call.cmd !== "ssh") return undefined;
+      const command = call.argv.at(-1) ?? "";
+      if (command.includes("rm -f")) {
+        removed = true;
+        return { code: 0, stdout: "", stderr: "" };
+      }
+      if (command.includes("'test'")) {
+        if (command.includes("'-x'")) {
+          return { code: 0, stdout: "", stderr: "" };
+        }
+        return { code: removed ? 1 : 0, stdout: "", stderr: "" };
+      }
+      return { code: 0, stdout: "", stderr: "" };
+    },
+  });
+  const m = createModel(harness.deps);
+  const { context } = testContext();
+  const result = await m.methods.remove.execute(
+    { ...BASE, path: PATH },
+    context,
+  );
+  assertEquals((result.result as { removed: boolean }).removed, true);
+  await assertNoSecretOnArgv(harness.recording, [SECRET]);
 });

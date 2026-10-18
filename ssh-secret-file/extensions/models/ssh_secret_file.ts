@@ -153,6 +153,9 @@ const SSH_FIELDS = {
 /** Maximum content size in bytes (1 MiB), enforced on the resolved bytes. */
 export const MAX_CONTENT_BYTES = 1_048_576;
 
+/** Maximum number of dotenv entries. */
+export const MAX_ENTRIES = 256;
+
 const CONTENT_FIELDS = {
   path: z.string().regex(
     /^\/[A-Za-z0-9._\/-]{1,4095}$/,
@@ -173,6 +176,9 @@ const CONTENT_FIELDS = {
   entries: z.record(
     z.string().max(128),
     z.string().max(65_536).meta({ sensitive: true }),
+  ).refine(
+    (entries) => Object.keys(entries).length <= MAX_ENTRIES,
+    { message: `entries must have at most ${MAX_ENTRIES} keys` },
   ).meta({ sensitive: true }).nullish().describe(
     "Dotenv entries; each value is rendered single-quoted as KEY='value'. Up to 256 entries and 1 MiB rendered.",
   ),
@@ -243,7 +249,6 @@ type RemoveArgs = z.infer<typeof REMOVE_ARGS>;
 type TargetArgs = Pick<WriteArgs, keyof typeof SSH_FIELDS>;
 
 const DOTENV_KEY_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
-const MAX_ENTRIES = 256;
 
 /**
  * Renders dotenv entries as `KEY='value'` lines for POSIX-shell sourcing. A
@@ -296,6 +301,15 @@ export const PROBE_TIMEOUT_MS = 30_000;
  * that is group- or world-writable, or not owned by the running user or root,
  * is refused.
  */
+/** The `cd` + canonical-path refusal shared by the anchored remote scripts. */
+function anchorLines(dir: string): string[] {
+  return [
+    `d=${posixQuote(dir)}`,
+    'cd "$d"',
+    '[ "$(pwd -P)" = "$d" ] || { echo \'destination directory has a symlinked path component; refusing\' >&2; exit 2; }',
+  ];
+}
+
 export function stageWriteScript(
   path: string,
   mode: string,
@@ -307,30 +321,44 @@ export function stageWriteScript(
   const target = posixQuote(`./${base}`);
   const lines = [
     "set -eu",
-    `d=${posixQuote(dir)}`,
-    'cd "$d"',
-    '[ "$(pwd -P)" = "$d" ] || { echo \'destination directory has a symlinked path component; refusing\' >&2; exit 1; }',
+    ...anchorLines(dir),
     "dmode=$(stat -c '%a' .)",
     "downer=$(stat -c '%u' .)",
     "duid=$(id -u)",
-    "[ \"$((0$dmode & 022))\" -eq 0 ] || { echo 'destination directory is group- or world-writable; refusing' >&2; exit 1; }",
-    '[ "$downer" = "$duid" ] || [ "$downer" = 0 ] || { echo \'destination directory is not owned by the running user or root; refusing\' >&2; exit 1; }',
+    "[ \"$((0$dmode & 022))\" -eq 0 ] || { echo 'destination directory is group- or world-writable; refusing' >&2; exit 3; }",
+    '[ "$downer" = "$duid" ] || [ "$downer" = 0 ] || { echo \'destination directory is not owned by the running user or root; refusing\' >&2; exit 4; }',
     "t=$(mktemp ./.secret-stage-XXXXXXXX)",
     "trap 'rm -f \"$t\"' EXIT",
     "trap 'exit 1' HUP INT TERM",
     'cat > "$t"',
-    `[ "$(wc -c < "$t" | tr -d '[:space:]')" -eq ${expectedBytes} ]`,
+    `[ "$(wc -c < "$t" | tr -d '[:space:]')" -eq ${expectedBytes} ] || { echo 'short read; refusing' >&2; exit 5; }`,
     `chmod ${posixQuote(mode)} "$t"`,
   ];
   if (spec !== undefined) lines.push(`chown -h ${posixQuote(spec)} "$t"`);
   lines.push(
     // Re-check the destination with no-follow immediately before the rename.
-    `[ ! -L ${target} ]`,
-    `[ ! -d ${target} ]`,
-    `mv -T "$t" ${target}`,
+    `[ ! -L ${target} ] || { echo 'destination changed; refusing' >&2; exit 6; }`,
+    `[ ! -d ${target} ] || { echo 'destination changed; refusing' >&2; exit 6; }`,
+    `mv -T "$t" ${target} || { echo 'destination changed; refusing' >&2; exit 6; }`,
     "trap - EXIT",
   );
   return lines.join("\n");
+}
+
+/**
+ * One anchored remove: refuse a symlinked path component, unlink the relative
+ * name, and prove it is gone, all in the pinned current directory.
+ */
+export function removeScript(path: string): string {
+  const dir = path.slice(0, path.lastIndexOf("/")) || "/";
+  const base = path.slice(path.lastIndexOf("/") + 1);
+  const target = posixQuote(`./${base}`);
+  return [
+    "set -eu",
+    ...anchorLines(dir),
+    `rm -f ${target}`,
+    `[ ! -e ${target} ] && [ ! -L ${target} ]`,
+  ].join("\n");
 }
 
 /** The content-bearing fields, shared by write and verify. */
@@ -458,17 +486,15 @@ function normalizeMode(mode: string): string {
   return trimmed === "" ? "0" : trimmed;
 }
 
-/** Throws a typed error when a remote command exits non-zero. */
-function requireOk(
-  result: { exit_code: number; stderr: string },
-  what: string,
-): void {
+/**
+ * Throws a typed error when a remote command exits non-zero. Remote stderr is
+ * never included: a hostile or misconfigured target can reflect stdin or file
+ * bytes into it, and an error reaches the run record and `--json`. The remote
+ * scripts use distinct exit codes so a failure stays diagnosable.
+ */
+function requireOk(result: { exit_code: number }, what: string): void {
   if (result.exit_code !== 0) {
-    throw new SshError(
-      `${what} failed (exit ${result.exit_code}): ${
-        result.stderr.trim().slice(0, 200)
-      }`,
-    );
+    throw new SshError(`${what} failed (exit ${result.exit_code})`);
   }
 }
 
@@ -482,32 +508,6 @@ interface FileStat {
   bytes: number;
 }
 
-/**
- * Stats a remote path. The caller must have confirmed it exists first; any
- * failure here is a real error, never silently an absent file.
- */
-async function statFile(
-  deps: SshDeps,
-  target: SshTarget,
-  path: string,
-): Promise<FileStat> {
-  const result = await sshExec(deps, target, [
-    "stat",
-    "-c",
-    "%a %U %G %u %g %s",
-    path,
-  ], { timeoutMs: PROBE_TIMEOUT_MS });
-  requireOk(result, `stat ${path}`);
-  const [mode, owner, group, ownerId, groupId, bytes] = result.stdout.trim()
-    .split(/\s+/);
-  if (
-    !mode || !owner || !ownerId || !group || !groupId || bytes === undefined
-  ) {
-    throw new SshError(`could not parse stat output for ${path}`);
-  }
-  return { mode, owner, ownerId, group, groupId, bytes: Number(bytes) };
-}
-
 /** Defines whether `value` asks for a numeric or a named owner comparison. */
 function matchesIdentity(
   requested: string | null | undefined,
@@ -518,21 +518,77 @@ function matchesIdentity(
   return /^\d+$/.test(requested) ? requested === id : requested === name;
 }
 
-/** The remote file's SHA-256, lowercase hex. */
-async function remoteSha256(
+/**
+ * One anchored read: `cd` into the destination directory, refuse a symlinked
+ * path component, then stat and hash the file by its relative name, so the cwd
+ * inode anchors both reads to the same directory. Prints one stat line and one
+ * `sha256sum` line.
+ */
+export function readFileScript(path: string): string {
+  const dir = path.slice(0, path.lastIndexOf("/")) || "/";
+  const base = path.slice(path.lastIndexOf("/") + 1);
+  const target = posixQuote(`./${base}`);
+  return [
+    "set -eu",
+    ...anchorLines(dir),
+    `stat -c '%a %U %G %u %g %s' ${target}`,
+    `sha256sum ${target}`,
+  ].join("\n");
+}
+
+/** One read of a remote file: metadata plus SHA-256, from one anchored script. */
+interface FileObservation {
+  stat: FileStat;
+  sha: string;
+}
+
+async function readFile(
   deps: SshDeps,
   target: SshTarget,
   path: string,
-): Promise<string> {
-  const result = await sshExec(deps, target, ["sha256sum", path], {
-    timeoutMs: SHA_TIMEOUT_MS,
-  });
-  requireOk(result, `sha256sum ${path}`);
-  const sha = result.stdout.trim().split(/\s+/)[0] ?? "";
+): Promise<FileObservation> {
+  const result = await sshExec(
+    deps,
+    target,
+    ["sh", "-c", readFileScript(path)],
+    { timeoutMs: SHA_TIMEOUT_MS },
+  );
+  requireOk(result, `read ${path}`);
+  const lines = result.stdout.trim().split("\n");
+  const [mode, owner, group, ownerId, groupId, bytes] = (lines[0] ?? "")
+    .trim().split(/\s+/);
+  if (
+    !mode || !owner || !ownerId || !group || !groupId || bytes === undefined
+  ) {
+    throw new SshError(`could not parse stat output for ${path}`);
+  }
+  const sha = (lines[1] ?? "").trim().split(/\s+/)[0] ?? "";
   if (!/^[0-9a-f]{64}$/.test(sha)) {
     throw new SshError(`could not read a SHA-256 for ${path}`);
   }
-  return sha;
+  return {
+    stat: { mode, owner, ownerId, group, groupId, bytes: Number(bytes) },
+    sha,
+  };
+}
+
+/** True when the remote file matches the wanted bytes, mode, owner and group. */
+async function converged(
+  deps: SshDeps,
+  target: SshTarget,
+  args: {
+    path: string;
+    mode: string;
+    owner?: string | null;
+    group?: string | null;
+  },
+  localSha: string,
+): Promise<boolean> {
+  const { stat, sha } = await readFile(deps, target, args.path);
+  return sha === localSha &&
+    normalizeMode(stat.mode) === normalizeMode(args.mode) &&
+    matchesIdentity(args.owner, stat.owner, stat.ownerId) &&
+    matchesIdentity(args.group, stat.group, stat.groupId);
 }
 
 /**
@@ -631,246 +687,230 @@ async function writeState(
 }
 
 /**
- * Builds the model with injectable dependencies. The production export is
- * `createModel()`; tests pass a fake runner, clock and sleep so no process is
- * spawned and no socket is opened.
+ * The methods, bound to one dependency set. Tests pass a fake runner, clock and
+ * sleep so no process is spawned and no socket is opened.
  */
-export function createModel(deps: SshDeps = denoDeps): SecretFileModel {
+function methodsFor(deps: SshDeps): Record<string, SecretFileMethod> {
   return {
-    type: "@randybias/ssh-secret-file",
-    version: "2026.10.17.1",
-    description:
-      "Write a secret file onto one host over SSH from vault values delivered over stdin, atomically and idempotently by content hash, with settable owner and group and a remove action. State holds metadata and at most a keyed HMAC of the content, never the value.",
-    upgrades: [],
-    globalArguments: z.strictObject({}),
-    resources: {
-      secretFile: {
-        description:
-          "Secret-file metadata: path, mode, owner, group, byte count and change flag",
-        schema: FileStateSchema,
-        lifetime: "infinite",
-        garbageCollection: 10,
-      },
-    },
-    methods: {
-      write: {
-        kind: "action",
-        description:
-          "DESTRUCTIVE. Write the file atomically over stdin with the given mode, owner and group, idempotently by content. The owner and group are applied to a staged file before the rename, so the published file is never briefly wrong. The value is never returned, logged or stored; state keeps only a keyed HMAC when hmac_key is given.",
-        arguments: WRITE_ARGS,
-        execute: async (
-          rawArgs: unknown,
-          context: MethodContext,
-        ): Promise<MethodResult> => {
-          const args = rawArgs as WriteArgs;
-          assertRemotePath(args.path);
-          const target = toTarget(args);
-          await assertReplaceable(deps, target, args.path);
-          const bytes = resolveContent(args);
-          const localSha = await sha256Hex(bytes);
-          const spec = chownSpec(args.owner, args.group);
-          let changed = true;
-          if (await exists(deps, target, args.path)) {
-            const stat = await statFile(deps, target, args.path);
-            const remote = await remoteSha256(deps, target, args.path);
-            if (
-              remote === localSha &&
-              normalizeMode(stat.mode) === normalizeMode(args.mode) &&
-              matchesIdentity(args.owner, stat.owner, stat.ownerId) &&
-              matchesIdentity(args.group, stat.group, stat.groupId)
-            ) {
-              changed = false;
-            }
-          }
-          if (changed) {
-            requireOk(
-              await sshExec(
-                deps,
-                target,
-                [
-                  "sh",
-                  "-c",
-                  stageWriteScript(args.path, args.mode, bytes.length, spec),
-                ],
-                { stdin: bytes, timeoutMs: WRITE_TIMEOUT_MS },
-              ),
-              `write ${args.path}`,
+    write: {
+      kind: "action",
+      description:
+        "DESTRUCTIVE. Write the file atomically over stdin with the given mode, owner and group, idempotently by content; the owner and group are applied to a staged file before the rename, so the published file is never briefly wrong. The value is never returned, logged or stored, and state keeps only a keyed HMAC when hmac_key is given.",
+      arguments: WRITE_ARGS,
+      execute: async (
+        rawArgs: unknown,
+        context: MethodContext,
+      ): Promise<MethodResult> => {
+        const args = rawArgs as WriteArgs;
+        assertRemotePath(args.path);
+        const target = toTarget(args);
+        const bytes = resolveContent(args);
+        const localSha = await sha256Hex(bytes);
+        const spec = chownSpec(args.owner, args.group);
+        await assertReplaceable(deps, target, args.path);
+        let changed = true;
+        if (await exists(deps, target, args.path)) {
+          changed = !await converged(deps, target, args, localSha);
+        }
+        if (changed) {
+          requireOk(
+            await sshExec(
+              deps,
+              target,
+              [
+                "sh",
+                "-c",
+                stageWriteScript(args.path, args.mode, bytes.length, spec),
+              ],
+              { stdin: bytes, timeoutMs: WRITE_TIMEOUT_MS },
+            ),
+            `write ${args.path}`,
+          );
+          if (!await converged(deps, target, args, localSha)) {
+            throw new SshError(
+              `secret file ${args.path} did not converge`,
             );
-            const stat = await statFile(deps, target, args.path);
-            const remote = await remoteSha256(deps, target, args.path);
-            if (
-              remote !== localSha ||
-              normalizeMode(stat.mode) !== normalizeMode(args.mode) ||
-              !matchesIdentity(args.owner, stat.owner, stat.ownerId) ||
-              !matchesIdentity(args.group, stat.group, stat.groupId)
-            ) {
-              throw new SshError(
-                `secret file ${args.path} did not converge`,
-              );
-            }
           }
-          const hmac = args.hmac_key != null
-            ? await hmacSha256Hex(args.hmac_key, bytes)
-            : undefined;
-          const handle = await writeState(context, args, {
+        }
+        const hmac = args.hmac_key != null
+          ? await hmacSha256Hex(args.hmac_key, bytes)
+          : undefined;
+        const handle = await writeState(context, args, {
+          path: args.path,
+          mode: args.mode,
+          owner: args.owner ?? undefined,
+          group: args.group ?? undefined,
+          bytes: bytes.length,
+          changed,
+          content_hmac: hmac,
+          status: "present",
+        }, new Date(deps.now()).toISOString());
+        context.logger.info(
+          "Wrote secret file {path} ({bytes} bytes, changed {changed})",
+          { path: args.path, bytes: bytes.length, changed },
+        );
+        return {
+          dataHandles: [handle],
+          result: {
             path: args.path,
             mode: args.mode,
-            owner: args.owner ?? undefined,
-            group: args.group ?? undefined,
             bytes: bytes.length,
             changed,
-            content_hmac: hmac,
-            status: "present",
-          }, new Date(deps.now()).toISOString());
-          context.logger.info(
-            "Wrote secret file {path} ({bytes} bytes, changed {changed})",
-            { path: args.path, bytes: bytes.length, changed },
-          );
-          return {
-            dataHandles: [handle],
-            result: {
-              path: args.path,
-              mode: args.mode,
-              bytes: bytes.length,
-              changed,
-            },
-          };
-        },
+          },
+        };
       },
+    },
 
-      verify: {
-        description:
-          "READ-ONLY. Stat the file and, when a content form is given, compare its SHA-256 with the local value's; also compares mode, owner and group when given. Stores match flags and metadata only, never the content or a hash.",
-        arguments: VERIFY_ARGS,
-        execute: async (
-          rawArgs: unknown,
-          context: MethodContext,
-        ): Promise<MethodResult> => {
-          const args = rawArgs as VerifyArgs;
-          assertRemotePath(args.path);
-          if (contentCount(args) > 1) {
-            throw new SshConfigError(
-              "pass at most one of content, entries or content_base64",
-            );
-          }
-          const target = toTarget(args);
-          const observedAt = new Date(deps.now()).toISOString();
-          if (!await exists(deps, target, args.path)) {
-            const handle = await writeState(context, args, {
-              path: args.path,
-              mode: args.mode ?? "",
-              bytes: undefined,
-              changed: false,
-              matches: false,
-              status: "not_found",
-            }, observedAt);
-            context.logger.info("Secret file {path} is absent", {
-              path: args.path,
-            });
-            return {
-              dataHandles: [handle],
-              result: { present: false, matches: false },
-            };
-          }
-          const stat = await statFile(deps, target, args.path);
-          const expected = contentCount(args) === 1
-            ? await sha256Hex(resolveContent(args))
-            : undefined;
-          const remote = expected === undefined
-            ? undefined
-            : await remoteSha256(deps, target, args.path);
-          const matches = (expected === undefined || expected === remote) &&
-            (args.mode == null ||
-              normalizeMode(stat.mode) === normalizeMode(args.mode)) &&
-            matchesIdentity(args.owner, stat.owner, stat.ownerId) &&
-            matchesIdentity(args.group, stat.group, stat.groupId);
+    verify: {
+      description:
+        "READ-ONLY. Stat the file and, when a content form is given, compare its SHA-256 with the local value's; also compares mode, owner and group when given. Stores match flags and metadata only, never the content or a hash.",
+      arguments: VERIFY_ARGS,
+      execute: async (
+        rawArgs: unknown,
+        context: MethodContext,
+      ): Promise<MethodResult> => {
+        const args = rawArgs as VerifyArgs;
+        assertRemotePath(args.path);
+        if (contentCount(args) > 1) {
+          throw new SshConfigError(
+            "pass at most one of content, entries or content_base64",
+          );
+        }
+        const target = toTarget(args);
+        const observedAt = new Date(deps.now()).toISOString();
+        if (!await exists(deps, target, args.path)) {
           const handle = await writeState(context, args, {
             path: args.path,
+            mode: args.mode ?? "",
+            bytes: undefined,
+            changed: false,
+            matches: false,
+            status: "not_found",
+          }, observedAt);
+          context.logger.info("Secret file {path} is absent", {
+            path: args.path,
+          });
+          return {
+            dataHandles: [handle],
+            result: { present: false, matches: false },
+          };
+        }
+        const { stat, sha } = await readFile(deps, target, args.path);
+        const expected = contentCount(args) === 1
+          ? await sha256Hex(resolveContent(args))
+          : undefined;
+        const matches = (expected === undefined || expected === sha) &&
+          (args.mode == null ||
+            normalizeMode(stat.mode) === normalizeMode(args.mode)) &&
+          matchesIdentity(args.owner, stat.owner, stat.ownerId) &&
+          matchesIdentity(args.group, stat.group, stat.groupId);
+        const handle = await writeState(context, args, {
+          path: args.path,
+          mode: stat.mode,
+          owner: stat.owner,
+          group: stat.group,
+          bytes: stat.bytes,
+          changed: false,
+          matches,
+          status: "present",
+        }, observedAt);
+        context.logger.info("Secret file {path} matches {matches}", {
+          path: args.path,
+          matches,
+        });
+        return {
+          dataHandles: [handle],
+          result: {
+            present: true,
+            matches,
             mode: stat.mode,
             owner: stat.owner,
             group: stat.group,
             bytes: stat.bytes,
-            changed: false,
-            matches,
-            status: "present",
-          }, observedAt);
-          context.logger.info("Secret file {path} matches {matches}", {
-            path: args.path,
-            matches,
-          });
-          return {
-            dataHandles: [handle],
-            result: {
-              present: true,
-              matches,
-              mode: stat.mode,
-              owner: stat.owner,
-              group: stat.group,
-              bytes: stat.bytes,
-            },
-          };
-        },
+          },
+        };
       },
+    },
 
-      remove: {
-        kind: "action",
-        description:
-          "DESTRUCTIVE. Remove the file from the host and prove it is gone. Idempotent: an already-absent file is a clean no-op.",
-        arguments: REMOVE_ARGS,
-        execute: async (
-          rawArgs: unknown,
-          context: MethodContext,
-        ): Promise<MethodResult> => {
-          const args = rawArgs as RemoveArgs;
-          assertRemotePath(args.path);
-          const target = toTarget(args);
-          const observedAt = new Date(deps.now()).toISOString();
-          if (!await exists(deps, target, args.path)) {
-            const handle = await writeState(context, args, {
-              path: args.path,
-              mode: "",
-              changed: false,
-              status: "not_found",
-            }, observedAt);
-            context.logger.info("Secret file {path} already absent", {
-              path: args.path,
-            });
-            return {
-              dataHandles: [handle],
-              result: { path: args.path, removed: false },
-            };
-          }
-          requireOk(
-            await sshExec(deps, target, ["rm", "-f", args.path], {
-              timeoutMs: PROBE_TIMEOUT_MS,
-            }),
-            `rm ${args.path}`,
-          );
-          if (await exists(deps, target, args.path)) {
-            throw new SshError(`secret file ${args.path} is still present`);
-          }
+    remove: {
+      kind: "action",
+      description:
+        "DESTRUCTIVE. Remove the file from the host and prove it is gone. Idempotent: an already-absent file is a clean no-op.",
+      arguments: REMOVE_ARGS,
+      execute: async (
+        rawArgs: unknown,
+        context: MethodContext,
+      ): Promise<MethodResult> => {
+        const args = rawArgs as RemoveArgs;
+        assertRemotePath(args.path);
+        const target = toTarget(args);
+        const observedAt = new Date(deps.now()).toISOString();
+        if (!await exists(deps, target, args.path)) {
           const handle = await writeState(context, args, {
             path: args.path,
             mode: "",
-            changed: true,
-            status: "removed",
+            changed: false,
+            status: "not_found",
           }, observedAt);
-          context.logger.info("Removed secret file {path}", {
+          context.logger.info("Secret file {path} already absent", {
             path: args.path,
           });
           return {
             dataHandles: [handle],
-            result: { path: args.path, removed: true },
+            result: { path: args.path, removed: false },
           };
-        },
+        }
+        requireOk(
+          await sshExec(deps, target, ["sh", "-c", removeScript(args.path)], {
+            timeoutMs: PROBE_TIMEOUT_MS,
+          }),
+          `remove ${args.path}`,
+        );
+        if (await exists(deps, target, args.path)) {
+          throw new SshError(`secret file ${args.path} is still present`);
+        }
+        const handle = await writeState(context, args, {
+          path: args.path,
+          mode: "",
+          changed: true,
+          status: "removed",
+        }, observedAt);
+        context.logger.info("Removed secret file {path}", {
+          path: args.path,
+        });
+        return {
+          dataHandles: [handle],
+          result: { path: args.path, removed: true },
+        };
       },
     },
   };
 }
 
-/** Production model: the factory with no overrides. */
+/** The model definition, bound to the production dependencies. */
 export const model = {
-  ...createModel(),
   type: "@randybias/ssh-secret-file",
   version: "2026.10.17.1",
+  description:
+    "Write a secret file onto one host over SSH from vault values delivered over stdin, atomically and idempotently by content hash, with settable owner and group and a remove action. State holds metadata and at most a keyed HMAC of the content, never the value.",
+  upgrades: [],
+  globalArguments: z.strictObject({}),
+  resources: {
+    secretFile: {
+      description:
+        "Secret-file metadata: path, mode, owner, group, byte count and change flag",
+      schema: FileStateSchema,
+      lifetime: "infinite",
+      garbageCollection: 10,
+    },
+  },
+  methods: methodsFor(denoDeps),
 } satisfies SecretFileModel;
+
+/**
+ * Builds the model with injectable dependencies. The production export is
+ * `model`; tests call this with a fake runner, clock and sleep.
+ */
+export function createModel(deps: SshDeps = denoDeps): SecretFileModel {
+  return { ...model, methods: methodsFor(deps) };
+}

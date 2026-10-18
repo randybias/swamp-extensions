@@ -19,10 +19,10 @@ method takes its own target, and state is keyed by host, port, user and path.
 
 ## Dependencies
 
-- OpenSSH client tools on the runner: `ssh`, `ssh-agent`, `ssh-add`. The target
-  must be Linux for the atomic rename.
-- GNU `stat` and `sha256sum` (or `shasum -a 256`) on the target. `chown` runs
-  only when `owner` or `group` is set.
+- OpenSSH client tools on the runner: `ssh`, `ssh-agent`, `ssh-add`.
+- GNU coreutils on the target: `stat -c`, `sha256sum` and `mv -T`. The target
+  must be Linux; a BSD userland fails its first probe with a typed error.
+  `chown` runs only when `owner` or `group` is set.
 
 ## Install
 

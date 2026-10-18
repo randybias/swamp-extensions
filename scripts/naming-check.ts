@@ -55,6 +55,8 @@ export const QUALIFIED_NAMES = new Set([
   "secret-file", // under audit, see STATUS
   "host-net", // under audit, see STATUS
   "server-host", // under audit, see STATUS
+  "linux-host-hardening", // confirmed rename of server-host (linux is the system)
+  "ssh-secret-file", // confirmed rename of secret-file (ssh is the system)
 ]);
 
 export const VERBS = new Set([

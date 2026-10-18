@@ -954,3 +954,21 @@ Deno.test("remove renders one anchored script through the vendored harness", asy
   assertEquals((result.result as { removed: boolean }).removed, true);
   await assertNoSecretOnArgv(harness.recording, [SECRET]);
 });
+
+Deno.test("write converges on the short octal mode GNU stat prints", async () => {
+  const sha = await sha256Hex(SECRET);
+  const { run, calls } = fakeRun(stagedRunner({
+    sha,
+    present: true,
+    statLine: "60 root root 0 0 18\n",
+  }));
+  const m = createModel(deps(run));
+  const { context, written } = testContext();
+  const result = await m.methods.write.execute(
+    { ...WRITE, mode: "0060" },
+    context,
+  );
+  assertEquals((result.result as { changed: boolean }).changed, false);
+  assertEquals(written[0].data.mode, "0060");
+  assertEquals(calls.some((c) => c.command.includes("mktemp")), false);
+});

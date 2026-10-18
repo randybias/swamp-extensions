@@ -400,6 +400,15 @@ mode for `@swamp/ssh`.
   cannot land an arbitrary token in state or `--json`.
 - 2026-10-18: `verify` resolves the supplied content form before it probes the
   host and stores `""` (not the requested mode) in a not_found record.
+- 2026-10-18: the live run found `write` failing for modes `0060` and `0040`:
+  GNU `stat %a` prints `60` and `40`, and the stat-token check required three
+  octal digits. The read check now accepts 1-4 octal digits (the input schema
+  still requires 3-4), so those modes converge and are recorded. The two files
+  the fail cells left on the throwaway host are noted in the live baseline.
+- residual low: spec section 4 says a dangling symlink destination is replaced,
+  while the code refuses any symlink destination (the security property the
+  reviewers required). The live receipt records the refusal as the observed
+  behaviour; the spec wording is a separate spec edit.
 - residual low: the spec file and LOGBOOK lineage still say `secret-file`; a
   `docs/specs/ssh-secret-file.md` rename is a separate docs change and would
   widen this branch's diff scope.

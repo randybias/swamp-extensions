@@ -571,7 +571,9 @@ async function readFile(
   const [mode, owner, group, ownerId, groupId, bytes] = (lines[0] ?? "")
     .trim().split(/\s+/);
   if (
-    mode === undefined || !/^[0-7]{3,4}$/.test(mode) ||
+    // GNU stat %a strips leading zeros (0060 prints as "60"), so accept any
+    // 1-4 octal digits here; the input schema still requires 3-4.
+    mode === undefined || !/^[0-7]{1,4}$/.test(mode) ||
     owner === undefined || !IDENTITY_RE.test(owner) ||
     ownerId === undefined || !/^\d{1,10}$/.test(ownerId) ||
     group === undefined || !IDENTITY_RE.test(group) ||

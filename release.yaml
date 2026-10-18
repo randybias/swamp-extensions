@@ -273,7 +273,10 @@ knot-dns:
 
 ssh-secret-file:
   channel: beta
-  ci: false
+  ci: true
   visibility: public
   audience: general
-  published: {}
+  published:
+    2026.10.17.1: c6ff3b4e1804312f1568ff29f61e3e963fb5004c2701adab6365d13ab2064e05
+  notes:
+    2026.10.17.1: 'First release under this name, beta. @randybias/ssh-secret-file is the confirmed rename of @randybias/secret-file, whose public versions stay published and are deprecated later; a definition moves by changing the type name and re-running write, which is a no-op on the host. Write one secret file onto one Linux host over SSH from vault values delivered over stdin (literal, base64 or dotenv entries single-quoted for shell sourcing), atomically and idempotently by content, mode, owner and group; verify (read-only) and remove (an action). Every remote step is one POSIX sh script that cd''s into the destination directory and refuses a symlinked component at any depth, a group- or world-writable directory and one not owned by the running user or root, stages under mktemp 0600, applies owner and group before the mode, checks the staged byte count and renames with mv -T; a symlink or directory destination is refused and errors never carry remote stderr. The transport is the canonical ssh-host 2026.10.17.3 copy: host keys are strict only and the private key goes to a short-lived ssh-agent over stdin. State keeps metadata and at most a keyed HMAC, never the value or a plain hash. Live end to end on a throwaway Ubuntu 24.04 VPS, twice: 28 pass and 1 fail on the first head (modes below 0100 were written but not parsed back; fixed), then on this version 30 pass, 0 fail, 1 untested (nothing to upgrade from), with a 0-line host baseline diff and 0 secret hits in 4145 process samples and the local argv scan. Residuals are in the LOGBOOK: a FIFO, device or socket destination is not refused (a bounded stall, or replacement of a node the operator named); a non-root runner writing an owner-unreadable mode leaves the file without a record; account names with a dot or a trailing $ cannot converge; repeated slashes in the path fail with a misleading exit code; a post-write read error leaves the new file unrecorded until a re-run; verify with nothing to compare reports matches true; the scripts'' exit codes are not decoded into messages; so it stays on beta.'

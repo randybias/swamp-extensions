@@ -276,6 +276,9 @@ hit list.
     queue; word match only. NONE.
   - `@sntxrr/scaleway-object-storage` (stable): S3 buckets signed with an access
     key and secret; word match only. NONE.
+  - `@randybias/secret-file` (beta): the package this one renames. It is the
+    same model under the previous name — the successor, not prior art — and its
+    public versions are deprecated after this package publishes.
   - `@randybias/k8s-secret` (beta), `@randybias/server-stack` (beta): ours; the
     Kubernetes counterpart and the stack that composes this extension. Not prior
     art.

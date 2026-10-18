@@ -1,0 +1,82 @@
+{
+  "extension": "@randybias/knot-dns",
+  "version": "2026.10.17.2",
+  "reviewedAt": "2026-10-18T04:45:00Z",
+  "dimensions": [
+    {
+      "id": "credentials-secrets",
+      "verdict": "pass",
+      "note": "The SSH key is named by ssh_key_ref (vault + key), resolved at execution through context.vaultService.get (the runtime object shape, driven by a plain-object context in tests) and handed to ssh-agent over stdin; every TSIG secret is a vault reference written host-side to a 0640 root:knot key file through a stdin upload and included by the config, never in the fragment render_zone returns, in argv, in a result or in stored state. host_key_policy accepts only strict with pinned host_keys (insecure_tofu refused live at validation). The transport is the canonical ssh-host 2026.10.17.3 copy (ssh.ts blob 8f132c4329c9e64bed686731cd5a0e02980194ea), so transport findings are judged in its owner. No content-derived hash on any argv or remote command text. Live run 2: 1,455 unique local argv lines (118,990 samples) and 94 unique host ps lines scanned against the run SSH key, the provider token and the swamp token, 0 hits; --json only on a host-less render_resolver run carrying vault references. README examples show vault references only."
+    },
+    {
+      "id": "logging-quality",
+      "verdict": "pass",
+      "note": "The model writes no free-text logs; every method's outcome is a typed record (outcome for install, apply and remove; observation for get and sync; ds; zone; resolver) and failures are typed errors mapped from fixed remote markers (PORT_BUSY with the owning process, ZONE_ABSENT as invalid_input, PURGE_KEYS_FAILED, RELOAD_FAILED_KEYS_PURGED) that carry no key material or TSIG content. Residual LOW (kept): PORT_BUSY prints the address twice and, when both the udp and tcp sockets match, a second unlabeled line; the method keeps only the first line."
+    },
+    {
+      "id": "error-handling",
+      "verdict": "pass",
+      "note": "Every host script runs under flock as POSIX sh (dash, set -eu); a staged zone, fragment or resolver config is validated by kzonecheck, knotc conf-check or kresctl validate before the swap, and a reload or verify failure restores the backup synchronously (live run 1 exercised the rollback twice; run 2 showed the prechecks refusing before any swap). Preconditions are enforced in-method against the actual arguments before any vault read or dial: a wildcard listen without listen_any_ack, an authoritative/resolver listen overlap in both directions, purge_keys_ack on an apex this model never applied, unsigning without dnssec_unsign_ack, remove_resolver without a record or remove_ack. The port-53 precheck strips the ss address scope (the systemd-resolved stub is 127.0.0.53%lo:53) and names the owner (live: PORT_BUSY 127.0.0.53:53 owner=systemd-resolve in 3.2 s, no restart). ksk_submitted maps knotc's 'no key ready for submission' to the already-done state; a failed keymgr list fails the purge (exit 16) instead of reporting removed with keys on disk. Residual LOW (kept): after knotc -f zone-purge an own_all failure rolls the files back under a plain CHOWN_FAILED although the KASP keys are gone (the README documents the purge as irreversible on any failed remove). Residual LOW (kept): the allow_query_from self-test check runs after the read-only port probe, so an intrinsically invalid access list dials before it is refused."
+    },
+    {
+      "id": "testing-completeness",
+      "verdict": "pass",
+      "note": "144 offline tests: schema, grammar and semantic rules; golden zone files for every record type, wildcard, delegation with DS and glue and a reverse zone; canonical-order stability; TXT escaping; golden fragments and resolver YAML; served-vs-declared diff; every rendered script under sh -n; and 13 container cells that run the rendered scripts against real knotd, kzonecheck, keymgr, kresctl and kdig (sign, purge, failed keymgr list, scoped ss precheck). Gates: deno, swamp fmt, quality, leak scan, gitleaks, fixture guard, naming, registry-lint, dash-runner, bashisms, fixture-provenance, workflow-edges, realtool, dry run. Live on a throwaway Ubuntu 24.04 VPS, loopback only: run 1 at the previous head 44 pass 4 fail, all four fixed and re-run; run 2 at this contentHash 48 pass, 0 fail, 1 untested (a kzonecheck rejection forced past the schema is unreachable from the CLI), 2 inconclusive (render_resolver returns its render and the CLI cannot show a method result; the bad-input row covers the method), covering the full lifecycle (install, apply, re-apply, record change, DNSSEC on and off, ksk_submitted, get_ds, resolver apply, re-apply and cache change, get, sync with drift, remove, remove again) and every failure path reachable from the CLI. Residual MEDIUM (kept): the dash-runner and bashisms gates capture no scripts because the tests use real tools in a container rather than the recording harness (both gates pass). Residual LOW (kept): the offline port-check test uses IP:port rather than the ADDR@port grammar and the ksk already-done branch is asserted as a substring; both branches were executed under dash by the triage."
+    },
+    {
+      "id": "idempotency-resilience",
+      "verdict": "pass",
+      "note": "Live run 2: install rerun left the package set, the include count, knotd's MainPID and knot.conf's mtime and sha unchanged (the run-1 touch observation fixed); an identical apply_zone made no reload and kept the serial and MainPID; apply_resolver rerun passed the precheck by kresd's own process name and changed nothing; remove_zone rerun returned removed false with every file and the MainPID identical; ksk_submitted called twice more was a no-op; a hand-added drift record was removed by a re-apply. Rollback is synchronous (DNS changes never cut the SSH path, so no armed timer is needed), and a restart that fails to bind restores the previous listen set. Residual LOW (documented): remove_resolver's second call is a refusal unless remove_ack is set, where remove_zone's is a no-op."
+    },
+    {
+      "id": "api-contracts",
+      "verdict": "pass",
+      "note": "Zone files, config fragments and the resolver config.yaml are rendered deterministically (the same declaration gave the same sha across both live runs) and validated by the vendor tools in the container cells and on the host before any swap; read-backs (knotc zone-status and zone-read, keymgr list and ds, ss, kresctl validate, kdig) are status-checked in the scripts, and get_ds output was byte-identical to keymgr ds on the host. Requires a Debian or Ubuntu target with apt, systemd and flock; Knot DNS 3.3 from the archive and Knot Resolver 6 from the CZ.NIC repository with a pinned, independently confirmed signing-key fingerprint, pinned at apt priority 100 so Knot DNS keeps the archive version (confirmed live: knot stayed 3.3.4)."
+    },
+    {
+      "id": "resource-management",
+      "verdict": "pass",
+      "note": "Staged files are swapped atomically from a backup that the rollback restores; a failed apply_resolver removes its staged file (EXIT trap); remove_zone removes the zone file, its fragment, its TSIG fragment and its listen entry, and with purge_keys_ack the journal, timers and KASP keys; remove_resolver restores the package config and consumes config.yaml.package. The run-2 baseline diff left only the documented install residue (packages and dependencies, the knot and knot-resolver users, /etc/knot with an empty knot.conf.d, the /var/lib/knot LMDBs with keymgr's trashed .pem files, kresd's own cache, the CZ.NIC repository files). Residual LOW (kept): install resolver true leaves /root/.gnupg from the gpg fingerprint check and an enabled supervisor.service, neither named in the README, and can upgrade curl and libcurl as a dependency side effect; purge_keys_ack leaves keymgr trash-bin entries until keymgr trash-discard."
+    },
+    {
+      "id": "published-surface-hygiene",
+      "verdict": "pass",
+      "note": "Manifest: @randybias/knot-dns, two-sentence description, Apache-2.0, additionalFiles README.md and LICENSE.txt, labels and platforms set. Read-only methods start READ-ONLY and mutating ones DESTRUCTIVE. README examples use one definition for many hosts, vault references only and the required host_keys; secondaries are documented as configuration only. Fixtures use RFC 5737 addresses and .test names; leak scan, gitleaks, fixture guard and the naming check pass. The LOGBOOK carries the visibility and audience lines, the five naming answers (package name kept), every review round's dispositions and the live receipts with addresses, hostnames and provider ids redacted."
+    },
+    {
+      "id": "schema-strictness",
+      "verdict": "pass",
+      "note": "Every argument object is z.strictObject; the apex, owner names, record types (closed allowlist, signer-owned types refused), rdata, TTL bounds, listen ADDR[@port], CIDRs, TSIG algorithms and the ssh block carry grammars and bounds; host_key_policy is the literal strict; the unimplemented parent_ds_check is dropped and refused. Live bad-input cells: an owner with a newline and $INCLUDE, a DNSKEY record, an apex CNAME, NS and TXT with newlines, injection in allow_transfer and notify_secondaries, a misspelt key, a wildcard listen without listen_any_ack and an authoritative upstream over TLS were each refused by field with nothing dialled. Host read-backs are parsed by projecting the needed fields."
+    },
+    {
+      "id": "lifetime-gc",
+      "verdict": "pass",
+      "note": "zone, resolver, observation, outcome and ds: lifetime infinite, garbage collection 10."
+    },
+    {
+      "id": "crud-completeness",
+      "verdict": "pass",
+      "note": "install, apply_zone, remove_zone, ksk_submitted, apply_resolver and remove_resolver are actions; render_zone, render_resolver, get_ds, get and sync are read-only and get, sync and get_ds persist their observation only after every probe succeeds. Live covered the whole lifecycle in order: create, read (get, sync, get_ds), update (record add, change and remove; DNSSEC on then off with the ack; resolver cache size), re-run adopting the existing resource, delete, delete again. Residual MEDIUM (kept, backlog): records are keyed by ssh.host plus apex rather than host, port and user as the spec says, so two targets behind one hostname share one record set."
+    },
+    {
+      "id": "preflight-checks",
+      "verdict": "pass",
+      "note": "Inputs are validated before any vault read or dial; the listen overlap, wildcard ack, purge gate and unsign ack are checked in-method before host work (live: each refused in under 2 s with no host contact); the port precheck runs before anything is staged and names the holder; the host key is verified before authentication (live: a wrong pin refused in 2.2 s with no authentication in sshd's log); kzonecheck, knotc conf-check and kresctl validate run on the staged candidate before the swap; apply_resolver tests a listen address allow_query_from permits and refuses a list that permits none."
+    },
+    {
+      "id": "instance-names",
+      "verdict": "pass",
+      "note": "Record names are derived from the host and the apex (or the host alone for the resolver, observation and outcome) with unsafe characters mapped, so one definition serves many hosts; names are unique across resource specs within one method run, with a test, and contain no path characters. Residual MEDIUM (kept, backlog): the key omits port and user, so a second target reached through the same hostname on another port or user overwrites the first's record (confirmed live in both runs as a render_zone row; not a security finding, the caller holds the credentials for the target it names). Residual LOW (kept): the uniqueness test compares recomputed names rather than the names the fake context captured."
+    },
+    {
+      "id": "data-access",
+      "verdict": "pass",
+      "note": "Methods read only this model's own records for the host they are given; every target arrives as method arguments and globalArguments is empty. get, sync and get_ds persist observations that were read back live with swamp data get (drift true after a hand-edited zone, DS byte-identical to the host). Residual LOW (kept): render_resolver returns its render without persisting a record, so the CLI cannot show it."
+    },
+    {
+      "id": "version-upgrades",
+      "verdict": "pass",
+      "note": "The model is a plain export const model literal with a literal upgrades[] carrying one identity entry to 2026.10.17.2. Stored record schemas are unchanged from 2026.10.17.1 (parent_ds_check was an input only and was never stored), so existing records need no migration; the reset-failed fix and strict schemas of 2026.10.17.1 that were never live-tested were covered by this version's live runs."
+    }
+  ]
+}

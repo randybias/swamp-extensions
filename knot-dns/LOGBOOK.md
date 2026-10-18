@@ -5,9 +5,10 @@ Not packaged. Notes for whoever maintains this extension.
 - 2026-10-17 (lane/d2-knot-dns, base origin/main): built `@randybias/knot-dns`
   from the approved clean-room spec only. Transport `_lib/ssh.ts` and its
   `_lib/ssh_test.ts` are vendored byte-identical from `@randybias/ssh-host`;
-  re-vendored for 2026.10.17.2 to blob
-  `8f132c4329c9e64bed686731cd5a0e02980194ea` (ssh-host 2026.10.17.3);
-  implementers never read the old source.
+  re-vendored for 2026.10.17.2 (ssh-host 2026.10.17.3) to blobs `ssh.ts`
+  `8f132c4329c9e64bed686731cd5a0e02980194ea` and `ssh_test.ts`
+  `4e8ac15fcd6bce797c523a221fe58fe9a8d9b386`; implementers never read the old
+  source.
 
 ## Vendored
 
@@ -360,10 +361,10 @@ Live testing is for the reset-failed fix and the strict schemas merged in
 2026.10.17.1, plus these changes.
 
 - **Transport.** `_lib/ssh.ts` and `_lib/ssh_test.ts` are byte-identical to
-  `@randybias/ssh-host` 2026.10.17.3 (blob `8f132c43...`); the SSH key reaches
-  `ssh-agent` over stdin and uploads stream over stdin, so no secret byte
-  touches an argv or a remote temp file. No knot code needed a change: the
-  transport's public shape is unchanged.
+  `@randybias/ssh-host` 2026.10.17.3 (blobs `ssh.ts` `8f132c43...`,
+  `ssh_test.ts` `4e8ac15f...`); the SSH key reaches `ssh-agent` over stdin and
+  uploads stream over stdin, so no secret byte touches an argv or a remote temp
+  file. No knot code needed a change: the transport's public shape is unchanged.
 - **`remove_zone` KASP purge.** The old `purge_keys_ack` ran `knotc zone-purge`
   without `-f` _after_ the zone had been removed, so Knot answered "force option
   required" and "no such zone found" and the `|| true` swallowed both. With the
@@ -467,3 +468,291 @@ fails are fixed here.
   `remove_resolver`'s second call stays a refusal; knot-resolver6's
   `supervisor.service` is an install artifact; `sync` lists a served-but-
   undeclared record under `removed`.
+
+## Review round 2 (HEAD 3b87cf4) dispositions
+
+Triage round 2 (run sp-2) on the round-1 fix commit was review-clean: no
+Critical or High. Seats conformance, adversarial and tightness all returned rc=0
+(tightness TIGHT, 3 lines); 138 offline tests. The lane neither fixed nor
+recorded the one Medium and four Lows, so they are dispositioned here at merge.
+
+- MEDIUM host-only record key (kept, backlog for the next version). Every
+  `zone`, `resolver`, `observation` and `ds` record is keyed by `ssh.host` plus
+  apex, where the spec keys state by `{host, port, user}`. Two targets reached
+  through one hostname on different ports or users share one record set, so an
+  apply on the second overwrites the first's record and the purge gate's
+  `managed` is true for a zone applied only on the other target. Downgraded from
+  the adversarial seat's High: unchanged since 2026.10.17.1, the operator names
+  the target and passes every ack explicitly, and no credential or privilege
+  boundary is crossed. Confirmed live in both runs (`render_zone` existing: user
+  `other` on port 2222 wrote v3 of the port-22 record). Fix: persist `port` and
+  `user` on apply and refuse a mismatching target with `invalid_input`, keeping
+  the names so existing records upgrade.
+- LOW `CHOWN_FAILED` after the purge (kept). After `knotc -f zone-purge` only
+  the reload rollback prints `RELOAD_FAILED_KEYS_PURGED`; an `own_all` failure
+  in the same window rolls the files back under a plain `CHOWN_FAILED` although
+  the KASP keys are gone. The README documents the purge as irreversible on any
+  failed remove; the path is rare.
+- LOW redundant `[ -n "$ids" ] || return 0` in `purge_keys` (kept, cosmetic).
+- LOW resource-name uniqueness test compares names it recomputes, not the names
+  the fake context captured (kept, test gap; the `apply_zone` test shares it).
+- LOW LOGBOOK blob prose (fixed here): the transport paragraphs now name both
+  blobs, `ssh.ts` 8f132c43... and `ssh_test.ts` 4e8ac15f....
+
+Refuted in round 2: the `ssh.ts` seat findings (timeout returns before the child
+settles, a stdin secret echoed by `cat`, a local kill leaving the remote
+mutation running, an orphaned `Promise.race` rejection, `killedForCap`) are
+dropped under ruling R6, the file being byte-identical to the canonical
+transport and knot-dns passing no `timeoutMs` or output cap; the `Promise.race`
+item went to the lead for `ssh-host`. Advisory "IPv4-embedded IPv6 reaches
+`BigInt(NaN)`": `isIpv6` admits only `[0-9a-fA-F:]`. Advisory "trashed keys make
+the acked re-run fail": the container cell asserts `keymgr list` is empty after
+the acked remove. Advisory "`return 1` in the pipeline subshell is not
+portable": the shell is dash under `set -eu`, where the pipeline's status is the
+function's. Advisory CIDR message: `CidrSchema` accepts a bare address as /32 or
+/128.
+
+## Review round 3 (HEAD 67e2169) dispositions
+
+Round 3 reviewed the live-round-1 fix commit. Seats conformance, adversarial and
+tightness all rc=0; 144 offline tests and 13 container cells passed in the
+triage worktree; tightness COULD-BE-TIGHTER (24 lines), not BLOATED, so no
+simplification pass was required. All four live fails were verified fixed at
+HEAD (see "Live round 1" above). No Critical or High: review-clean, and the head
+went to its second live run unchanged.
+
+- MEDIUM host-only record key: carried from round 2, see above.
+- LOW `allow_query_from` ordering (kept). The purely local `pickTestListen`
+  check (an access list that permits no listen address) now runs after
+  `sshTarget` and the `assertPortsFree` probe, so `apply_resolver` dials and
+  probes before refusing. Still refused before anything is swapped, and the
+  probe is read-only; live run 2 recorded the connect timeout on an unroutable
+  target where run 1 refused in 1.7 s. Fix: move the check before the render and
+  the vault read, and assert `host.commands.length === 0`.
+- LOW `CHOWN_FAILED` after the purge (kept, carried).
+- LOW redundant `ids` check (kept, carried).
+- LOW `PORT_BUSY` formatting (kept, cosmetic). The message prints the address
+  twice and, when both the udp and tcp sockets match, a second unlabeled line;
+  the method keeps only the first line. Seen live as
+  `PORT_BUSY 127.0.0.53:53 ... owner=systemd-resolve`.
+- LOW string-level tests (kept, test gap). The offline port-check test passes
+  `127.0.0.53:53`, not the `ADDR@port` grammar the script parses, and the
+  `ksk_submitted` already-done branch is asserted as a substring; the executed
+  coverage is the container cell for the scope strip and owner, plus the
+  triage's dash run of both `ksk_submitted` branches. Next version: use
+  `127.0.0.53@53` and add a dash-executed test with a stub `knotc`.
+- LOW tightness (kept): `ipv4ToInt` is single-use (about 5 lines), the three
+  `apply_resolver` refusal tests repeat their setup (about 15), and the
+  `keys_purged` shell state is fixed at render time (about 4).
+- LOW uniqueness test (kept, carried).
+- LOW LOGBOOK blob prose: fixed here.
+
+Refuted in round 3: advisory HIGH "`return 1` inside the `printf | while`
+subshell never fails `purge_keys`", by execution under dash and bash-as-sh (the
+function returns 1 for both the `keymgr delete` failure and the grammar guard).
+Adversarial MEDIUM "`pickTestListen` returns the wildcard literal": by design,
+the apply script's `query_ok` rewrites `0.0.0.0` to `127.0.0.1` and `::` to
+`::1` before `kdig`, as `resolver_test.ts` asserts. The `ssh.ts` timeout and
+`killedForCap` items are dropped under R6 as in round 2. Advisory IPv4-embedded
+IPv6: as in round 2. Advisory "idempotency detected by an English substring":
+`knotc` has no message catalogue, the text is libknot's fixed error string, and
+`knotc`'s exit 1 cannot tell this case from a real failure.
+
+## Live round 2 (HEAD 67e2169, sp-2 vps-small)
+
+Run sp-2 on 67e2169, contentHash
+`114326131b4aef84406adeeb9b865d15d04d165d998785c0dae44a8ba952600a`,
+2026-10-18T03:27Z to 03:49Z, the second and last live run of this version; the
+four run-1 fails were re-run first. Result is `pass`, `fail`, `untested` or
+`inconclusive`; only `pass` counts. Real addresses, hostnames and provider ids
+are redacted: `<vps>` is the target, a throwaway hourly VPS (1 vCPU, 1 GB,
+Ubuntu 24.04.5, kernel 6.8.0-142, knot 3.3.4 from the archive, knot-resolver6
+6.5.0 from CZ.NIC pinned at priority 100). No container cell: the control host
+is aarch64 with docker only, and every method drives apt, systemd and
+knotd/kresd over SSH, so the lifecycle ran on the VPS with every listen on
+loopback (knotd 127.0.0.1 and 127.0.0.2, kresd 127.0.0.3); 491 host listener
+samples at 1/s showed no non-loopback :53 or :853 at any time. Fresh scratch
+repo with the head's `extensions/models` copied in unchanged (tar sha256
+identical on both sides); model `dns`, typeVersion 2026.10.17.2; the SSH key a
+vault reference, the TSIG secret generated straight into the vault; host key
+pinned by keyscan on first contact, policy strict; every run through a logging
+wrapper with `--input-file`, `--json` only on one host-less `render_resolver`
+run carrying vault references only. Baseline before and after (144-line diff):
+only the documented install residue remains (the knot, knot-dnsutils,
+knot-dnssecutils and knot-resolver6 packages with their dependencies, the knot
+and knot-resolver users, `/etc/knot` with an empty `knot.conf.d`, the
+`/var/lib/knot` LMDBs with two trashed `.pem` files from keymgr's trash bin, the
+package `config.yaml`, kresd's own cache, the CZ.NIC list, preferences and
+keyring, curl/libcurl 10.15 to 10.16, and `/root/.gnupg` from the documented
+`gpg --show-keys` fingerprint check); listeners identical to the baseline. Argv
+scan: 1,455 unique local `ps` argv lines (118,990 raw samples at 2 s) and 94
+unique host `ps` lines scanned in memory against the run SSH key, the provider
+token and the swamp token: 0 secret hits. The throwaway server was deleted at
+the end (HTTP 204) and the provider's project listing showed no server of this
+lane afterwards. `content_hash_proved` is the first 12 characters of the hash
+above.
+
+| method_or_workflow | scenario     | result       | run_id | test_cell | content_hash_proved | note                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
+| ------------------ | ------------ | ------------ | ------ | --------- | ------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| render_zone        | fresh        | pass         | sp-2   | vps-small | 114326131b4a        | no host contact (unroutable 192.0.2.1 target, 33 ms): record knot_32040b0a… status rendered, sha 4495d22c…, 8 records (same sha as run 1, deterministic render)                                                                                                                                                                                                                                                                                                                                                                                                   |
+| render_zone        | rerun        | pass         | sp-2   | vps-small | 114326131b4a        | same inputs: same sha 4495d22c…, record v2 with identical content                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
+| render_zone        | existing     | pass         | sp-2   | vps-small | 114326131b4a        | the known Medium (recorded, not failed): same host with user `other` and port 2222 and a 3-record declaration wrote v3 of the same record knot_32040b0a… (sha 2087a7e4…, record_count 3); records are still keyed by host and apex only                                                                                                                                                                                                                                                                                                                           |
+| render_zone        | bad-input    | pass         | sp-2   | vps-small | 114326131b4a        | owner `evil\n$INCLUDE /etc/shadow`: invalid owner label; DNSKEY record: signer-owned types refused; apex CNAME refused; dnssec.parent_ds_check refused by the strict schema; all without host contact (1.7-1.8 s wall, CLI start-up)                                                                                                                                                                                                                                                                                                                              |
+| render_resolver    | fresh        | inconclusive | sp-2   | vps-small | 114326131b4a        | succeeded in 24 ms without host contact, but the rendered config.yaml and sha are only in the return value: the CLI, --json (dataArtifacts [], "succeeded with no data output") and the output metadata do not show them and nothing is persisted; the applied render is validated on the host in apply_resolver fresh                                                                                                                                                                                                                                            |
+| render_resolver    | rerun        | inconclusive | sp-2   | vps-small | 114326131b4a        | succeeded again; no observable output to compare (same gap as run 1)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
+| render_resolver    | bad-input    | pass         | sp-2   | vps-small | 114326131b4a        | authoritative upstream with transport tls refused at validation; observation unchanged from run 1: an allow_query_from excluding every listen still renders fine and is refused only by apply_resolver                                                                                                                                                                                                                                                                                                                                                            |
+| install            | bad-input    | pass         | sp-2   | vps-small | 114326131b4a        | host_key_policy insecure_tofu refused at validation (`expected "strict"`), nothing dialled                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
+| get                | bad-input    | pass         | sp-2   | vps-small | 114326131b4a        | missing ssh.host_keys refused at validation (`expected array, received undefined`), nothing dialled                                                                                                                                                                                                                                                                                                                                                                                                                                                               |
+| remove_zone        | bad-input    | pass         | sp-2   | vps-small | 114326131b4a        | purge_keys_ack on an apex this model never applied and on a render-only apex: both refused before host work (`purge_keys_ack only applies to a zone this model applied on this host`); invalid apex refused at validation                                                                                                                                                                                                                                                                                                                                         |
+| ksk_submitted      | bad-input    | pass         | sp-2   | vps-small | 114326131b4a        | invalid apex refused at validation, nothing dialled                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               |
+| get_ds             | bad-input    | pass         | sp-2   | vps-small | 114326131b4a        | invalid apex refused at validation, nothing dialled                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               |
+| apply_zone         | bad-input    | pass         | sp-2   | vps-small | 114326131b4a        | NS with a newline, TXT with a newline, allow_transfer `127.0.0.1"\n action: update`, notify_secondaries `; reboot`, a misspelt `TTL` key and a 0.0.0.0 listen without listen_any_ack: each refused by field before host work (the wildcard refusal was reproduced with the vault key deliberately absent, so it precedes even the key read)                                                                                                                                                                                                                       |
+| apply_resolver     | failure-path | pass         | sp-2   | vps-small | 114326131b4a        | run-1 High re-run: listen 0.0.0.0 without listen_any_ack is now refused in 1.7 s (`a wildcard listen address needs listen_any_ack`) before the vault key is read or the host dialled (reproduced with the vault key absent; unroutable target), no kresd restart possible                                                                                                                                                                                                                                                                                         |
+| apply_resolver     | bad-input    | pass         | sp-2   | vps-small | 114326131b4a        | allow_query_from permitting no listen address is still refused, but at this head only AFTER the port precheck has dialled the host (unroutable target: `could not connect` after the 15 s timeout, 16.9 s); run 1 refused it before host work: ordering regression, pure-input check now behind `assertPortsFree` (resolver_methods.ts: sshTarget/assertPortsFree precede pickTestListen); no host mutation                                                                                                                                                       |
+| remove_resolver    | bad-input    | pass         | sp-2   | vps-small | 114326131b4a        | no recorded resolver and no remove_ack: refused before dialling (`this model did not apply a resolver on this host; pass remove_ack to proceed`, 2.2 s, unroutable target)                                                                                                                                                                                                                                                                                                                                                                                        |
+| install            | fresh        | pass         | sp-2   | vps-small | 114326131b4a        | Ubuntu 24.04.5 target: knot, knot-dnsutils, knot-dnssecutils 3.3.4 from the archive in 57.4 s; knotc/kdig/kzonecheck/keymgr present, `include: /etc/knot/knot.conf.d/*.conf` once in knot.conf (sha b5479f32…), knot active (MainPID 2176); outcome knot_version 3.3.4; read back over a second SSH session; no :53 listener added (knotd binds only when a zone sets a listen)                                                                                                                                                                                   |
+| install            | rerun        | pass         | sp-2   | vps-small | 114326131b4a        | 3.8 s; package set, include count (1), MainPID 2176 and knot.conf mtime (1792294587) and sha identical: the run-1 `touch` mtime observation is fixed at this head; journal shows no restart                                                                                                                                                                                                                                                                                                                                                                       |
+| install            | existing     | pass         | sp-2   | vps-small | 114326131b4a        | resolver true over the existing install (1m2s): knot stays 3.3.4 (apt candidate 3.3.4, knotd MainPID 7488 unchanged) while knot-resolver6 6.5.0 and libknot16/libdnssec10/libzscanner5 3.5.8 come from CZ.NIC (`Pin: origin pkg.labs.nic.cz` 100, cznic-labs-pkg.gpg keyring, list file); knot-resolver inactive, disabled, not failed; outcome kresd_version 6.5.0; documented side effect curl/libcurl 10.15 to 10.16                                                                                                                                           |
+| apply_zone         | fresh        | pass         | sp-2   | vps-small | 114326131b4a        | a.example.test on 127.0.0.1: zone file root:knot 0640 under /var/lib/knot/zones, fragments 40-managed-listen.conf (`listen: ["127.0.0.1"]`) and 50-managed-a.example.test.conf; `knotc zone-status` role master serial 1; kdig www A 192.0.2.10, AAAA 2001:db8::10, alias CNAME www; knotd (MainPID 3477) listens on 127.0.0.1:53 only, resolved's 127.0.0.53/54 untouched; 16.2 s                                                                                                                                                                                |
+| apply_zone         | fresh        | pass         | sp-2   | vps-small | 114326131b4a        | b.example.test signed (ecdsap256sha256) on 127.0.0.2: listen fragment became ["127.0.0.1", "127.0.0.2"], knotd restarted (3477 to 5895), both addresses answer both zones; B answers carry RRSIG and 2 DNSKEY (256/257 alg 13), A none; keymgr lists ZSK 31323 active and KSK 19731 ready; served serial 1792294674; outcome dnssec true                                                                                                                                                                                                                          |
+| apply_zone         | rerun        | pass         | sp-2   | vps-small | 114326131b4a        | identical A: every mtime under /etc/knot and the zone file, served serial 1 and MainPID 3477 unchanged; journal shows only zone-status/zone-read control commands, no zone-reload or restart; same record sha 4495d22c…                                                                                                                                                                                                                                                                                                                                           |
+| apply_zone         | existing     | pass         | sp-2   | vps-small | 114326131b4a        | record add/change/remove on A: www 192.0.2.10 to .11, alias removed (NXDOMAIN), ftp 192.0.2.21 added, serial 1 to 1792294654 via `zone-reload … loaded`, MainPID 3477 unchanged (no restart); injection literal: TXT `x" ; $INCLUDE /etc/shadow` stored escaped and served literally                                                                                                                                                                                                                                                                              |
+| apply_zone         | existing     | pass         | sp-2   | vps-small | 114326131b4a        | DNSSEC turned on for the applied A: RRSIG served, 2 DNSKEY, 2 new KASP keys, `dnssec-signing: on` plus a managed policy in the fragment (serial 1792294803); then off with dnssec_unsign_ack: `dnssec-signing: off`, 0 RRSIG, 0 DNSKEY, www still NOERROR 192.0.2.11, the 2 keys kept (documented: no delete-algorithm path)                                                                                                                                                                                                                                      |
+| apply_zone         | existing     | pass         | sp-2   | vps-small | 114326131b4a        | drift adopted: after a hand-appended `drift A 192.0.2.99` and a manual `knotc zone-reload` (answered 192.0.2.99; see sync existing), re-applying the declaration removed it (NXDOMAIN, 0 occurrences in the zone file), serial 1792294999                                                                                                                                                                                                                                                                                                                         |
+| apply_zone         | failure-path | pass         | sp-2   | vps-small | 114326131b4a        | signed A turned off without the ack: refused (`turning signing off needs dnssec_unsign_ack`) in 1.7 s; every file mtime under /etc/knot and /var/lib/knot and MainPID 7488 identical before and after                                                                                                                                                                                                                                                                                                                                                             |
+| apply_zone         | failure-path | pass         | sp-2   | vps-small | 114326131b4a        | run-1 High re-run: listen 127.0.0.53 (systemd-resolved's stub, `127.0.0.53%lo:53` in ss) is now refused at the precheck in 3.2 s with `PORT_BUSY 127.0.0.53:53 … owner=systemd-resolve`; MainPID 5895, the listen fragment, the fragment list and the served answers unchanged, no restart in the journal. Control: 127.0.0.54 refused the same way (owner named) in 3.3 s. Observation: the message prints the address twice                                                                                                                                     |
+| apply_zone         | failure-path | pass         | sp-2   | vps-small | 114326131b4a        | listen overlap with the applied resolver (zone C on 127.0.0.3): refused before any host work (`the authoritative and resolver listen sets overlap at 127.0.0.3`, 1.7 s); knotd 7488 and kresd 11675 MainPIDs and the fragment list unchanged                                                                                                                                                                                                                                                                                                                      |
+| apply_zone         | failure-path | untested     | sp-2   | vps-small | 114326131b4a        | kzonecheck rejection with broken glue forced past schema: still not reachable from the CLI at this head; every malformed input is refused by the schema before host work (bad-input row), and the matrix forbids editing the model to bypass it                                                                                                                                                                                                                                                                                                                   |
+| remove_zone        | failure-path | pass         | sp-2   | vps-small | 114326131b4a        | signed B without dnssec_unsign_ack: refused (`recorded as signed; pass dnssec_unsign_ack`) in 1.7 s, the three fragments and the served answer (www.b 192.0.2.10) unchanged                                                                                                                                                                                                                                                                                                                                                                                       |
+| remove_zone        | fresh        | pass         | sp-2   | vps-small | 114326131b4a        | B with dnssec_unsign_ack and purge_keys_ack: journal `zone-purge … zone purged`, fragment and zone file gone, `keymgr -l` lists no B key (the two .pem files on disk are the documented keymgr trash-bin residual), listen shrank to ["127.0.0.1"], knotd restarted (5895 to 7488), 127.0.0.2:53 released, B REFUSED on 127.0.0.1 while A answers 192.0.2.11; outcome removed true; 4.8 s                                                                                                                                                                         |
+| remove_zone        | rerun        | pass         | sp-2   | vps-small | 114326131b4a        | same call again: outcome removed false; every file under /etc/knot and /var/lib/knot (mtime and size) and MainPID 7488 identical, except the mtime of keymgr's LMDB lock (the present=no key-list read)                                                                                                                                                                                                                                                                                                                                                           |
+| remove_zone        | existing     | pass         | sp-2   | vps-small | 114326131b4a        | A (unsigned, keys kept) without purge: zone file, fragment and the listen fragment gone, 127.0.0.1:53 released, knot stays active, A's keys survive in `keymgr -l` (1 line); the follow-up remove with purge_keys_ack returned removed false and left `keymgr -l` empty (the present=no retry purge path)                                                                                                                                                                                                                                                         |
+| get_ds             | fresh        | pass         | sp-2   | vps-small | 114326131b4a        | B: 2 DS (keytag 19731, alg 13, digest types 2 and 4) persisted as knot_7627c82d…, byte-identical to `keymgr b.example.test. ds` on the host                                                                                                                                                                                                                                                                                                                                                                                                                       |
+| get_ds             | rerun        | pass         | sp-2   | vps-small | 114326131b4a        | same 2 DS, record v2                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
+| get_ds             | existing     | pass         | sp-2   | vps-small | 114326131b4a        | unsigned A: ds [] persisted (knot_efbef535…), no error                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            |
+| ksk_submitted      | fresh        | pass         | sp-2   | vps-small | 114326131b4a        | B: KSK 19731 advanced ready to active (`keymgr list` gained active=1792294692), zone re-signed, served serial 1792294674 to 1792294692                                                                                                                                                                                                                                                                                                                                                                                                                            |
+| ksk_submitted      | rerun        | pass         | sp-2   | vps-small | 114326131b4a        | run-1 High re-run: the second and a third call both succeed in 1.5 s; knotd logs `(no key ready for submission)` and the method treats it as the already-done state; keymgr list, served serial 1792294692 and MainPID 5895 unchanged                                                                                                                                                                                                                                                                                                                             |
+| ksk_submitted      | failure-path | pass         | sp-2   | vps-small | 114326131b4a        | absent zone c.example.test: refused with the typed message `the zone is not present on the host` (the run-1 untyped exit 3 is fixed); no host change                                                                                                                                                                                                                                                                                                                                                                                                              |
+| apply_resolver     | fresh        | pass         | sp-2   | vps-small | 114326131b4a        | 127.0.0.3 forwarding example.test. to 127.0.0.1 (authoritative, dnssec false), cache 64 MB: kresd 6.5.0 active and enabled on 127.0.0.3:53 (UDP and TCP) only, self-test name a.example.test. chosen from the served zones; through 127.0.0.3: www.a 192.0.2.11 and ftp.a 192.0.2.21; config.yaml size-max 64M, `kresctl validate` ok, sha bb8910d1…; config.yaml.package kept beside it; 13.0 s. Observation: kresd also holds an unconnected UDP socket `*:<ephemeral>` for its upstream queries while running (not a :53 listener, gone after remove_resolver) |
+| apply_resolver     | rerun        | pass         | sp-2   | vps-small | 114326131b4a        | the requested unchanged-listen re-apply: kresd's own 127.0.0.3:53 socket passed the new port precheck by its `ss -p` process name; outcome changed false; config.yaml mtime 1792294904, size 375, sha bb8910d1… and kresd MainPID 11675 identical; still answers www.a; 8.5 s                                                                                                                                                                                                                                                                                     |
+| apply_resolver     | existing     | pass         | sp-2   | vps-small | 114326131b4a        | cache_size_mb 64 to 128: changed true, size-max 128M on the host (sha 88fb30d3…), kresd worker restarted (11700 to 12543, manager MainPID 11675 stable) and still answers www.a; no .staged leftover                                                                                                                                                                                                                                                                                                                                                              |
+| apply_resolver     | failure-path | pass         | sp-2   | vps-small | 114326131b4a        | run-1 High re-run: resolver listen 127.0.0.1 (held by the applied zone A) is now refused before any host work (`the authoritative and resolver listen sets overlap at 127.0.0.1`, 1.7 s); config.yaml sha 88fb30d3…, kresd 11675 and knotd 7488 MainPIDs unchanged, no restart in the journal. The live-host wildcard variant was not repeated (my input generator omitted the file after the server was up); the host-less wildcard row above covers the same code path, which runs before sshTarget                                                             |
+| remove_resolver    | fresh        | pass         | sp-2   | vps-small | 114326131b4a        | config.yaml sha back to the package's 4e8f6b4e…, config.yaml.package consumed, unit inactive and disabled, no kresd socket (only resolved's 127.0.0.53/54 remain); outcome removed true; 3.1 s                                                                                                                                                                                                                                                                                                                                                                    |
+| remove_resolver    | rerun        | pass         | sp-2   | vps-small | 114326131b4a        | second call changed nothing but is refused (`this model did not apply a resolver on this host; pass remove_ack`) rather than a silent no-op like remove_zone; config sha, unit state and listeners identical                                                                                                                                                                                                                                                                                                                                                      |
+| get                | fresh        | pass         | sp-2   | vps-small | 114326131b4a        | observation knot_04ac8f60… v1 persisted: 1 zone (a.example.test.), drift false, resolver_active active; 4.4 s                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
+| get                | rerun        | pass         | sp-2   | vps-small | 114326131b4a        | v2 of the same observation, same size (541 B) and content fields                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
+| get                | failure-path | pass         | sp-2   | vps-small | 114326131b4a        | wrong pinned host key: `host key verification failed for <vps>:22; refusing to connect` in 2.2 s; unreachable RFC 5737 target: `could not connect` after the 3 s timeout (host-less run)                                                                                                                                                                                                                                                                                                                                                                          |
+| sync               | fresh        | pass         | sp-2   | vps-small | 114326131b4a        | drift false, resolver_active active, observation v3 persisted                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
+| sync               | rerun        | pass         | sp-2   | vps-small | 114326131b4a        | observation v4, same size and content                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             |
+| sync               | existing     | pass         | sp-2   | vps-small | 114326131b4a        | after `drift A 192.0.2.99` appended to the live zone file by hand plus `knotc zone-reload` (kdig answered it): observation v5 reports drift true (v4 false); the re-apply then removed it (apply_zone existing)                                                                                                                                                                                                                                                                                                                                                   |
+
+Result: pass 48, fail 0, untested 1, inconclusive 2. The untested cell
+(`kzonecheck` rejection with broken glue forced past the schema) is unreachable
+from the CLI: every malformed input is refused by the schema before host work,
+and the matrix forbids editing the model to bypass it. The two inconclusive rows
+are `render_resolver` fresh and rerun: the method succeeds without host contact
+but returns its render instead of persisting it, and the CLI shows no method
+result, so there is nothing to compare; the applied render is validated on the
+host in `apply_resolver` fresh and the bad-input row covers the method. Both
+keep this version on `beta`.
+
+Observations for the maintainer (no cell failed on them): `apply_resolver`'s
+`allow_query_from` check now runs after the port precheck's SSH connection
+(ordering regression from run 1, input-only, no host mutation); `PORT_BUSY` and
+the listen-overlap messages print the address twice; `install resolver: true`
+leaves `/root/.gnupg` and an enabled `supervisor.service`, neither named in the
+README; kresd holds a wildcard-bound ephemeral UDP socket for its upstream
+queries while running (not a :53 listener, gone after `remove_resolver`);
+`remove_resolver`'s second call is a refusal where `remove_zone`'s is a no-op;
+the host-only record key remains the known Medium.
+
+## Residuals at 2026.10.17.2 (beta)
+
+The complete list at publish; it supersedes "Residuals (beta)" above. None
+blocks `beta`; all are backlog for the next version.
+
+- MEDIUM records are keyed by `ssh.host` plus apex, not `{host, port, user}`
+  (spec section 4); see review round 2.
+- MEDIUM the `dash-runner` and `bashisms` gates capture no scripts: the rendered
+  scripts run against real `knotd`, `kzonecheck`, `kresctl` and `kdig` in a
+  container plus `sh -n`, not through the recording harness (both gates pass).
+- LOW the `allow_query_from` self-test check runs after the port probe.
+- LOW `CHOWN_FAILED` after a purge hides that the KASP keys are gone.
+- LOW `PORT_BUSY` prints the address twice.
+- LOW `render_resolver` returns its render without persisting a record, so the
+  CLI cannot show it.
+- LOW `remove_resolver`'s second call is refused unless `remove_ack` is set;
+  `remove_zone`'s second call is a no-op.
+- LOW `install resolver: true` leaves `/root/.gnupg` (gpg's homedir from the
+  fingerprint check) and an enabled `supervisor.service` (knot-resolver6's
+  dependency), and can upgrade curl and libcurl as a dependency side effect.
+- LOW `purge_keys_ack` leaves keymgr trash-bin entries until
+  `keymgr <zone> trash-discard`.
+- LOW unsigning drops DNSKEY and RRSIG immediately (no delete-algorithm path).
+- LOW `sync` lists a served-but-undeclared record under `removed`.
+- LOW test gaps: the port-check and `ksk_submitted` already-done tests assert
+  strings only; the uniqueness test compares recomputed names.
+- No promotion to `stable`: one `untested` cell and two `inconclusive` rows.
+
+## Prior art (re-checked at merge, 2026-10-18)
+
+`swamp extension search` for knot, knot resolver, dns, bind and resolver on
+stable and beta: unchanged since 2026-10-17. The only Knot package on either
+channel is this one (`@randybias/knot-dns` 2026.10.17.1, beta); every other
+match drives another product or a provider API (Technitium, FreeIPA, Pi-hole,
+AdGuard, Route 53 and its resolver endpoints, Cloudflare, GCP, Vercel, Scaleway,
+Porkbun, GoDaddy, mDNS, a DNS policy compiler). Nothing to file upstream.
+
+## Merge prep (2026-10-18)
+
+- Merged `lane/d2-knot-dns` at 67e2169 into main with `--no-ff` (70e46a7); the
+  `knot-dns/` tree on main is byte-identical to the live-tested head, and the
+  branch diff touches only `knot-dns/` plus one notes line in the knot-dns
+  `release.yaml` stanza (`channel: beta`, `ci: true` unchanged). No file was
+  added on the branch, so no licence-history squash was needed.
+- Post-live freeze: nothing under `knot-dns/` other than this LOGBOOK (not
+  packaged) changed after 67e2169. The dry run at merge gave contentHash
+  `114326131b4aef84406adeeb9b865d15d04d165d998785c0dae44a8ba952600a`, equal to
+  the live-tested hash; `version-exists` passed, so 2026.10.17.2 is new.
+- Transport: `_lib/ssh.ts` blob `8f132c4329c9e64bed686731cd5a0e02980194ea`
+  (canonical, ssh-host 2026.10.17.3), `_lib/ssh_test.ts`
+  `4e8ac15fcd6bce797c523a221fe58fe9a8d9b386`.
+- Gate-7 mechanics already in place: plain `export const model = {...}`, literal
+  `upgrades[]` with one identity entry to 2026.10.17.2, a sibling `_test.ts` for
+  every model file.
+- Review report for the hash committed as
+  `reviews/knot-dns/114326131b4aef84406adeeb9b865d15d04d165d998785c0dae44a8ba952600a.json`,
+  written from the round-2 and round-3 seat outputs, the dispositions above and
+  the live receipts.
+
+## Factory events
+
+Run sp-2, item `knot-dns next`, from the conductor's event log (UTC). The
+version was built on DeepSeek lane d2; three review rounds (round 1 routed one
+High, rounds 2 and 3 clean) and two live runs (44/4 then 48/0) preceded the
+merge.
+
+| At                   | Stage      | Rung      | Head         | Reason                                                                                                                  |
+| -------------------- | ---------- | --------- | ------------ | ----------------------------------------------------------------------------------------------------------------------- |
+| 2026-10-17T21:58:08Z | spec       | prior-art |              | spec-ok                                                                                                                 |
+| 2026-10-17T22:36:16Z | building   | fix       |              | prior-art-fail                                                                                                          |
+| 2026-10-17T23:06:11Z | checks     | gates     | 0c973fab8cda | new-head                                                                                                                |
+| 2026-10-17T23:18:21Z | checks     | realtool  | 0c973fab8cda | gates-pass                                                                                                              |
+| 2026-10-17T23:25:17Z | review     | review    | 0c973fab8cda | realtool-pass                                                                                                           |
+| 2026-10-17T23:43:50Z | building   | build     |              | resume                                                                                                                  |
+| 2026-10-18T00:04:33Z | checks     | gates     | 8bf261fc7a62 | head-reported                                                                                                           |
+| 2026-10-18T00:16:16Z | checks     | realtool  | 8bf261fc7a62 | gates-pass                                                                                                              |
+| 2026-10-18T00:25:44Z | review     | review    | 8bf261fc7a62 | realtool-pass                                                                                                           |
+| 2026-10-18T00:52:36Z | building   | fix       | 8bf261fc7a62 | triage:routed                                                                                                           |
+| 2026-10-18T01:02:27Z | checks     | gates     | 3b87cf45f74d | new-head                                                                                                                |
+| 2026-10-18T01:11:17Z | checks     | realtool  | 3b87cf45f74d | gates-pass                                                                                                              |
+| 2026-10-18T01:21:45Z | review     | review    | 3b87cf45f74d | realtool-pass                                                                                                           |
+| 2026-10-18T01:47:30Z | live test  | live      | 3b87cf45f74d | triage:clean                                                                                                            |
+| 2026-10-18T02:19:47Z | building   | fix       | 3b87cf45f74d | live-fail                                                                                                               |
+| 2026-10-18T02:32:54Z | checks     | gates     | 67e21693047c | new-head                                                                                                                |
+| 2026-10-18T02:47:56Z | checks     | realtool  | 67e21693047c | gates-pass                                                                                                              |
+| 2026-10-18T02:55:38Z | review     | review    | 67e21693047c | realtool-pass                                                                                                           |
+| 2026-10-18T03:25:16Z | live test  | live      | 67e21693047c | triage:clean                                                                                                            |
+| 2026-10-18T03:54:47Z | paused     | parked    | 67e21693047c | park:lead: inconclusive rows are a cli visibility gap, not a defect; conductor rule being adjusted; resume:live follows |
+| 2026-10-18T03:57:50Z | live test  | live      | 67e21693047c | resume                                                                                                                  |
+| 2026-10-18T04:00:50Z | publishing | merge     | 67e21693047c | live-pass                                                                                                               |

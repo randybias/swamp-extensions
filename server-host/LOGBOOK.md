@@ -231,30 +231,151 @@ Untested live: a failing `gpasswd`, a failing `id -nG` and a failing account
 lookup on the revoke path (covered only by tests under `sh` with failing stubs).
 Not stable until those are exercised or ruled out.
 
-## Live matrix 2026.10.17.4
+## 2026-10-18 live e2e (2026.10.17.4, head 89f7a47)
 
-Filled by the live lane. Result is `pass`, `fail`, `untested` or `inconclusive`;
-only `pass` counts.
+Run sp-2 on 89f7a47, contentHash
+`371317a6c90a64b765708c5eb873c795697ed825c0887ab2dc6c137f0c02a2af`,
+2026-10-18T00:05Z to 00:30Z. Result is `pass`, `fail`, `untested` or
+`inconclusive`; only `pass` counts. Real addresses, hostnames, provider ids and
+revert tokens are redacted: `<vps1>` is the target, a throwaway hourly VPS (1
+vCPU, 1 GB, Ubuntu 24.04, kernel 6.8.0-142, nftables 1.0.9); `<vps2>` a second
+throwaway VPS in the same project used only as an outside SSH source, never a
+target; `<control-egress>` the control host's egress address, the only
+management CIDR (/32); `<server-id>` the provider id of `<vps1>` and
+`<other-id>` a made-up one; `<token1>` to `<token4>` the four revert tokens in
+order. No container cells: the control host is aarch64 with docker only, and the
+armed-revert cells need systemd as PID 1 driving transient timers behind a real
+netfilter input hook on a host that can lock the operator out, which spec
+section 6 places on a throwaway VPS. Fresh scratch repo with the head's
+`extensions/models` copied in unchanged; model `sh` with empty globalArguments;
+the SSH key a vault reference; host keys pinned from the first contact, policy
+strict; every run with `--input-file`, no `--json` on any run carrying an SSH
+target. `content_hash_proved` is the first 12 characters of the hash above.
 
-| method_or_workflow | scenario     | result   | run_id | test_cell | content_hash_proved | note                                                       |
-| ------------------ | ------------ | -------- | ------ | --------- | ------------------- | ---------------------------------------------------------- |
-| apply_base         | fresh        | untested |        |           |                     | packages, admin user, keys, sysctl, journald, time         |
-| apply_base         | rerun        | untested |        |           |                     | no remote command on an unchanged rerun                    |
-| apply_base         | existing     | untested |        |           |                     | admin_user change revokes the previous account, sudo first |
-| apply_base         | bad-input    | untested |        |           |                     | injection literal in package, user, key                    |
-| render_firewall    | fresh        | untested |        |           |                     | matches the golden for the live inputs                     |
-| apply_firewall     | fresh        | untested |        |           |                     | ruleset active, revert armed, scripts on stdin only        |
-| apply_firewall     | rerun        | untested |        |           |                     | identical live ruleset is a no-op                          |
-| apply_firewall     | failure-path | untested |        |           |                     | revert fires with no commit; original ruleset back         |
-| apply_firewall     | existing     | untested |        |           |                     | ssh_port change cannot widen a management-only rule        |
-| commit             | fresh        | untested |        |           |                     | timer cancelled, ruleset persists                          |
-| commit             | failure-path | untested |        |           |                     | after expiry: clean error                                  |
-| lockdown           | fresh        | untested |        |           |                     | SSH reachable only from the management CIDR                |
-| lockdown           | failure-path | untested |        |           |                     | no commit: public SSH restored automatically               |
-| get                | fresh        | untested |        |           |                     | reflects the real host                                     |
-| sync               | existing     | untested |        |           |                     | drift after a fired revert                                 |
-| forget             | existing     | untested |        |           |                     | identity-mismatch refusal (never run live)                 |
-| forget             | rerun        | untested |        |           |                     | second forget writes nothing                               |
+| method_or_workflow | scenario     | result   | run_id | test_cell | content_hash_proved | note                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
+| ------------------ | ------------ | -------- | ------ | --------- | ------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| apply_base         | bad-input    | pass     | sp-2   | vps-small | 371317a6c90a        | 4 runs against an unroutable RFC 5737 target: `curl; id` package, `ops$(id)` user, a backticked key line and `0; reboot` sysctl each refused at validation by name (`packages.0`, `admin_user`, `authorized_keys.0`, `sysctl.*`); nothing dialled (1.7 s each = CLI start)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
+| apply_firewall     | bad-input    | pass     | sp-2   | vps-small | 371317a6c90a        | 6 runs, unroutable target: `/33` CIDR, port 70000 and revert_after_s 30 refused by schema; `0.0.0.0/0` and the two /1 halves refused by the wide-range rule without allow_ssh_from_anywhere; host_key_policy insecure_tofu refused (`expected "strict"`); nothing dialled                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
+| lockdown           | bad-input    | pass     | sp-2   | vps-small | 371317a6c90a        | allow_ssh_from_anywhere refused (`lockdown ... never allows SSH from anywhere`), empty management_cidrs refused; nothing dialled                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
+| get                | bad-input    | pass     | sp-2   | vps-small | 371317a6c90a        | missing host_keys refused at validation (`expected array ... at "host_keys"`); nothing dialled                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
+| render_firewall    | fresh        | pass     | sp-2   | vps-small | 371317a6c90a        | no host touched; the `render-golden-mgmt` resource read back with `swamp data query` is byte-identical to goldens/mgmt-only.nft (sha ebf5911b…) and the service-ports inputs (ssh_port 2222, tcp 8443/443/22, udp 51820) to goldens/service-ports.nft (6d0791e1…); the live-input render is compared with the applied table in the apply_firewall rerun row                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       |
+| render_firewall    | rerun        | pass     | sp-2   | vps-small | 371317a6c90a        | same inputs rendered again: same ruleset_sha256 ebf5911b…, same managed_sha256 71050a53…, only observed_at moved                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
+| apply_base         | fresh        | pass     | sp-2   | vps-small | 371317a6c90a        | 9 steps, 14.4 s; read back over a separate SSH session: ops uid 1000 in group sudo, /home/ops/.ssh 700 and authorized_keys 600 whose sha256 equals the public key line's, jq `install ok installed` (already on the image), sysctl tcp_syncookies=1 live and in /etc/sysctl.d/99-server-host.conf, journald drop-in, Timezone=UTC NTP=yes, marker /var/lib/server-host/sudo-granted-ops; listeners sampled twice: 22 and loopback 53 only                                                                                                                                                                                                                                                                                                                                                                                                                         |
+| apply_base         | rerun        | pass     | sp-2   | vps-small | 371317a6c90a        | identical inputs: `0 steps`, 61 ms; sshd's `Accepted publickey` count moved only by the read-back session and the mtimes of authorized_keys, both drop-ins, /etc/group and the sudo marker are unchanged                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
+| apply_base         | existing     | pass     | sp-2   | vps-small | 371317a6c90a        | admin_user ops -> ops2 with `tree` added (absent on the image): 4 steps, 47.6 s; read back: ops keeps its account but has no authorized_keys file, is out of group sudo and its marker is gone; ops2 uid 1001 in sudo, keys 600 with the same sha256, marker sudo-granted-ops2; tree `install ok installed`; no new listener. Observation only: the emptied /home/ops/.ssh is left with group root                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
+| apply_firewall     | fresh        | pass     | sp-2   | vps-small | 371317a6c90a        | management `<control-egress>`/32, tcp 80, revert_after_s 60: armed `<token1>`, 5 steps, 7.7 s (00:16:46Z); `nft list table inet server_host` 2 s later shows policy drop, `ip saddr <control-egress> tcp dport 22 accept` and tcp 80; `server-host-revert-<token1>.timer` active/waiting and its .service inactive; state dir holds current, revert-<token1>.nft/.sh and revert.lock; a foreign table `inet foreign_test` and its rule untouched; from `<vps2>`: port 22 blocked, port 80 answered (RST = reaches the host); no new listener                                                                                                                                                                                                                                                                                                                      |
+| get                | fresh        | pass     | sp-2   | vps-small | 371317a6c90a        | run inside the armed window (00:17:03Z): observation-<vps1> read back with `swamp data query` records what the host showed: observed_by get, base_applied true, admin_user ops2, firewall_mode firewall, ssh_exposure management-only, managed_table true, revert_armed true, revert_expires_at 00:17:38.909Z (= armed_at + 60 s), drift [], pending_revoke [], ruleset_sha256 ebf8c082…                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
+| commit             | fresh        | pass     | sp-2   | vps-small | 371317a6c90a        | `revert <token1> cancelled`, 10.8 s (00:17:16Z); 2 s later the timer and its service are gone from systemctl, the revert-<token1> files are gone (revert.lock stays), the table listing has the same sha (b92b775c…) as after the apply; read again 93 s after arming: same sha, no server-host timer or unit, state dir holds only revert.lock and the sudo marker                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               |
+| apply_firewall     | rerun        | pass     | sp-2   | vps-small | 371317a6c90a        | identical inputs over the committed table: `ruleset already live, no-op`, 3.2 s; read back: same table sha b92b775c…, no timer, no unit, no revert files; the live-input render (render-live) has the state's ruleset_sha256 75c4c368… and managed_sha256 92a53483…                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               |
+| apply_firewall     | existing     | pass     | sp-2   | vps-small | 371317a6c90a        | over the live management-only rule: allow_ssh_from_anywhere with ssh_port 2222 and no management CIDR refused (`locked down to its management CIDRs; refusing to open SSH to anywhere again. Set allow_widening_ssh_exposure`), 4.9 s; table sha unchanged, no timer armed                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
+| apply_firewall     | failure-path | pass     | sp-2   | vps-small | 371317a6c90a        | revert fires: tcp 8080 added over the committed table, never committed. armed_at 00:19:02.6Z (`<token2>`); at 00:19:07Z the table had `tcp dport { 80, 8080 }` (sha b3504160…), timer active/waiting, `<vps2>` still blocked on 22, a fresh control-host SSH worked; host journal: timer started 00:19:02, service ran and deactivated 00:20:03 (61 s); at 00:20:19Z the table is byte-identical to the committed one (sha b92b775c…, tcp 80 only), no timer or unit, state dir back to revert.lock + marker, foreign table and rule intact, listeners unchanged                                                                                                                                                                                                                                                                                                  |
+| sync               | existing     | pass     | sp-2   | vps-small | 371317a6c90a        | run after the fired revert: observation-<vps1> read back shows observed_by sync, drift ["ruleset","revert_fired"], revert_armed false with the fired `<token2>` and its expiry 00:19:58Z, ssh_exposure unknown, managed_table true; the recorded state keeps the intended (8080) ruleset_sha256 187c2c3f…, which is the drift                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
+| sync               | rerun        | pass     | sp-2   | vps-small | 371317a6c90a        | second sync 11 s later: identical observation (same drift, token, expiry, hashes), only observed_at moved; host untouched (table sha, no timer)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
+| commit             | failure-path | pass     | sp-2   | vps-small | 371317a6c90a        | commit after expiry: `The armed revert for <vps1> expired at 2026-10-18T00:19:58.061Z; nothing to cancel`, exit 1 in 1.7 s; table sha unchanged, no timer                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
+| lockdown           | fresh        | pass     | sp-2   | vps-small | 371317a6c90a        | management `<control-egress>`/32, revert 60: armed `<token3>`, 8.5 s (00:22:00Z); table now holds only `ip saddr <control-egress> tcp dport 22 accept` (sha eff86030…, the tcp 80 allow of the firewall phase is gone), timer active; `<vps2>` -> 22 blocked while the control host still connects; commit at 00:22:20Z cancelled the timer, table unchanged after it; foreign table intact; no new listener                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
+| lockdown           | rerun        | pass     | sp-2   | vps-small | 371317a6c90a        | identical lockdown over the committed one: `ruleset already live, no-op`, 3.0 s; same table sha, no timer, no revert files; `<vps2>` still blocked                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
+| lockdown           | failure-path | pass     | sp-2   | vps-small | 371317a6c90a        | lockout, revert fires: management 198.51.100.0/24 (excludes the control host), revert 60, never committed. armed_at 00:23:06.1Z (`<token4>`); the run itself then could not reconnect (`Change on <vps1> failed after arming; revert <token4> stays armed and will restore the host`, exit 1 in 22.9 s); control-host poll (ssh every 2 s, 4 s timeout): ok 00:22:55, failed 00:23:12 through 00:24:35 (14 attempts), ok again 00:24:37; `<vps2>` blocked throughout; host journal: timer started 00:23:06, service fired 00:24:33 (87 s after arming, 31 s after the recorded expires_at 00:24:01.6Z: systemd's default timer AccuracySec of 1 min); at 00:24:37Z the committed lockdown table is back (sha eff86030…, saddr `<control-egress>` only), no timer, state dir clean, foreign table intact; the firewall-phase revert fired 5 s after its expires_at |
+| get                | rerun        | pass     | sp-2   | vps-small | 371317a6c90a        | after the lockout revert: observation read back shows observed_by get, firewall_mode lockdown, drift ["revert_fired"], revert_armed false, `<token4>`, expires 00:24:01.6Z, ssh_exposure unknown; host not changed by the read (table sha, no timer)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
+| get                | failure-path | pass     | sp-2   | vps-small | 371317a6c90a        | wrong pinned host key: `host key verification failed for <vps1>:22; refusing to connect`, exit 1 in 2.2 s; sshd journal shows that connection `closed ... [preauth]`, so no authentication was attempted; wrong identity: `The records for <vps1> were made for another machine (<server-id>, not <other-id>); run forget for it first`, 1.7 s, nothing dialled                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
+| forget             | existing     | pass     | sp-2   | vps-small | 371317a6c90a        | identity mismatch refused before any write: same `made for another machine (<server-id>, not <other-id>)` error, exit 1; record versions unchanged (state v12, revert v6)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
+| forget             | fresh        | pass     | sp-2   | vps-small | 371317a6c90a        | right identity: `Forgot the records of <vps1>`, 73 ms, no remote call (forget never dials); state-<vps1> rewritten (v13) to host + forgotten_at only, revert-<vps1> (v7) gets cancelled_at; the observation record is left as the last probe wrote it (hashes and the opaque token, no key)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       |
+| forget             | rerun        | pass     | sp-2   | vps-small | 371317a6c90a        | second forget 3 s later: succeeded in 28 ms and wrote nothing (state still v13, revert still v7)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
+| commit             | rerun        | untested | sp-2   | vps-small | 371317a6c90a        | omission: a second commit over the same already-cancelled revert was not scheduled before the target was deleted (the commit failure-path row covers the nothing-to-cancel path for a fired revert)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               |
+
+Result: pass 26, fail 0, untested 1, inconclusive 0. Stays on beta (one cell
+untested).
+
+Host before/after baseline (84 diff lines, every one accounted for): the package
+tree; users ops and ops2 with home directories, group sudo = ops2; the sysctl
+and journald drop-ins; the image's default timezone -> UTC;
+`/var/lib/server-host` with `revert.lock` and the sudo marker;
+`table inet
+server_host` (the committed lockdown) and the foreign table added
+for the non-interference checks; no change in enabled or running units,
+listeners, timers, cron, mounts, netplan or interfaces. Listener samples: 10
+across baseline, every apply, every revert and every commit, always 22 plus
+loopback 53. Argv scan: 74 logged swamp commands and 173 scratch files scanned
+in memory against every line of the private key and both API tokens: 0 hits (the
+only matches were the generic `-----BEGIN/END OPENSSH PRIVATE KEY-----` lines of
+the head's own synthetic fixtures). Both servers deleted at the provider (204
+each); the project listing afterwards shows 0 servers carrying this lane's tag.
+Secrets: none printed, none rotated; the key copy was deleted from the scratch
+vault. The unredacted receipts are the maintainer's `receipts/server-host.md`,
+kept outside git.
+
+Findings for the maintainer (no cell failed):
+
+- The transient timer fires up to a minute after `expires_at`:
+  `systemd-run
+  --on-active` inherits the default `AccuracySec=1min` (observed
+  +5 s and +31 s). In that slack `commit` already answers "expired; nothing to
+  cancel" while the host is about to revert. Passing
+  `--timer-property=AccuracySec=1s` would make the fire time match the recorded
+  expiry. Residual Low for the next version.
+- `forget` leaves the observation record as the last probe wrote it (hashes and
+  the opaque token, no key).
+- An emptied `~/.ssh` of a revoked account keeps group root.
+
+Triage dispositions at 89f7a47 (review CLEAN: conformance, adversarial and
+tightness seats each rc=0, tightness COULD-BE-TIGHTER at about 50 lines; the GLM
+advisory seat was read, not counted):
+
+- Refuted High (conformance) `_lib/armed_revert.ts:94`, "restore proceeds after
+  the 120 s lock wait": by design. Every lock holder (arm 60 s, apply 30 s,
+  cancel 60 s, lock waits 10-20 s) is killed by its own remote timeout long
+  before the wait expires, so a lock still held belongs to a wedged process;
+  failing the restore on contention would leave the host unreachable with no
+  recovery, the opposite of the dead-man property. The marker and snapshot
+  re-check runs after the wait either way.
+- Refuted High (conformance) `_lib/plans.ts:150`, "absence detection trusts grep
+  errors and unknown NSS backends": the sudo marker is written only when
+  `usermod -aG sudo` succeeded, which it does only for a local `/etc/passwd`
+  account, and such an account is found by `id -u` or the passwd grep before any
+  NSS reasoning. The remaining "stays pending" case is the accepted Low residual
+  in "## Residuals".
+- High (conformance) naming: kept as Low. The rename to `linux-host-hardening`
+  is a separate item awaiting the owner (spec Q3); nothing renamed here.
+- Medium kept `_lib/remote.ts:74`: the base64 data literal and the body become
+  one argv word of the inner `sh -c` under `timeout`; schema-legal inputs (64
+  authorized keys of 4096 bytes, about 350 KiB base64) exceed Linux
+  `MAX_ARG_STRLEN` (128 KiB) and fail opaquely ("Argument list too long"
+  reported as a plain step failure); the module doc's "never on the remote
+  command line" overstates the guarantee. Next version: cap the rendered body
+  before any remote call with a clear error naming the input, or read data as a
+  stdin segment; correct the doc comment; add an oversize test.
+- Medium kept `_lib/test_support.ts:93` (test gap): the harness's
+  `stdinIsScript` recognises only a bare `sh -s`, so `assertNoRemoteSecretWrite`
+  never scans sudo-delivered stdin scripts and the sudo-stripped mirror
+  recording that would be scanned is discarded. Next version: expose the
+  mirror's recording and assert on it too; `sudo -n` recognition is filed for
+  the harness.
+- Medium "live matrix untested, gates 2/3/7 blocked": resolved by this entry and
+  by the merge-prep gates below.
+- Low kept `server_host.ts:1270`: the exported `model` spreads `createModel()`,
+  so the literal carries no `upgrades: [` (it lives inside the factory); same
+  shape as the published 2026.10.17.3, and gate 7 passes.
+- Low kept `server_host.ts:1162`: `forget` checks identity only against an open
+  revert and leaves a closed (committed or cancelled) revert record of a reused
+  address in place; harmless (closed records are inert for `currentRevert`), but
+  the description says the revert record is deleted.
+- Low kept `_lib/armed_revert_shell_test.ts:142` (tightness): six repeated
+  guarded-apply constructions, about 40 lines; an `apply(b, token, suffix, now)`
+  helper next time.
+- Downgraded or refuted: the adversarial Medium on `forget` and a closed revert
+  is the Low above (a closed record is never adopted); the adversarial Low
+  "forget tombstones instead of deleting" is a platform limit (records cannot be
+  removed from inside a method; the tombstone carries only host and timestamps);
+  the tightness Low on `bogworks/containers.ts` (unused stdin parameter) is in
+  the vendored harness, reported to the harness owner; the advisory items on the
+  vendored transport are judged in its owner, and the advisory "widening guard
+  refuses on third-party rules" is refuted because the managed input chain
+  belongs to this extension's own table, which the next apply replaces whole.
+
+Merge-prep 2026-10-18 (main): merged `--no-ff` from lane/b2-server-host 89f7a47,
+server-host/ only; no code change after the live-tested head, so the published
+bytes are the live-tested bytes. Gates 2, 3 and 7, blocked in the lane for lack
+of a credential, ran green on main with the dry run reporting the same
+contentHash 371317a6….
 
 ## Review findings
 
@@ -635,7 +756,21 @@ Residuals on 2026.10.17.3 (beta):
 
 ## Factory events
 
-Filled at merge from the conductor's events.
+Run sp-2, item server-host 2026.10.17.4, from the conductor's event log (UTC).
+The sibling item `linux-host-hardening` was parked at the start of the run until
+this version is published; its head is the base for the renamed package.
+
+| At                   | Stage      | Rung      | Head    | Reason            |
+| -------------------- | ---------- | --------- | ------- | ----------------- |
+| 2026-10-17T21:58:08Z | spec       | prior-art |         | spec-ok           |
+| 2026-10-17T22:39:17Z | building   | build     |         | prior-art:overlap |
+| 2026-10-17T23:21:49Z | checks     | gates     | b4c0be3 | head-reported     |
+| 2026-10-17T23:25:17Z | checks     | gates     | 496d71e | head-moved        |
+| 2026-10-17T23:30:13Z | checks     | gates     | 89f7a47 | head-moved        |
+| 2026-10-17T23:35:33Z | checks     | realtool  | 89f7a47 | gates-pass        |
+| 2026-10-17T23:47:43Z | review     | review    | 89f7a47 | realtool-pass     |
+| 2026-10-18T00:04:33Z | live test  | live      | 89f7a47 | triage:clean      |
+| 2026-10-18T00:35:55Z | publishing | merge     | 89f7a47 | live-pass         |
 
 ## Prior art
 

@@ -1,0 +1,89 @@
+{
+  "extension": "@randybias/server-host",
+  "version": "2026.10.17.4",
+  "reviewedAt": "2026-10-18T00:02:02Z",
+  "dimensions": [
+    {
+      "id": "credentials-secrets",
+      "verdict": "pass",
+      "note": "The SSH private key is named by ssh_key_ref (vault + key), resolved at execution through context.vaultService.get (the runtime object shape, driven by a plain-object context in tests) and handed to ssh-agent over stdin; it never appears on argv, in logs, in results or on the host. 2026.10.17.4: every remote step is one RemoteCall whose script is streamed over the SSH session's stdin to `sh -s` (behind `sudo -n` when asked); caller values are `set --` positional parameters quoted by posixQuote and file content (public keys, fixed settings) is base64 text read through bw_data, so nothing but `sh -s` is on the remote command line. No content-derived hash on any argv or remote script text. README examples use vault references only and never --json. Live: 74 logged swamp commands and 173 scratch files scanned against the private key and both API tokens, 0 hits. Residual MEDIUM (conformance, kept): inside the remote `timeout` wrapper the body and the base64 literal form one argv word of an inner `sh -c`, so a schema-legal 256 KiB authorized_keys set exceeds MAX_ARG_STRLEN and fails opaquely; no secret is involved (public keys), fix in the next version."
+    },
+    {
+      "id": "logging-quality",
+      "verdict": "pass",
+      "note": "One structured log line per method (host, phase, changed operations, revert token and expiry); no key material, command text or remote output in log fields."
+    },
+    {
+      "id": "error-handling",
+      "verdict": "pass",
+      "note": "Every plan step is checked: nft -c failure stops before anything is armed, a failing table listing aborts the arm instead of emptying the snapshot, commit after expiry and stacking while armed are typed refusals (live: `expired ...; nothing to cancel`, exit 1). 2026.10.17.4 remote deadlines: each call runs under `timeout -k 5 <sec>` inside a surviving outer shell (30 s apply, 60 s arm/cancel/listing, 120 s base steps, 900 s package installs) with the local ssh deadline 25 s later; an exit of 124 or 137 is an unknown outcome, the plan throws, and a deadline on the apply step leaves the revert armed and the record open. Locks are bounded (arm and cancel wait 20 s, the guarded apply 10 s, then exit 75 `earlier revert still active or firing`); the on-host restore waits 120 s and then restores anyway because every other holder is bounded below that (a conformance High on this was refuted: failing the restore on contention would leave the host unreachable, the opposite of the dead-man property). Revoke is fail-closed: sudo is taken back before the keys file, and getent exit 2 counts as gone only when id and the local passwd file agree and nsswitch lists no network passwd source (a conformance High on absence detection was refuted: a sudo marker exists only for a local account). Live: the lockout run failed loudly with `revert ... stays armed and will restore the host` and the host came back on its own after 87 s. Residual LOW (live finding): systemd-run inherits AccuracySec=1min, so the revert fired 5 s and 31 s after the recorded expires_at while commit already answered expired."
+    },
+    {
+      "id": "testing-completeness",
+      "verdict": "pass",
+      "note": "215 tests: unit, golden-render and shell tests (server_host, nftables including real nft -c and the JSON read-back on nftables 1.0.9 in a container, armed_revert and base shell scripts run under dash through the vendored bogworks recording runner, plans, validate, remote, test_support, ssh). The arm-before-apply ordering is asserted on the emitted command stream. Gates: deno, swamp fmt, quality, leak scan, gitleaks, fixture guard, naming, registry-lint, dash-runner, bashisms, fixture-provenance, realtool, dry run. Live 2026-10-18 on 89f7a47 (contentHash 371317a6...) on a throwaway VPS with an outside probe host: 26 pass, 0 fail, 1 untested (commit/rerun, an omission), including both armed-revert failure paths (a firewall revert fired and restored the committed table byte-identically; a lockout excluding the control host self-healed after 87 s), the identity-mismatch refusals of get and forget, idempotent re-runs of every phase and an injection sweep refused by name before any dial. Residual MEDIUM test gap (conformance, kept): the harness recognises a stdin script only behind a bare `sh -s`, so assertNoRemoteSecretWrite never scans sudo-delivered scripts and the sudo-stripped mirror recording is discarded; filed for the harness."
+    },
+    {
+      "id": "idempotency-resilience",
+      "verdict": "pass",
+      "note": "Live: apply_base with identical inputs emits no remote command (0 steps, 61 ms); an identical firewall re-apply and an identical lockdown over the committed table are `ruleset already live, no-op` with no timer armed; a second forget writes nothing. A host-side systemd timer armed before any change restores the previous managed table and leaves foreign tables intact (live: a foreign table and rule survived every apply, revert and commit); only the generation that armed it can disarm it. 2026.10.17.4: the widening guard counts any source-limited rule in the live managed input chain as management-only SSH whatever port it names, so an ssh_port change cannot bypass it (live: allow_ssh_from_anywhere with ssh_port 2222 refused over a management-only rule). forget now checks the revert record's identity too and is idempotent. Residual LOW (kept): forget checks identity only against an open revert and leaves a closed revert record of a reused address in place (inert for currentRevert) although the description says it is deleted. Residual LOW (earlier, accepted): an account recreated by another root actor between the lookup and the marker removal keeps sudo with no marker."
+    },
+    {
+      "id": "api-contracts",
+      "verdict": "pass",
+      "note": "nftables JSON read-back is the comparison source (never the render text); merge-aware address sets, table flags and sets; add+delete of the managed table instead of a destroy. Requires a Debian/Ubuntu target with nft, systemd (systemd-run), sudo, flock, timeout, runuser and the shadow tools. Goldens are validated by the real tool in the realtool gate."
+    },
+    {
+      "id": "resource-management",
+      "verdict": "pass",
+      "note": "2026.10.17.4: no remote temp file for any script or secret; scripts travel on the session's stdin. Config files the tool owns (sysctl and journald drop-ins, the revert script, authorized_keys) are written through a same-directory mktemp file and an atomic mv removed by the EXIT trap; they carry no secret. The revert timer, its service and the revert files are removed on commit or after firing (live: state dir back to revert.lock plus the sudo marker after each). The vendored _lib/ssh.ts is the canonical transport (blob 8f132c4329c9e64bed686731cd5a0e02980194ea, ssh-host 2026.10.17.3); the convergence debt of 2026.10.17.3 is closed."
+    },
+    {
+      "id": "published-surface-hygiene",
+      "verdict": "pass",
+      "note": "Manifest: @randybias/server-host, two-sentence description, Apache-2.0, additionalFiles README.md and LICENSE.txt. Mutating methods start DESTRUCTIVE, render/get/sync start READ-ONLY. README examples include the required host_keys and vault references only. Fixtures use RFC 5737 CIDRs and example.com/.test with provenance headers; leak scan, gitleaks and fixture guard pass; live receipts folded into the LOGBOOK with addresses, provider ids and tokens redacted. The LOGBOOK carries the visibility/audience lines and the five naming answers. Residual LOW (kept, the owner's call): `server-host` is two banned nouns; the naming audit proposes `linux-host-hardening` as a separate package item, nothing renamed in this version."
+    },
+    {
+      "id": "schema-strictness",
+      "verdict": "pass",
+      "note": "All arguments are strict objects; host, port, user, CIDRs, ports, package names, sysctl keys and authorized keys carry grammars and bounds; host_keys required (1-16); host_key_policy accepts only strict. 0.0.0.0/0 or equivalent halves are refused without an explicit acknowledgement, and lockdown never allows SSH from anywhere. Live bad-input cells: `/33`, port 70000, revert_after_s 30, insecure_tofu, empty management_cidrs, a missing host_keys and injection literals in package, user, key and sysctl were each refused at validation by field name with nothing dialled."
+    },
+    {
+      "id": "lifetime-gc",
+      "verdict": "pass",
+      "note": "host_state and observation: infinite, GC 20/5; revert and firewall_render: 1d, GC 5."
+    },
+    {
+      "id": "crud-completeness",
+      "verdict": "pass",
+      "note": "Phase methods apply_base, apply_firewall, lockdown, commit and forget are actions; render_firewall, get and sync are read-only. Changing admin_user revokes the previous account's managed keys and tool-granted sudo, sudo first (live: ops -> ops2 left ops without keys, out of sudo, marker gone). forget refuses a mismatching identity before any write and is a no-op on repeat (both live)."
+    },
+    {
+      "id": "preflight-checks",
+      "verdict": "pass",
+      "note": "Inputs, CIDR safety, host-key pins and the record identity are validated before any spawn (live: a wrong identity refused in 1.7 s with nothing dialled; a wrong pinned host key refused before authentication); nft -c pre-checks every ruleset before anything is armed; a revert is armed before any firewall change, and the arm step precedes the apply in the asserted command stream."
+    },
+    {
+      "id": "instance-names",
+      "verdict": "pass",
+      "note": "Per-host instances state-, revert-, observation- and render-<host> with unsafe characters mapped to underscores, so one definition serves many hosts. Records carry an optional identity (the provider server id) and a record for another identity is refused (live), so a rebuilt host that receives a deleted host's address does not inherit its state. Residuals (earlier, accepted): revert records drop the identity when it is omitted, and records without an identity are adopted silently and stamped."
+    },
+    {
+      "id": "data-access",
+      "verdict": "pass",
+      "note": "Methods read only this model's own resources for the host; every target arrives as method arguments. get/sync persist their findings in the observation resource (live: read back with swamp data query inside the armed window and after each fired revert, with drift [\"ruleset\",\"revert_fired\"] recorded)."
+    },
+    {
+      "id": "version-upgrades",
+      "verdict": "pass",
+      "note": "upgrades[] carries entries from 2026.10.17.1 and 2026.10.17.3 with no attribute change; inputs and rendered rulesets are unchanged in 2026.10.17.4 (the goldens only moved from fixtures/ to goldens/), so the upgrade is a no-op. 2026.10.17.2 was never published."
+    }
+  ],
+  "panel": {
+    "codex-astra-conformance": "codex gpt-6-astra conformance seat over the lane/b2-server-host diff at 89f7a47 (rc=0): 3 High, all refuted or downgraded at triage: naming (kept as Low, rename is a separate item pending the owner), restore proceeds after the 120 s lock wait (by design, every holder is bounded below it; failing closed would strand the host), absence detection trusting grep errors and unknown NSS backends (a sudo marker exists only for a local account, found before any NSS reasoning). 3 Medium: gate-7 shape (downgraded to Low, same shape as the published 17.3), the inner sh -c argv word under timeout (kept, Medium), the sudo-stripped mirror recording not asserted on (kept, Medium test gap).",
+    "codex-terra-adversarial": "codex gpt-5.6-terra adversarial seat (rc=0): 1 Medium, forget ignores a closed revert record of a reused address (downgraded to Low: a closed record is never adopted, so no identity check is bypassed for anything that acts); 1 Low, forget tombstones instead of deleting (platform limit: a method cannot remove a record; the tombstone carries only host and timestamps).",
+    "codex-astra-tightness": "codex gpt-6-astra tightness seat (rc=0): COULD-BE-TIGHTER, about 50 removable lines: six repeated guarded-apply constructions in armed_revert_shell_test.ts (Low, kept for the next version) and an unused stdin parameter in the vendored bogworks/containers.ts (reported to the harness owner, not changed here).",
+    "advisory-glm": "GLM advisory seat (rc=0, read, not counted): widening guard refusing on third-party rules (refuted: the managed input chain belongs to this extension's own table), TOFU persistence and an upload probe fallthrough in the vendored transport (judged in its owner; the model admits only strict), a forget repeat write on an identity-only record (refuted: the repeat is a no-op), a grep regex on a user name (refuted: the admin_user grammar admits no metacharacter), and the live matrix untested at triage time (resolved by the live run).",
+    "merge-prep": "Merged on main as 21caf205f36012edc49fe34e800c2450d3804f62 from lane/b2-server-host 89f7a47af247 (server-host/ only, --no-ff). No code change after the live-tested head; the published bytes equal the live-tested bytes. Live 2026-10-18 on a throwaway VPS: 26 pass, 0 fail, 1 untested (commit/rerun omission). Residuals kept in the LOGBOOK: the inner sh -c argv size limit for large authorized_keys sets, the sudo-wrapped stdin scripts not scanned by the harness assertion, forget and a closed revert record, the timer AccuracySec slack, the gate-7 spread shape and the pending rename."
+  }
+}

@@ -724,6 +724,17 @@ Porkbun, GoDaddy, mDNS, a DNS policy compiler). Nothing to file upstream.
   `reviews/knot-dns/114326131b4aef84406adeeb9b865d15d04d165d998785c0dae44a8ba952600a.json`,
   written from the round-2 and round-3 seat outputs, the dispositions above and
   the live receipts.
+- Gates on the docs commit (0674140): 0 consistency, 1 deno, 2 swamp fmt, 3
+  quality, 4 leak scan, 5 gitleaks, 6 fixture guard, 7 dry run (contentHash
+  `114326...`), 8 review, 9 naming all PASS; `--tree` leak scan and gitleaks
+  PASS.
+- Published 2026-10-18T04:50Z with
+  `swamp extension push manifest.yaml
+  --repo-dir knot-dns --channel beta --yes`:
+  `@randybias/knot-dns@2026.10.17.2`, channel beta, visibility public; the
+  registry's `latestBeta` reads 2026.10.17.2. The `release.yaml` record
+  (published hash and the final release note) is the commit after this one;
+  gates were re-run on it before the push of main.
 
 ## Factory events
 

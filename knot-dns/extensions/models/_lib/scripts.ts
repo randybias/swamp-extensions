@@ -273,14 +273,37 @@ export function removeZoneScript(opts: {
   purgeKeysAck: boolean;
   unsigned: boolean;
 }): string {
-  const purge = opts.purgeKeysAck
-    ? `knotc zone-purge "$apex" 2>/dev/null || true`
-    : "true";
+  // `keymgr` reads the KASP database directly, so it still removes a zone's
+  // keys after the zone is unloaded; `knotc zone-purge` only works while the
+  // zone is still configured (and needs -f). Run both: purge data, journal and
+  // timers while configured, then drop the keys the signer may have
+  // regenerated with keymgr. An earlier run that failed after removing the
+  // zone leaves `present=no`, so the key purge is retried there too.
+  const purgeKeys = [
+    "purge_keys() {",
+    '  keymgr "$apex" list 2>/dev/null | while read -r id rest; do',
+    '    [ -n "$id" ] || continue',
+    '    keymgr "$apex" delete "$id" >/dev/null 2>&1 || return 1',
+    "  done",
+    "}",
+  ];
+  const keyRetry = opts.purgeKeysAck
+    ? ["purge_keys || { echo PURGE_KEYS_FAILED >&2; exit 16; }"]
+    : [];
+  const purgeZone = opts.purgeKeysAck
+    ? [
+      'knotc -f zone-purge "$apex" >/dev/null 2>&1 || rollback PURGE_FAILED 15',
+    ]
+    : [];
   const inner = [
     ...zoneHead({ apex: opts.apex, run: opts.run, reloadZone: false }),
+    ...(opts.purgeKeysAck ? purgeKeys : []),
     "present=no",
     '[ -f "$f" ] && present=yes',
-    `if [ "$present" = no ]; then echo "removed=no"; exit 0; fi`,
+    'if [ "$present" = no ]; then',
+    ...keyRetry.map((l) => `  ${l}`),
+    '  echo "removed=no"; exit 0',
+    "fi",
     'if [ -f "$z" ]; then',
     `  signed=$(grep -c 'dnssec-signing: on' "$f" 2>/dev/null || true)`,
     `  if [ "$signed" != "0" ] && [ ${
@@ -289,12 +312,13 @@ export function removeZoneScript(opts: {
     "fi",
     "listen_diff",
     ...BACKUP_LINES,
+    ...purgeZone,
     'rm -f "$z" "$f" "$t"',
     'if [ "$want_listen" = yes ]; then mv "$lst" "$l"; else rm -f "$l" "$lst"; fi',
     'own_all "$l" || rollback CHOWN_FAILED 10',
     "reload_knot || rollback RELOAD_FAILED 5",
+    ...keyRetry,
     'rm -rf "${b:?}"',
-    purge,
     'echo "removed=yes"',
   ].join("\n");
   return underLock(KNOT_LOCK, inner);

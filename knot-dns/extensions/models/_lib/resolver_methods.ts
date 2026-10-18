@@ -20,7 +20,11 @@ import {
   StateResolverSchema,
 } from "./schemas.ts";
 import { mapScriptError } from "./errors.ts";
-import { pickTestQuery, renderResolverYaml } from "./resolver.ts";
+import {
+  pickTestListen,
+  pickTestQuery,
+  renderResolverYaml,
+} from "./resolver.ts";
 import {
   type Ctx,
   deps,
@@ -56,6 +60,13 @@ async function applyResolver(
   const yaml = renderResolverYaml(a.resolver);
   const sha = await sha256Hex(yaml);
   const target = await sshTarget(context, a.ssh);
+  const testListen = pickTestListen(a.resolver);
+  if (testListen === null) {
+    throw new KnotError(
+      "invalid_input",
+      "allow_query_from permits none of the resolver listen addresses, so the apply self-test would be refused; add a listen address (or loopback) to allow_query_from",
+    );
+  }
   const testName = pickTestQuery(a.resolver, await servedApexes(target));
   let res;
   try {
@@ -71,7 +82,7 @@ async function applyResolver(
         liveYaml: RESOLVER_YAML,
         packageBackup: RESOLVER_PACKAGE_BACKUP,
         stagedYaml: RESOLVER_YAML_STAGED,
-        testListen: a.resolver.listen[0],
+        testListen,
         testName,
       }),
     ]);
@@ -176,7 +187,7 @@ export const resolverMethods = {
   apply_resolver: {
     kind: "action" as const,
     description:
-      "DESTRUCTIVE. Validate with kresctl, back up the package config, atomically swap the resolver config.yaml, reload and verify a test query on a name the forwarded upstream serves, restoring the previous config on failure. Idempotent: an unchanged render is a no-op.",
+      "DESTRUCTIVE. Validate with kresctl, back up the package config, atomically swap the resolver config.yaml, reload and verify a test query on a listen address allow_query_from permits, restoring the previous config on failure. Idempotent: an unchanged render is a no-op.",
     arguments: ApplyResolverArgs,
     execute: applyResolver,
   },

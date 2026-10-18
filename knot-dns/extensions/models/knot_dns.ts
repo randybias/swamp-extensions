@@ -287,9 +287,17 @@ async function observe(
 /** Model definition for `@randybias/knot-dns`. */
 export const model = {
   type: "@randybias/knot-dns",
-  version: "2026.10.17.1",
+  version: "2026.10.17.2",
   description:
     "Manage authoritative Knot DNS zones and a Knot Resolver 6 recursive resolver over SSH, validating every candidate with the vendor tools before it reaches the service.",
+  upgrades: [
+    {
+      toVersion: "2026.10.17.2",
+      description:
+        "Re-vendor the canonical SSH transport; drop the unrendered parent_ds_check input; purge a removed zone's KASP keys when acknowledged; test the resolver on a listen address the access list permits.",
+      upgradeAttributes: (old: Record<string, unknown>) => old,
+    },
+  ],
   globalArguments: z.strictObject({}),
   resources: {
     zone: {
@@ -510,7 +518,7 @@ export const model = {
     remove_zone: {
       kind: "action" as const,
       description:
-        "DESTRUCTIVE. Stop serving one managed zone and remove its zone file, config fragment and TSIG fragment. A signed zone is refused unless dnssec_unsign_ack is set; with purge_keys_ack the journal is purged. A second call is a no-op.",
+        "DESTRUCTIVE. Stop serving one managed zone and remove its zone file, config fragment and TSIG fragment. A signed zone is refused unless dnssec_unsign_ack is set; with purge_keys_ack the journal, timers and KASP keys are purged. A second call is a no-op.",
       arguments: RemoveZoneArgs,
       execute: async (args: z.input<typeof RemoveZoneArgs>, context: Ctx) => {
         const a = RemoveZoneArgs.parse(args);

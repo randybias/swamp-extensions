@@ -341,8 +341,6 @@ export const DnssecSchema = z.strictObject({
   zsk_lifetime: z.string().regex(/^\d+[dhwmy]$/).optional().describe(
     "ZSK lifetime, e.g. 90d.",
   ),
-  parent_ds_check: z.array(z.enum(["ipv4", "ipv6"])).max(2).optional()
-    .describe("Families to check the parent DS over."),
 });
 
 /** SOA fields; the serial is Knot's. */

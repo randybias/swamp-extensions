@@ -29,7 +29,7 @@ const ZONE_ARGS = {
 
 Deno.test("model is a plain object with the expected type and methods", () => {
   assertEquals(model.type, "@randybias/knot-dns");
-  assertEquals(model.version, "2026.10.17.1");
+  assertEquals(model.version, "2026.10.17.2");
   const methods = Object.keys(model.methods);
   assertEquals(
     methods.sort(),
@@ -305,6 +305,41 @@ Deno.test("apply_resolver tests a name the upstream serves, and records what it 
       test_name: "a.example.test.",
       observed_at: (records[1].data as { observed_at: string }).observed_at,
     });
+  } finally {
+    host.restore();
+  }
+});
+
+Deno.test("every resource name written in one apply_resolver run is unique", async () => {
+  const host = fakeHost((command) =>
+    command.includes("50-managed-*.conf")
+      ? { stdout: "a.example.test.\n" }
+      : command.includes("kresctl")
+      ? { stdout: "changed=yes\n" }
+      : {}
+  );
+  try {
+    const c = vaultContext();
+    await model.methods.apply_resolver.execute(
+      RESOLVER_ARGS as never,
+      c.context,
+    );
+    const records = c.getWrittenResources();
+    assertEquals(records.length, 2);
+    // The per-method spec names are distinct ...
+    assertEquals(new Set(records.map((r) => r.specName)).size, records.length);
+    // ... and so are the state instance names they are keyed by.
+    const resolverName = await instanceName([
+      "resolver",
+      RESOLVER_ARGS.ssh.host,
+    ]);
+    const outcomeName = await instanceName([
+      "outcome",
+      "apply_resolver",
+      RESOLVER_ARGS.ssh.host,
+      "",
+    ]);
+    assertEquals(resolverName === outcomeName, false);
   } finally {
     host.restore();
   }

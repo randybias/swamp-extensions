@@ -104,11 +104,33 @@ Deno.test("remove script refuses a signed zone without an ack", () => {
   assert(script.includes("[ 1 = 1 ]"));
   const acked = removeZoneScript({
     ...REMOVE,
-    purgeKeysAck: true,
     unsigned: true,
   });
   assert(acked.includes("[ 0 = 1 ]"));
-  assert(acked.includes("zone-purge"));
+});
+
+Deno.test("remove without purge_keys_ack keeps the journal and KASP keys", () => {
+  const script = removeZoneScript(REMOVE);
+  assert(!script.includes("zone-purge"));
+  assert(!script.includes("keymgr"));
+});
+
+Deno.test("remove with purge_keys_ack purges zone data and KASP keys", async () => {
+  const acked = removeZoneScript({
+    ...REMOVE,
+    purgeKeysAck: true,
+    unsigned: true,
+  });
+  // -f is required: without it `knotc zone-purge` refuses and does nothing.
+  assert(acked.includes('knotc -f zone-purge "$apex"'));
+  assert(acked.includes('keymgr "$apex" delete "$id"'));
+  // The zone data purge runs while the zone is still configured (before the
+  // fragment is removed), and the key purge retries on a present=no re-run.
+  assert(
+    acked.indexOf("zone-purge") < acked.indexOf('rm -f "$z" "$f" "$t"'),
+  );
+  assert(acked.includes("PURGE_KEYS_FAILED"));
+  assertEquals(await shSyntax(acked), 0);
 });
 
 Deno.test("resolver apply script validates with kresctl before swapping", () => {

@@ -1,8 +1,11 @@
 import { assert, assertEquals } from "jsr:@std/assert@1.0.19";
 import {
+  cidrContains,
   CidrSchema,
+  effectiveAllowQueryFrom,
   ForwardSchema,
   ListenAddressSchema,
+  pickTestListen,
   pickTestQuery,
   renderResolverYaml,
   ResolverSchema,
@@ -102,6 +105,60 @@ Deno.test("resolver YAML escapes scalar content", () => {
   });
   const yaml = renderResolverYaml(input);
   assert(yaml.includes('subtree: "example.test."'));
+});
+
+Deno.test("CIDR containment covers both families and /0", () => {
+  assert(cidrContains("127.0.0.0/8", "127.0.0.1"));
+  assert(!cidrContains("203.0.113.0/24", "127.0.0.1"));
+  assert(cidrContains("192.0.2.10/32", "192.0.2.10"));
+  assert(!cidrContains("192.0.2.10/32", "192.0.2.11"));
+  assert(cidrContains("2001:db8::/32", "2001:db8::1"));
+  assert(!cidrContains("2001:db8:1::/48", "2001:db8:2::1"));
+  assert(!cidrContains("2001:db8::/32", "192.0.2.1"));
+  assert(cidrContains("::1/128", "::1"));
+  assert(cidrContains("0.0.0.0/0", "203.0.113.7"));
+});
+
+Deno.test("the default access list covers loopback and the listen addresses", () => {
+  const input = ResolverSchema.parse({
+    listen: ["127.0.0.1@53", "192.0.2.10@53"],
+  });
+  const allow = effectiveAllowQueryFrom(input);
+  assert(allow.includes("127.0.0.0/8"));
+  assert(allow.includes("192.0.2.10/32"));
+  // An explicit list is used verbatim.
+  const explicit = ResolverSchema.parse({
+    listen: ["192.0.2.10@53"],
+    allow_query_from: ["192.0.2.0/24"],
+  });
+  assertEquals(effectiveAllowQueryFrom(explicit), ["192.0.2.0/24"]);
+});
+
+Deno.test("the self-test picks a listen address the access list permits", () => {
+  // The first listen is excluded; the second is permitted.
+  const picksSecond = ResolverSchema.parse({
+    listen: ["127.0.0.1@53", "192.0.2.10@53"],
+    allow_query_from: ["192.0.2.0/24"],
+  });
+  assertEquals(pickTestListen(picksSecond), "192.0.2.10@53");
+  // Default: loopback is permitted.
+  assertEquals(
+    pickTestListen(ResolverSchema.parse({ listen: ["127.0.0.1@5353"] })),
+    "127.0.0.1@5353",
+  );
+  // A wildcard is probed on loopback.
+  assertEquals(
+    pickTestListen(ResolverSchema.parse({ listen: ["0.0.0.0@5353"] })),
+    "0.0.0.0@5353",
+  );
+  // An explicit list excluding every listen returns null (the caller refuses).
+  assertEquals(
+    pickTestListen(ResolverSchema.parse({
+      listen: ["192.0.2.10@53"],
+      allow_query_from: ["203.0.113.0/24"],
+    })),
+    null,
+  );
 });
 
 Deno.test("the self-test asks a name the forwarded upstream actually serves", () => {

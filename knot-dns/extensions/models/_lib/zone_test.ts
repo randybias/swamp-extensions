@@ -6,6 +6,7 @@ import {
   canonicalZoneFile,
   declaredTuples,
   diffDeclared,
+  DnssecSchema,
   isApex,
   isFqdn,
   isIpv4,
@@ -360,6 +361,23 @@ Deno.test("served-vs-declared diff", () => {
   assertEquals(diff.removed, [
     { name: "old.example.com.", type: "A", data: "192.0.2.99" },
   ]);
+});
+
+Deno.test("the DNSSEC policy accepts only keys the renderer uses", () => {
+  assertEquals(
+    DnssecSchema.safeParse({
+      algorithm: "ecdsap256sha256",
+      nsec3: false,
+      ksk_lifetime: "365d",
+      zsk_lifetime: "90d",
+    }).success,
+    true,
+  );
+  // parent_ds_check was accepted but never rendered; it is gone now.
+  assertEquals(
+    DnssecSchema.safeParse({ parent_ds_check: ["ipv4"] }).success,
+    false,
+  );
 });
 
 Deno.test("a record with an unknown key is refused, not silently stripped", () => {

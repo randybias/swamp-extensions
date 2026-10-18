@@ -365,6 +365,58 @@ Deno.test({
 });
 
 Deno.test({
+  name: "remove: purge_keys_ack removes the zone's KASP keys",
+  ignore: !available,
+  fn: async () => {
+    const l = ["127.0.0.1@5353"];
+    const run = "p1";
+    const p = zonePaths(APEX, run);
+    const { file } = zoneFixture(1, []);
+    const signed = renderZoneConfig({
+      apex: APEX,
+      file: zonePaths(APEX).zoneFile,
+      signed: true,
+      dnssec: { algorithm: "ecdsap256sha256", nsec3: false },
+      notifySecondaries: [],
+      allowTransfer: [],
+      tsigKeyNames: [],
+    }).trimEnd();
+    const stageSigned = [
+      put(stagedListen(run), listenFragment(l).trimEnd()),
+      put(p.stagedZone, file),
+      put(p.stagedFragment, signed),
+      `: > '${p.stagedTsig}'`,
+    ].join("\n");
+    const r = await box("", [
+      ["stage", stageSigned],
+      ["apply", applyZoneScript({ apex: APEX, run, listens: l })],
+      [
+        "keys_before",
+        'for i in 1 2 3 4 5 6 7 8 9 10; do n=$(keymgr example.com. list 2>/dev/null | wc -l); [ "$n" -ge 2 ] && break; sleep 1; done; echo "$n"',
+      ],
+      ["stage_remove", put(stagedListen("p2"), "")],
+      [
+        "remove",
+        removeZoneScript({
+          apex: APEX,
+          run: "p2",
+          purgeKeysAck: true,
+          unsigned: true,
+        }),
+      ],
+      ["keys_after", "keymgr example.com. list 2>/dev/null | wc -l"],
+      ["zones_left", "keymgr -l 2>/dev/null | grep -c '^example.com' || true"],
+    ]);
+    assertEquals(r.apply.rc, 0, r.apply.err);
+    assert(Number(r.keys_before.out.trim()) >= 2, r.keys_before.out);
+    assertEquals(r.remove.rc, 0, r.remove.err);
+    assertStringIncludes(r.remove.out, "removed=yes");
+    assertEquals(r.keys_after.out.trim(), "0");
+    assertEquals(r.zones_left.out.trim(), "0");
+  },
+});
+
+Deno.test({
   name: "restore: undoing a listen change restarts knotd on the old address",
   ignore: !available,
   fn: async () => {

@@ -6,6 +6,13 @@ import {
 import { createModelTestContext } from "jsr:@swamp-club/swamp-testing@0.20261014.55";
 import { createModel, type HostDeps, hostInstance } from "./server_host.ts";
 import { type CommandRunner } from "./_lib/ssh.ts";
+import { bodyOf, fakeHost, unquoteBody } from "./_lib/test_support.ts";
+import {
+  assertNoRemoteSecretWrite,
+  assertNoSecretOnArgv,
+  createRecordingRunner,
+  type Recording,
+} from "./_lib/bogworks/recording-runner.ts";
 import {
   expectedListing,
   expectedManagedSha256,
@@ -15,6 +22,7 @@ import {
   rulesetSha256,
 } from "./_lib/nftables.ts";
 import { renderSysctlConf } from "./_lib/plans.ts";
+import { renderRevertScript } from "./_lib/armed_revert.ts";
 
 const NOW = 1_700_000_000_000;
 const TOKEN = "0".repeat(16);
@@ -64,71 +72,57 @@ async function sha256Hex(text: string): Promise<string> {
 
 interface Fake {
   deps: Partial<HostDeps>;
+  /** Every remote call: its ssh argument, then the script it runs on stdin. */
   commands: string[];
   stdins: string[];
   secrets: [string, string][];
   /** Arguments of every ssh-keyscan call. */
   scans: string[][];
-  /** known_hosts text written for each ssh invocation's session. */
-  knownHosts: string[];
+  /** The argv of every ssh call, in order. */
+  sshArgs(): string[][];
+  /** The harness recording of every local command. */
+  recording: Recording;
 }
 
-/** A fake transport that records ssh commands, stdin and secret lookups. */
+/** A fake transport that records ssh scripts, stdin and secret lookups. */
 function fakeTransport(
   respond: (command: string) => { code: number; stdout?: string } = () => ({
     code: 0,
   }),
+  capture = false,
 ): Fake {
-  const commands: string[] = [];
   const stdins: string[] = [];
   const secrets: [string, string][] = [];
   const scans: string[][] = [];
-  const knownHosts: string[] = [];
-  const run: CommandRunner = async (cmd, args, options = {}) => {
-    await Promise.resolve();
-    if (options.stdin) stdins.push(new TextDecoder().decode(options.stdin));
-    if (cmd === "ssh-agent") {
-      return args[0] === "-s"
-        ? {
-          code: 0,
-          stdout: "SSH_AUTH_SOCK=/tmp/a.sock;\nSSH_AGENT_PID=1;\n",
-          stderr: "",
-        }
-        : { code: 0, stdout: "", stderr: "" };
-    }
-    if (cmd === "ssh-add") return { code: 0, stdout: "", stderr: "" };
-    if (cmd === "ssh-keyscan") {
-      scans.push(args);
-      return {
-        code: 0,
-        stdout: `${SSH.host} ${KEY}\n`,
-        stderr: "",
-      };
-    }
-    if (cmd !== "ssh") return { code: 0, stdout: "", stderr: "" };
-    const command = args[args.length - 1];
-    commands.push(command);
+  const host = fakeHost((body, call) => {
+    const command = `${call.argv[call.argv.length - 1]}\n${body}`;
     const r = respond(command);
     // Unscripted nft reads answer like a host: no managed table in the
     // ruleset, and the rendered table when it is read back after an apply.
     const stdout = r.stdout ??
       (command.includes("ip -4 -j route show default")
         ? '[{"dst":"default","dev":"enp1s0"}]\n---\n[]\n---\n[{"dev":"wg0"}]'
-        : command.includes("'nft' '-j' 'list' 'ruleset'")
+        : command.includes("nft -j list ruleset")
         ? '{"nftables":[]}'
-        : command.includes("'nft' '-j' 'list' 'table'")
+        : command.includes("nft -j list table")
         ? expectedListing(FIREWALL)
         : "");
-    return { code: r.code, stdout, stderr: "" };
+    return { code: r.code, stdout };
+  }, capture);
+  const base = host.run;
+  const run: CommandRunner = (cmd, args, options = {}) => {
+    if (options.stdin) {
+      stdins.push(
+        typeof options.stdin === "string"
+          ? options.stdin
+          : new TextDecoder().decode(options.stdin),
+      );
+    }
+    if (cmd === "ssh-keyscan") scans.push(args);
+    return base(cmd, args, options);
   };
   const deps: Partial<HostDeps> = {
     run,
-    makeTempDir: () => Promise.resolve("/tmp/t"),
-    writeFile: (_path, text) => {
-      knownHosts.push(text);
-      return Promise.resolve();
-    },
-    removeDir: () => Promise.resolve(),
     now: () => NOW,
     sleep: () => Promise.resolve(),
     token: () => TOKEN,
@@ -137,13 +131,28 @@ function fakeTransport(
       return Promise.resolve(PEM);
     },
   };
-  return { deps, commands, stdins, secrets, scans, knownHosts };
+  return {
+    deps,
+    get commands() {
+      return host.sshCalls().map((c) =>
+        `${c.argv[c.argv.length - 1]}\n${bodyOf(c)}`
+      );
+    },
+    stdins,
+    secrets,
+    scans,
+    sshArgs: () => host.sshCalls().map((c) => c.argv),
+    recording: host.recording,
+  };
 }
 
 /** The apply step: the guarded `nft -f -` script that checks the revert first. */
 const isGuardedApply = (c: string) =>
-  c.includes("nft -f -") && c.includes("exit 70");
+  c.includes("| nft -f -") && c.includes("exit 70");
 const isArm = (c: string) => c.includes("systemd-run");
+/** The read-only timer probe, not the scripts that merely mention the command. */
+const isTimerProbe = (c: string) =>
+  /systemctl is-active 'server-host-revert-[0-9a-f]+\.timer'\n/.test(c);
 const isDisarm = (c: string) => c.includes('"$unit.timer" 2>/dev/null || true');
 
 function modelWith(f: Fake) {
@@ -152,7 +161,7 @@ function modelWith(f: Fake) {
 
 function liveResponse() {
   return (command: string): { code: number; stdout?: string } => {
-    if (command.includes("'nft' '-j' 'list' 'ruleset'")) {
+    if (command.includes("nft -j list ruleset")) {
       return { code: 0, stdout: expectedListing(FIREWALL) };
     }
     return { code: 0 };
@@ -420,9 +429,7 @@ Deno.test("apply_firewall: the ssh command stream arms before it applies", async
   );
   const armAt = f.commands.findIndex((c) => c.includes("systemd-run"));
   const applyAt = f.commands.findIndex(isGuardedApply);
-  const checkAt = f.commands.findIndex((c) =>
-    c.includes("'nft' '-c' '-f' '-'")
-  );
+  const checkAt = f.commands.findIndex((c) => c.includes("nft -c -f -"));
   assertEquals(checkAt >= 0 && checkAt < stageAt, true, "syntax check first");
   assertEquals(stageAt >= 0, true, "revert script staged");
   assertEquals(stageAt < armAt, true, "script staged before timer");
@@ -473,7 +480,7 @@ Deno.test("apply_firewall: a stale record re-applies instead of trusting the sha
   const name = `state-${hostInstance(SSH.host)}`;
   // Live output has no managed table, as after a fired revert.
   const f = fakeTransport((c) =>
-    c.includes("'nft' '-j' 'list' 'ruleset'")
+    c.includes("nft -j list ruleset")
       ? { code: 0, stdout: '{"nftables":[]}' }
       : { code: 0 }
   );
@@ -528,10 +535,10 @@ Deno.test("lockdown: an identical live ruleset with an armed revert is a no-op, 
   const ruleset_sha256 = await rulesetSha256(rendered);
   const managed_sha256 = await expectedManagedSha256(FIREWALL);
   const f = fakeTransport((c) => {
-    if (c.includes("'nft' '-j' 'list' 'ruleset'")) {
+    if (c.includes("nft -j list ruleset")) {
       return { code: 0, stdout: expectedListing(FIREWALL) };
     }
-    if (c.includes("'systemctl' 'is-active'")) {
+    if (isTimerProbe(c)) {
       return { code: 0, stdout: "active\n" };
     }
     return { code: 0 };
@@ -622,10 +629,10 @@ Deno.test("commit: probes the timer and rules, then records a verified cancel", 
   const name = `revert-${hostInstance(SSH.host)}`;
   const active = [true, false];
   const f = fakeTransport((c) => {
-    if (c.includes("'nft' '-j' 'list' 'ruleset'")) {
+    if (c.includes("nft -j list ruleset")) {
       return { code: 0, stdout: expectedListing(FIREWALL) };
     }
-    if (c.includes("'systemctl' 'is-active'")) {
+    if (isTimerProbe(c)) {
       return { code: 0, stdout: active.shift() ? "active\n" : "inactive\n" };
     }
     return { code: 0 };
@@ -660,10 +667,10 @@ Deno.test("commit: a failed cancellation is fatal and records nothing", async ()
   const managed_sha256 = await expectedManagedSha256(FIREWALL);
   const name = `revert-${hostInstance(SSH.host)}`;
   const f = fakeTransport((c) => {
-    if (c.includes("'nft' '-j' 'list' 'ruleset'")) {
+    if (c.includes("nft -j list ruleset")) {
       return { code: 0, stdout: expectedListing(FIREWALL) };
     }
-    if (c.includes("'systemctl' 'is-active'")) {
+    if (isTimerProbe(c)) {
       return { code: 0, stdout: "active\n" };
     }
     if (c.includes("systemctl stop")) return { code: 1 };
@@ -736,10 +743,10 @@ Deno.test("commit: refuses nothing armed, expired, not active, and mismatched ru
   );
   // Timer not active.
   const inactive = fakeTransport((c) => {
-    if (c.includes("'nft' '-j' 'list' 'ruleset'")) {
+    if (c.includes("nft -j list ruleset")) {
       return { code: 0, stdout: expectedListing(FIREWALL) };
     }
-    if (c.includes("'systemctl' 'is-active'")) {
+    if (isTimerProbe(c)) {
       return { code: 3, stdout: "inactive\n" };
     }
     return { code: 0 };
@@ -759,10 +766,10 @@ Deno.test("commit: refuses nothing armed, expired, not active, and mismatched ru
   );
   // Live rules no longer match the armed revert.
   const mismatch = fakeTransport((c) => {
-    if (c.includes("'nft' '-j' 'list' 'ruleset'")) {
+    if (c.includes("nft -j list ruleset")) {
       return { code: 0, stdout: expectedListing(FIREWALL) };
     }
-    if (c.includes("'systemctl' 'is-active'")) {
+    if (isTimerProbe(c)) {
       return { code: 0, stdout: "active\n" };
     }
     return { code: 0 };
@@ -784,10 +791,10 @@ Deno.test("commit: refuses nothing armed, expired, not active, and mismatched ru
 
 Deno.test("get and sync: probe the host and report phase state and drift", async () => {
   const f = fakeTransport((c) => {
-    if (c.includes("'nft' '-j' 'list' 'ruleset'")) {
+    if (c.includes("nft -j list ruleset")) {
       return { code: 0, stdout: expectedListing(FIREWALL) };
     }
-    if (c.includes("'systemctl' 'is-active'")) {
+    if (isTimerProbe(c)) {
       return { code: 3, stdout: "inactive\n" };
     }
     return { code: 0 };
@@ -811,7 +818,7 @@ Deno.test("get and sync: probe the host and report phase state and drift", async
 
 Deno.test("get: a failed probe is an error and writes no state", async () => {
   const f = fakeTransport((c) =>
-    c.includes("'nft' '-j' 'list' 'ruleset'") ? { code: 1 } : { code: 0 }
+    c.includes("nft -j list ruleset") ? { code: 1 } : { code: 0 }
   );
   const m = modelWith(f);
   const ctx = createModelTestContext({ globalArgs: {} });
@@ -871,7 +878,7 @@ Deno.test("apply_firewall: a step failing after arming leaves the timer armed an
   // The read-back fails after the apply went through: the outcome is unknown,
   // so the host must keep the revert that will restore it.
   const f = fakeTransport((c) =>
-    c.includes("'list' 'table'") ? { code: 1 } : { code: 0 }
+    c.includes("nft -j list table") ? { code: 1 } : { code: 0 }
   );
   const m = modelWith(f);
   const ctx = createModelTestContext({ globalArgs: {} });
@@ -925,7 +932,7 @@ Deno.test("apply_firewall: a definite apply failure disarms its own timer and ma
 
 Deno.test("apply_firewall: a failing syntax check arms nothing and needs no cleanup", async () => {
   const f = fakeTransport((c) =>
-    c.includes("'nft' '-c' '-f' '-'") ? { code: 1 } : { code: 0 }
+    c.includes("nft -c -f -") ? { code: 1 } : { code: 0 }
   );
   const m = modelWith(f);
   const ctx = createModelTestContext({ globalArgs: {} });
@@ -979,7 +986,7 @@ Deno.test("strict is the only host-key policy: trust-on-first-use is rejected an
   );
 });
 
-Deno.test("every ssh step runs with the same pinned known_hosts and nothing is scanned", async () => {
+Deno.test("every ssh step verifies the pinned host keys strictly and nothing is scanned", async () => {
   const f = fakeTransport();
   const m = modelWith(f);
   const ctx = createModelTestContext({ globalArgs: {} });
@@ -988,9 +995,12 @@ Deno.test("every ssh step runs with the same pinned known_hosts and nothing is s
     ctx.context,
   );
   assertEquals(f.scans.length, 0);
-  assertEquals(f.knownHosts.length, f.commands.length);
-  assertEquals(new Set(f.knownHosts).size, 1);
-  assertEquals(f.knownHosts[0], `${SSH.host} ${KEY}\n`);
+  const ssh = f.sshArgs();
+  assertEquals(ssh.length, f.commands.length);
+  for (const args of ssh) {
+    assertEquals(args.includes("StrictHostKeyChecking=yes"), true);
+    assertEquals(args.includes("StrictHostKeyChecking=accept-new"), false);
+  }
 });
 
 Deno.test("commit: an armed revert the model never recorded is found through the host's marker", async () => {
@@ -1002,7 +1012,7 @@ Deno.test("commit: an armed revert the model never recorded is found through the
         stdout: `${TOKEN} ${Math.floor(NOW / 1000) + 200} ${liveHash}\n`,
       };
     }
-    if (c.includes("'systemctl' 'is-active'")) {
+    if (isTimerProbe(c)) {
       return { code: 0, stdout: "active\n" };
     }
     return { code: 0 };
@@ -1012,12 +1022,11 @@ Deno.test("commit: an armed revert the model never recorded is found through the
   let cancelled = false;
   const base = f.deps.run!;
   f.deps.run = (cmd, args, o) => {
-    if (
-      cmd === "ssh" && args.at(-1)!.includes('systemctl stop "$unit.timer"')
-    ) {
+    const script = String(o?.stdin ?? "");
+    if (cmd === "ssh" && script.includes('systemctl stop "$unit.timer"')) {
       cancelled = true;
     }
-    if (cmd === "ssh" && cancelled && args.at(-1)!.includes("'is-active'")) {
+    if (cmd === "ssh" && cancelled && isTimerProbe(unquoteBody(script))) {
       return Promise.resolve({ code: 3, stdout: "inactive\n", stderr: "" });
     }
     return base(cmd, args, o);
@@ -1042,7 +1051,7 @@ Deno.test("commit: the marker fallback refuses when the host recorded no ruleset
     if (c.includes("/var/lib/server-host/current") && c.includes("cat")) {
       return { code: 0, stdout: `${TOKEN} ${Math.floor(NOW / 1000) + 200}\n` };
     }
-    if (c.includes("'systemctl' 'is-active'")) {
+    if (isTimerProbe(c)) {
       return { code: 0, stdout: "active\n" };
     }
     return { code: 0 };
@@ -1191,9 +1200,7 @@ Deno.test("lockdown: a re-run with identical inputs after commit is a no-op, wit
     ],
   });
   const f = fakeTransport((c) =>
-    c.includes("'nft' '-j' 'list' 'ruleset'")
-      ? { code: 0, stdout: live }
-      : { code: 0 }
+    c.includes("nft -j list ruleset") ? { code: 0, stdout: live } : { code: 0 }
   );
   const m = modelWith(f);
   const { context, getWrittenResources } = createModelTestContext({
@@ -1232,7 +1239,7 @@ Deno.test("lockdown: a re-run with identical inputs after commit is a no-op, wit
   // Only read-only probes ran: nothing armed, staged or applied.
   assertEquals(
     f.commands.some((c) =>
-      c.includes("systemd-run") || c.includes("nft -f -") ||
+      c.includes("systemd-run") || c.includes("| nft -f -") ||
       c.includes("'nft' '-f'")
     ),
     false,
@@ -1319,10 +1326,10 @@ Deno.test("real nft output: apply verifies, then commit and an identical re-appl
     const f = fakeTransport((c) => {
       if (isGuardedApply(c)) applied = true;
       if (c.includes('systemctl stop "$unit.timer"')) cancelled = true;
-      if (c.includes("'nft' '-j' 'list'")) {
+      if (c.includes("nft -j list")) {
         return { code: 0, stdout: applied ? live : '{"nftables":[]}' };
       }
-      if (c.includes("'systemctl' 'is-active'")) {
+      if (isTimerProbe(c)) {
         return cancelled
           ? { code: 3, stdout: "inactive\n" }
           : { code: 0, stdout: "active\n" };
@@ -1446,10 +1453,10 @@ Deno.test("get and sync persist their observation as a resource readable with sw
     ],
   });
   const f = fakeTransport((c) => {
-    if (c.includes("'nft' '-j' 'list' 'ruleset'")) {
+    if (c.includes("nft -j list ruleset")) {
       return { code: 0, stdout: live };
     }
-    if (c.includes("'systemctl' 'is-active'")) {
+    if (isTimerProbe(c)) {
       return { code: 0, stdout: "active\n" };
     }
     return { code: 0 };
@@ -1509,9 +1516,7 @@ Deno.test("get and sync persist their observation as a resource readable with sw
 
 Deno.test("sync records drift: a revert that fired, and a changed ruleset", async () => {
   const f = fakeTransport((c) =>
-    c.includes("'systemctl' 'is-active'")
-      ? { code: 3, stdout: "inactive\n" }
-      : { code: 0 }
+    isTimerProbe(c) ? { code: 3, stdout: "inactive\n" } : { code: 0 }
   );
   const m = modelWith(f);
   const { context, getWrittenResources } = createModelTestContext({
@@ -1659,9 +1664,7 @@ Deno.test("apply_base: keys left alone (exit 3) keep the account on the pending 
 
 Deno.test("observation: ssh_exposure is unknown when the host disagrees with the record, and pending revokes are listed", async () => {
   const f = fakeTransport((c) =>
-    c.includes("'systemctl' 'is-active'")
-      ? { code: 3, stdout: "inactive\n" }
-      : { code: 0 }
+    isTimerProbe(c) ? { code: 3, stdout: "inactive\n" } : { code: 0 }
   );
   const m = modelWith(f);
   const { context, getWrittenResources } = createModelTestContext({
@@ -1715,7 +1718,7 @@ function applyWithTrusted(
     // Under sudo, env_reset strips SSH_CLIENT: the real script exits 3 there.
     isRouteProbe(c)
       ? (c.includes("'sudo'") ? { code: 3 } : reply)
-      : c.includes("'nft' '-j' 'list' 'table'")
+      : c.includes("nft -j list table")
       ? {
         code: 0,
         stdout: expectedListing({ ...FIREWALL, trustedInterfaces: trusted }),
@@ -1883,8 +1886,9 @@ Deno.test("trusted_interfaces: the probe fails closed: no ip, no default route, 
 });
 
 Deno.test("trusted_interfaces: the probe script is read-only and fails closed", async () => {
-  const { UPLINK_SCRIPT } = await import("./_lib/plans.ts");
-  assertEquals(UPLINK_SCRIPT.startsWith("set -e\n"), true);
+  const { UPLINK_CALL, UPLINK_SCRIPT } = await import("./_lib/plans.ts");
+  assertEquals(UPLINK_CALL.sudo, false);
+  assertEquals(UPLINK_SCRIPT.includes("exit 3"), true);
   assertEquals(UPLINK_SCRIPT.includes("2>/dev/null"), false);
   assertEquals(UPLINK_SCRIPT.includes("exit 3"), true);
   assertEquals(
@@ -1903,13 +1907,14 @@ function widen(
   tool: "apply_firewall" | "lockdown" = "apply_firewall",
 ) {
   const f = fakeTransport((c) =>
-    c.includes("'nft' '-j' 'list' 'ruleset'")
+    c.includes("nft -j list ruleset")
       ? { code: 0, stdout: live }
-      : c.includes("'nft' '-j' 'list' 'table'")
+      : c.includes("nft -j list table")
       ? {
         code: 0,
         stdout: expectedListing({
           ...FIREWALL,
+          sshPort: Number(extra.ssh_port ?? 22),
           allowSshFromAnywhere: tool === "apply_firewall",
         }),
       }
@@ -1947,15 +1952,22 @@ Deno.test("exposure: it proceeds when asked, when already open, when there is no
   assertEquals((await lock.run()).result.changed, true);
 });
 
-Deno.test("exposure: liveSshExposure reads the normalized input chain", async () => {
-  const { liveSshExposure } = await import("./server_host.ts");
-  assertEquals(liveSshExposure(["tcp.dport in n:22 ; accept"], 22), "anywhere");
+Deno.test("exposure: liveSshManagementOnly reads any source-limited rule of the input chain", async () => {
+  const { liveSshManagementOnly } = await import("./server_host.ts");
   assertEquals(
-    liveSshExposure(["ip.saddr in a4:1-2 ; tcp.dport in n:22 ; accept"], 22),
-    "management-only",
+    liveSshManagementOnly(["ip.saddr in a4:1-2 ; tcp.dport in n:22 ; accept"]),
+    true,
   );
-  assertEquals(liveSshExposure(["tcp.dport in n:80 ; accept"], 22), "none");
-  assertEquals(liveSshExposure([], 22), "none");
+  // Whatever the port: a change of ssh_port cannot hide the restriction.
+  assertEquals(
+    liveSshManagementOnly([
+      "ip6.saddr in a6:1-2 ; tcp.dport in n:2222 ; accept",
+    ]),
+    true,
+  );
+  assertEquals(liveSshManagementOnly(["tcp.dport in n:22 ; accept"]), false);
+  assertEquals(liveSshManagementOnly(["tcp.dport in n:80 ; accept"]), false);
+  assertEquals(liveSshManagementOnly([]), false);
 });
 
 Deno.test("identity: a record made for another machine is refused by every method, not trusted", async () => {
@@ -2139,4 +2151,279 @@ Deno.test("forget: the next apply_base on the same address runs every step (not 
     true,
   );
   assertEquals(f.commands.length > 0, true);
+});
+
+Deno.test("exposure: a changed ssh_port cannot hide a management-only rule from the widening guard", async () => {
+  // The live table limits SSH on port 22 to the management CIDRs; the request
+  // opens port 2222 to anywhere.
+  const { f, run } = widen(MGMT_LISTING(), { ssh_port: 2222 });
+  await assertRejects(run, Error, "refusing to open SSH to anywhere again");
+  assertEquals(f.commands.some(isArm), false);
+  const ok = widen(MGMT_LISTING(), {
+    ssh_port: 2222,
+    allow_widening_ssh_exposure: true,
+  });
+  assertEquals((await ok.run()).result.changed, true);
+});
+
+Deno.test("forget: a repeat is a no-op, not a new record version", async () => {
+  const key = `state-${hostInstance(SSH.host)}`;
+  const stored = await baseStored("ops");
+  const m = modelWith(fakeTransport());
+  const first = createModelTestContext({
+    globalArgs: {},
+    storedResources: stored,
+  });
+  const args = m.methods.forget.arguments.parse({ host: SSH.host });
+  const out = await m.methods.forget.execute(args, first.context);
+  assertEquals(out.result, { host: SSH.host, forgotten: true, changed: true });
+  const emptied = first.getWrittenResources().find((r) => r.name === key)!;
+  // The second run sees the emptied record and the host with nothing recorded.
+  for (
+    const again of [
+      { [key]: emptied.data },
+      {},
+    ]
+  ) {
+    const ctx = createModelTestContext({
+      globalArgs: {},
+      storedResources: again,
+    });
+    const repeat = await m.methods.forget.execute(args, ctx.context);
+    assertEquals(repeat.result, {
+      host: SSH.host,
+      forgotten: true,
+      changed: false,
+    });
+    assertEquals(ctx.getWrittenResources().length, 0);
+  }
+});
+
+Deno.test("forget: an open revert recorded for another machine is refused, and nothing is written", async () => {
+  const revertKey = `revert-${hostInstance(SSH.host)}`;
+  const ctx = createModelTestContext({
+    globalArgs: {},
+    storedResources: {
+      [revertKey]: {
+        host: SSH.host,
+        identity: "server-1",
+        token: TOKEN,
+        phase: "lockdown",
+        unit: `server-host-revert-${TOKEN}`,
+        expires_at: new Date(NOW + 60_000).toISOString(),
+        armed_at: "2026-01-01T00:00:00.000Z",
+        ruleset_sha256: PLACEHOLDER_SHA,
+      },
+    },
+  });
+  const m = modelWith(fakeTransport());
+  await assertRejects(
+    () =>
+      m.methods.forget.execute(
+        m.methods.forget.arguments.parse({
+          host: SSH.host,
+          identity: "server-2",
+        }),
+        ctx.context,
+      ),
+    Error,
+    "another machine",
+  );
+  assertEquals(ctx.getWrittenResources().length, 0);
+  // The matching identity cancels the open revert record.
+  const ok = await m.methods.forget.execute(
+    m.methods.forget.arguments.parse({ host: SSH.host, identity: "server-1" }),
+    ctx.context,
+  );
+  assertEquals(ok.result.changed, true);
+  const written = ctx.getWrittenResources().find((r) => r.name === revertKey)!;
+  assertEquals(
+    typeof (written.data as Record<string, unknown>).cancelled_at,
+    "string",
+  );
+});
+
+Deno.test("transport: scripts and the key travel on stdin; no remote command line carries them, and nothing is written to a remote temp path", async () => {
+  const f = fakeTransport();
+  const m = modelWith(f);
+  const ctx = createModelTestContext({ globalArgs: {} });
+  await m.methods.apply_base.execute(
+    m.methods.apply_base.arguments.parse({
+      ...SSH,
+      packages: ["curl"],
+      admin_user: "ops",
+      authorized_keys: [KEY],
+      sysctl: { "net.ipv4.ip_forward": "1" },
+    }),
+    ctx.context,
+  );
+  await m.methods.apply_firewall.execute(
+    m.methods.apply_firewall.arguments.parse(FIREWALL_ARGS),
+    ctx.context,
+  );
+  const remote = f.sshArgs().map((a) => a[a.length - 1]);
+  assertEquals(remote.length > 5, true);
+  for (const r of remote) {
+    // The only thing on the remote command line is the shell that reads stdin.
+    assertEquals(["'sh' '-s'", "'sudo' '-n' 'sh' '-s'"].includes(r), true, r);
+  }
+  await assertNoSecretOnArgv(f.recording, [PEM, "PRIVATE KEY"]);
+  await assertNoRemoteSecretWrite(f.recording, [PEM, "PRIVATE KEY"]);
+  assertEquals(f.recording.uploads, []);
+});
+
+Deno.test("apply_firewall: an apply that hits its remote deadline leaves the revert armed and recorded", async () => {
+  const f = fakeTransport((c) =>
+    isGuardedApply(c) ? { code: 124 } : { code: 0 }
+  );
+  const m = modelWith(f);
+  const ctx = createModelTestContext({ globalArgs: {} });
+  await assertRejects(
+    () =>
+      m.methods.apply_firewall.execute(
+        m.methods.apply_firewall.arguments.parse(FIREWALL_ARGS),
+        ctx.context,
+      ),
+    Error,
+    "deadline",
+  );
+  // nft may have committed after the deadline fired: disarming would strand
+  // the new ruleset, so the timer stays and the record stays open.
+  assertEquals(f.commands.some(isDisarm), false);
+  const rec = ctx.getWrittenResources().find((r) =>
+    r.name === `revert-${hostInstance(SSH.host)}`
+  )!.data as Record<string, unknown>;
+  assertEquals(rec.cancelled_at, undefined);
+});
+
+Deno.test("resources: data names are distinct within one method run, and carry no path characters", async () => {
+  const f = fakeTransport();
+  const m = modelWith(f);
+  const cases: [string, (c: never) => Promise<unknown>][] = [
+    [
+      "apply_base",
+      (c) =>
+        m.methods.apply_base.execute(
+          m.methods.apply_base.arguments.parse({
+            ...BASE_ARGS,
+            admin_user: "ops",
+          }),
+          c,
+        ),
+    ],
+    [
+      "apply_firewall",
+      (c) =>
+        m.methods.apply_firewall.execute(
+          m.methods.apply_firewall.arguments.parse(FIREWALL_ARGS),
+          c,
+        ),
+    ],
+    [
+      "get",
+      (c) => m.methods.get.execute(m.methods.get.arguments.parse(SSH), c),
+    ],
+    [
+      "render_firewall",
+      (c) =>
+        m.methods.render_firewall.execute(
+          m.methods.render_firewall.arguments.parse({
+            host: "../a/b",
+            management_cidrs: FIREWALL.managementCidrs,
+            allow_tcp: FIREWALL.allowTcp,
+          }),
+          c,
+        ),
+    ],
+  ];
+  for (const [name, call] of cases) {
+    const ctx = createModelTestContext({ globalArgs: {} });
+    await call(ctx.context as never);
+    const names = ctx.getWrittenResources().map((r) => r.name);
+    assertEquals(new Set(names).size, names.length, name);
+    for (const n of names) assertEquals(/[\/\\\0]|\.\./.test(n), false, n);
+  }
+});
+
+Deno.test("capture: one pass over every script shape, for the dash and bashism gates", async () => {
+  let cancelled = false;
+  let applied = false;
+  const f = fakeTransport((c) => {
+    if (isGuardedApply(c)) applied = true;
+    if (c.includes('systemctl stop "$unit.timer"')) cancelled = true;
+    if (isRouteProbe(c)) return { code: 0, stdout: ROUTES };
+    if (c.includes("nft -j list ruleset")) {
+      return {
+        code: 0,
+        stdout: applied
+          ? expectedListing({ ...FIREWALL, trustedInterfaces: ["cali*"] })
+          : '{"nftables":[]}',
+      };
+    }
+    if (c.includes("nft -j list table")) {
+      return {
+        code: 0,
+        stdout: expectedListing({ ...FIREWALL, trustedInterfaces: ["cali*"] }),
+      };
+    }
+    if (isTimerProbe(c)) {
+      return cancelled
+        ? { code: 3, stdout: "inactive\n" }
+        : { code: 0, stdout: "active\n" };
+    }
+    return { code: 0 };
+  }, true);
+  const m = modelWith(f);
+  const stored = await baseStored("oldops");
+  const ctx = createModelTestContext({
+    globalArgs: {},
+    storedResources: stored,
+  });
+  await m.methods.apply_base.execute(
+    m.methods.apply_base.arguments.parse({
+      ...BASE_ARGS,
+      packages: ["curl", "nftables"],
+      admin_user: "ops",
+      sysctl: { "net.ipv4.ip_forward": "1" },
+    }),
+    ctx.context,
+  );
+  await m.methods.apply_firewall.execute(
+    m.methods.apply_firewall.arguments.parse({
+      ...FIREWALL_ARGS,
+      trusted_interfaces: ["cali*"],
+    }),
+    ctx.context,
+  );
+  await m.methods.get.execute(m.methods.get.arguments.parse(SSH), ctx.context);
+  await m.methods.commit.execute(
+    m.methods.commit.arguments.parse(SSH),
+    ctx.context,
+  );
+  await m.methods.sync.execute(
+    m.methods.sync.arguments.parse(SSH),
+    ctx.context,
+  );
+  const commands = f.commands;
+  for (
+    const shape of [
+      "apt-get install",
+      "useradd",
+      "authorized_keys",
+      "sysctl --system",
+      "systemd-run",
+      "| nft -c -f -",
+      "| nft -f -",
+      "gpasswd",
+      'systemctl stop "$unit.timer"',
+      "ip -j route get",
+    ]
+  ) {
+    assertEquals(commands.some((c) => c.includes(shape)), true, shape);
+  }
+  // The restore script runs from a file on the host, under systemd; it is
+  // captured as the shell script it is.
+  const revert = createRecordingRunner();
+  await revert.run("sh", ["-c", renderRevertScript(TOKEN)]);
+  assertEquals(revert.recording.calls.length, 1);
 });

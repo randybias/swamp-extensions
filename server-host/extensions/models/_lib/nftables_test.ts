@@ -1,3 +1,4 @@
+import { captureRenders } from "./bogworks/recording-runner.ts";
 import { assertEquals, assertThrows } from "jsr:@std/assert@1.0.19";
 import {
   assertFirewallRules,
@@ -14,9 +15,10 @@ import {
 import { HostConfigError } from "./validate.ts";
 
 const FIX = new URL("./fixtures/", import.meta.url);
+const GOLDENS = new URL("./goldens/", import.meta.url);
 
 async function golden(name: string): Promise<string> {
-  return await Deno.readTextFile(new URL(name, FIX));
+  return await Deno.readTextFile(new URL(name, GOLDENS));
 }
 
 const BASE: FirewallRules = {
@@ -80,7 +82,10 @@ Deno.test("render: golden files for the base, management-only, service and ipv6 
     ],
   ];
   for (const [name, rules] of cases) {
-    assertEquals(renderRuleset(rules), await golden(name), name);
+    const text = renderRuleset(rules);
+    assertEquals(text, await golden(name), name);
+    // Handed to the real-tool gate, which feeds it to `nft -c`.
+    await captureRenders(`server-host-${name}`, text);
   }
 });
 

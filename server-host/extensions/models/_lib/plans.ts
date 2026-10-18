@@ -2,12 +2,12 @@
  * Phase planning and execution: turns validated inputs into an ordered stream
  * of remote steps, then runs that stream through the SSH transport.
  *
- * Every step is an `exec` of a fixed argv. Caller values travel as separate
- * argv words, on stdin, or inside a fixed script that reads them as positional
- * parameters, so nothing is interpolated into a shell string. File writes go
- * through a sudo-wrapped `sh -c` that reads the content on stdin, creates the
- * parent directory, writes a same-directory temp file and `mv`s it into place
- * atomically, so they work for a non-root login and are idempotent by content.
+ * Every step is a {@link RemoteCall}: a fixed script streamed over the SSH
+ * session's stdin. Caller values reach it only as positional parameters, and
+ * file content as the base64 `bw_data` bytes, so nothing is interpolated into
+ * a shell string. File writes create the parent directory, write a
+ * same-directory temp file and `mv` it into place atomically, so they work for
+ * a non-root login and are idempotent by content.
  *
  * The firewall and lockdown plans write the revert script (kind `stage`) and
  * then activate the timer (kind `arm`) before they apply (kind `apply`).
@@ -17,21 +17,22 @@
  * @module
  */
 
-import { exec, type ExecResult, type SshDeps, type Target } from "./ssh.ts";
+import type { ExecResult, SshDeps, SshTarget } from "./ssh.ts";
 import {
+  armCall,
+  commitCall,
+  disarmCall,
+  guardedApplyCall,
   isTimerActive,
+  markerCall,
   parseMarker,
-  renderArmArgv,
-  renderCommitArgv,
-  renderDisarmArgv,
-  renderGuardedApplyArgv,
-  renderMarkerArgv,
-  renderProbeArgv,
+  PROBE_DEADLINE_S,
+  probeCall,
   renderRevertScript,
   scriptPath,
   STATE_DIR,
-  withSudo,
 } from "./armed_revert.ts";
+import { DEADLINE_EXITS, type RemoteCall, runRemote } from "./remote.ts";
 import { listingSha256, managedSha256, normalizeListing } from "./nftables.ts";
 import { HostConfigError, ifacePatternMatches } from "./validate.ts";
 
@@ -51,16 +52,12 @@ export interface Step {
   kind: StepKind;
   /** Human-readable label. */
   label: string;
-  /** The remote argv; each element reaches the host as one word. */
-  argv: string[];
-  /** Content delivered on stdin, if any. */
-  stdin?: Uint8Array;
+  /** The script to run and its deadline. */
+  call: RemoteCall;
   /** When true, a remote exit outside `okExit` stops the plan. */
   check?: boolean;
   /** Exit codes that count as success for a checked step; default `[0]`. */
   okExit?: number[];
-  /** Per-step transport timeout in seconds; defaults to {@link STEP_TIMEOUT_S}. */
-  timeoutS?: number;
 }
 
 /** A step after execution, with its result summarised for logging and tests. */
@@ -69,18 +66,18 @@ export interface EmittedStep {
   kind: StepKind;
   /** Human-readable label. */
   label: string;
-  /** The remote argv. */
-  argv: string[];
+  /** The script the step ran. */
+  script: string;
   /** The remote exit code. */
   exit_code: number;
 }
 
 const enc = new TextEncoder();
 
-/** Default per-step timeout. */
-export const STEP_TIMEOUT_S = 600;
-/** Timeout of the guarded apply, kept well under the shortest revert (60 s). */
-export const APPLY_TIMEOUT_S = 30;
+/** Deadline of a package install, which may fetch and unpack a lot. */
+const PACKAGES_DEADLINE_S = 900;
+/** Deadline of every other base step. */
+const BASE_DEADLINE_S = 120;
 
 /**
  * True when the timer-activation step (`arm`) precedes the first mutating
@@ -100,8 +97,7 @@ export function assertArmedBeforeApply(steps: Step[]): void {
   }
 }
 
-const PKG_SCRIPT = `set -e
-for p in "$@"; do
+const PKG_SCRIPT = `for p in "$@"; do
   if dpkg-query -W -f='\${Status}' "$p" 2>/dev/null | grep -q "install ok installed"; then
     continue
   fi
@@ -112,8 +108,7 @@ for p in "$@"; do
 done
 `;
 
-const USER_SCRIPT = `set -e
-if ! id -u "$1" >/dev/null 2>&1; then
+const USER_SCRIPT = `if ! id -u "$1" >/dev/null 2>&1; then
   useradd -m -s /bin/bash "$1"
   printf 'created %s\\n' "$1"
 fi
@@ -126,46 +121,39 @@ fi
 `;
 
 /**
- * Takes back what an earlier run granted a previous managed account: the
- * managed authorized_keys file, and the sudo membership only if this tool added
- * it (a marker on the host records that). The account itself stays.
+ * Takes back what an earlier run granted a previous managed account: the sudo
+ * membership only if this tool added it (a marker on the host records that),
+ * then the managed authorized_keys file. The account itself stays. Sudo goes
+ * first, so a keys file that cannot be removed leaves the account without its
+ * privilege, and the marker is already gone, so a rerun retries only the keys.
  *
  * Exit 0: revoked. Exit 3: the keys file was left alone because `~/.ssh` is a
  * symlink or not the account's own directory (removing through it could delete
  * another account's keys); the sudo part is still done. Any other non-zero
- * exit: the sudo membership could not be removed, and the marker is kept so a
- * rerun retries.
+ * exit: part of the revoke failed, and a rerun retries it.
+ *
+ * `getent` exits 2 for "no such entry", but a failing name-service backend can
+ * answer the same way, so an account counts as gone only when `id` and the
+ * local passwd file agree and no network source is configured for passwd.
  */
 export const REVOKE_SKIPPED = 3;
-const REVOKE_SCRIPT = `set -e
-user=$1
+const REVOKE_SCRIPT = `user=$1
 rc=0
-# Decide first whether the account exists: getent exits 2 only for "no such
-# entry"; any other failure (NSS, LDAP) must not be read as "gone".
 set +e
 entry=$(getent passwd "$user" 2>/dev/null)
 found=$?
 set -e
 case $found in
   0) exists=1 ;;
-  2) exists=0 ;;
+  2)
+    if id -u "$user" >/dev/null 2>&1 || grep -q "^$user:" /etc/passwd ||
+      grep -Eq '^passwd:.*(ldap|sss|nis|winbind)' /etc/nsswitch.conf; then
+      echo "cannot confirm $user is gone" >&2
+      exit 1
+    fi
+    exists=0 ;;
   *) echo "cannot look up $user" >&2; exit 1 ;;
 esac
-if [ "$exists" = 1 ]; then
-  home=$(printf '%s\\n' "$entry" | cut -d: -f6)
-  d="$home/.ssh"
-  if [ -L "$d" ] || [ ! -d "$d" ] || [ "$(stat -c %U "$d")" != "$user" ]; then
-    if [ -e "$d" ] || [ -L "$d" ]; then
-      echo "left $d alone: not the account's own directory" >&2
-      rc=${REVOKE_SKIPPED}
-    fi
-  else
-    # Removed as the account itself, so a swap of its own ~/.ssh for a symlink
-    # between the checks above and this line cannot make root delete a file
-    # that belongs to someone else.
-    runuser -u "$user" -- rm -f "$d/authorized_keys"
-  fi
-fi
 m="${STATE_DIR}/sudo-granted-$user"
 if [ -e "$m" ]; then
   if [ "$exists" = 1 ]; then
@@ -181,17 +169,31 @@ if [ -e "$m" ]; then
   fi
   rm -f "$m"
 fi
+if [ "$exists" = 1 ]; then
+  home=$(printf '%s\\n' "$entry" | cut -d: -f6)
+  d="$home/.ssh"
+  if [ -L "$d" ] || [ ! -d "$d" ] || [ "$(stat -c %U "$d")" != "$user" ]; then
+    if [ -e "$d" ] || [ -L "$d" ]; then
+      echo "left $d alone: not the account's own directory" >&2
+      rc=${REVOKE_SKIPPED}
+    fi
+  else
+    # Removed as the account itself, so a swap of its own ~/.ssh for a symlink
+    # between the checks above and this line cannot make root delete a file
+    # that belongs to someone else.
+    runuser -u "$user" -- rm -f "$d/authorized_keys"
+  fi
+fi
 exit $rc
 `;
 
-const KEYS_SCRIPT = `set -e
-user=$1
+const KEYS_SCRIPT = `user=$1
 home=$(getent passwd "$user" | cut -d: -f6)
 [ -n "$home" ] || { printf 'no home directory for %s\\n' "$user" >&2; exit 1; }
 install -d -m 700 "$home/.ssh"
 chown "$user" "$home/.ssh" 2>/dev/null || true
 tmp=$(mktemp "$home/.ssh/authorized_keys.XXXXXX")
-cat > "$tmp"
+bw_data > "$tmp"
 chmod 600 "$tmp"
 chown "$user" "$tmp" 2>/dev/null || true
 if [ -f "$home/.ssh/authorized_keys" ] && cmp -s "$tmp" "$home/.ssh/authorized_keys"; then
@@ -234,9 +236,9 @@ export function renderJournaldConf(): string {
 }
 
 /**
- * A sudo-wrapped step that writes `content` to an absolute path on stdin. The
- * parent directory is created, the temp file lives in the destination
- * directory, and `mv` replaces the destination atomically. `path` and `mode`
+ * A step that writes `content` to an absolute path. The parent directory is
+ * created, the temp file lives in the destination directory and is removed on
+ * any exit, and `mv` replaces the destination atomically. `path` and `mode`
  * are constants chosen by this module, never a caller value.
  */
 export function writeFileStep(
@@ -247,15 +249,13 @@ export function writeFileStep(
   mode: string,
   sudo: boolean,
 ): Step {
-  const script = `set -e
-dir=$(dirname "${path}")
+  const script = `dir=$(dirname "${path}")
 install -d -m 0755 "$dir"
 tmp=$(mktemp "${path}.XXXXXX")
-cat > "$tmp"
+bw_data > "$tmp"
 chmod ${mode} "$tmp"
 if [ -f "${path}" ] && cmp -s "$tmp" "${path}"; then
   chmod ${mode} "${path}"
-  rm -f "$tmp"
   exit 0
 fi
 mv -f "$tmp" "${path}"
@@ -263,8 +263,13 @@ mv -f "$tmp" "${path}"
   return {
     kind,
     label,
-    argv: withSudo(sudo, ["sh", "-c", script]),
-    stdin: content,
+    call: {
+      sudo,
+      script,
+      data: content,
+      deadlineS: BASE_DEADLINE_S,
+      cleanup: 'rm -f "${tmp:-}"',
+    },
     check: true,
   };
 }
@@ -280,65 +285,53 @@ export function planApplyBase(
 ): Step[] {
   const steps: Step[] = [];
   const want = (name: string) => changed.includes(name);
+  const base = (
+    label: string,
+    call: Omit<RemoteCall, "sudo" | "deadlineS"> & { deadlineS?: number },
+    okExit?: number[],
+  ): Step => ({
+    kind: "base",
+    label,
+    call: { sudo: input.sudo, deadlineS: BASE_DEADLINE_S, ...call },
+    check: true,
+    ...(okExit ? { okExit } : {}),
+  });
   if (want("revoke_previous")) {
     for (const user of input.revoke ?? []) {
-      steps.push({
-        kind: "base",
-        label: `revoke grants of ${user}`,
-        argv: withSudo(input.sudo, ["sh", "-c", REVOKE_SCRIPT, "sh", user]),
-        // 0 = revoked, 3 = keys left alone (the caller reads it); anything else
-        // stops the plan before the new account is granted anything.
-        check: true,
-        okExit: [0, REVOKE_SKIPPED],
-      });
+      // 0 = revoked, 3 = keys left alone (the caller reads it); anything else
+      // stops the plan before the new account is granted anything.
+      steps.push(
+        base(`revoke grants of ${user}`, {
+          script: REVOKE_SCRIPT,
+          args: [user],
+        }, [0, REVOKE_SKIPPED]),
+      );
     }
   }
   if (want("packages") && input.packages.length > 0) {
-    steps.push({
-      kind: "base",
-      label: "install packages",
-      argv: withSudo(input.sudo, [
-        "sh",
-        "-c",
-        PKG_SCRIPT,
-        "sh",
-        ...input.packages,
-      ]),
-      check: true,
-    });
+    steps.push(base("install packages", {
+      script: PKG_SCRIPT,
+      args: input.packages,
+      deadlineS: PACKAGES_DEADLINE_S,
+    }));
   }
   if (want("admin_user")) {
-    steps.push({
-      kind: "base",
-      label: "create admin user",
-      argv: withSudo(input.sudo, [
-        "sh",
-        "-c",
-        USER_SCRIPT,
-        "sh",
-        input.adminUser,
-      ]),
-      check: true,
-    });
+    steps.push(base("create admin user", {
+      script: USER_SCRIPT,
+      args: [input.adminUser],
+    }));
   }
   if (want("authorized_keys")) {
-    steps.push({
-      kind: "base",
-      label: "authorize admin keys",
-      argv: withSudo(input.sudo, [
-        "sh",
-        "-c",
-        KEYS_SCRIPT,
-        "sh",
-        input.adminUser,
-      ]),
-      stdin: enc.encode(
+    steps.push(base("authorize admin keys", {
+      script: KEYS_SCRIPT,
+      args: [input.adminUser],
+      data: enc.encode(
         input.authorizedKeys.length > 0
           ? `${input.authorizedKeys.join("\n")}\n`
           : "",
       ),
-      check: true,
-    });
+      cleanup: 'rm -f "${tmp:-}"',
+    }));
   }
   if (want("sysctl")) {
     steps.push(
@@ -350,13 +343,8 @@ export function planApplyBase(
         "0644",
         input.sudo,
       ),
+      base("apply sysctl", { script: "sysctl --system\n" }),
     );
-    steps.push({
-      kind: "base",
-      label: "apply sysctl",
-      argv: withSudo(input.sudo, ["sysctl", "--system"]),
-      check: true,
-    });
   }
   if (want("journald")) {
     steps.push(
@@ -368,33 +356,21 @@ export function planApplyBase(
         "0644",
         input.sudo,
       ),
+      base("restart journald", {
+        script: "systemctl restart systemd-journald\n",
+      }),
     );
-    steps.push({
-      kind: "base",
-      label: "restart journald",
-      argv: withSudo(input.sudo, ["systemctl", "restart", "systemd-journald"]),
-      check: true,
-    });
   }
   if (want("timezone")) {
-    steps.push({
-      kind: "base",
-      label: "set time zone",
-      argv: withSudo(input.sudo, [
-        "timedatectl",
-        "set-timezone",
-        input.timezone,
-      ]),
-      check: true,
-    });
+    steps.push(base("set time zone", {
+      script: 'timedatectl set-timezone "$1"\n',
+      args: [input.timezone],
+    }));
   }
   if (want("time_sync")) {
-    steps.push({
-      kind: "base",
-      label: "enable time sync",
-      argv: withSudo(input.sudo, ["timedatectl", "set-ntp", "true"]),
-      check: true,
-    });
+    steps.push(base("enable time sync", {
+      script: "timedatectl set-ntp true\n",
+    }));
   }
   return steps;
 }
@@ -426,8 +402,12 @@ export function planFirewallChange(input: FirewallChangeInput): Step[] {
     {
       kind: "precheck",
       label: "nft syntax check",
-      argv: withSudo(input.sudo, ["nft", "-c", "-f", "-"]),
-      stdin: rules,
+      call: {
+        sudo: input.sudo,
+        data: rules,
+        deadlineS: PROBE_DEADLINE_S,
+        script: "bw_data | nft -c -f -\n",
+      },
       check: true,
     },
     writeFileStep(
@@ -441,7 +421,7 @@ export function planFirewallChange(input: FirewallChangeInput): Step[] {
     {
       kind: "arm",
       label: "arm revert timer",
-      argv: renderArmArgv(
+      call: armCall(
         input.token,
         input.revertAfterS,
         input.sudo,
@@ -452,22 +432,17 @@ export function planFirewallChange(input: FirewallChangeInput): Step[] {
     {
       kind: "apply",
       label: "apply ruleset",
-      argv: renderGuardedApplyArgv(input.token, input.sudo),
-      stdin: rules,
+      call: guardedApplyCall(input.token, input.sudo, rules),
       check: true,
-      timeoutS: APPLY_TIMEOUT_S,
     },
     {
       kind: "verify",
       label: "read table back",
-      argv: withSudo(input.sudo, [
-        "nft",
-        "-j",
-        "list",
-        "table",
-        "inet",
-        "server_host",
-      ]),
+      call: {
+        sudo: input.sudo,
+        deadlineS: PROBE_DEADLINE_S,
+        script: "nft -j list table inet server_host\n",
+      },
       check: true,
     },
   ];
@@ -480,20 +455,20 @@ export function planCommit(token: string, sudo: boolean): Step[] {
   return [{
     kind: "cleanup",
     label: "cancel revert timer",
-    argv: renderCommitArgv(token, sudo),
+    call: commitCall(token, sudo),
     check: true,
   }];
 }
 
 /**
  * The step that abandons a revert after a change that definitely did not
- * happen. Tolerant and idempotent; see {@link renderDisarmArgv}.
+ * happen. Tolerant and idempotent; see {@link disarmCall}.
  */
 export function planDisarm(token: string, sudo: boolean): Step[] {
   return [{
     kind: "cleanup",
     label: "disarm revert timer",
-    argv: renderDisarmArgv(token, sudo),
+    call: disarmCall(token, sudo),
     check: true,
   }];
 }
@@ -530,28 +505,23 @@ export interface ProbeResult {
 
 /**
  * Runs READ-ONLY probes and returns the host's current firewall state. A probe
- * that fails or is truncated throws {@link HostOpsError}; a caller must not
+ * that fails throws {@link HostOpsError} (and one whose output overruns the
+ * transport's capture cap throws the transport's own error); a caller must not
  * persist an observation it did not obtain.
  */
 export async function probeState(
   deps: SshDeps,
-  target: Target,
+  target: SshTarget,
   input: ReadInput,
 ): Promise<ProbeResult> {
-  const listed = await exec(
-    deps,
-    target,
-    withSudo(input.sudo, ["nft", "-j", "list", "ruleset"]),
-    { timeoutS: 60 },
-  );
+  const listed = await runRemote(deps, target, {
+    sudo: input.sudo,
+    deadlineS: LIST_DEADLINE_S,
+    script: "nft -j list ruleset\n",
+  });
   if (listed.exit_code !== 0) {
     throw new HostOpsError(
       `nft -j list ruleset on ${target.host} failed with exit code ${listed.exit_code}; refusing to record firewall state`,
-    );
-  }
-  if (listed.truncated) {
-    throw new HostOpsError(
-      `nft -j list ruleset on ${target.host} output was truncated; refusing to record firewall state`,
     );
   }
   let table;
@@ -563,20 +533,10 @@ export async function probeState(
     );
   }
   const managed = table !== null;
-  const marked = await exec(
-    deps,
-    target,
-    renderMarkerArgv(input.sudo),
-    { timeoutS: 30 },
-  );
+  const marked = await runRemote(deps, target, markerCall(input.sudo));
   if (marked.exit_code !== 0) {
     throw new HostOpsError(
       `Reading the revert marker on ${target.host} failed with exit code ${marked.exit_code}; refusing to record firewall state`,
-    );
-  }
-  if (marked.truncated) {
-    throw new HostOpsError(
-      `The revert marker on ${target.host} was truncated; refusing to record firewall state`,
     );
   }
   const marker = parseMarker(marked.stdout);
@@ -588,11 +548,10 @@ export async function probeState(
   const token = input.token ?? marker?.token;
   let armed = false;
   if (token) {
-    const probe = await exec(
+    const probe = await runRemote(
       deps,
       target,
-      renderProbeArgv(token, input.sudo),
-      { timeoutS: 30 },
+      probeCall(token, input.sudo),
     );
     if (probe.exit_code === 0) {
       armed = isTimerActive(probe.stdout);
@@ -624,25 +583,35 @@ export async function probeState(
   };
 }
 
+/** Deadline of the full-ruleset listing, which can be large. */
+const LIST_DEADLINE_S = 60;
+
 /**
  * Runs `steps` through the transport in order and returns what was emitted. A
  * step marked `check` throws {@link HostOpsError} on a non-zero remote exit,
- * so a failed `nft -c` pre-check stops the plan before anything is armed.
+ * so a failed `nft -c` pre-check stops the plan before anything is armed. A
+ * step that outlives its remote deadline always throws, checked or not, and
+ * the error says the outcome is unknown.
  * `after` runs once each step has succeeded, before the next one starts; the
  * model uses it to persist the armed revert before the change is applied.
  */
 export async function executePlan(
   deps: SshDeps,
-  target: Target,
+  target: SshTarget,
   steps: Step[],
   after?: (step: Step, result: ExecResult) => Promise<void>,
 ): Promise<EmittedStep[]> {
   const emitted: EmittedStep[] = [];
   for (const step of steps) {
-    const res = await exec(deps, target, step.argv, {
-      stdin: step.stdin,
-      timeoutS: step.timeoutS ?? STEP_TIMEOUT_S,
-    });
+    const res = await runRemote(deps, target, step.call);
+    if (DEADLINE_EXITS.includes(res.exit_code)) {
+      throw new HostOpsError(
+        `Remote step "${step.label}" outlived its ${step.call.deadlineS}s deadline on the host; its outcome is unknown`,
+        step.kind,
+        res.exit_code,
+        true,
+      );
+    }
     if (step.check && !(step.okExit ?? [0]).includes(res.exit_code)) {
       throw new HostOpsError(
         `Remote step "${step.label}" failed with exit code ${res.exit_code}`,
@@ -653,7 +622,7 @@ export async function executePlan(
     emitted.push({
       kind: step.kind,
       label: step.label,
-      argv: step.argv,
+      script: step.call.script,
       exit_code: res.exit_code,
     });
     if (after) await after(step, res);
@@ -667,12 +636,20 @@ export class HostOpsError extends Error {
   readonly stepKind?: StepKind;
   /** The remote exit code, when the failure was a remote exit. */
   readonly exitCode?: number;
+  /** True when the step hit its remote deadline, so what it did is unknown. */
+  readonly deadline: boolean;
   /** Creates a host-operations error. */
-  constructor(message: string, stepKind?: StepKind, exitCode?: number) {
+  constructor(
+    message: string,
+    stepKind?: StepKind,
+    exitCode?: number,
+    deadline = false,
+  ) {
     super(message);
     this.name = "HostOpsError";
     this.stepKind = stepKind;
     this.exitCode = exitCode;
+    this.deadline = deadline;
   }
 }
 
@@ -686,8 +663,8 @@ export { HostConfigError, STATE_DIR };
  * command, or an empty `SSH_CLIENT` is a non-zero exit. It must NOT run under
  * sudo, whose env_reset strips `SSH_CLIENT`; `ip route` needs no privilege.
  */
-export const UPLINK_SCRIPT = `set -e
-c="\${SSH_CLIENT%% *}"
+export const UPLINK_SCRIPT = `c="\${SSH_CLIENT:-}"
+c="\${c%% *}"
 if [ -z "$c" ]; then echo "SSH_CLIENT is empty" >&2; exit 3; fi
 command -v ip >/dev/null
 ip -4 -j route show default
@@ -697,10 +674,12 @@ echo ---
 ip -j route get "$c"
 `;
 
-/** The argv of {@link UPLINK_SCRIPT}; deliberately not wrapped in sudo. */
-export function renderUplinkArgv(): string[] {
-  return ["sh", "-c", UPLINK_SCRIPT];
-}
+/** The call of {@link UPLINK_SCRIPT}; deliberately not run through sudo. */
+export const UPLINK_CALL: RemoteCall = {
+  sudo: false,
+  script: UPLINK_SCRIPT,
+  deadlineS: PROBE_DEADLINE_S,
+};
 
 /** The interfaces the probe found, by role. */
 export interface UplinkDevs {
@@ -756,12 +735,12 @@ export function parseUplinkDevs(stdout: string): UplinkDevs {
  */
 export async function assertTrustedNotUplink(
   deps: SshDeps,
-  target: Target,
+  target: SshTarget,
   trusted: readonly string[],
 ): Promise<void> {
   if (trusted.length === 0) return;
-  const res = await exec(deps, target, renderUplinkArgv(), { timeoutS: 30 });
-  if (res.exit_code !== 0 || res.truncated) {
+  const res = await runRemote(deps, target, UPLINK_CALL);
+  if (res.exit_code !== 0) {
     throw new HostOpsError(
       `The route probe on ${target.host} failed (exit ${res.exit_code}); refusing trusted_interfaces it could not check`,
     );

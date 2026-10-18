@@ -12,6 +12,7 @@
  */
 
 import { TABLE } from "./nftables.ts";
+import type { RemoteCall } from "./remote.ts";
 import { HostConfigError } from "./validate.ts";
 
 /** Remote directory holding snapshots and revert scripts. */
@@ -50,10 +51,18 @@ function assertToken(token: string): void {
   }
 }
 
-/** Prefixes `argv` with a non-interactive `sudo` when `sudo` is true. */
-export function withSudo(sudo: boolean, argv: string[]): string[] {
-  return sudo ? ["sudo", "-n", ...argv] : argv;
-}
+/** Seconds a script waits for the host lock before it reports the host busy. */
+const LOCK_WAIT_S = 20;
+/** Seconds an arm or cancel may run on the host. */
+const CHANGE_DEADLINE_S = 60;
+/** Seconds the guarded apply may run, kept under the shortest revert (60 s). */
+const APPLY_DEADLINE_S = 30;
+/** Seconds a read-only probe may run on the host. */
+export const PROBE_DEADLINE_S = 30;
+/** Seconds the revert script waits for the lock before it restores anyway. */
+const RESTORE_LOCK_WAIT_S = 120;
+
+const LOCK = { path: LOCK_PATH, waitSec: LOCK_WAIT_S } as const;
 
 /** Shell helper: true when a unit is active or on its way in or out of it. */
 const BUSY_FN = `busy() {
@@ -77,9 +86,12 @@ export function renderRevertScript(token: string): string {
   const self = scriptPath(token);
   return `#!/bin/sh
 # Armed revert for @randybias/server-host. Generated; do not edit.
-set -e
+set -eu
 exec 9>"${LOCK_PATH}"
-flock 9
+# Every holder of the lock is bounded by its own deadline, so a lock still held
+# after the wait belongs to a wedged process; restoring matters more than
+# excluding it.
+flock -w ${RESTORE_LOCK_WAIT_S} 9 || echo "lock wait expired; restoring anyway" >&2
 snap="${snap}"
 ctok=
 if [ -f "${CURRENT_PATH}" ]; then read ctok _ < "${CURRENT_PATH}" || true; fi
@@ -97,19 +109,21 @@ rm -f "$snap" "${self}" "${CURRENT_PATH}"
 }
 
 /**
- * The argv that arms the dead-man's switch, all under the host lock: refuse
+ * The call that arms the dead-man's switch, all under the host lock: refuse
  * (exit 75) while any earlier revert's timer OR service is active, or its
  * artifacts remain within {@link FIRING_GRACE_S} of its expiry; otherwise
  * clear the dead revert's leftovers, snapshot the ruleset, record this token
  * as current, and start the transient `--on-active` timer. The snapshot is
- * taken here, under the lock, so it cannot predate another change.
+ * taken here, under the lock, so it cannot predate another change. A lock that
+ * stays busy past {@link LOCK_WAIT_S} also exits 75, so a wedged holder cannot
+ * hang the arm.
  */
-export function renderArmArgv(
+export function armCall(
   token: string,
   revertAfterS: number,
   sudo: boolean,
   managedSha256: string,
-): string[] {
+): RemoteCall {
   if (!/^[0-9a-f]{64}$/.test(managedSha256)) {
     throw new HostConfigError("managed table hash must be 64 lowercase hex");
   }
@@ -119,12 +133,12 @@ export function renderArmArgv(
     throw new HostConfigError("revert_after_s must be 60-1800");
   }
   const unit = unitName(token);
-  const script = `set -e
-umask 077
-mkdir -p "${STATE_DIR}"
-exec 9>"${LOCK_PATH}"
-flock 9
-${BUSY_FN}cur="${CURRENT_PATH}"
+  return {
+    sudo,
+    deadlineS: CHANGE_DEADLINE_S,
+    lock: LOCK,
+    umask: "077",
+    script: `${BUSY_FN}cur="${CURRENT_PATH}"
 if [ -f "$cur" ]; then
   otok=; oexp=0
   read otok oexp _ < "$cur" || true
@@ -147,19 +161,19 @@ snap="${snapshotPath(token)}"
 : > "$snap"
 tables=$(nft list tables)
 if printf '%s\\n' "$tables" | grep -qx 'table inet ${TABLE}'; then nft list table inet ${TABLE} > "$snap"; fi
-printf '%s %s %s\n' '${token}' "$(( $(date +%s) + ${revertAfterS} ))" '${managedSha256}' > "$cur.tmp"
+printf '%s %s %s\\n' '${token}' "$(( $(date +%s) + ${revertAfterS} ))" '${managedSha256}' > "$cur.tmp"
 mv -f "$cur.tmp" "$cur"
 if ! systemd-run --on-active=${revertAfterS}s --unit=${unit} --collect --description='server-host armed revert' --quiet '${
-    scriptPath(token)
-  }'; then
+      scriptPath(token)
+    }'; then
   rm -f "$cur" "${snapshotPath(token)}"
   exit 1
 fi
-`;
-  return withSudo(sudo, ["sh", "-c", script]);
+`,
+  };
 }
 
-/** Exit codes of {@link renderGuardedApplyArgv} when the revert no longer guards the change. */
+/** Exit codes of {@link guardedApplyCall} when the revert no longer guards the change. */
 export const APPLY_REFUSED = {
   /** The revert is not the current one (superseded). */
   superseded: 70,
@@ -172,18 +186,24 @@ export const APPLY_REFUSED = {
 } as const;
 
 /**
- * The argv that applies a ruleset read on stdin, under the host lock and only
+ * The call that applies the ruleset `rules`, under the host lock and only
  * while this token's revert still guards the change: it is the current revert,
  * its snapshot exists, it has not expired and its timer is active. Because the
  * restore holds the same lock, the apply either completes before the restore
  * starts or is refused after it; the two can never interleave.
  */
-export function renderGuardedApplyArgv(token: string, sudo: boolean): string[] {
+export function guardedApplyCall(
+  token: string,
+  sudo: boolean,
+  rules: Uint8Array,
+): RemoteCall {
   const unit = unitName(token);
-  const script = `set -e
-exec 9>"${LOCK_PATH}"
-flock 9
-[ -f "${CURRENT_PATH}" ] || exit ${APPLY_REFUSED.superseded}
+  return {
+    sudo,
+    data: rules,
+    deadlineS: APPLY_DEADLINE_S,
+    lock: { path: LOCK_PATH, waitSec: 10 },
+    script: `[ -f "${CURRENT_PATH}" ] || exit ${APPLY_REFUSED.superseded}
 ctok=; cexp=0
 read ctok cexp _ < "${CURRENT_PATH}" || true
 [ "$ctok" = '${token}' ] || exit ${APPLY_REFUSED.superseded}
@@ -191,62 +211,69 @@ read ctok cexp _ < "${CURRENT_PATH}" || true
 case "$cexp" in ""|*[!0-9]*) exit ${APPLY_REFUSED.expired} ;; esac
 [ "$(date +%s)" -lt "$cexp" ] || exit ${APPLY_REFUSED.expired}
 [ "$(systemctl is-active '${unit}.timer' || true)" = active ] || exit ${APPLY_REFUSED.timerGone}
-nft -f -
-`;
-  return withSudo(sudo, ["sh", "-c", script]);
+bw_data | nft -f -
+`,
+  };
 }
 
-function cancelScript(token: string, requireActive: boolean): string {
+function cancelCall(
+  token: string,
+  sudo: boolean,
+  requireActive: boolean,
+): RemoteCall {
   const unit = unitName(token);
-  return `set -e
-exec 9>"${LOCK_PATH}"
-flock 9
-unit='${unit}'
+  return {
+    sudo,
+    deadlineS: CHANGE_DEADLINE_S,
+    lock: LOCK,
+    script: `unit='${unit}'
 ${
-    requireActive
-      ? `state=$(systemctl is-active "$unit.timer" || true)
+      requireActive
+        ? `state=$(systemctl is-active "$unit.timer" || true)
 if [ "$state" != "active" ]; then
   echo "revert timer $unit is not active" >&2
   exit 1
 fi
 systemctl stop "$unit.timer"
 `
-      : `systemctl stop "$unit.timer" 2>/dev/null || true
+        : `systemctl stop "$unit.timer" 2>/dev/null || true
 `
-  }systemctl stop "$unit.service" 2>/dev/null || true
+    }systemctl stop "$unit.service" 2>/dev/null || true
 ctok=
 if [ -f "${CURRENT_PATH}" ]; then read ctok _ < "${CURRENT_PATH}" || true; fi
 if [ "$ctok" = '${token}' ]; then rm -f "${CURRENT_PATH}"; fi
 rm -f '${snapshotPath(token)}' '${scriptPath(token)}'
-`;
+`,
+  };
 }
 
 /**
- * The argv that confirms the change: under the host lock it FAILS unless the
+ * The call that confirms the change: under the host lock it FAILS unless the
  * timer is still active, stops the timer and service, and removes the files
  * and the current marker. A non-zero exit means no commit may be recorded.
  */
-export function renderCommitArgv(token: string, sudo: boolean): string[] {
-  return withSudo(sudo, ["sh", "-c", cancelScript(token, true)]);
+export function commitCall(token: string, sudo: boolean): RemoteCall {
+  return cancelCall(token, sudo, true);
 }
 
 /**
- * The argv that abandons a revert after a change that definitely did not
+ * The call that abandons a revert after a change that definitely did not
  * happen: like commit, but tolerant, so it succeeds when the timer is already
  * gone. Idempotent.
  */
-export function renderDisarmArgv(token: string, sudo: boolean): string[] {
-  return withSudo(sudo, ["sh", "-c", cancelScript(token, false)]);
+export function disarmCall(token: string, sudo: boolean): RemoteCall {
+  return cancelCall(token, sudo, false);
 }
 
-/** The READ-ONLY argv that prints the host's current-revert marker, if any. */
-export function renderMarkerArgv(sudo: boolean): string[] {
-  return withSudo(sudo, [
-    "sh",
-    "-c",
+/** The READ-ONLY call that prints the host's current-revert marker, if any. */
+export function markerCall(sudo: boolean): RemoteCall {
+  return {
+    sudo,
+    deadlineS: PROBE_DEADLINE_S,
     // Empty only when the marker is absent; any read error exits non-zero.
-    `if [ -e "${CURRENT_PATH}" ]; then cat "${CURRENT_PATH}"; fi`,
-  ]);
+    script: `if [ -e "${CURRENT_PATH}" ]; then cat "${CURRENT_PATH}"; fi
+`,
+  };
 }
 
 /**
@@ -268,9 +295,14 @@ export function parseMarker(
     : null;
 }
 
-/** The READ-ONLY argv that reports whether the revert timer is still armed. */
-export function renderProbeArgv(token: string, sudo: boolean): string[] {
-  return withSudo(sudo, ["systemctl", "is-active", unitName(token) + ".timer"]);
+/** The READ-ONLY call that reports whether the revert timer is still armed. */
+export function probeCall(token: string, sudo: boolean): RemoteCall {
+  return {
+    sudo,
+    deadlineS: PROBE_DEADLINE_S,
+    script: `systemctl is-active '${unitName(token)}.timer'
+`,
+  };
 }
 
 /** True when `systemctl is-active` reported `active` for a timer. */

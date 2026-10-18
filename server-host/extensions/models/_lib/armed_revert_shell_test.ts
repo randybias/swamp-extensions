@@ -5,13 +5,14 @@
 import { assertEquals } from "jsr:@std/assert@1.0.19";
 import {
   APPLY_REFUSED,
-  renderArmArgv,
-  renderCommitArgv,
-  renderDisarmArgv,
-  renderGuardedApplyArgv,
+  armCall,
+  commitCall,
+  disarmCall,
+  guardedApplyCall,
   renderRevertScript,
   STATE_DIR,
 } from "./armed_revert.ts";
+import { type RemoteCall, renderScript } from "./remote.ts";
 
 const A = "a".repeat(16);
 const SHA = "c".repeat(64);
@@ -24,6 +25,8 @@ interface Box {
   /** Unit states the `systemctl` stub reports, by unit name. */
   setUnit(unit: string, state: string): Promise<void>;
   run(script: string, stdin?: string, now?: number): Promise<number>;
+  /** Runs a rendered call the way the host would (stdin script, dash). */
+  runCall(call: RemoteCall, now?: number): Promise<number>;
   file(name: string): Promise<string | null>;
   put(name: string, text: string): Promise<void>;
 }
@@ -76,7 +79,7 @@ esac`,
 echo active > "${dir}/unit-$u.timer"`,
   );
   const sub = (s: string) => s.replaceAll(STATE_DIR, state);
-  return {
+  const self: Box = {
     dir,
     state,
     bin,
@@ -103,6 +106,9 @@ echo active > "${dir}/unit-$u.timer"`,
       }
       return (await child.output()).code;
     },
+    runCall(call, now) {
+      return self.run(renderScript(call), "", now);
+    },
     async file(name) {
       try {
         return await Deno.readTextFile(`${dir}/${name}`);
@@ -112,9 +118,10 @@ echo active > "${dir}/unit-$u.timer"`,
     },
     put: (name, text) => Deno.writeTextFile(`${dir}/${name}`, text),
   };
+  return self;
 }
 
-const scriptOf = (argv: string[]) => argv[2];
+const enc = new TextEncoder();
 
 /** Stages the revert script for `token` and arms it; returns the exit code. */
 async function arm(b: Box, token: string, secs = 300, now = 1000) {
@@ -122,7 +129,7 @@ async function arm(b: Box, token: string, secs = 300, now = 1000) {
     `${b.state}/revert-${token}.sh`,
     renderRevertScript(token).replaceAll(STATE_DIR, b.state),
   );
-  return await b.run(scriptOf(renderArmArgv(token, secs, false, SHA)), "", now);
+  return await b.runCall(armCall(token, secs, false, SHA), now);
 }
 
 Deno.test("shell: arm snapshots, records the marker, starts the timer; apply then succeeds", async () => {
@@ -135,9 +142,14 @@ Deno.test("shell: arm snapshots, records the marker, starts the timer; apply the
       await b.file(`state/revert-${A}.nft`),
       "table inet server_host original\n",
     );
-    const code = await b.run(
-      scriptOf(renderGuardedApplyArgv(A, false)),
-      "add table inet server_host\ndelete table inet server_host\ntable inet server_host new\n",
+    const code = await b.runCall(
+      guardedApplyCall(
+        A,
+        false,
+        enc.encode(
+          "add table inet server_host\ndelete table inet server_host\ntable inet server_host new\n",
+        ),
+      ),
       1100,
     );
     assertEquals(code, 0);
@@ -190,9 +202,14 @@ Deno.test("shell: once the restore has run, an apply under the old token is refu
       0,
     );
     assertEquals(await b.file("live"), "table inet server_host original\n");
-    const code = await b.run(
-      scriptOf(renderGuardedApplyArgv(A, false)),
-      "add table inet server_host\ndelete table inet server_host\ntable inet server_host late\n",
+    const code = await b.runCall(
+      guardedApplyCall(
+        A,
+        false,
+        enc.encode(
+          "add table inet server_host\ndelete table inet server_host\ntable inet server_host late\n",
+        ),
+      ),
       1100,
     );
     assertEquals(code, APPLY_REFUSED.superseded);
@@ -207,9 +224,14 @@ Deno.test("shell: an apply after the revert expired is refused", async () => {
   try {
     await b.put("live", "table inet server_host original\n");
     assertEquals(await arm(b, A), 0); // expires at 1300
-    const code = await b.run(
-      scriptOf(renderGuardedApplyArgv(A, false)),
-      "add table inet server_host\ndelete table inet server_host\ntable inet server_host late\n",
+    const code = await b.runCall(
+      guardedApplyCall(
+        A,
+        false,
+        enc.encode(
+          "add table inet server_host\ndelete table inet server_host\ntable inet server_host late\n",
+        ),
+      ),
       1300,
     );
     assertEquals(code, APPLY_REFUSED.expired);
@@ -225,12 +247,17 @@ Deno.test("shell: a superseded restore never overwrites the newer rules", async 
     await b.put("live", "table inet server_host original\n");
     assertEquals(await arm(b, A), 0);
     // A is gone (committed away); B becomes current and applies new rules.
-    assertEquals(await b.run(scriptOf(renderCommitArgv(A, false))), 0);
+    assertEquals(await b.runCall(commitCall(A, false)), 0);
     assertEquals(await arm(b, B, 300, 1100), 0);
     assertEquals(
-      await b.run(
-        scriptOf(renderGuardedApplyArgv(B, false)),
-        "add table inet server_host\ndelete table inet server_host\ntable inet server_host b\n",
+      await b.runCall(
+        guardedApplyCall(
+          B,
+          false,
+          enc.encode(
+            "add table inet server_host\ndelete table inet server_host\ntable inet server_host b\n",
+          ),
+        ),
         1150,
       ),
       0,
@@ -255,15 +282,15 @@ Deno.test("shell: commit removes the marker; disarm is idempotent and leaves ano
   const b = await box();
   try {
     assertEquals(await arm(b, A), 0);
-    assertEquals(await b.run(scriptOf(renderDisarmArgv(B, false))), 0);
+    assertEquals(await b.runCall(disarmCall(B, false)), 0);
     assertEquals((await b.file("state/current"))?.startsWith(A), true);
-    assertEquals(await b.run(scriptOf(renderDisarmArgv(A, false))), 0);
+    assertEquals(await b.runCall(disarmCall(A, false)), 0);
     assertEquals(await b.file("state/current"), null);
-    assertEquals(await b.run(scriptOf(renderDisarmArgv(A, false))), 0);
+    assertEquals(await b.runCall(disarmCall(A, false)), 0);
     assertEquals(await arm(b, B, 300, 1100), 0);
     // Commit fails when the timer is gone.
     await b.setUnit(`server-host-revert-${B}.timer`, "inactive");
-    assertEquals(await b.run(scriptOf(renderCommitArgv(B, false))), 1);
+    assertEquals(await b.runCall(commitCall(B, false)), 1);
   } finally {
     await Deno.remove(b.dir, { recursive: true });
   }
@@ -283,9 +310,14 @@ Deno.test("shell: the snapshot and the restore touch only the managed table; oth
     );
     // The apply replaces the managed table and leaves the others alone.
     assertEquals(
-      await b.run(
-        scriptOf(renderGuardedApplyArgv(A, false)),
-        "add table inet server_host\ndelete table inet server_host\ntable inet server_host new\n",
+      await b.runCall(
+        guardedApplyCall(
+          A,
+          false,
+          enc.encode(
+            "add table inet server_host\ndelete table inet server_host\ntable inet server_host new\n",
+          ),
+        ),
         1100,
       ),
       0,
@@ -314,9 +346,14 @@ Deno.test("shell: when no managed table existed, the restore removes it and stil
     assertEquals(await arm(b, A), 0);
     assertEquals(await b.file(`state/revert-${A}.nft`), "");
     assertEquals(
-      await b.run(
-        scriptOf(renderGuardedApplyArgv(A, false)),
-        "add table inet server_host\ndelete table inet server_host\ntable inet server_host new\n",
+      await b.runCall(
+        guardedApplyCall(
+          A,
+          false,
+          enc.encode(
+            "add table inet server_host\ndelete table inet server_host\ntable inet server_host new\n",
+          ),
+        ),
         1100,
       ),
       0,

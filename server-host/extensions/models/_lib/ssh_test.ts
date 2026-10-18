@@ -1,8 +1,8 @@
 import {
+  assert,
   assertEquals,
-  assertMatch,
-  assertNotMatch,
   assertRejects,
+  assertStringIncludes,
   assertThrows,
 } from "jsr:@std/assert@1.0.19";
 import {
@@ -10,599 +10,1102 @@ import {
   assertMode,
   assertRemotePath,
   assertUser,
-  baseSshArgs,
+  base64Decode,
+  buildKnownHosts,
+  buildRemoteCommand,
+  checkHostKeys,
   type CommandResult,
   type CommandRunner,
+  denoDeps,
+  denoRunner,
   exec,
+  execPipeline,
+  fingerprint,
+  type HostKey,
+  keysForHost,
+  MAX_EXEC_TIMEOUT_MS,
   parseHostKeys,
-  parseKeyscan,
   posixQuote,
   quoteArgv,
-  renderKnownHosts,
+  type RemoteOperator,
+  type RunOptions,
+  scanHostKeys,
+  sha256Hex,
+  SshConfigError,
   type SshDeps,
   SshError,
-  type Target,
   upload,
-  UPLOAD_SCRIPT,
-  verifyHostKeys,
   waitConnection,
-  withSession,
 } from "./ssh.ts";
+import * as sshModule from "./ssh.ts";
 
-const KEY1 = "AAAAC3NzaC1lZDI1NTE5AAAAIFakeKeyOne";
-const KEY2 = "AAAAC3NzaC1lZDI1NTE5AAAAIFakeKeyTwo";
-const PEM =
-  "-----BEGIN OPENSSH PRIVATE KEY-----\nZmFrZS1rZXktbWF0ZXJpYWw=\n-----END OPENSSH PRIVATE KEY-----";
+const KEY: HostKey = {
+  type: "ssh-ed25519",
+  key: "QUFBQUFB",
+};
+const OTHER: HostKey = {
+  type: "ssh-ed25519",
+  key: "QkJCQkJC",
+};
+const PRIVATE_KEY = "PLACEHOLDER-PRIVATE-KEY-MATERIAL";
+const HOST = "192.0.2.10";
 
 interface Call {
   cmd: string;
   args: string[];
-  stdin?: string;
+  stdin?: Uint8Array | string;
   env?: Record<string, string>;
+  timeoutMs?: number;
+  truncate?: boolean;
 }
 
-/** A fake spawner: ssh-agent and ssh-add succeed; `ssh` returns `sshResult`. */
-function fakeDeps(
-  sshResult: Partial<CommandResult> = {},
-  keyscan = "",
-) {
-  const calls: Call[] = [];
-  const files = new Map<string, string>();
-  const removed: string[] = [];
-  let clock = 0;
-  const run: CommandRunner = (cmd, args, options) => {
+/** A fake runner that answers ssh-agent/ssh-add and delegates ssh/keyscan. */
+function fakeRun(
+  calls: Call[],
+  handlers: {
+    ssh?: (args: string[], options: RunOptions) => CommandResult;
+    keyscan?: (args: string[]) => CommandResult;
+    add?: () => CommandResult;
+  } = {},
+): CommandRunner {
+  return (cmd, args, options = {}) => {
     calls.push({
       cmd,
       args,
-      stdin: options?.stdin
-        ? new TextDecoder().decode(options.stdin)
-        : undefined,
-      env: options?.env,
+      stdin: options.stdin,
+      env: options.env,
+      timeoutMs: options.timeoutMs,
+      truncate: options.truncate,
     });
     if (cmd === "ssh-agent" && args[0] === "-s") {
       return Promise.resolve({
         code: 0,
         stdout:
-          "SSH_AUTH_SOCK=/tmp/agent.sock; export SSH_AUTH_SOCK;\nSSH_AGENT_PID=4242; export SSH_AGENT_PID;\n",
+          "SSH_AUTH_SOCK=/tmp/agent.test; export SSH_AUTH_SOCK;\nSSH_AGENT_PID=4242; export SSH_AGENT_PID;\n",
         stderr: "",
       });
     }
+    if (cmd === "ssh-agent") {
+      return Promise.resolve({ code: 0, stdout: "", stderr: "" });
+    }
+    if (cmd === "ssh-add") {
+      return Promise.resolve(
+        handlers.add?.() ?? { code: 0, stdout: "", stderr: "" },
+      );
+    }
     if (cmd === "ssh-keyscan") {
-      return Promise.resolve({ code: 0, stdout: keyscan, stderr: "" });
+      return Promise.resolve(
+        handlers.keyscan?.(args) ?? { code: 0, stdout: "", stderr: "" },
+      );
     }
     if (cmd === "ssh") {
-      return Promise.resolve({ code: 0, stdout: "", stderr: "", ...sshResult });
+      return Promise.resolve(
+        handlers.ssh?.(args, options) ??
+          { code: 0, stdout: "ok\n", stderr: "" },
+      );
     }
     return Promise.resolve({ code: 0, stdout: "", stderr: "" });
   };
-  const deps: SshDeps = {
+}
+
+/** Fake deps with an advancing clock for wait loops. */
+function fakeDeps(run: CommandRunner): SshDeps {
+  let t = 0;
+  return {
     run,
-    makeTempDir: () => Promise.resolve("/tmp/ssh-host-test"),
-    writeFile: (p, t) => {
-      files.set(p, t);
-      return Promise.resolve();
-    },
-    removeDir: (p) => {
-      removed.push(p);
-      return Promise.resolve();
-    },
-    now: () => clock,
-    sleep: (ms) => {
-      clock += ms;
+    now: () => t,
+    sleep: (ms: number) => {
+      t += ms;
       return Promise.resolve();
     },
   };
-  return { deps, calls, files, removed };
 }
 
-const T: Target = {
-  host: "192.0.2.10",
+const STRICT_TARGET = {
+  host: HOST,
   port: 22,
-  user: "ops",
-  hostKeyPolicy: "strict",
-  hostKeys: [`192.0.2.10 ssh-ed25519 ${KEY1}`],
-  privateKey: PEM,
-  connectTimeoutS: 15,
+  user: "root",
+  host_key_policy: "strict" as const,
+  host_keys: [`${HOST} ${KEY.type} ${KEY.key}`],
+  private_key: PRIVATE_KEY,
 };
 
-// 1. schema / grammar
-
-Deno.test("host, user, port, path and mode grammars reject hostile values", () => {
-  for (const h of ["", "-oProxyCommand=x", "a b", "host;rm", "$(x)", "h\nx"]) {
-    assertThrows(() => assertHost(h), SshError, "Invalid host");
-  }
-  assertHost("example.com");
-  assertHost("192.0.2.1");
-  assertHost("2001:db8::1");
-  for (const u of ["", "Root", "a b", "x;y", "-l", "a\nb", "$(id)"]) {
-    assertThrows(() => assertUser(u), SshError);
-  }
-  assertUser("ops_1");
+Deno.test("posixQuote makes one literal word of every metacharacter", () => {
+  assertEquals(posixQuote("simple"), "'simple'");
+  assertEquals(posixQuote(""), "''");
+  assertEquals(posixQuote("a'b"), "'a'\\''b'");
   for (
-    const p of [
-      "relative",
-      "/a/../b",
-      "/a b",
-      "/a;b",
-      "/a$(x)",
-      "/a\nb",
-      "/dir/",
-      "/a'b",
-      "",
+    const evil of [
+      "; rm -rf /",
+      "$(id)",
+      "`id`",
+      "a\nb",
+      "$HOME",
+      "*",
+      "a && b",
+      "a | b",
+      "> /etc/passwd",
     ]
   ) {
-    assertThrows(() => assertRemotePath(p), SshError);
-  }
-  assertRemotePath("/etc/app/config.yaml");
-  for (const m of ["", "999", "7777x", "0o644", "64", "-1"]) {
-    assertThrows(() => assertMode(m), SshError);
-  }
-  assertMode("0600");
-});
-
-// 2. pure mapping
-
-Deno.test("posixQuote makes every element one literal word", () => {
-  assertEquals(posixQuote("plain"), "'plain'");
-  assertEquals(posixQuote("it's"), `'it'\\''s'`);
-  assertThrows(() => posixQuote("a\0b"), SshError);
-  assertEquals(quoteArgv(["echo", "a b"]), "'echo' 'a b'");
-  assertThrows(() => quoteArgv([]), SshError);
-  assertThrows(() => quoteArgv([""]), SshError);
-});
-
-const HOSTILE = [
-  "; rm -rf /",
-  "$(touch /tmp/pwn)",
-  "`touch /tmp/pwn`",
-  "a\nb; echo owned",
-  'it\'s "quoted" \\ back',
-  "&& echo owned",
-  "| cat /etc/passwd",
-  "> /tmp/pwn",
-  "-n",
-  "*",
-  "$HOME ${IFS}",
-];
-
-Deno.test("quoted argv survives a real POSIX shell as literal words", async () => {
-  for (const h of HOSTILE) {
-    const cmd = quoteArgv(["printf", "%s|", h, h + "x"]);
-    const out = await new Deno.Command("sh", { args: ["-c", cmd] }).output();
-    assertEquals(
-      new TextDecoder().decode(out.stdout),
-      `${h}|${h}x|`,
-      `element ${JSON.stringify(h)} must stay one literal word`,
-    );
-    assertEquals(out.code, 0);
+    const quoted = posixQuote(evil);
+    assertEquals(quoted.startsWith("'"), true);
+    assertEquals(quoted.endsWith("'"), true);
+    // Stripping the outer quotes leaves the value untouched; no shell runs.
+    assertEquals(quoted.slice(1, -1).replaceAll("'\\''", "'"), evil);
+    assertEquals(/^'[^']*(?:'\\''[^']*)*'$/.test(quoted), true);
   }
 });
 
-Deno.test("the upload script survives a real POSIX shell with hostile paths refused earlier", async () => {
-  const dir = await Deno.makeTempDir();
-  try {
-    const dest = `${dir}/out.txt`;
-    const run = async (body: string) => {
-      const cmd = new Deno.Command("sh", {
-        args: ["-c", UPLOAD_SCRIPT, "sh", dest, "0640"],
-        stdin: "piped",
-        stdout: "piped",
-        stderr: "piped",
-      }).spawn();
-      const w = cmd.stdin.getWriter();
-      await w.write(new TextEncoder().encode(body));
-      await w.close();
-      const o = await cmd.output();
-      return { code: o.code, out: new TextDecoder().decode(o.stdout) };
-    };
-    const first = await run("hello\n");
-    assertEquals(first.code, 0);
-    const sum =
-      "5891b5b522d5df086d0ff0b110fbd9d21bb4fc7163af34d08286a2e846f6be03";
-    assertEquals(first.out.trim(), `${sum} 6 1`);
-    assertEquals(await Deno.readTextFile(dest), "hello\n");
-    assertEquals((await Deno.stat(dest)).mode! & 0o777, 0o640);
-    // idempotent re-run: same bytes, reported unchanged
-    assertEquals((await run("hello\n")).out.trim(), `${sum} 6 0`);
-    // changed content replaces atomically, no temp file left behind
-    assertEquals((await run("bye\n")).out.trim().endsWith(" 4 1"), true);
-    assertEquals(await Deno.readTextFile(dest), "bye\n");
-    assertEquals([...Deno.readDirSync(dir)].map((e) => e.name), ["out.txt"]);
-    // unwritable destination directory: non-zero, nothing left behind
-    const bad = new Deno.Command("sh", {
-      args: ["-c", UPLOAD_SCRIPT, "sh", `${dir}/missing/out.txt`, "0640"],
-      stdin: "piped",
-      stdout: "null",
-      stderr: "null",
-    }).spawn();
-    const bw = bad.stdin.getWriter();
-    await bw.write(new TextEncoder().encode("x")).catch(() => {});
-    await bw.close().catch(() => {});
-    assertEquals((await bad.output()).code !== 0, true);
-    assertEquals([...Deno.readDirSync(dir)].map((e) => e.name), ["out.txt"]);
-  } finally {
-    await Deno.remove(dir, { recursive: true });
-  }
-});
-
-Deno.test("host-key parsing accepts keyscan lines and rejects known_hosts syntax", () => {
-  assertEquals(
-    parseHostKeys([
-      `# comment`,
-      `192.0.2.10 ssh-ed25519 ${KEY1} root@box`,
-      `ssh-ed25519 ${KEY2}`,
-      ``,
-    ]),
-    [
-      { type: "ssh-ed25519", key: KEY1 },
-      { type: "ssh-ed25519", key: KEY2 },
-    ],
+Deno.test("parseHostKeys reads keyscan and bare lines, skipping comments", () => {
+  const keys = parseHostKeys(
+    `# ${HOST}:22 SSH-2.0-OpenSSH\n${HOST} ${KEY.type} ${KEY.key}\n${OTHER.type} ${OTHER.key}\n`,
   );
-  for (
-    const bad of [
-      `@cert-authority * ssh-ed25519 ${KEY1}`,
-      `|1|abc|def ssh-ed25519 ${KEY1}`,
-      `192.0.2.10 ssh-bogus ${KEY1}`,
-      `192.0.2.10 ssh-ed25519 ${KEY1}\nother ssh-rsa ${KEY2}`,
-      `a b c ssh-ed25519 ${KEY1}`,
-      `ssh-ed25519`,
-      `192.0.2.10 ssh-ed25519 !!notbase64`,
-    ]
-  ) {
-    assertThrows(() => parseHostKeys([bad]), SshError);
-  }
+  assertEquals(keys, [{ host: HOST, ...KEY }, OTHER]);
 });
 
-Deno.test("known_hosts is generated for the target, whatever the pinned host field", () => {
-  const keys = parseHostKeys([`other.example.com ssh-ed25519 ${KEY1}`]);
+Deno.test("parseHostKeys accepts non-ssh algorithm names on bare lines", () => {
+  const sk = {
+    type: "sk-ed25519",
+    key: "QkJCQkJC",
+  };
+  assertEquals(parseHostKeys(`${sk.type} ${sk.key}\n`), [sk]);
+});
+
+Deno.test("keysForHost accepts both host and [host]:22 pins on port 22", () => {
   assertEquals(
-    renderKnownHosts(keys, "192.0.2.10", 22),
-    `192.0.2.10 ssh-ed25519 ${KEY1}\n`,
-  );
-  assertEquals(
-    renderKnownHosts(keys, "192.0.2.10", 2222),
-    `[192.0.2.10]:2222 ssh-ed25519 ${KEY1}\n`,
+    keysForHost([{ host: `[${HOST}]:22`, ...KEY }], HOST, 22),
+    [{ host: `[${HOST}]:22`, ...KEY }],
   );
 });
 
-Deno.test("verifyHostKeys follows OpenSSH: mismatch refuses, unpinned types ignored", () => {
-  const pinned = [{ type: "ssh-ed25519", key: KEY1 }];
-  const rsa = { type: "ssh-rsa", key: "AAAAB3NzaC1yc2EAAAADAQABFake" };
+Deno.test("the public surface exposes no raw command-string entry point", () => {
+  assertEquals("runRemote" in sshModule, false);
+  assertEquals(typeof sshModule.exec, "function");
+  assertEquals(typeof sshModule.execPipeline, "function");
+  assertEquals(typeof sshModule.quoteArgv, "function");
+  assertEquals(typeof sshModule.buildRemoteCommand, "function");
+});
+
+Deno.test("execPipeline runs quoted stages joined by an allowlisted operator", async () => {
+  const calls: Call[] = [];
+  const deps = fakeDeps(fakeRun(calls));
+  await execPipeline(deps, STRICT_TARGET, [
+    ["wg", "show"],
+    ["grep", "peer"],
+  ], ["|"] as RemoteOperator[]);
   assertEquals(
-    verifyHostKeys([rsa, { type: "ssh-ed25519", key: KEY1 }], pinned, "h"),
-    pinned,
+    calls.find((c) => c.cmd === "ssh")?.args.at(-1),
+    "'wg' 'show' | 'grep' 'peer'",
+  );
+});
+
+Deno.test("quoteArgv and buildRemoteCommand only emit quoted words", () => {
+  assertEquals(quoteArgv(["echo", "; rm -rf /"]), "'echo' '; rm -rf /'");
+  assertEquals(
+    buildRemoteCommand([
+      ["wg", "show"],
+      ["grep", "-c", "handshake"],
+    ], ["|"] as RemoteOperator[]),
+    "'wg' 'show' | 'grep' '-c' 'handshake'",
+  );
+  assertEquals(
+    buildRemoteCommand([["true"], ["false"]], ["&&"] as RemoteOperator[]),
+    "'true' && 'false'",
+  );
+  assertThrows(() => quoteArgv([]), SshConfigError);
+  assertThrows(() => quoteArgv(["a", 1 as unknown as string]), SshConfigError);
+  assertThrows(
+    () => quoteArgv(["echo", "a\u0000b"]),
+    SshConfigError,
+    "NUL",
   );
   assertThrows(
-    () => verifyHostKeys([{ type: "ssh-ed25519", key: KEY2 }], pinned, "h"),
+    () => buildRemoteCommand([["a"], ["b"]], []),
+    SshConfigError,
+    "operator",
+  );
+  assertThrows(
+    () => buildRemoteCommand([["a"], ["b"]], ["$(id)" as RemoteOperator]),
+    SshConfigError,
+    "unsupported",
+  );
+});
+
+Deno.test("keysForHost honours the host field and the port", () => {
+  const keys = parseHostKeys(
+    `${HOST},server.example.com ${KEY.type} ${KEY.key}\n` +
+      `[${HOST}]:2222 ${OTHER.type} ${OTHER.key}\n` +
+      `198.51.100.7 ${OTHER.type} ${OTHER.key}\n` +
+      `${OTHER.type} ${OTHER.key}\n`,
+  );
+  assertEquals(keysForHost(keys, HOST, 22).map((k) => k.key), [
+    KEY.key,
+    OTHER.key,
+  ]);
+  assertEquals(keysForHost(keys, HOST, 2222).length, 2);
+  assertEquals(
+    keysForHost(keys, "203.0.113.9", 22).every((k) => k.host === undefined),
+    true,
+  );
+});
+
+Deno.test("checkHostKeys strict matches, ignores unpinned types, refuses otherwise", () => {
+  const RSA: HostKey = {
+    type: "ssh-rsa",
+    key: "Q0NDQ0ND",
+  };
+  assertEquals(checkHostKeys([KEY], "strict", [KEY, OTHER]), [KEY]);
+  assertEquals(checkHostKeys([RSA, KEY], "strict", [KEY]), [KEY]);
+  assertThrows(
+    () => checkHostKeys([OTHER], "strict", [KEY]),
     SshError,
     "mismatch",
   );
-  assertThrows(() => verifyHostKeys([rsa], pinned, "h"), SshError, "matches");
-  assertThrows(() => verifyHostKeys([], pinned, "h"), SshError);
-  assertThrows(() => verifyHostKeys([rsa], [], "h"), SshError, "requires");
-});
-
-Deno.test("parseKeyscan reads keyscan output and skips comments", () => {
-  assertEquals(
-    parseKeyscan(
-      `# 192.0.2.10:22 SSH-2.0-OpenSSH\n192.0.2.10 ssh-ed25519 ${KEY1}\njunk\n`,
-    ),
-    [{ type: "ssh-ed25519", key: KEY1 }],
+  assertThrows(
+    () => checkHostKeys([KEY], "strict", []),
+    SshConfigError,
+    "requires",
   );
-});
-
-Deno.test("ssh argv: strict pins, no config, no secret, no shell metacharacters", () => {
-  const strict = baseSshArgs(T, "/tmp/s.sock", "/tmp/kh");
-  assertEquals(strict.includes("StrictHostKeyChecking=yes"), true);
-  assertEquals(strict.includes("UserKnownHostsFile=/tmp/kh"), true);
-  assertEquals(strict.includes("GlobalKnownHostsFile=/dev/null"), true);
-  assertEquals(strict.includes("IdentityFile=none"), true);
-  assertEquals(strict.includes("BatchMode=yes"), true);
-  assertEquals(strict.slice(0, 2), ["-F", "/dev/null"]);
-  assertEquals(strict.join(" ").includes("BEGIN"), false);
-  assertEquals(strict.includes("StrictHostKeyChecking=accept-new"), false);
-  assertEquals(strict.includes("StrictHostKeyChecking=no"), false);
-});
-
-// session / exec
-
-Deno.test("exec: key on ssh-add stdin only, never argv; session torn down", async () => {
-  const f = fakeDeps({ code: 0, stdout: "out\n", stderr: "" });
-  const r = await exec(f.deps, T, ["uname", "-a"]);
-  assertEquals(r.exit_code, 0);
-  assertEquals(r.stdout, "out\n");
-  const add = f.calls.find((c) => c.cmd === "ssh-add")!;
-  assertMatch(add.stdin!, /BEGIN OPENSSH PRIVATE KEY/);
-  assertEquals(add.args, ["-q", "-"]);
-  for (const c of f.calls) {
-    assertNotMatch(JSON.stringify(c.args), /PRIVATE KEY|ZmFrZS1rZXk/);
-    assertNotMatch(JSON.stringify(c.env ?? {}), /PRIVATE KEY|ZmFrZS1rZXk/);
-  }
-  const ssh = f.calls.find((c) => c.cmd === "ssh")!;
-  assertEquals(ssh.args.slice(-3), ["--", "192.0.2.10", "'uname' '-a'"]);
-  assertEquals(
-    f.files.get("/tmp/ssh-host-test/known_hosts"),
-    `192.0.2.10 ssh-ed25519 ${KEY1}\n`,
-  );
-  assertEquals(f.calls.at(-1)!.cmd, "ssh-agent");
-  assertEquals(f.calls.at(-1)!.args, ["-k"]);
-  assertEquals(f.removed, ["/tmp/ssh-host-test"]);
-});
-
-Deno.test("exec: a non-zero remote exit is data, not an error", async () => {
-  const f = fakeDeps({ code: 3, stdout: "", stderr: "boom\n" });
-  const r = await exec(f.deps, T, ["false"]);
-  assertEquals(r.exit_code, 3);
-  assertEquals(r.stderr, "boom\n");
-});
-
-Deno.test("exec: injection attempts reach ssh as one quoted word each", async () => {
-  for (const h of HOSTILE) {
-    const f = fakeDeps();
-    await exec(f.deps, T, ["echo", h]);
-    const cmd = f.calls.find((c) => c.cmd === "ssh")!.args.at(-1)!;
-    assertEquals(cmd, `'echo' ${posixQuote(h)}`);
-  }
-});
-
-Deno.test("exec: trust-on-first-use is not offered; the policy must be strict", async () => {
-  const f = fakeDeps();
-  for (const policy of ["insecure_tofu", "accept-new", "none"]) {
-    await assertRejects(
-      () =>
-        exec(f.deps, {
-          ...T,
-          hostKeyPolicy: policy as never,
-          hostKeys: undefined,
-        }, [
-          "id",
-        ]),
-      SshError,
-      "must be strict",
-    );
-  }
-  assertEquals(f.calls.length, 0);
-});
-
-Deno.test("exec: strict without host_keys refuses before spawning anything", async () => {
-  const f = fakeDeps();
-  await assertRejects(
-    () => exec(f.deps, { ...T, hostKeys: [] }, ["id"]),
+  assertThrows(
+    () => checkHostKeys([], "strict", [KEY]),
     SshError,
-    "requires host_keys",
+    "no host keys",
   );
-  assertEquals(f.calls.length, 0);
+  assertThrows(
+    () => checkHostKeys([RSA], "strict", [KEY]),
+    SshError,
+    "is pinned",
+  );
 });
 
-Deno.test("exec: bad target fields refuse before spawning anything", async () => {
-  const f = fakeDeps();
+Deno.test("checkHostKeys trusts freely only on a tofu first use", () => {
+  assertEquals(checkHostKeys([OTHER], "insecure_tofu"), [OTHER]);
+  assertEquals(checkHostKeys([], "insecure_tofu"), []);
+  // A recorded pin is verified under either policy.
+  assertEquals(checkHostKeys([KEY], "insecure_tofu", [KEY]), [KEY]);
+  assertThrows(
+    () => checkHostKeys([OTHER], "insecure_tofu", [KEY]),
+    SshError,
+    "mismatch",
+  );
+});
+
+Deno.test("buildKnownHosts renders the host field and port", () => {
+  assertEquals(
+    buildKnownHosts(HOST, 22, [KEY]),
+    `${HOST} ${KEY.type} ${KEY.key}\n`,
+  );
+  assertEquals(
+    buildKnownHosts(HOST, 2222, [KEY]),
+    `[${HOST}]:2222 ${KEY.type} ${KEY.key}\n`,
+  );
+  assertEquals(buildKnownHosts(HOST, 22, []), "");
+});
+
+Deno.test("fingerprint matches ssh-keygen's SHA256 format", async () => {
+  assertEquals(
+    await fingerprint(KEY.key),
+    "SHA256:adxsMhDiXmLFk4/06EHoHOPH0s3lg1U0eKd9f8s4nzA",
+  );
+});
+
+Deno.test("sha256Hex and base64Decode round-trip known values", async () => {
+  assertEquals(
+    await sha256Hex("abc"),
+    "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
+  );
+  assertEquals(Array.from(base64Decode("QUJD")), [65, 66, 67]);
+  assertThrows(() => base64Decode("not base64!"), SshConfigError);
+});
+
+Deno.test("input grammars reject injection attempts", () => {
+  for (
+    const bad of ["a;b", "$(id)", "host name", "a`b`", "-oProxyCommand=x"]
+  ) {
+    assertThrows(() => assertHost(bad), SshConfigError);
+  }
+  for (const bad of ["root;id", "-l", "a b", ".root", "a'b"]) {
+    assertThrows(() => assertUser(bad), SshConfigError);
+  }
   for (
     const bad of [
-      { host: "-oProxyCommand=evil" },
-      { host: "h;id" },
-      { user: "root; id" },
-      { port: 0 },
-      { port: 70000 },
-      { connectTimeoutS: 0 },
-      { privateKey: "not a key" },
-      {
-        privateKey:
-          "-----BEGIN OPENSSH PRIVATE KEY-----\nx\n-----END OPENSSH PRIVATE KEY-----\n; id",
-      },
+      "relative/path",
+      "/tmp/x'; rm -rf /",
+      "/a/../etc/passwd",
+      "/tmp/$(id)",
+      "/tmp/a b",
+      "/etc/",
+      "/etc/.",
+      "/a/./b",
     ]
   ) {
-    await assertRejects(() => exec(f.deps, { ...T, ...bad }, ["id"]), SshError);
+    assertThrows(() => assertRemotePath(bad), SshConfigError);
   }
-  assertEquals(f.calls.length, 0);
+  assertEquals(assertUser("Deploy.User"), undefined);
+  for (const bad of ["999", "08", "u+rw", "77777"]) {
+    assertThrows(() => assertMode(bad), SshConfigError);
+  }
+  assertHost("192.0.2.10");
+  assertHost("server-1.example.com");
+  assertHost("2001:db8::1");
+  assertUser("root");
+  assertRemotePath("/etc/wireguard/wg0.conf");
+  assertMode("0640");
 });
 
-Deno.test("exec: failure classes are typed, name the host, and leak nothing", async () => {
-  const cases: [string, string, boolean][] = [
-    ["Connection timed out during banner exchange", "unreachable", false],
+Deno.test("exec quotes the argv and never puts the key on the command line", async () => {
+  const calls: Call[] = [];
+  const deps = fakeDeps(fakeRun(calls));
+  const result = await exec(deps, STRICT_TARGET, ["echo", "; rm -rf /"]);
+  assertEquals(result, {
+    stdout: "ok\n",
+    stderr: "",
+    exit_code: 0,
+    truncated: false,
+    duration_ms: 0,
+  });
+
+  const ssh = calls.find((c) => c.cmd === "ssh");
+  assert(ssh);
+  assertEquals(ssh.args.at(-1), "'echo' '; rm -rf /'");
+  assertEquals(ssh.args.includes("StrictHostKeyChecking=yes"), true);
+  assertEquals(ssh.args.includes("IdentityAgent=/tmp/agent.test"), true);
+  assertEquals(ssh.args.some((a) => a.startsWith("UserKnownHostsFile=")), true);
+  assertEquals(ssh.args.includes("GlobalKnownHostsFile=/dev/null"), true);
+  assertEquals(ssh.args.slice(0, 2), ["-F", "/dev/null"]);
+  // The key travels over stdin to ssh-add and appears nowhere in any argv.
+  const add = calls.find((c) => c.cmd === "ssh-add");
+  assertEquals(add?.stdin, `${PRIVATE_KEY}\n`);
+  for (const call of calls) {
+    assertEquals(call.args.join(" ").includes(PRIVATE_KEY), false);
+  }
+  // The agent is always torn down.
+  assertEquals(calls.at(-1)?.cmd, "ssh-agent");
+  assertEquals(calls.at(-1)?.args, ["-k"]);
+});
+
+Deno.test("exec refusal modes name the host and leak no key material", async () => {
+  for (
+    const [stderr, message] of [
+      ["Host key verification failed.", "host key verification failed"],
+      [
+        "root@192.0.2.10: Permission denied (publickey).",
+        "authentication failed",
+      ],
+      [
+        "ssh: connect to host 192.0.2.10 port 22: Connection refused",
+        "could not connect",
+      ],
+    ] as const
+  ) {
+    const calls: Call[] = [];
+    const deps = fakeDeps(fakeRun(calls, {
+      ssh: () => ({ code: 255, stdout: "", stderr }),
+    }));
+    const err = await assertRejects(
+      () => exec(deps, STRICT_TARGET, ["true"]),
+      SshError,
+    );
+    assertStringIncludes(err.message, message);
+    assertStringIncludes(err.message, HOST);
+    assertEquals(err.message.includes(PRIVATE_KEY), false);
+  }
+});
+
+Deno.test("exec returns a non-zero remote exit as data, not an error", async () => {
+  const calls: Call[] = [];
+  const deps = fakeDeps(fakeRun(calls, {
+    ssh: () => ({ code: 1, stdout: "", stderr: "boom\n" }),
+  }));
+  assertEquals(await exec(deps, STRICT_TARGET, ["false"]), {
+    stdout: "",
+    stderr: "boom\n",
+    exit_code: 1,
+    truncated: false,
+    duration_ms: 0,
+  });
+});
+
+Deno.test("exec enforces the output capture cap with a typed error", async () => {
+  const calls: Call[] = [];
+  const deps = fakeDeps(fakeRun(calls, {
+    ssh: () => ({ code: 0, stdout: "0123456789", stderr: "" }),
+  }));
+  await assertRejects(
+    () => exec(deps, { ...STRICT_TARGET, max_output_bytes: 4 }, ["true"]),
+    SshError,
+    "capture limit",
+  );
+});
+
+Deno.test("exec treats any ssh exit 255 as a transport error, not data", async () => {
+  const calls: Call[] = [];
+  const deps = fakeDeps(fakeRun(calls, {
+    ssh: () => ({ code: 255, stdout: "", stderr: "remote said no\n" }),
+  }));
+  await assertRejects(
+    () => exec(deps, STRICT_TARGET, ["./script"]),
+    SshError,
+    "transport failed",
+  );
+});
+
+/**
+ * The exact ssh argv a no-options exec produced before the options extension,
+ * with the transport-internal random known_hosts path masked.
+ */
+const GOLDEN_EXEC_ARGS = [
+  "-F",
+  "/dev/null",
+  "-o",
+  "IdentityFile=none",
+  "-o",
+  "StrictHostKeyChecking=yes",
+  "-o",
+  "UserKnownHostsFile=<tmp>",
+  "-o",
+  "GlobalKnownHostsFile=/dev/null",
+  "-o",
+  "ConnectTimeout=15",
+  "-o",
+  "ServerAliveInterval=5",
+  "-o",
+  "ServerAliveCountMax=2",
+  "-o",
+  "IdentityAgent=/tmp/agent.test",
+  "-o",
+  "BatchMode=yes",
+  "-o",
+  "PreferredAuthentications=publickey",
+  "-p",
+  "22",
+  "-l",
+  "root",
+  HOST,
+  "'echo' 'hi'",
+];
+
+Deno.test("exec without options spawns the byte-identical pre-extension argv", async () => {
+  const calls: Call[] = [];
+  const deps = fakeDeps(fakeRun(calls));
+  const result = await exec(deps, STRICT_TARGET, ["echo", "hi"]);
+  assertEquals(result, {
+    stdout: "ok\n",
+    stderr: "",
+    exit_code: 0,
+    truncated: false,
+    duration_ms: 0,
+  });
+  const ssh = calls.find((c) => c.cmd === "ssh");
+  assert(ssh);
+  assertEquals(
+    ssh.args.map((a) =>
+      a.startsWith("UserKnownHostsFile=") ? "UserKnownHostsFile=<tmp>" : a
+    ),
+    GOLDEN_EXEC_ARGS,
+  );
+  assertEquals(ssh.stdin, undefined);
+  assertEquals(ssh.timeoutMs, undefined);
+  assertEquals(ssh.truncate, undefined);
+});
+
+Deno.test("exec streams stdin byte-exact, including NUL, and never on argv", async () => {
+  const payload = new Uint8Array([0, 1, 2, 255, 0, 65, 0, 10]);
+  const calls: Call[] = [];
+  const deps = fakeDeps(fakeRun(calls));
+  await exec(deps, STRICT_TARGET, ["sha256sum"], { stdin: payload });
+  const ssh = calls.find((c) => c.cmd === "ssh");
+  assert(ssh);
+  assert(ssh.stdin instanceof Uint8Array);
+  assertEquals([...(ssh.stdin as Uint8Array)], [...payload]);
+  for (const call of calls) {
+    assertEquals(call.args.join(" ").includes("\u0000"), false);
+  }
+});
+
+Deno.test("exec streams a large stdin payload byte-exact", async () => {
+  const payload = new Uint8Array(256 * 1024);
+  for (let i = 0; i < payload.length; i++) payload[i] = i % 256;
+  const calls: Call[] = [];
+  const deps = fakeDeps(fakeRun(calls));
+  await exec(deps, STRICT_TARGET, ["cat"], { stdin: payload });
+  const ssh = calls.find((c) => c.cmd === "ssh");
+  assert(ssh);
+  const sent = ssh.stdin as Uint8Array;
+  assertEquals(sent.byteLength, payload.byteLength);
+  assertEquals(sent[255], 255);
+  assertEquals(sent[256], 0);
+});
+
+Deno.test("exec timeout kills ssh and raises a typed timeout", async () => {
+  const calls: Call[] = [];
+  const deps = fakeDeps(fakeRun(calls, {
+    ssh: () => ({ code: -1, stdout: "partial", stderr: "", timedOut: true }),
+  }));
+  const err = await assertRejects(
+    () => exec(deps, STRICT_TARGET, ["sleep", "5"], { timeoutMs: 50 }),
+    SshError,
+  ) as SshError;
+  assertEquals(err.kind, "timeout");
+  assertStringIncludes(err.message, "timed out");
+  assertEquals(calls.find((c) => c.cmd === "ssh")?.timeoutMs, 50);
+});
+
+Deno.test("exec truncates and flags instead of throwing when maxOutputBytes is set", async () => {
+  const calls: Call[] = [];
+  const deps = fakeDeps(fakeRun(calls, {
+    ssh: () => ({
+      code: 0,
+      stdout: "0123",
+      stderr: "",
+      truncated: true,
+      killedForCap: true,
+    }),
+  }));
+  const result = await exec(deps, STRICT_TARGET, ["true"], {
+    maxOutputBytes: 4,
+  });
+  assertEquals(result, {
+    stdout: "0123",
+    stderr: "",
+    exit_code: 0,
+    truncated: true,
+    duration_ms: 0,
+  });
+  assertEquals(calls.find((c) => c.cmd === "ssh")?.truncate, true);
+});
+
+Deno.test("a secret in stdin never appears on argv or in a transport error", async () => {
+  const secret = "PLACEHOLDER-SECRET-VALUE";
+  const calls: Call[] = [];
+  const deps = fakeDeps(fakeRun(calls, {
+    ssh: () => ({ code: 255, stdout: "", stderr: "Connection refused" }),
+  }));
+  const err = await assertRejects(
+    () => exec(deps, STRICT_TARGET, ["cat"], { stdin: secret }),
+    SshError,
+  ) as SshError;
+  assertEquals(err.message.includes(secret), false);
+  for (const call of calls) {
+    assertEquals(call.args.join(" ").includes(secret), false);
+  }
+});
+
+Deno.test("exec rejects invalid maxOutputBytes and timeoutMs before connecting", async () => {
+  const calls: Call[] = [];
+  const deps = fakeDeps(fakeRun(calls));
+  const target = { ...STRICT_TARGET, max_output_bytes: 1000 };
+  for (const bad of [NaN, Infinity, -Infinity, 0, -1, 1.5, 1001]) {
+    await assertRejects(
+      () => exec(deps, target, ["true"], { maxOutputBytes: bad }),
+      SshConfigError,
+      "maxOutputBytes",
+    );
+  }
+  for (const bad of [NaN, Infinity, 0, -1, 1.5, MAX_EXEC_TIMEOUT_MS + 1]) {
+    await assertRejects(
+      () => exec(deps, target, ["true"], { timeoutMs: bad }),
+      SshConfigError,
+      "timeoutMs",
+    );
+  }
+  // Nothing was spawned for any rejected option.
+  assertEquals(calls.length, 0);
+  const ok = await exec(deps, target, ["true"], {
+    maxOutputBytes: 1000,
+    timeoutMs: 1,
+  });
+  assertEquals(ok.exit_code, 0);
+});
+
+Deno.test("denoRunner streams a multi-megabyte stdin while stderr floods", async () => {
+  const big = new Uint8Array(4 * 1024 * 1024);
+  for (let i = 0; i < big.length; i++) big[i] = i % 256;
+  const res = await denoRunner(
+    "sh",
     [
-      "ssh: connect to host 192.0.2.10 port 22: Connection refused",
-      "unreachable",
-      false,
+      "-c",
+      "i=0; while [ $i -lt 2000 ]; do echo flood >&2; i=$((i+1)); done; wc -c",
     ],
-    ["Permission denied (publickey).", "auth", false],
-    ["Host key verification failed.", "host_key", false],
-    ["WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED!", "host_key", false],
-    ["something odd", "transport", false],
-    ["", "timeout", true],
-  ];
-  for (const [stderr, kind, timedOut] of cases) {
-    const f = fakeDeps(
-      timedOut ? { code: -1, timedOut: true } : { code: 255, stderr },
-    );
-    const e = await assertRejects(() => exec(f.deps, T, ["id"]), SshError);
-    assertEquals(e.kind, kind);
-    assertMatch(e.message, /192\.0\.2\.10/);
-    assertNotMatch(e.message, /PRIVATE KEY|ZmFrZS1rZXk|'id'/);
-    assertEquals(f.removed.length, 1, "temp dir removed even on failure");
-    assertEquals(f.calls.at(-1)!.args, ["-k"], "agent killed even on failure");
-  }
+    { stdin: big, maxOutputBytes: 1024 * 1024 },
+  );
+  assertEquals(res.code, 0);
+  assertEquals(res.stdout.trim(), String(big.length));
+  assertEquals(res.truncated, false);
 });
 
-Deno.test("exec: an unreachable host (192.0.2.1) is a typed error", async () => {
-  const f = fakeDeps({
-    code: 255,
-    stderr: "ssh: connect to host 192.0.2.1 port 22: Connection timed out",
+Deno.test("denoRunner truncates at the cap and returns without draining", async () => {
+  const started = Date.now();
+  const res = await denoRunner("sh", ["-c", "yes"], {
+    maxOutputBytes: 128,
+    truncate: true,
   });
-  const e = await assertRejects(
-    () => exec(f.deps, { ...T, host: "192.0.2.1" }, ["id"]),
+  const elapsed = Date.now() - started;
+  assertEquals(res.truncated, true);
+  assertEquals(res.stdout.length, 128);
+  assert(elapsed < 5000, `truncation took ${elapsed}ms`);
+});
+
+Deno.test("denoRunner caps without truncation by throwing", async () => {
+  await assertRejects(
+    () => denoRunner("sh", ["-c", "printf 0123456789"], { maxOutputBytes: 4 }),
     SshError,
+    "capture limit",
   );
-  assertEquals(e.kind, "unreachable");
 });
 
-Deno.test("exec: ssh-agent or ssh-add failure is a config error and still cleans up", async () => {
-  const f = fakeDeps();
-  const base = f.deps.run;
-  f.deps.run = (cmd, args, o) =>
-    cmd === "ssh-add"
-      ? Promise.resolve({ code: 1, stdout: "", stderr: "Bad passphrase" })
-      : base(cmd, args, o);
-  const e = await assertRejects(() => exec(f.deps, T, ["id"]), SshError);
-  assertEquals(e.kind, "config");
-  assertNotMatch(e.message, /passphrase/);
-  assertEquals(f.removed.length, 1);
-});
-
-Deno.test("exec: output is capped and flagged", async () => {
-  const f = fakeDeps({ code: 0, stdout: "x".repeat(2_000_000) });
-  const r = await exec(f.deps, T, ["cat", "big"]);
-  assertEquals(r.stdout.length, 1048576);
-  assertEquals(r.truncated, true);
-});
-
-// upload
-
-Deno.test("upload: content goes over ssh stdin; path and mode are quoted argv words", async () => {
-  const content = new TextEncoder().encode("hello\n");
-  const sum =
-    "5891b5b522d5df086d0ff0b110fbd9d21bb4fc7163af34d08286a2e846f6be03";
-  const f = fakeDeps({ code: 0, stdout: `${sum} 6 1\n` });
-  const r = await upload(f.deps, T, "/etc/app/conf.yaml", content, "0600");
-  assertEquals(r, {
-    path: "/etc/app/conf.yaml",
-    bytes: 6,
-    sha256: sum,
-    changed: true,
+Deno.test("denoRunner times out a large stdin write and leaves no child", async () => {
+  const big = new Uint8Array(4 * 1024 * 1024);
+  const started = Date.now();
+  const res = await denoRunner("sh", ["-c", "exec sleep 10"], {
+    stdin: big,
+    timeoutMs: 300,
+    maxOutputBytes: 1024 * 1024,
   });
-  const ssh = f.calls.find((c) => c.cmd === "ssh")!;
-  assertEquals(ssh.stdin, "hello\n");
-  const cmd = ssh.args.at(-1)!;
-  assertEquals(cmd.endsWith(`'sh' '/etc/app/conf.yaml' '0600'`), true);
-  assertEquals(cmd.includes("hello"), false);
+  const elapsed = Date.now() - started;
+  assertEquals(res.timedOut, true);
+  assert(elapsed < 5000, `timeout took ${elapsed}ms`);
 });
 
-Deno.test("upload: identical re-run reports changed false with the same sha", async () => {
-  const sum =
-    "5891b5b522d5df086d0ff0b110fbd9d21bb4fc7163af34d08286a2e846f6be03";
-  const f = fakeDeps({ code: 0, stdout: `${sum} 6 0\n` });
-  const r = await upload(
-    f.deps,
-    T,
-    "/etc/x",
-    new TextEncoder().encode("hello\n"),
-  );
-  assertEquals(r.changed, false);
-  assertEquals(r.sha256, sum);
-});
-
-Deno.test("upload: a checksum or size mismatch from the remote is an error", async () => {
-  for (const out of [`${"0".repeat(64)} 6 1\n`, `garbage\n`, ""]) {
-    const f = fakeDeps({ code: 0, stdout: out });
-    await assertRejects(
-      () => upload(f.deps, T, "/etc/x", new TextEncoder().encode("hello\n")),
-      SshError,
-      "could not be verified",
-    );
-  }
-  const sum =
-    "5891b5b522d5df086d0ff0b110fbd9d21bb4fc7163af34d08286a2e846f6be03";
-  const f = fakeDeps({ code: 0, stdout: `${sum} 7 1\n` });
+Deno.test("exec still throws on a transport 255 whose stderr exceeds a small cap", async () => {
+  const deps = fakeDeps(fakeRun([], {
+    ssh: () => ({
+      code: 255,
+      stdout: "",
+      stderr: "Connection closed by remote host " + "x".repeat(200),
+    }),
+  }));
   await assertRejects(
-    () => upload(f.deps, T, "/etc/x", new TextEncoder().encode("hello\n")),
+    () => exec(deps, STRICT_TARGET, ["true"], { maxOutputBytes: 16 }),
     SshError,
-    "could not be verified",
+    "could not connect",
   );
 });
 
-Deno.test("upload: unwritable path is a typed remote error; bad path/mode refuse locally", async () => {
-  const f = fakeDeps({ code: 1, stderr: "mktemp: failed to create file" });
-  const e = await assertRejects(
-    () => upload(f.deps, T, "/root/x", new Uint8Array([1])),
-    SshError,
+Deno.test("a long stderr warning does not fail a successful command", async () => {
+  let seen: RunOptions = {};
+  const deps = fakeDeps(fakeRun([], {
+    ssh: (_args, options) => {
+      seen = options;
+      return { code: 0, stdout: "ok\n", stderr: "w".repeat(500) };
+    },
+  }));
+  const target = { ...STRICT_TARGET, max_output_bytes: 1000 };
+  const res = await exec(deps, target, ["true"], { maxOutputBytes: 100 });
+  assertEquals(seen.maxOutputBytes, 100);
+  assertEquals(seen.stderrMaxOutputBytes, 1000);
+  assertEquals(res.exit_code, 0);
+  assertEquals(res.stderr.length, 500);
+  assertEquals(res.truncated, false);
+});
+
+const WARN_50 = "i=0; while [ $i -lt 50 ]; do echo warn >&2; i=$((i+1)); done";
+
+Deno.test("denoRunner keeps a stderr warning whole under a small stdout cap", async () => {
+  const res = await denoRunner(
+    "sh",
+    ["-c", `${WARN_50}; echo hi`],
+    { maxOutputBytes: 4, truncate: true, stderrMaxOutputBytes: 4096 },
   );
-  assertEquals(e.kind, "remote");
-  assertMatch(e.message, /nothing was written/);
-  const g = fakeDeps();
-  for (const p of ["rel", "/a;b", "/a/../b", "/a\nb", "/x'y"]) {
-    await assertRejects(
-      () => upload(g.deps, T, p, new Uint8Array([1])),
-      SshError,
-    );
-  }
-  await assertRejects(
-    () => upload(g.deps, T, "/x", new Uint8Array([1]), "0o9"),
-    SshError,
-  );
-  assertEquals(g.calls.length, 0);
+  assertEquals(res.code, 0);
+  assertEquals(res.stdout, "hi\n");
+  assertEquals(res.stderr.split("\n").filter((l) => l !== "").length, 50);
+  assertEquals(res.truncated, false);
 });
 
-Deno.test("upload: transport failures are typed", async () => {
-  const f = fakeDeps({ code: 255, stderr: "Permission denied (publickey)." });
-  const e = await assertRejects(
-    () => upload(f.deps, T, "/x", new Uint8Array([1])),
-    SshError,
-  );
-  assertEquals(e.kind, "auth");
-});
-
-// wait_connection
-
-const WT = {
-  host: "192.0.2.10",
-  port: 22,
-  hostKeyPolicy: "strict" as const,
-  hostKeys: [`192.0.2.10 ssh-ed25519 ${KEY1}`],
-  connectTimeoutS: 5,
-};
-
-Deno.test("waitConnection: reachable with pinned keys; no key needed, nothing authenticated", async () => {
-  const f = fakeDeps({}, `192.0.2.10 ssh-ed25519 ${KEY1}\n`);
-  const r = await waitConnection(f.deps, WT, 60, 5);
-  assertEquals(r.reachable, true);
-  assertEquals(r.host_keys, [`192.0.2.10 ssh-ed25519 ${KEY1}`]);
-  assertEquals(f.calls.map((c) => c.cmd), ["ssh-keyscan"]);
-});
-
-Deno.test("waitConnection: strict mismatch never reports reachable, polls to the deadline", async () => {
-  const f = fakeDeps({}, `192.0.2.10 ssh-ed25519 ${KEY2}\n`);
-  const r = await waitConnection(f.deps, WT, 20, 5);
-  assertEquals(r.reachable, false);
-  assertEquals(r.host_keys, []);
-  assertMatch(r.reason!, /mismatch/);
-  assertEquals(r.attempts > 1, true);
-});
-
-Deno.test("waitConnection: unreachable host times out cleanly", async () => {
-  const f = fakeDeps({}, "");
-  const r = await waitConnection(f.deps, { ...WT, host: "192.0.2.1" }, 10, 5);
-  assertEquals(r.reachable, false);
-  assertMatch(r.reason!, /did not present/);
-});
-
-Deno.test("waitConnection: strict without pins refuses, and so does any other policy", async () => {
-  const f = fakeDeps({}, `192.0.2.10 ssh-ed25519 ${KEY2}\n`);
+Deno.test("denoRunner throws when stderr exceeds its own cap", async () => {
   await assertRejects(
     () =>
-      waitConnection(
-        f.deps,
-        { ...WT, hostKeyPolicy: "insecure_tofu" as never, hostKeys: undefined },
-        10,
-        5,
+      denoRunner(
+        "sh",
+        ["-c", WARN_50],
+        { maxOutputBytes: 4, truncate: true, stderrMaxOutputBytes: 16 },
       ),
     SshError,
-    "must be strict",
+    "capture limit",
   );
+});
+
+Deno.test("strict needs pinned keys and rejects two credentials at once", async () => {
+  const deps = fakeDeps(fakeRun([]));
   await assertRejects(
-    () => waitConnection(f.deps, { ...WT, hostKeys: [] }, 10, 5),
-    SshError,
+    () => exec(deps, { ...STRICT_TARGET, host_keys: undefined }, ["true"]),
+    SshConfigError,
     "requires host_keys",
   );
   await assertRejects(
-    () => waitConnection(f.deps, { ...WT, host: "h;id" }, 10, 5),
-    SshError,
+    () =>
+      exec(deps, { ...STRICT_TARGET, password: "notsecret" }, [
+        "true",
+      ]),
+    SshConfigError,
+    "not both",
   );
 });
 
-Deno.test("withSession validates before touching the filesystem", async () => {
-  const f = fakeDeps();
+Deno.test("password auth uses askpass, never argv", async () => {
+  const calls: Call[] = [];
+  const password = "placeholder-password";
+  const deps = fakeDeps(fakeRun(calls));
+  await exec(deps, {
+    host: HOST,
+    port: 22,
+    user: "root",
+    host_key_policy: "insecure_tofu",
+    password,
+  }, ["true"]);
+  const ssh = calls.find((c) => c.cmd === "ssh");
+  assert(ssh);
+  assertEquals(ssh.args.includes("StrictHostKeyChecking=accept-new"), true);
+  assertEquals(ssh.args.some((a) => a.startsWith("SSH_ASKPASS")), false);
+  assert(ssh.env);
+  assertEquals(ssh.env.SSH_ASKPASS_SECRET, password);
+  assert(ssh.env.SSH_ASKPASS);
+  for (const call of calls) {
+    assertEquals(call.args.join(" ").includes(password), false);
+  }
+});
+
+Deno.test("upload streams bytes over stdin and renames atomically", async () => {
+  const calls: Call[] = [];
+  const contentSha = await sha256Hex("placeholder config\n");
+  let seen: Uint8Array | undefined;
+  const deps = fakeDeps(fakeRun(calls, {
+    ssh: (args, options) => {
+      const remote = args.at(-1) ?? "";
+      if (remote.includes("mktemp")) {
+        seen = typeof options.stdin === "string"
+          ? new TextEncoder().encode(options.stdin)
+          : options.stdin;
+        // The remote prints the destination's hash and mode; the expected hash
+        // is never sent.
+        return { code: 0, stdout: `${contentSha} 640\n`, stderr: "" };
+      }
+      return { code: 0, stdout: "", stderr: "" };
+    },
+  }));
+  const result = await upload(deps, STRICT_TARGET, {
+    path: "/etc/wireguard/wg0.conf",
+    content: "placeholder config\n",
+    mode: "0640",
+  });
+  assertEquals(result.path, "/etc/wireguard/wg0.conf");
+  assertEquals(result.bytes, 19);
+  assertEquals(result.sha256, contentSha);
+  assertEquals(result.changed, true);
+  assertEquals(new TextDecoder().decode(seen), "placeholder config\n");
+  const sshCalls = calls.filter((c) => c.cmd === "ssh");
+  // First the idempotence probe, then the write.
+  assertEquals(sshCalls.length, 2);
+  assertStringIncludes(sshCalls[0].args.at(-1) ?? "", "sha256sum");
+  assertEquals(sshCalls[0].stdin, undefined);
+  const remote = sshCalls[1].args.at(-1) ?? "";
+  assertStringIncludes(remote, "mktemp");
+  assertStringIncludes(remote, "chmod '0640'");
+  assertStringIncludes(remote, `f='/etc/wireguard/wg0.conf'`);
+  // No-target-directory rename on Linux only, then a post-move printf.
+  assertStringIncludes(remote, "mv -T");
+  assertStringIncludes(remote, "printf");
+  assertEquals(remote.includes("mv -f "), false);
+  for (const call of calls) {
+    assertEquals(call.args.join(" ").includes("placeholder config"), false);
+  }
+});
+
+Deno.test("upload never puts the content hash on a spawned argv or in script text", async () => {
+  const calls: Call[] = [];
+  const contentSha = await sha256Hex("low-entropy-secret\n");
+  const deps = fakeDeps(fakeRun(calls, {
+    ssh: (args) => {
+      const remote = args.at(-1) ?? "";
+      return remote.includes("mktemp")
+        ? { code: 0, stdout: `${contentSha} 600\n`, stderr: "" }
+        : { code: 0, stdout: "", stderr: "" };
+    },
+  }));
+  await upload(deps, STRICT_TARGET, {
+    path: "/etc/wireguard/secret.key",
+    content: "low-entropy-secret\n",
+  });
+  for (const call of calls) {
+    const text = call.args.join(" ");
+    assertEquals(
+      text.includes(contentSha),
+      false,
+      `expected hash on argv: ${text}`,
+    );
+    assertEquals(
+      (text.match(/[0-9a-f]{64}/g) ?? []).length,
+      0,
+      `no 64-hex string may appear on argv or in script text: ${text}`,
+    );
+  }
+});
+
+Deno.test("upload is idempotent: matching bytes and mode mean no write", async () => {
+  const calls: Call[] = [];
+  const content = "already there\n";
+  const sha = await sha256Hex(content);
+  const deps = fakeDeps(fakeRun(calls, {
+    ssh: () => ({ code: 0, stdout: `${sha} 600\n`, stderr: "" }),
+  }));
+  const result = await upload(deps, STRICT_TARGET, {
+    path: "/etc/x",
+    content,
+  });
+  assertEquals(result.changed, false);
+  const sshCalls = calls.filter((c) => c.cmd === "ssh");
+  assertEquals(sshCalls.length, 1);
+  assertEquals(sshCalls[0].stdin, undefined);
+});
+
+Deno.test("upload replaces through the temp path on a mode-only difference", async () => {
+  const calls: Call[] = [];
+  const content = "same bytes\n";
+  const sha = await sha256Hex(content);
+  const deps = fakeDeps(fakeRun(calls, {
+    ssh: (args) =>
+      (args.at(-1) ?? "").includes("mktemp")
+        ? { code: 0, stdout: `${sha} 600\n`, stderr: "" }
+        : { code: 0, stdout: `${sha} 644\n`, stderr: "" },
+  }));
+  const result = await upload(deps, STRICT_TARGET, {
+    path: "/etc/x",
+    content,
+    mode: "0600",
+  });
+  assertEquals(result.changed, true);
+  const sshCalls = calls.filter((c) => c.cmd === "ssh");
+  assertEquals(sshCalls.length, 2);
+  const remote = sshCalls[1].args.at(-1) ?? "";
+  assertStringIncludes(remote, "mktemp");
+  assertStringIncludes(remote, "chmod '0600'");
+  assertStringIncludes(remote, "mv -T");
+  // Never a chmod-in-place on the destination.
+  assertEquals(remote.includes("chmod '0600' '/etc/x'"), false);
+  assertEquals(sshCalls[1].stdin !== undefined, true);
+});
+
+Deno.test("upload refuses a symlink destination without following it", async () => {
+  const calls: Call[] = [];
+  const deps = fakeDeps(fakeRun(calls, {
+    ssh: () => ({ code: 0, stdout: "SYMLINK\n", stderr: "" }),
+  }));
   await assertRejects(
-    () => withSession(f.deps, { ...T, user: "x y" }, () => Promise.resolve(1)),
+    () => upload(deps, STRICT_TARGET, { path: "/etc/x", content: "x" }),
+    SshError,
+    "symlink",
+  );
+  assertEquals(calls.filter((c) => c.cmd === "ssh").length, 1);
+});
+
+Deno.test("upload fails closed on a target without a no-target-directory rename", async () => {
+  const calls: Call[] = [];
+  const marker = "ssh-host: upload requires a Linux target with mv -T";
+  const deps = fakeDeps(fakeRun(calls, {
+    ssh: (args) => {
+      const remote = args.at(-1) ?? "";
+      return remote.includes("mktemp")
+        ? { code: 1, stdout: `${marker}\n`, stderr: "" }
+        : { code: 0, stdout: "MISSING\n", stderr: "" };
+    },
+  }));
+  await assertRejects(
+    () => upload(deps, STRICT_TARGET, { path: "/etc/x", content: "x" }),
+    SshConfigError,
+    "Linux target",
+  );
+});
+
+Deno.test("upload refuses a destination that is a directory", async () => {
+  const calls: Call[] = [];
+  const deps = fakeDeps(fakeRun(calls, {
+    ssh: () => ({ code: 0, stdout: "DIRECTORY\n", stderr: "" }),
+  }));
+  await assertRejects(
+    () => upload(deps, STRICT_TARGET, { path: "/etc", content: "x" }),
+    SshError,
+    "is a directory",
+  );
+  assertEquals(calls.filter((c) => c.cmd === "ssh").length, 1);
+});
+
+Deno.test("upload to an unwritable path is a typed error", async () => {
+  const calls: Call[] = [];
+  const deps = fakeDeps(fakeRun(calls, {
+    ssh: () => ({ code: 1, stdout: "", stderr: "mktemp: Permission denied\n" }),
+  }));
+  await assertRejects(
+    () => upload(deps, STRICT_TARGET, { path: "/proc/1/nope", content: "x" }),
+    SshError,
+    "/proc/1/nope",
+  );
+});
+
+Deno.test("upload validates the destination and mode before connecting", async () => {
+  const deps = fakeDeps(fakeRun([]));
+  await assertRejects(
+    () => upload(deps, STRICT_TARGET, { path: "/a/../b", content: "x" }),
+    SshConfigError,
+  );
+  await assertRejects(
+    () =>
+      upload(deps, STRICT_TARGET, { path: "/ok", content: "x", mode: "9x" }),
+    SshConfigError,
+  );
+});
+
+Deno.test("scanHostKeys passes the host and port as separate arguments", async () => {
+  let seen: string[] = [];
+  const run: CommandRunner = (_cmd, args) => {
+    seen = args;
+    return Promise.resolve({
+      code: 0,
+      stdout: `${HOST} ${KEY.type} ${KEY.key}\n`,
+      stderr: "",
+    });
+  };
+  assertEquals(await scanHostKeys(run, HOST, 2222), [{ host: HOST, ...KEY }]);
+  assertEquals(seen, ["-T", "5", "-p", "2222", HOST]);
+});
+
+Deno.test("waitConnection strict returns the matched keys with fingerprints", async () => {
+  const calls: Call[] = [];
+  const deps = fakeDeps(fakeRun(calls, {
+    keyscan: () => ({
+      code: 0,
+      stdout: `${HOST} ${KEY.type} ${KEY.key}\n`,
+      stderr: "",
+    }),
+  }));
+  const result = await waitConnection(deps, STRICT_TARGET, { timeout_s: 5 });
+  assertEquals(result.reachable, true);
+  assertEquals(result.host_keys.length, 1);
+  assertEquals(result.host_keys[0].type, KEY.type);
+  assertEquals(
+    result.host_keys[0].sha256,
+    "SHA256:adxsMhDiXmLFk4/06EHoHOPH0s3lg1U0eKd9f8s4nzA",
+  );
+});
+
+Deno.test("waitConnection strict refuses a mismatched key", async () => {
+  const calls: Call[] = [];
+  const deps = fakeDeps(fakeRun(calls, {
+    keyscan: () => ({
+      code: 0,
+      stdout: `${HOST} ${OTHER.type} ${OTHER.key}\n`,
+      stderr: "",
+    }),
+  }));
+  await assertRejects(
+    () => waitConnection(deps, STRICT_TARGET, { timeout_s: 5 }),
+    SshError,
+    "mismatch",
+  );
+});
+
+Deno.test("waitConnection times out on a host that never answers", async () => {
+  const calls: Call[] = [];
+  const deps = fakeDeps(fakeRun(calls, {
+    keyscan: () => ({ code: 1, stdout: "", stderr: "" }),
+  }));
+  const err = await assertRejects(
+    () =>
+      waitConnection(deps, STRICT_TARGET, { timeout_s: 1, poll_interval_s: 1 }),
     SshError,
   );
-  assertEquals(f.files.size + f.calls.length + f.removed.length, 0);
+  assertStringIncludes(err.message, HOST);
+});
+
+Deno.test("waitConnection insecure_tofu accepts the first keys observed", async () => {
+  const calls: Call[] = [];
+  const deps = fakeDeps(fakeRun(calls, {
+    keyscan: () => ({
+      code: 0,
+      stdout: `${HOST} ${OTHER.type} ${OTHER.key}\n`,
+      stderr: "",
+    }),
+  }));
+  const result = await waitConnection(deps, {
+    host: HOST,
+    port: 22,
+    user: "root",
+    host_key_policy: "insecure_tofu",
+  });
+  assertEquals(result.host_keys[0].key, OTHER.key);
+});
+
+Deno.test("a supplied pin that matches no host refuses instead of accept-new", async () => {
+  const deps = fakeDeps(fakeRun([]));
+  await assertRejects(
+    () =>
+      exec(deps, {
+        ...STRICT_TARGET,
+        host_key_policy: "insecure_tofu",
+        host_keys: [
+          `other.example.com ${KEY.type} ${KEY.key}`,
+        ],
+      }, ["true"]),
+    SshConfigError,
+    "none apply",
+  );
+  // The same supplied set also refuses in waitConnection.
+  const waitDeps = fakeDeps(fakeRun([]));
+  await assertRejects(
+    () =>
+      waitConnection(waitDeps, {
+        host: HOST,
+        port: 22,
+        user: "root",
+        host_key_policy: "strict",
+        host_keys: [`other.example.com ${KEY.type} ${KEY.key}`],
+      }, { timeout_s: 1 }),
+    SshConfigError,
+    "none apply",
+  );
+});
+
+Deno.test("waitConnection verifies a recorded tofu pin and refuses a change", async () => {
+  const calls: Call[] = [];
+  const good = fakeDeps(fakeRun(calls, {
+    keyscan: () => ({
+      code: 0,
+      stdout: `${HOST} ${KEY.type} ${KEY.key}\n`,
+      stderr: "",
+    }),
+  }));
+  const result = await waitConnection(good, {
+    host: HOST,
+    port: 22,
+    user: "root",
+    host_key_policy: "insecure_tofu",
+    host_keys: [`${KEY.type} ${KEY.key}`],
+  });
+  assertEquals(result.host_keys[0].key, KEY.key);
+
+  const bad = fakeDeps(fakeRun([], {
+    keyscan: () => ({
+      code: 0,
+      stdout: `${HOST} ${OTHER.type} ${OTHER.key}\n`,
+      stderr: "",
+    }),
+  }));
+  await assertRejects(
+    () =>
+      waitConnection(bad, {
+        host: HOST,
+        port: 22,
+        user: "root",
+        host_key_policy: "insecure_tofu",
+        host_keys: [`${KEY.type} ${KEY.key}`],
+      }),
+    SshError,
+    "mismatch",
+  );
+});
+
+Deno.test("denoDeps is the production wiring", () => {
+  assertEquals(typeof denoDeps.run, "function");
+  assertEquals(typeof denoDeps.now, "function");
+  assertEquals(typeof denoDeps.sleep, "function");
 });

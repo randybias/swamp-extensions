@@ -3,6 +3,7 @@
 import { assertEquals } from "jsr:@std/assert@1.0.19";
 import { planApplyBase, REVOKE_SKIPPED } from "./plans.ts";
 import { STATE_DIR } from "./armed_revert.ts";
+import { renderScript } from "./remote.ts";
 
 const INPUT = {
   sudo: false,
@@ -19,7 +20,7 @@ const script = (label: string) => {
     "revoke_previous",
     "admin_user",
   ]).find((s) => s.label === label)!;
-  return { script: step.argv[2], args: step.argv.slice(4) };
+  return renderScript({ ...step.call, sudo: false });
 };
 
 async function box() {
@@ -46,6 +47,7 @@ echo "$2:x:1:1::${dir}/home/$2:/bin/bash"`,
   await stub(
     "runuser",
     `echo "$@" >> "${dir}/runuser.log"
+[ ! -e "${dir}/runuser-fails" ] || exit 1
 shift 3
 exec "$@"`,
   );
@@ -66,11 +68,21 @@ sed -i 's/ sudo//' "${dir}/groups"`,
   // `id -u` succeeds; `id -nG` lists the groups in ${dir}/groups.
   await stub(
     "id",
-    `case "$1" in -u) exit 0;; -nG) [ ! -e "${dir}/id-fails" ] || exit 1; [ -e "${dir}/groups" ] && cat "${dir}/groups";; esac`,
+    `case "$1" in -u) [ ! -e "${dir}/absent" ] || exit 1; exit 0;; -nG) [ ! -e "${dir}/id-fails" ] || exit 1; [ -e "${dir}/groups" ] && cat "${dir}/groups";; esac`,
   );
-  const run = async (s: { script: string; args: string[] }) => {
+  // The local account and name-service configuration the scripts consult.
+  await Deno.writeTextFile(`${dir}/passwd`, "root:x:0:0::/root:/bin/sh\n");
+  await Deno.writeTextFile(`${dir}/nsswitch.conf`, "passwd: files systemd\n");
+  const run = async (text: string) => {
     const out = await new Deno.Command("sh", {
-      args: ["-c", s.script.replaceAll(STATE_DIR, state), "sh", ...s.args],
+      args: [
+        "-c",
+        text.replaceAll(STATE_DIR, state).replaceAll(
+          "/etc/passwd",
+          `${dir}/passwd`,
+        )
+          .replaceAll("/etc/nsswitch.conf", `${dir}/nsswitch.conf`),
+      ],
       env: { PATH: `${bin}:/usr/bin:/bin` },
       stdout: "null",
       stderr: "null",
@@ -251,6 +263,62 @@ Deno.test("revoke: a ~/.ssh owned by someone else is left alone", async () => {
     const code = await b.run(script("revoke grants of oldops"));
     assertEquals(code, REVOKE_SKIPPED);
     assertEquals(await b.read("home/oldops/.ssh/authorized_keys"), "k\n");
+  } finally {
+    await Deno.remove(b.dir, { recursive: true });
+  }
+});
+
+Deno.test("revoke: getent exit 2 is not 'gone' while the local files, id or a network source say the account may exist", async () => {
+  const cases: [string, (dir: string) => Promise<void>][] = [
+    [
+      "a local passwd entry",
+      (dir) =>
+        Deno.writeTextFile(
+          `${dir}/passwd`,
+          "root:x:0:0::/root:/bin/sh\noldops:x:1:1::/home/oldops:/bin/sh\n",
+        ),
+    ],
+    [
+      "a network passwd source",
+      (dir) =>
+        Deno.writeTextFile(`${dir}/nsswitch.conf`, "passwd: files sss\n"),
+    ],
+  ];
+  for (const [name, arrange] of cases) {
+    const b = await box();
+    try {
+      await Deno.writeTextFile(`${b.state}/sudo-granted-oldops`, "");
+      await Deno.writeTextFile(`${b.dir}/absent`, "");
+      await arrange(b.dir);
+      const code = await b.run(script("revoke grants of oldops"));
+      assertEquals(code, 1, name);
+      assertEquals(await b.exists(`${b.state}/sudo-granted-oldops`), true);
+      assertEquals(await b.read("home/oldops/.ssh/authorized_keys"), "k\n");
+    } finally {
+      await Deno.remove(b.dir, { recursive: true });
+    }
+  }
+});
+
+Deno.test("revoke: sudo is taken back first, so keys that cannot be removed leave no privilege and a rerun retries only the keys", async () => {
+  const b = await box();
+  try {
+    await Deno.writeTextFile(`${b.state}/sudo-granted-oldops`, "");
+    await Deno.writeTextFile(`${b.dir}/groups`, "oldops sudo\n");
+    await Deno.writeTextFile(`${b.dir}/runuser-fails`, "");
+    const failed = await b.run(script("revoke grants of oldops"));
+    assertEquals(failed !== 0 && failed !== REVOKE_SKIPPED, true);
+    assertEquals(await b.read("gpasswd.log"), "-d oldops sudo\n");
+    assertEquals(await b.exists(`${b.state}/sudo-granted-oldops`), false);
+    assertEquals(await b.read("home/oldops/.ssh/authorized_keys"), "k\n");
+    await Deno.remove(`${b.dir}/runuser-fails`);
+    assertEquals(await b.run(script("revoke grants of oldops")), 0);
+    assertEquals(
+      await b.exists(`${b.dir}/home/oldops/.ssh/authorized_keys`),
+      false,
+    );
+    // The rerun did not touch sudo again.
+    assertEquals(await b.read("gpasswd.log"), "-d oldops sudo\n");
   } finally {
     await Deno.remove(b.dir, { recursive: true });
   }

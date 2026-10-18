@@ -16,7 +16,7 @@
  */
 
 import { z } from "npm:zod@4.3.6";
-import { denoDeps, type SshDeps, type Target } from "./_lib/ssh.ts";
+import { denoDeps, type SshDeps, type SshTarget } from "./_lib/ssh.ts";
 import {
   assertAuthorizedKey,
   assertCidr,
@@ -348,17 +348,16 @@ function assertIdentity(
   }
 }
 
-/** The ssh exposure the live managed input chain gives `port`. */
-export function liveSshExposure(
-  inputRules: readonly string[],
-  port: number,
-): "anywhere" | "management-only" | "none" {
-  const dport = `tcp.dport in n:${port}`;
-  if (inputRules.some((r) => r === `${dport} ; accept`)) return "anywhere";
-  if (inputRules.some((r) => r.includes("saddr") && r.includes(dport))) {
-    return "management-only";
-  }
-  return "none";
+/**
+ * True when the live managed input chain restricts any TCP port to a source
+ * list. The only rules the ruleset limits by source are the SSH allow rules,
+ * so this is "SSH is management-only", whatever port it was on: a change of
+ * `ssh_port` cannot hide the restriction from the widening guard.
+ */
+export function liveSshManagementOnly(inputRules: readonly string[]): boolean {
+  return inputRules.some((r) =>
+    r.includes("saddr") && /tcp\.dport in n:\d+/.test(r)
+  );
 }
 
 /** The recorded, still-open revert for `host`, if there is one. */
@@ -414,15 +413,15 @@ function target(
     connect_timeout_s: number;
   },
   privateKey: string,
-): Target {
+): SshTarget {
   return {
     host: a.host,
     port: a.port,
     user: a.user,
-    hostKeyPolicy: a.host_key_policy,
-    hostKeys: a.host_keys,
-    privateKey,
-    connectTimeoutS: a.connect_timeout_s,
+    host_key_policy: a.host_key_policy,
+    host_keys: a.host_keys,
+    private_key: privateKey,
+    connect_timeout_s: a.connect_timeout_s,
   };
 }
 
@@ -464,7 +463,7 @@ export function createModel(overrides: Partial<HostDeps> = {}) {
     a: Parameters<typeof target>[0] & {
       ssh_key_ref: { vault: string; key: string };
     },
-  ): Promise<Target> {
+  ): Promise<SshTarget> {
     const key = await resolvePrivateKey(deps, context, a.ssh_key_ref);
     return target(a, key);
   }
@@ -500,10 +499,7 @@ export function createModel(overrides: Partial<HostDeps> = {}) {
     // Never widen a live management-only SSH rule back to anywhere unless asked.
     if (rules.allowSshFromAnywhere && !args.allow_widening_ssh_exposure) {
       const live = await probeState(deps, t, { sudo: args.sudo });
-      if (
-        liveSshExposure(live.managed_input_rules, rules.sshPort) ===
-          "management-only"
-      ) {
+      if (liveSshManagementOnly(live.managed_input_rules)) {
         throw new HostConfigError(
           `${args.host} is locked down to its management CIDRs; refusing to open SSH to anywhere again. Set allow_widening_ssh_exposure to do it on purpose`,
         );
@@ -619,7 +615,7 @@ export function createModel(overrides: Partial<HostDeps> = {}) {
    */
   async function settleFailedChange(
     context: Ctx,
-    t: Target,
+    t: SshTarget,
     args: { host: string; sudo: boolean },
     token: string,
     armed: boolean,
@@ -627,8 +623,10 @@ export function createModel(overrides: Partial<HostDeps> = {}) {
     error: unknown,
   ): Promise<void> {
     if (!armed && !attempted) return;
+    // A step that hit its remote deadline is not a definite failure: the
+    // command may have finished the change after the deadline fired.
     const definite = error instanceof HostOpsError &&
-      error.exitCode !== undefined;
+      error.exitCode !== undefined && !error.deadline;
     if (armed && !(definite && (error as HostOpsError).stepKind === "apply")) {
       context.logger.warning(
         "Change on {host} failed after arming; revert {token} stays armed and will restore the host",
@@ -746,7 +744,7 @@ export function createModel(overrides: Partial<HostDeps> = {}) {
   }
   return {
     type: "@randybias/server-host",
-    version: "2026.10.17.3",
+    version: "2026.10.17.4",
     description:
       "Harden a Linux host over SSH in three phases: base packages and users, an nftables firewall rendered from inputs, and an SSH lockdown. The SSH key is named by a vault reference and the firewall and lockdown phases arm a host-side revert timer before they change anything.",
     upgrades: [
@@ -760,6 +758,12 @@ export function createModel(overrides: Partial<HostDeps> = {}) {
         toVersion: "2026.10.17.3",
         description:
           "Adds identity, allow_widening_ssh_exposure and the forget action; stored attributes are unchanged",
+        upgradeAttributes: (old: Record<string, unknown>) => old,
+      },
+      {
+        toVersion: "2026.10.17.4",
+        description:
+          "Re-vendors the canonical SSH transport and streams every script over stdin; stored attributes are unchanged",
         upgradeAttributes: (old: Record<string, unknown>) => old,
       },
     ],
@@ -1152,6 +1156,22 @@ export function createModel(overrides: Partial<HostDeps> = {}) {
             | HostState
             | null;
           assertIdentity(stored?.identity, args.identity, args.host);
+          const revert = await context.readResource(revertName(args.host)) as
+            | Revert
+            | null;
+          const open = isOpen(revert) ? revert : null;
+          if (open) assertIdentity(open.identity, args.identity, args.host);
+          const holdsState = stored !== null &&
+            (stored.identity !== undefined || stored.base !== undefined ||
+              stored.firewall !== undefined ||
+              (stored.pending_revoke?.length ?? 0) > 0);
+          // Nothing recorded to forget: a repeat is a no-op, not a new version.
+          if (!holdsState && !open) {
+            return {
+              dataHandles: [],
+              result: { host: args.host, forgotten: true, changed: false },
+            };
+          }
           const now = new Date(deps.now()).toISOString();
           const handles = [];
           // Records cannot be removed from inside a method, so each is replaced
@@ -1163,13 +1183,10 @@ export function createModel(overrides: Partial<HostDeps> = {}) {
               observed_at: now,
             }),
           );
-          const revert = await context.readResource(revertName(args.host)) as
-            | Revert
-            | null;
-          if (revert && isOpen(revert)) {
+          if (open) {
             handles.push(
               await context.writeResource("revert", revertName(args.host), {
-                ...revert,
+                ...open,
                 cancelled_at: now,
               }),
             );
@@ -1179,7 +1196,7 @@ export function createModel(overrides: Partial<HostDeps> = {}) {
           });
           return {
             dataHandles: handles,
-            result: { host: args.host, forgotten: true },
+            result: { host: args.host, forgotten: true, changed: true },
           };
         },
       },
@@ -1252,5 +1269,5 @@ async function writeFirewallState(
 export const model = {
   ...createModel(),
   type: "@randybias/server-host",
-  version: "2026.10.17.3",
+  version: "2026.10.17.4",
 };
